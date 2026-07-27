@@ -15,21 +15,20 @@ export function App() {
 
   return (
     <>
-      <header className="masthead">
-        <div className="brand">
-          <LogoMark />
-          <h1>Bridge Portal</h1>
-        </div>
-        {me?.user && (
+      {me?.user && (
+        <header className="masthead">
+          <div className="brand">
+            <LogoMark />
+            <h1>Armada &#8646; Discord Bridge</h1>
+          </div>
           <div className="row">
             <span className="muted">{me.user.username}</span>
             <button className="ghost" onClick={() => void api("/api/auth/logout", { method: "POST" }).then(refresh)}>
               Sign out
             </button>
           </div>
-        )}
-      </header>
-      <p className="muted tagline">Connect a Discord channel to an Armada community channel.</p>
+        </header>
+      )}
 
       {!me && <p className="muted">Loading…</p>}
       {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
@@ -43,7 +42,27 @@ export function App() {
           onCancel={() => setView("dashboard")}
         />
       )}
+      <Footer />
     </>
+  );
+}
+
+function Footer() {
+  return (
+    <footer className="footer">
+      <div className="footer-brand">
+        <LogoMark />
+        <span>Armada &#8646; Discord Bridge</span>
+      </div>
+      <nav className="footer-links">
+        <a href="https://gitworkshop.dev/npub1jvnpg4c6ljadf5t6ry0w9q0rnm4mksde87kglkrc993z46c39axsgq89sc/armada-discord-bridge" target="_blank" rel="noreferrer">
+          Source code
+        </a>
+        <a href="https://soapbox.pub/armada" target="_blank" rel="noreferrer">About Armada</a>
+        <a href="https://armada.buzz" target="_blank" rel="noreferrer">armada.buzz</a>
+        <a href="https://soapbox.pub" target="_blank" rel="noreferrer">Soapbox</a>
+      </nav>
+    </footer>
   );
 }
 
@@ -51,10 +70,13 @@ function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSigned
   return (
     <>
       <section className="hero-title">
-        <h2>
-          Armada <span className="swap">&#8646;</span> Discord Bridge
-        </h2>
-        <p>Mirror a channel from your Discord server into your Armada community, and back.</p>
+        <LogoMark />
+        <div>
+          <h2>
+            Armada <span className="swap">&#8646;</span> Discord Bridge
+          </h2>
+          <p>Mirror a channel from your Discord server into your Armada community, and back.</p>
+        </div>
       </section>
 
       <section className="hero">
@@ -98,6 +120,22 @@ function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSigned
         <p className="muted" style={{ marginBottom: 0 }}>
           Either side can pause or unlink the bridge at any time. Unlinking destroys the
           bridge's keys.
+        </p>
+      </section>
+
+      <section className="panel landing">
+        <h2>About Armada</h2>
+        <p>
+          <a href="https://soapbox.pub/armada" target="_blank" rel="noreferrer">Armada</a> is
+          an end-to-end encrypted community chat by{" "}
+          <a href="https://soapbox.pub" target="_blank" rel="noreferrer">Soapbox</a>, built
+          on the Concord protocol over Nostr. Each community holds its own keys and runs
+          its own moderation.
+        </p>
+        <p style={{ marginBottom: 0 }}>
+          No Armada community yet? Create one at{" "}
+          <a href="https://armada.buzz" target="_blank" rel="noreferrer">armada.buzz</a>,
+          then come back here with an invite link.
         </p>
       </section>
     </>

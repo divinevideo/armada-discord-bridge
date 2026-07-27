@@ -69,7 +69,7 @@ a { color: hsl(var(--primary)); }
   /* waterline negative cut in the mark reads through to the chrome plane */
   --logo-bg: hsl(var(--chrome));
 }
-.tagline { font-size: 0.85rem; margin: 0 0 1rem; }
+
 
 .muted { color: hsl(var(--muted-foreground)); }
 .mono { font-family: var(--mono); font-size: 0.85em; }
@@ -143,11 +143,13 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 .pick:hover { border-color: hsl(var(--border)); background: hsl(var(--card)); }
 .pick.on { border-color: hsl(var(--primary)); color: hsl(var(--primary)); background: hsl(var(--primary) / 0.06); }
 
-/* Signed-out landing title. */
-.hero-title { margin: 2rem 0 0.25rem; }
+/* Signed-out landing header: the crest at full size beside the product name. */
+.hero-title { display: flex; align-items: center; gap: 1.1rem; margin: 2.25rem 0 0.25rem; }
+.hero-title .logo-mark { width: 52px; height: 52px; flex: none; --logo-bg: hsl(var(--background)); }
 .hero-title h2 { font-size: 2.1rem; line-height: 1.15; margin: 0; letter-spacing: -0.02em; }
 .hero-title .swap { color: hsl(var(--primary)); font-weight: 400; }
-.hero-title p { font-size: 1.02rem; color: hsl(var(--muted-foreground)); margin: 0.5rem 0 0; }
+.hero-title p { font-size: 1.02rem; color: hsl(var(--muted-foreground)); margin: 0.4rem 0 0; }
+@media (max-width: 700px) { .hero-title { align-items: flex-start; } .hero-title h2 { font-size: 1.6rem; } }
 
 /* Hero: pitch left, a mocked bridged channel pair right. */
 .hero {
@@ -249,6 +251,21 @@ label.consent { display: flex; gap: 0.6rem; align-items: flex-start; margin: 0.7
 .status.pending_confirm { color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.6); }
 .status.paused { color: hsl(var(--muted-foreground)); }
 .status.severed { color: hsl(var(--destructive)); border-color: hsl(var(--destructive) / 0.6); }
+
+/* Footer: a recessed chrome plane closing the page. */
+.footer {
+  margin-top: 3rem; padding: 0.8rem 0.9rem;
+  background: hsl(var(--chrome));
+  border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius-chrome);
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 1rem; flex-wrap: wrap; font-size: 0.8rem;
+}
+.footer-brand { display: flex; align-items: center; gap: 0.5rem; color: hsl(var(--muted-foreground)); }
+.footer-brand .logo-mark { width: 18px; height: 18px; color: hsl(var(--muted-foreground)); --logo-bg: hsl(var(--chrome)); }
+.footer-links { display: flex; gap: 1.1rem; flex-wrap: wrap; }
+.footer-links a { color: hsl(var(--muted-foreground)); text-decoration: none; }
+.footer-links a:hover { color: hsl(var(--primary)); }
 
 table { width: 100%; border-collapse: collapse; }
 td { padding: 0.5rem 0.4rem; border-top: 1px solid hsl(var(--chrome-divider)); vertical-align: top; }
