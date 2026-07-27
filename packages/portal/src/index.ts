@@ -87,11 +87,13 @@ app.post("/api/auth/logout", async (c) => {
 
 app.get("/api/me", async (c) => {
   const session = await sessions.get(c);
-  if (!session || !session.user.id) return c.json({ user: null, devLogin: env.devLogin });
+  const discordConfigured = Boolean(env.discordClientId && env.discordClientSecret);
+  if (!session || !session.user.id) return c.json({ user: null, devLogin: env.devLogin, discordConfigured });
   return c.json({
     user: session.user,
     guilds: session.guilds.filter((g) => g.canManage),
     devLogin: env.devLogin,
+    discordConfigured,
   });
 });
 

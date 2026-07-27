@@ -15,6 +15,7 @@ export interface Me {
   user: { id: string; username: string; avatarUrl?: string } | null;
   guilds?: Array<{ id: string; name: string; icon?: string }>;
   devLogin: boolean;
+  discordConfigured: boolean;
 }
 
 export interface BridgeSummary {

@@ -77,11 +77,19 @@ export class BridgeManager {
 
   async init(): Promise<void> {
     if (this.env.discordBotToken) {
-      this.adapter = new DiscordAdapter(this.env.discordBotToken, {
-        onMessage: async (msg) => this.onDiscord(msg),
-      });
-      await this.adapter.start();
-      console.log("portal: discord gateway up");
+      try {
+        this.adapter = new DiscordAdapter(this.env.discordBotToken, {
+          onMessage: async (msg) => this.onDiscord(msg),
+        });
+        await this.adapter.start();
+        console.log("portal: discord gateway up");
+      } catch (error) {
+        // Common cause: MESSAGE_CONTENT privileged intent not enabled on the
+        // bot ("Used disallowed intents"). The portal stays up so the rest of
+        // the flow keeps working; fix the app settings and restart.
+        this.adapter = undefined;
+        console.error("portal: discord gateway failed to start:", error);
+      }
     } else {
       console.warn("portal: DISCORD_TOKEN not set; bridges cannot go live");
     }

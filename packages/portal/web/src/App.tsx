@@ -31,7 +31,7 @@ export function App() {
       </header>
 
       {!me && <p className="muted">Loading…</p>}
-      {me && !me.user && <SignIn devLogin={me.devLogin} onSignedIn={refresh} />}
+      {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
       {me?.user && view === "dashboard" && (
         <Dashboard onNew={() => setView("wizard")} />
       )}
@@ -46,7 +46,7 @@ export function App() {
   );
 }
 
-function SignIn(props: { devLogin: boolean; onSignedIn: () => void }) {
+function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSignedIn: () => void }) {
   return (
     <div className="panel">
       <h2>What this does, plainly</h2>
@@ -61,7 +61,14 @@ function SignIn(props: { devLogin: boolean; onSignedIn: () => void }) {
         encryption and land on Discord's servers in plaintext.
       </p>
       <div className="row" style={{ marginTop: "1rem" }}>
-        <a className="btn" href="/api/auth/discord">Sign in with Discord</a>
+        {props.discordConfigured ? (
+          <a className="btn" href="/api/auth/discord">Sign in with Discord</a>
+        ) : (
+          <span className="muted">
+            Discord OAuth is not configured on this server (set DISCORD_CLIENT_ID and
+            DISCORD_CLIENT_SECRET, restart the API).
+          </span>
+        )}
         {props.devLogin && (
           <button className="ghost" onClick={() => void api("/api/auth/dev", { method: "POST" }).then(props.onSignedIn)}>
             Dev login
