@@ -7,6 +7,7 @@ import { Wizard } from "./Wizard";
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [view, setView] = useState<"dashboard" | "wizard">("dashboard");
+  const [wizardFrom, setWizardFrom] = useState<BridgeSummary | undefined>();
 
   const refresh = useCallback(() => {
     void api<Me>("/api/me").then(setMe).catch(() => setMe({ user: null, devLogin: false, discordConfigured: false }));
@@ -33,11 +34,12 @@ export function App() {
       {!me && <p className="muted">Loading…</p>}
       {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
       {me?.user && view === "dashboard" && (
-        <Dashboard onNew={() => setView("wizard")} />
+        <Dashboard onNew={(from) => { setWizardFrom(from); setView("wizard"); }} />
       )}
       {me?.user && view === "wizard" && (
         <Wizard
           guilds={me.guilds ?? []}
+          from={wizardFrom}
           onDone={() => setView("dashboard")}
           onCancel={() => setView("dashboard")}
         />
@@ -261,7 +263,7 @@ function AvatarMireille({ id }: { id: string }) {
   );
 }
 
-function Dashboard(props: { onNew: () => void }) {
+function Dashboard(props: { onNew: (from?: BridgeSummary) => void }) {
   const [bridges, setBridges] = useState<BridgeSummary[] | null>(null);
   const [error, setError] = useState("");
 
@@ -286,7 +288,7 @@ function Dashboard(props: { onNew: () => void }) {
     <div>
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2>Your bridges</h2>
-        <button onClick={props.onNew}>Create a bridge</button>
+        <button onClick={() => props.onNew()}>Create a bridge</button>
       </div>
       {error && <p className="error">{error}</p>}
       {bridges === null && <p className="muted">Loading…</p>}
@@ -328,6 +330,9 @@ function Dashboard(props: { onNew: () => void }) {
             </tbody>
           </table>
           <div className="row" style={{ marginTop: "0.6rem" }}>
+            {b.community_id && b.discord_guild_id && (
+              <button className="ghost" onClick={() => props.onNew(b)}>Add channel</button>
+            )}
             {b.status === "active" && <button className="ghost" onClick={() => void act(b.bridge_id, "pause")}>Pause</button>}
             {(b.status === "paused" || b.status === "severed") && (
               <button className="ghost" onClick={() => void act(b.bridge_id, "resume")}>Resume</button>

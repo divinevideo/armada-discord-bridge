@@ -24,7 +24,7 @@ import {
 import { loadPortalEnv } from "./env";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
-import { seal } from "./seal";
+import { seal, unseal } from "./seal";
 
 const env = loadPortalEnv();
 await migrate(env.databaseUrl);
@@ -119,15 +119,25 @@ const ownedBridge = async (c: { req: { param: (k: string) => string } }, ownerId
 app.post("/api/bridges", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
-  const { inviteUrl } = (await c.req.json()) as { inviteUrl?: string };
-  if (!inviteUrl) return c.json({ error: "inviteUrl required" }, 400);
+  const { inviteUrl, fromBridgeId } = (await c.req.json()) as { inviteUrl?: string; fromBridgeId?: string };
 
-  const inspected = await manager.inspectInvite(inviteUrl).catch((error) => ({ error: String(error) }));
+  // "Add channel": reuse the sealed invite from a bridge the user already owns
+  // instead of demanding a fresh link for every channel of the same community.
+  let invite = inviteUrl;
+  if (!invite && fromBridgeId) {
+    const [src] = await sql<BridgeRow[]>`
+      SELECT * FROM bridges WHERE bridge_id = ${fromBridgeId} AND owner_discord_id = ${session.user.id}`;
+    if (!src?.invite_url_sealed) return c.json({ error: "source bridge not found" }, 404);
+    invite = unseal(env.sealKeyHex, src.invite_url_sealed);
+  }
+  if (!invite) return c.json({ error: "inviteUrl required" }, 400);
+
+  const inspected = await manager.inspectInvite(invite).catch((error) => ({ error: String(error) }));
   if ("error" in inspected) return c.json(inspected, 422);
 
   const [row] = await sql<BridgeRow[]>`
     INSERT INTO bridges (owner_discord_id, status, invite_url_sealed, community_id, community_name)
-    VALUES (${session.user.id}, 'draft', ${seal(env.sealKeyHex, inviteUrl)},
+    VALUES (${session.user.id}, 'draft', ${seal(env.sealKeyHex, invite)},
             ${inspected.community.idHex}, ${inspected.community.name})
     RETURNING *`;
   return c.json({ bridgeId: row.bridge_id, community: inspected.community, channels: inspected.channels });

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { api } from "./api";
+import type { BridgeSummary } from "./api";
 
 interface GuildOpt { id: string; name: string }
 interface ChannelOpt { id: string; name: string }
@@ -8,7 +9,13 @@ interface ConcordChannel { idHex: string; name: string }
 
 const STEPS = ["guild", "channel", "armada", "pair", "confirm"] as const;
 
-export function Wizard(props: { guilds: GuildOpt[]; onDone: () => void; onCancel: () => void }) {
+export function Wizard(props: {
+  guilds: GuildOpt[];
+  /** Add-channel mode: reuse this bridge's community; no invite link asked. */
+  from?: BridgeSummary;
+  onDone: () => void;
+  onCancel: () => void;
+}) {
   const [step, setStep] = useState(0);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -43,24 +50,35 @@ export function Wizard(props: { guilds: GuildOpt[]; onDone: () => void; onCancel
     }
   }
 
-  async function submitInvite() {
+  async function submitInvite(body: { inviteUrl: string } | { fromBridgeId: string }, advance: boolean) {
     setBusy(true);
     setError("");
     try {
       const res = await api<{ bridgeId: string; community: { name: string }; channels: ConcordChannel[] }>(
         "/api/bridges",
-        { method: "POST", body: JSON.stringify({ inviteUrl }) },
+        { method: "POST", body: JSON.stringify(body) },
       );
       setBridgeId(res.bridgeId);
       setCommunityName(res.community.name);
       setConcordChannels(res.channels);
-      setStep(3);
+      if (advance) setStep(3);
     } catch (e) {
       setError(String((e as Error).message));
     } finally {
       setBusy(false);
     }
   }
+
+  // Add-channel mode: the community is known, so mint the draft from the
+  // stored invite right away and start at the Discord channel pick.
+  useEffect(() => {
+    if (!props.from?.discord_guild_id) return;
+    setGuildId(props.from.discord_guild_id);
+    setStep(1);
+    void checkBot(props.from.discord_guild_id);
+    void submitInvite({ fromBridgeId: props.from.bridge_id }, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function submitLink() {
     setBusy(true);
@@ -121,6 +139,12 @@ export function Wizard(props: { guilds: GuildOpt[]; onDone: () => void; onCancel
       {step === 1 && (
         <div className="panel">
           <h2>Install the bot, pick the channel</h2>
+          {props.from && (
+            <p className="muted">
+              Adding a channel to {props.from.community_name ?? "the community"}; the stored
+              invite is reused, no new link needed.
+            </p>
+          )}
           {botPresent === null && <p className="muted">Checking…</p>}
           {botPresent === false && (
             <>
@@ -139,7 +163,12 @@ export function Wizard(props: { guilds: GuildOpt[]; onDone: () => void; onCancel
                 </button>
               ))}
               <div className="row" style={{ marginTop: "0.75rem" }}>
-                <button disabled={!channelId} onClick={() => setStep(2)}>Continue</button>
+                <button
+                  disabled={!channelId || (props.from && !bridgeId) || busy}
+                  onClick={() => setStep(props.from ? 3 : 2)}
+                >
+                  Continue
+                </button>
               </div>
             </>
           )}
@@ -160,7 +189,7 @@ export function Wizard(props: { guilds: GuildOpt[]; onDone: () => void; onCancel
             onChange={(e) => setInviteUrl(e.target.value)}
           />
           <div className="row" style={{ marginTop: "0.75rem" }}>
-            <button disabled={!inviteUrl || busy} onClick={() => void submitInvite()}>
+            <button disabled={!inviteUrl || busy} onClick={() => void submitInvite({ inviteUrl }, true)}>
               {busy ? "Resolving…" : "Resolve invite"}
             </button>
           </div>
