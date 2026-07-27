@@ -14,12 +14,19 @@ import {
   ChannelType,
   Client,
   GatewayIntentBits,
+  Partials,
   type Message,
   type TextChannel,
   type Webhook,
 } from "discord.js";
 
-import type { ChannelLink, DiscordInboundMessage, WebhookSender } from "../router";
+import type {
+  ChannelLink,
+  DiscordInboundMessage,
+  DiscordMessageDelete,
+  DiscordReactionAdd,
+  WebhookSender,
+} from "../router";
 
 export const BRIDGE_WEBHOOK_NAME = "armada-bridge";
 
@@ -42,11 +49,14 @@ export function toInbound(message: Message): DiscordInboundMessage {
     })),
     webhookId: message.webhookId ?? undefined,
     applicationId: message.applicationId ?? undefined,
+    referencedMessageId: message.reference?.messageId ?? undefined,
   };
 }
 
 export interface DiscordAdapterHandlers {
   onMessage(msg: DiscordInboundMessage): Promise<void>;
+  onMessageDelete?(del: DiscordMessageDelete): Promise<void>;
+  onReactionAdd?(reaction: DiscordReactionAdd): Promise<void>;
 }
 
 export class DiscordAdapter implements WebhookSender {
@@ -63,13 +73,44 @@ export class DiscordAdapter implements WebhookSender {
       intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildMessageReactions,
         GatewayIntentBits.MessageContent,
       ],
+      // Deletes and reactions arrive for uncached (pre-boot) messages too.
+      partials: [Partials.Message, Partials.Reaction, Partials.User],
     });
     this.client.on("messageCreate", (message) => {
       void this.handlers.onMessage(toInbound(message)).catch((error) => {
         console.error("bridge: onMessage failed", error);
       });
+    });
+    this.client.on("messageDelete", (message) => {
+      void this.handlers
+        .onMessageDelete?.({
+          id: message.id,
+          channelId: message.channelId,
+          guildId: message.guildId ?? "",
+        })
+        .catch((error) => console.error("bridge: onMessageDelete failed", error));
+    });
+    this.client.on("messageReactionAdd", (reaction, user) => {
+      void (async () => {
+        if (user.id === this.client.user?.id) return; // our own bot reactions
+        const full = reaction.partial ? await reaction.fetch() : reaction;
+        const fullUser = user.partial ? await user.fetch() : user;
+        await this.handlers.onReactionAdd?.({
+          messageId: full.message.id,
+          channelId: full.message.channelId,
+          guildId: full.message.guildId ?? "",
+          emoji: { name: full.emoji.name, id: full.emoji.id },
+          user: {
+            id: fullUser.id,
+            display: fullUser.displayName ?? fullUser.username,
+            avatarUrl: fullUser.displayAvatarURL?.(),
+            bot: fullUser.bot,
+          },
+        });
+      })().catch((error) => console.error("bridge: onReactionAdd failed", error));
     });
   }
 
@@ -117,16 +158,52 @@ export class DiscordAdapter implements WebhookSender {
   /** WebhookSender: post as a Concord member persona; returns message id. */
   async send(
     link: ChannelLink,
-    message: { username: string; avatarUrl?: string; content: string },
+    message: {
+      username: string;
+      avatarUrl?: string;
+      content: string;
+      embeds?: Array<{ description: string }>;
+    },
   ): Promise<string> {
     const webhook = await this.webhookFor(link.discordChannelId);
     const created = await webhook.send({
       content: message.content,
       username: sanitizeUsername(message.username),
       avatarURL: message.avatarUrl,
+      embeds: message.embeds,
       allowedMentions: { parse: [] },
     });
     return created.id;
+  }
+
+  private async textChannel(channelId: string): Promise<TextChannel> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || channel.type !== ChannelType.GuildText) {
+      throw new Error(`channel ${channelId} is not a guild text channel`);
+    }
+    return channel as TextChannel;
+  }
+
+  /**
+   * WebhookSender: remove a bridged message. Webhook delete covers our own
+   * mirrors; user-authored posts (moderator delete from the Armada side)
+   * need the bot's Manage Messages permission.
+   */
+  async delete(link: ChannelLink, discordMessageId: string): Promise<void> {
+    const webhook = await this.webhookFor(link.discordChannelId);
+    try {
+      await webhook.deleteMessage(discordMessageId);
+    } catch {
+      const channel = await this.textChannel(link.discordChannelId);
+      await channel.messages.delete(discordMessageId);
+    }
+  }
+
+  /** WebhookSender: react as the bot account (webhooks cannot react). */
+  async react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
+    const channel = await this.textChannel(link.discordChannelId);
+    const message = await channel.messages.fetch(discordMessageId);
+    await message.react(emoji);
   }
 }
 

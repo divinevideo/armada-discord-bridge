@@ -36,11 +36,22 @@ class FakePool implements RelayLike {
 }
 
 class FakeWebhooks {
-  sent: Array<{ username: string; content: string }> = [];
+  sent: Array<{ username: string; content: string; embeds?: Array<{ description: string }> }> = [];
+  deleted: string[] = [];
+  reactions: Array<{ messageId: string; emoji: string }> = [];
   private seq = 9000;
-  async send(_link: ChannelLink, message: { username: string; content: string }): Promise<string> {
+  async send(
+    _link: ChannelLink,
+    message: { username: string; content: string; embeds?: Array<{ description: string }> },
+  ): Promise<string> {
     this.sent.push(message);
     return String(this.seq++);
+  }
+  async delete(_link: ChannelLink, discordMessageId: string): Promise<void> {
+    this.deleted.push(discordMessageId);
+  }
+  async react(_link: ChannelLink, messageId: string, emoji: string): Promise<void> {
+    this.reactions.push({ messageId, emoji });
   }
 }
 
@@ -225,5 +236,190 @@ describe("BridgeRouter: Concord -> Discord", () => {
     expect(await router.onConcordChat(concordChat({ author: banned }), link)).toEqual([]);
 
     expect(webhooks.sent).toHaveLength(0);
+  });
+});
+
+describe("BridgeRouter: replies", () => {
+  it("Discord reply to a mirrored Armada message carries a q tag naming rumor and author", async () => {
+    const { router, pool, store, channel, link } = harness();
+    // An Armada member's message, mirrored to Discord as id 9000.
+    await router.onConcordChat(concordChat(), link);
+    expect(store.rows[0].discordMessageId).toBe("9000");
+
+    await router.onDiscordMessage(
+      discordMsg({ id: "2", content: "replying!", referencedMessageId: "9000" }),
+      link,
+    );
+    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const opened = openWrap(wrap, channel.current.group);
+    expect(opened.tags).toContainEqual(["q", "r".repeat(64), "", "f".repeat(64)]);
+  });
+
+  it("Discord reply to a bridged Discord message names the puppet author", async () => {
+    const { router, pool, store, channel, puppets, link } = harness();
+    const rumorId = await router.onDiscordMessage(discordMsg({ id: "1" }), link);
+    await router.onDiscordMessage(discordMsg({ id: "2", referencedMessageId: "1" }), link);
+
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const opened = openWrap(wraps[1], channel.current.group);
+    expect(opened.tags).toContainEqual(["q", rumorId!, "", puppets.get("80351110224678912").pk]);
+    expect(store.rows).toHaveLength(2);
+  });
+
+  it("unmapped references degrade to a bare message", async () => {
+    const { router, pool, channel, link } = harness();
+    await router.onDiscordMessage(discordMsg({ referencedMessageId: "404404" }), link);
+    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const opened = openWrap(wrap, channel.current.group);
+    expect(opened.tags.some((t) => t[0] === "q")).toBe(false);
+  });
+
+  it("Concord q-tag reply renders a jump-link embed on the first part", async () => {
+    const { router, webhooks, store, link } = harness();
+    await store.insert({
+      discordMessageId: "555",
+      discordChannelId: "c1",
+      concordRumorId: "t".repeat(64),
+      concordChannelId: link.concordChannelIdHex,
+      communityId: link.communityId,
+      origin: "discord",
+      authorRef: "80351110224678912",
+      partIndex: 0,
+    });
+    await router.onConcordChat(concordChat({ tags: [["q", "t".repeat(64)]] }), link);
+    expect(webhooks.sent[0].embeds).toHaveLength(1);
+    expect(webhooks.sent[0].embeds![0].description).toContain("https://discord.com/channels/g1/c1/555");
+  });
+});
+
+describe("BridgeRouter: deletes", () => {
+  it("Discord delete of a bridged message publishes a puppet kind 5 with proxy tag", async () => {
+    const { router, pool, channel, puppets, link } = harness();
+    const rumorId = await router.onDiscordMessage(discordMsg(), link);
+    const before = pool.published.filter((e) => e.kind === 1059).length;
+
+    const deleteRumorId = await router.onDiscordDelete(
+      { id: "111222333", channelId: "c1", guildId: "g1" },
+      link,
+    );
+    expect(deleteRumorId).toBeDefined();
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    expect(wraps).toHaveLength(before + 1);
+    const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
+    expect(opened.kind).toBe(5);
+    expect(opened.author).toBe(puppets.get("80351110224678912").pk);
+    expect(opened.tags).toContainEqual(["e", rumorId!]);
+    expect(hasProxyTag(opened)).toBe(true);
+  });
+
+  it("Discord delete of an Armada member's mirror stops at Discord", async () => {
+    const { router, pool, link } = harness();
+    await router.onConcordChat(concordChat(), link); // mirror as id 9000
+    const before = pool.published.filter((e) => e.kind === 1059).length;
+    expect(await router.onDiscordDelete({ id: "9000", channelId: "c1", guildId: "g1" }, link)).toBeUndefined();
+    expect(pool.published.filter((e) => e.kind === 1059)).toHaveLength(before);
+  });
+
+  it("Concord kind 5 removes every mapped part for the author, ignores strangers, honors moderators", async () => {
+    const { router, webhooks, link } = harness();
+    const ids = await router.onConcordChat(concordChat({ content: "word ".repeat(600) }), link);
+    expect(ids.length).toBeGreaterThan(1);
+
+    // A stranger without MANAGE_MESSAGES cannot delete.
+    await router.onConcordChat(
+      concordChat({ rumorId: "d1".repeat(32), kind: 5, author: "a".repeat(64), content: "", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.deleted).toHaveLength(0);
+
+    // The author can.
+    await router.onConcordChat(
+      concordChat({ rumorId: "d2".repeat(32), kind: 5, content: "", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.deleted).toEqual(ids);
+  });
+
+  it("Concord moderator deletes propagate", async () => {
+    const { router, webhooks, client, link } = harness();
+    const ids = await router.onConcordChat(concordChat(), link);
+    client.isModerator = () => true;
+    await router.onConcordChat(
+      concordChat({ rumorId: "d3".repeat(32), kind: 5, author: "a".repeat(64), content: "", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.deleted).toEqual(ids);
+  });
+});
+
+describe("BridgeRouter: reactions", () => {
+  const reaction = (overrides: Record<string, unknown> = {}) => ({
+    messageId: "111222333",
+    channelId: "c1",
+    guildId: "g1",
+    emoji: { name: "🔥", id: null },
+    user: { id: "80351110224678912", display: "mk", bot: false },
+    ...overrides,
+  });
+
+  it("Discord reaction publishes a puppet kind 7 targeting the mapped rumor", async () => {
+    const { router, pool, channel, puppets, link } = harness();
+    const rumorId = await router.onDiscordMessage(discordMsg(), link);
+
+    const reactionRumorId = await router.onDiscordReaction(reaction(), link);
+    expect(reactionRumorId).toBeDefined();
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
+    expect(opened.kind).toBe(7);
+    expect(opened.content).toBe("🔥");
+    expect(opened.author).toBe(puppets.get("80351110224678912").pk);
+    expect(opened.tags).toContainEqual(["e", rumorId!]);
+    expect(opened.tags).toContainEqual(["k", "9"]);
+    expect(hasProxyTag(opened)).toBe(true);
+  });
+
+  it("skips custom emoji, bots, and unmapped messages", async () => {
+    const { router, pool, link } = harness();
+    await router.onDiscordMessage(discordMsg(), link);
+    const before = pool.published.filter((e) => e.kind === 1059).length;
+
+    expect(await router.onDiscordReaction(reaction({ emoji: { name: "blob", id: "999" } }), link)).toBeUndefined();
+    expect(
+      await router.onDiscordReaction(reaction({ user: { id: "1", display: "bot", bot: true } }), link),
+    ).toBeUndefined();
+    expect(await router.onDiscordReaction(reaction({ messageId: "404404" }), link)).toBeUndefined();
+    expect(pool.published.filter((e) => e.kind === 1059)).toHaveLength(before);
+  });
+
+  it("Concord kind 7 reacts on the mapped Discord message, mapping NIP-25 likes", async () => {
+    const { router, webhooks, link } = harness();
+    await router.onConcordChat(concordChat(), link); // mirror as id 9000
+
+    await router.onConcordChat(
+      concordChat({ rumorId: "e1".repeat(32), kind: 7, content: "+", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    await router.onConcordChat(
+      concordChat({ rumorId: "e2".repeat(32), kind: 7, content: "🔥", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.reactions).toEqual([
+      { messageId: "9000", emoji: "👍" },
+      { messageId: "9000", emoji: "🔥" },
+    ]);
+  });
+
+  it("skips NIP-30 shortcodes and non-emoji content", async () => {
+    const { router, webhooks, link } = harness();
+    await router.onConcordChat(concordChat(), link);
+    await router.onConcordChat(
+      concordChat({ rumorId: "e3".repeat(32), kind: 7, content: ":pepe:", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    await router.onConcordChat(
+      concordChat({ rumorId: "e4".repeat(32), kind: 7, content: "lol", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.reactions).toHaveLength(0);
   });
 });

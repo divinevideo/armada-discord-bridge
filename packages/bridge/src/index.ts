@@ -98,6 +98,14 @@ const adapter = new DiscordAdapter(config.discordToken, {
     if (msg.channelId !== link.discordChannelId) return;
     await router.onDiscordMessage(msg, link);
   },
+  async onMessageDelete(del) {
+    if (del.channelId !== link.discordChannelId) return;
+    await router.onDiscordDelete(del, link);
+  },
+  async onReactionAdd(reaction) {
+    if (reaction.channelId !== link.discordChannelId) return;
+    await router.onDiscordReaction(reaction, link);
+  },
 });
 await adapter.start();
 router = new BridgeRouter(client, puppets, store, adapter, profiles, {

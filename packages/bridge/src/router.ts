@@ -11,6 +11,7 @@
  *     and never bridge a rumor we already have a mapping row for.
  */
 
+import { KIND_DELETE, KIND_MESSAGE, KIND_REACTION } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 
 import type { ConcordClient } from "./concord/client";
@@ -38,6 +39,23 @@ export interface DiscordInboundMessage extends DiscordMessageContent {
   author: { id: string; display: string; avatarUrl?: string; bot: boolean };
   webhookId?: string;
   applicationId?: string;
+  /** message_reference: the Discord message this one replies to. */
+  referencedMessageId?: string;
+}
+
+export interface DiscordMessageDelete {
+  id: string;
+  channelId: string;
+  guildId: string;
+}
+
+export interface DiscordReactionAdd {
+  messageId: string;
+  channelId: string;
+  guildId: string;
+  /** Unicode emoji have only a name; custom emoji carry an id. */
+  emoji: { name: string | null; id: string | null };
+  user: { id: string; display: string; avatarUrl?: string; bot: boolean };
 }
 
 export interface MessageMappingRow {
@@ -54,14 +72,38 @@ export interface MessageMappingRow {
 export interface MappingStore {
   insert(row: MessageMappingRow): Promise<void>;
   byRumorId(rumorId: string): Promise<MessageMappingRow[]>;
+  byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]>;
 }
 
 export interface WebhookSender {
   /** Post as the given persona; returns the created Discord message id. */
   send(
     link: ChannelLink,
-    message: { username: string; avatarUrl?: string; content: string },
+    message: {
+      username: string;
+      avatarUrl?: string;
+      content: string;
+      embeds?: Array<{ description: string }>;
+    },
   ): Promise<string>;
+  /** Remove a bridged message (webhook delete; bot delete for user posts). */
+  delete(link: ChannelLink, discordMessageId: string): Promise<void>;
+  /** React as the bot account (webhooks cannot react). */
+  react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
+}
+
+/**
+ * NIP-25 reaction content -> a Discord-reactable unicode emoji, or undefined
+ * for content Discord would reject ("+"/"" mean like, "-" dislike; NIP-30
+ * `:shortcode:` custom emoji have no Discord equivalent).
+ */
+export function reactionEmoji(content: string): string | undefined {
+  const c = content.trim();
+  if (c === "" || c === "+") return "👍";
+  if (c === "-") return "👎";
+  if (/^:.+:$/.test(c)) return undefined;
+  if (/\p{Extended_Pictographic}/u.test(c)) return c;
+  return undefined;
 }
 
 export interface ProfileResolver {
@@ -127,10 +169,22 @@ export class BridgeRouter {
       console.warn(`bridge: puppet profile publish failed for ${msg.author.id}`, error),
     );
 
+    const tags = [proxyTag(msg.id)];
+    if (msg.referencedMessageId) {
+      // NIP-C7 inline quote-reply naming the mapped rumor and its author.
+      // An unmapped reference (pre-bridge history) degrades to a bare message.
+      const [target] = await this.store.byDiscordId(msg.referencedMessageId);
+      if (target) {
+        const authorPk =
+          target.origin === "discord" ? this.puppets.get(target.authorRef).pk : target.authorRef;
+        tags.push(["q", target.concordRumorId, "", authorPk]);
+      }
+    }
+
     const { rumor } = await this.client.sendChat(channel, {
       content,
       author: identity,
-      tags: [proxyTag(msg.id)],
+      tags,
     });
 
     await this.store.insert({
@@ -149,15 +203,25 @@ export class BridgeRouter {
   /** Concord -> Discord. Returns created Discord message ids (may split). */
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (!link.enabled) return [];
-    if (chat.kind !== 9) return []; // MVP: plain messages only
     // Layer 1 + 2: bridge-originated or already-bridged rumors never bounce.
     if (hasProxyTag(chat)) return [];
     if (this.puppets.isPuppetPubkey(chat.author)) return [];
-    if ((await this.store.byRumorId(chat.rumorId)).length > 0) return [];
     if (this.client.isBanned(chat.author)) return [];
+
+    if (chat.kind === KIND_DELETE) {
+      await this.onConcordDelete(chat, link);
+      return [];
+    }
+    if (chat.kind === KIND_REACTION) {
+      await this.onConcordReaction(chat, link);
+      return [];
+    }
+    if (chat.kind !== KIND_MESSAGE) return []; // threads/edits/zaps: not yet bridged
+    if ((await this.store.byRumorId(chat.rumorId)).length > 0) return [];
 
     const profile = await this.profiles.resolve(chat.author).catch(() => fallbackProfile(chat.author));
     const parts = splitForDiscord(concordToDiscord(chat.content));
+    const reply = await this.replyEmbed(chat, link);
 
     const ids: string[] = [];
     for (const [index, part] of parts.entries()) {
@@ -165,6 +229,7 @@ export class BridgeRouter {
         username: profile.name,
         avatarUrl: profile.avatarUrl,
         content: part,
+        embeds: index === 0 && reply ? [reply] : undefined,
       });
       ids.push(discordMessageId);
       await this.store.insert({
@@ -180,6 +245,112 @@ export class BridgeRouter {
     }
     return ids;
   }
+
+  /**
+   * Discord MESSAGE_DELETE -> kind 5 from the original author's puppet.
+   * Deleting a mirror of an Armada member's message stops at Discord: the
+   * puppet cannot (and must not) tombstone someone else's rumor.
+   */
+  async onDiscordDelete(del: DiscordMessageDelete, link: ChannelLink): Promise<string | undefined> {
+    if (!link.enabled) return undefined;
+    const [row] = await this.store.byDiscordId(del.id);
+    if (!row || row.origin !== "discord") return undefined;
+
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) return undefined;
+
+    const puppet = this.puppets.get(row.authorRef);
+    const { rumor } = await this.client.sendChat(channel, {
+      kind: KIND_DELETE,
+      content: "",
+      author: { pk: puppet.pk, signer: localIdentity(puppet.sk).signer },
+      tags: [["e", row.concordRumorId], proxyTag(del.id)],
+    });
+    return rumor.id;
+  }
+
+  /** Discord MESSAGE_REACTION_ADD -> kind 7 from the reactor's puppet. */
+  async onDiscordReaction(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
+    if (!link.enabled) return undefined;
+    if (reaction.user.bot) return undefined;
+    // Custom Discord emoji have an id and no unicode form; skip until NIP-30
+    // emoji tags are carried (NEXT-STEPS section 1).
+    if (reaction.emoji.id || !reaction.emoji.name) return undefined;
+
+    const [row] = await this.store.byDiscordId(reaction.messageId);
+    if (!row) return undefined;
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) return undefined;
+
+    const puppet = this.puppets.get(reaction.user.id);
+    const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
+    await this.syncPuppetProfile(reaction.user, identity).catch((error) =>
+      console.warn(`bridge: puppet profile publish failed for ${reaction.user.id}`, error),
+    );
+
+    const { rumor } = await this.client.sendChat(channel, {
+      kind: KIND_REACTION,
+      content: reaction.emoji.name,
+      author: identity,
+      tags: [
+        ["e", row.concordRumorId],
+        ["k", String(KIND_MESSAGE)],
+        proxyTag(reaction.messageId),
+      ],
+    });
+    return rumor.id;
+  }
+
+  /**
+   * Kind 5 -> remove every mapped Discord part. Honored for the rumor's own
+   * author and for MANAGE_MESSAGES holders (moderator deletes propagate).
+   */
+  private async onConcordDelete(chat: OpenedChat, link: ChannelLink): Promise<void> {
+    const targets = chat.tags.filter((t) => t[0] === "e" && t[1]).map((t) => t[1]);
+    for (const target of targets) {
+      const rows = await this.store.byRumorId(target);
+      if (rows.length === 0) continue;
+      const own = rows[0].origin === "concord" && rows[0].authorRef === chat.author;
+      if (!own && !this.client.isModerator(chat.author)) continue;
+      for (const row of rows) {
+        await this.webhooks
+          .delete(link, row.discordMessageId)
+          .catch((error) => console.warn(`bridge: discord delete failed for ${row.discordMessageId}`, error));
+      }
+    }
+  }
+
+  /** Kind 7 -> bot reaction on the mapped Discord message (add-only). */
+  private async onConcordReaction(chat: OpenedChat, link: ChannelLink): Promise<void> {
+    const target = chat.tags.find((t) => t[0] === "e" && t[1])?.[1];
+    if (!target) return;
+    const emoji = reactionEmoji(chat.content);
+    if (!emoji) return;
+    const rows = await this.store.byRumorId(target);
+    const row = rows.find((r) => r.partIndex === 0) ?? rows[0];
+    if (!row) return;
+    await this.webhooks.react(link, row.discordMessageId, emoji);
+  }
+
+  /** A kind 9 `q` tag -> an embed linking the mapped Discord message. */
+  private async replyEmbed(
+    chat: OpenedChat,
+    link: ChannelLink,
+  ): Promise<{ description: string } | undefined> {
+    const target = chat.tags.find((t) => t[0] === "q" && t[1])?.[1];
+    if (!target) return undefined;
+    const rows = await this.store.byRumorId(target);
+    const row = rows.find((r) => r.partIndex === 0) ?? rows[0];
+    if (!row) return undefined;
+    const url = `https://discord.com/channels/${link.discordGuildId}/${row.discordChannelId}/${row.discordMessageId}`;
+    if (row.origin === "concord") {
+      const profile = await this.profiles
+        .resolve(row.authorRef)
+        .catch(() => fallbackProfile(row.authorRef));
+      return { description: `Replying to ${profile.name} ([view message](${url}))` };
+    }
+    return { description: `Replying to [this message](${url})` };
+  }
 }
 
 /** In-memory store for tests and dry runs; Postgres implementation in db/. */
@@ -190,5 +361,8 @@ export class MemoryMappingStore implements MappingStore {
   }
   async byRumorId(rumorId: string): Promise<MessageMappingRow[]> {
     return this.rows.filter((r) => r.concordRumorId === rumorId);
+  }
+  async byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]> {
+    return this.rows.filter((r) => r.discordMessageId === discordMessageId);
   }
 }

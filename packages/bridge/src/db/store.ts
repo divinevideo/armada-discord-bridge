@@ -33,7 +33,20 @@ export class PostgresMappingStore implements MappingStore {
              concord_channel_id, community_id, origin, author_ref, part_index
       FROM messages
       WHERE tenant_id = ${this.tenantId} AND concord_rumor_id = ${rumorId}`;
-    return rows.map((r) => ({
+    return rows.map((r) => this.toRow(r));
+  }
+
+  async byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]> {
+    const rows = await this.sql`
+      SELECT discord_message_id, discord_channel_id, concord_rumor_id,
+             concord_channel_id, community_id, origin, author_ref, part_index
+      FROM messages
+      WHERE tenant_id = ${this.tenantId} AND discord_message_id = ${discordMessageId}`;
+    return rows.map((r) => this.toRow(r));
+  }
+
+  private toRow(r: Record<string, unknown>): MessageMappingRow {
+    return {
       discordMessageId: r.discord_message_id as string,
       discordChannelId: r.discord_channel_id as string,
       concordRumorId: r.concord_rumor_id as string,
@@ -42,7 +55,7 @@ export class PostgresMappingStore implements MappingStore {
       origin: r.origin as "discord" | "concord",
       authorRef: r.author_ref as string,
       partIndex: r.part_index as number,
-    }));
+    };
   }
 }
 

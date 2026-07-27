@@ -80,6 +80,14 @@ export class BridgeManager {
       try {
         this.adapter = new DiscordAdapter(this.env.discordBotToken, {
           onMessage: async (msg) => this.onDiscord(msg),
+          onMessageDelete: async (del) => {
+            const rb = this.activeRouterFor(del.channelId);
+            if (rb) await rb.router!.onDiscordDelete(del, rb.link);
+          },
+          onReactionAdd: async (reaction) => {
+            const rb = this.activeRouterFor(reaction.channelId);
+            if (rb) await rb.router!.onDiscordReaction(reaction, rb.link);
+          },
         });
         await this.adapter.start();
         console.log("portal: discord gateway up");
@@ -101,10 +109,14 @@ export class BridgeManager {
   }
 
   private async onDiscord(msg: DiscordInboundMessage): Promise<void> {
-    const id = this.byDiscordChannel.get(msg.channelId);
+    const rb = this.activeRouterFor(msg.channelId);
+    if (rb) await rb.router!.onDiscordMessage(msg, rb.link);
+  }
+
+  private activeRouterFor(discordChannelId: string): Running | undefined {
+    const id = this.byDiscordChannel.get(discordChannelId);
     const rb = id ? this.running.get(id) : undefined;
-    if (!rb?.router || rb.status !== "active") return;
-    await rb.router.onDiscordMessage(msg, rb.link);
+    return rb?.router && rb.status === "active" ? rb : undefined;
   }
 
   /** Resolve + fold a community for the wizard's pairing step (transient). */

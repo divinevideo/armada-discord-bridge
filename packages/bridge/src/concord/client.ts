@@ -13,6 +13,7 @@ import {
   KIND_MESSAGE,
   KIND_SEAL_ENCRYPTED,
   KIND_WRAP,
+  Permissions,
   buildJoinRumor,
   buildRumor,
   bundleToEntry,
@@ -23,6 +24,7 @@ import {
   foldControlState,
   guestbookGroups,
   inviteRefOf,
+  isAuthorized,
   openChatBatch,
   openControlWraps,
   parseBundleEvent,
@@ -149,6 +151,12 @@ export class ConcordClient {
   /** Honest clients drop banned authors; the bridge must never publish for them. */
   isBanned(pubkeyHex: string): boolean {
     return this.folded?.banned.has(pubkeyHex) ?? false;
+  }
+
+  /** MANAGE_MESSAGES holder (or owner) per the current fold. */
+  isModerator(pubkeyHex: string): boolean {
+    if (!this.folded) return false;
+    return isAuthorized(this.folded.roster, pubkeyHex, this.community.owner, Permissions.MANAGE_MESSAGES);
   }
 
   /**
