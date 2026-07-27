@@ -158,7 +158,7 @@ export class ConcordClient {
    */
   async publishProfile(
     author: LocalIdentity,
-    meta: { name: string; picture?: string; about?: string },
+    meta: { name: string; picture?: string; about?: string; bot?: boolean },
   ): Promise<void> {
     const event = await author.signer.signEvent({
       kind: 0,

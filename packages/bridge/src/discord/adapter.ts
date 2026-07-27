@@ -77,6 +77,11 @@ export class DiscordAdapter implements WebhookSender {
     return this.client.application?.id ?? "";
   }
 
+  /** The bot account's own avatar, for the bridge's Concord kind 0. */
+  get botAvatarUrl(): string | undefined {
+    return this.client.user?.displayAvatarURL?.({ size: 256 });
+  }
+
   async start(): Promise<void> {
     await this.client.login(this.token);
     await new Promise<void>((resolve) => {

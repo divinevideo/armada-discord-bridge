@@ -177,6 +177,15 @@ export class BridgeManager {
       throw new Error("concord channel not found (deleted, or key not held)");
     }
     await client.publishJoin().catch(() => {});
+    await client
+      .publishProfile(primary, {
+        name: "Discord <-> Armada Bridge Bot",
+        picture: this.adapter?.botAvatarUrl,
+        about:
+          "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
+        bot: true,
+      })
+      .catch(() => {});
 
     const link: ChannelLink = {
       discordGuildId: row.discord_guild_id ?? "",

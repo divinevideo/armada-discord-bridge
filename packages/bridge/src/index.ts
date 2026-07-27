@@ -68,6 +68,13 @@ if (!channel) throw new Error(`concord channel not found (have: ${client.channel
 console.log(`bridge: target channel #${channel.name}`);
 
 await client.publishJoin().catch((error) => console.warn("bridge: guestbook join failed", error));
+await client
+  .publishProfile(primary, {
+    name: "Discord <-> Armada Bridge Bot",
+    about: "Automated bridge account: mirrors this channel with a Discord server.",
+    bot: true,
+  })
+  .catch((error) => console.warn("bridge: profile publish failed", error));
 
 // ── Storage, Discord, router ────────────────────────────────────────────────
 const sql = postgres(config.databaseUrl, { onnotice: () => {} });
