@@ -16,6 +16,9 @@ import type { OpenedChat } from "@armada-bridge/concord-core";
 import type { ConcordClient } from "./concord/client";
 import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
+import type { LocalIdentity } from "./concord/signer";
+
+type LocalIdentitySigner = LocalIdentity["signer"];
 import type { PuppetCache } from "./puppets";
 import { concordToDiscord, discordToConcord, splitForDiscord } from "./transform";
 import type { DiscordMessageContent } from "./transform";
@@ -72,6 +75,9 @@ export const fallbackProfile = (pk: string): { name: string; avatarUrl?: string 
 });
 
 export class BridgeRouter {
+  /** discord user id -> last published "name|avatar" (skip republishing). */
+  private readonly publishedProfiles = new Map<string, string>();
+
   constructor(
     private readonly client: ConcordClient,
     private readonly puppets: PuppetCache,
@@ -80,6 +86,25 @@ export class BridgeRouter {
     private readonly profiles: ProfileResolver,
     private readonly self: { applicationId: string; webhookIds: Set<string> },
   ) {}
+
+  /**
+   * Keep the puppet's kind 0 in step with the Discord identity so Armada
+   * shows the person's name and avatar instead of an anonymous key. Failure
+   * is tolerable (the message still bridges); it retries on the next change.
+   */
+  private async syncPuppetProfile(
+    author: DiscordInboundMessage["author"],
+    identity: { pk: string; signer: LocalIdentitySigner },
+  ): Promise<void> {
+    const fingerprint = `${author.display}|${author.avatarUrl ?? ""}`;
+    if (this.publishedProfiles.get(author.id) === fingerprint) return;
+    await this.client.publishProfile(identity, {
+      name: author.display,
+      picture: author.avatarUrl,
+      about: "Bridged from Discord by armada-bridge.",
+    });
+    this.publishedProfiles.set(author.id, fingerprint);
+  }
 
   /** Discord -> Concord. Returns the rumor id, or undefined when skipped. */
   async onDiscordMessage(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
@@ -97,9 +122,14 @@ export class BridgeRouter {
     const content = discordToConcord(msg);
     if (content.length === 0) return undefined;
 
+    const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
+    await this.syncPuppetProfile(msg.author, identity).catch((error) =>
+      console.warn(`bridge: puppet profile publish failed for ${msg.author.id}`, error),
+    );
+
     const { rumor } = await this.client.sendChat(channel, {
       content,
-      author: { pk: puppet.pk, signer: localIdentity(puppet.sk).signer },
+      author: identity,
       tags: [proxyTag(msg.id)],
     });
 

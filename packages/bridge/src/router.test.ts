@@ -145,6 +145,25 @@ describe("BridgeRouter: Discord -> Concord", () => {
     expect(pool.published).toHaveLength(0);
   });
 
+  it("publishes the puppet's kind 0 once, refreshing when identity changes", async () => {
+    const { router, pool, puppets, link } = harness();
+    await router.onDiscordMessage(discordMsg({ id: "1" }), link);
+    await router.onDiscordMessage(discordMsg({ id: "2" }), link);
+
+    const profiles = pool.published.filter((e) => e.kind === 0);
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0].pubkey).toBe(puppets.get("80351110224678912").pk);
+    expect(JSON.parse(profiles[0].content)).toMatchObject({ name: "mk" });
+
+    await router.onDiscordMessage(
+      discordMsg({ id: "3", author: { id: "80351110224678912", display: "mk (afk)", bot: false } }),
+      link,
+    );
+    const updated = pool.published.filter((e) => e.kind === 0);
+    expect(updated).toHaveLength(2);
+    expect(JSON.parse(updated[1].content)).toMatchObject({ name: "mk (afk)" });
+  });
+
   it("transforms mentions, emoji, and attachments", async () => {
     const { router, pool, channel, link } = harness();
     await router.onDiscordMessage(

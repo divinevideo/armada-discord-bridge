@@ -151,6 +151,24 @@ export class ConcordClient {
     return this.folded?.banned.has(pubkeyHex) ?? false;
   }
 
+  /**
+   * Publish a kind 0 profile for an identity (puppets: Discord name +
+   * avatar). Plain unwrapped event; Armada resolves member profiles from
+   * the same relays the community lives on.
+   */
+  async publishProfile(
+    author: LocalIdentity,
+    meta: { name: string; picture?: string; about?: string },
+  ): Promise<void> {
+    const event = await author.signer.signEvent({
+      kind: 0,
+      content: JSON.stringify(meta),
+      tags: [],
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    await this.pool.publish(event);
+  }
+
   /** Publish the primary identity's Guestbook join (kind 3306). */
   async publishJoin(ms = Date.now()): Promise<NostrEvent> {
     const group = currentGuestbookGroup(this.community);
