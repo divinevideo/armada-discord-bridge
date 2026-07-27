@@ -50,11 +50,15 @@ import type { NostrEvent } from "nostr-tools/pure";
 import type { RelayLike } from "./pool";
 import type { LocalIdentity } from "./signer";
 
-/** Tag stamped on every bridge-published rumor: ["proxy", <discord id>, "discord"]. */
+/**
+ * NIP-48 tag stamped on every bridge-published rumor:
+ * ["proxy", <discord permalink>, "web"]. The full URL keeps the origin
+ * clickable in any client that surfaces proxy tags.
+ */
 export const TAG_PROXY = "proxy";
 
-export function proxyTag(discordMessageId: string): string[] {
-  return [TAG_PROXY, discordMessageId, "discord"];
+export function proxyTag(guildId: string, channelId: string, messageId: string): string[] {
+  return [TAG_PROXY, `https://discord.com/channels/${guildId}/${channelId}/${messageId}`, "web"];
 }
 
 /** True when a rumor was published by any bridge (ours or a peer's). */

@@ -162,7 +162,7 @@ describe("ConcordClient", () => {
     const { rumor, wrap } = await client.sendChat(channel, {
       content: "hello from discord",
       author: puppet,
-      tags: [proxyTag("1234567890")],
+      tags: [proxyTag("111", "222", "1234567890")],
     });
 
     expect(pool.published).toHaveLength(1);

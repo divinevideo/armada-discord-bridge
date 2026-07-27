@@ -253,7 +253,7 @@ export class BridgeRouter {
     const puppet = this.puppets.get(msg.author.id);
     const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
 
-    const tags = [proxyTag(msg.id)];
+    const tags = [proxyTag(msg.guildId, msg.channelId, msg.id)];
     let source = await upgradeGifEmbed(msg);
     source = await this.transcodedGifFallback(source, identity);
     const attachments = await this.rehostAttachments(source, identity, tags);
@@ -369,7 +369,7 @@ export class BridgeRouter {
       kind: KIND_DELETE,
       content: "",
       author: { pk: puppet.pk, signer: localIdentity(puppet.sk).signer },
-      tags: [["e", row.concordRumorId], proxyTag(del.id)],
+      tags: [["e", row.concordRumorId], proxyTag(del.guildId, del.channelId, del.id)],
     });
     return rumor.id;
   }
@@ -393,7 +393,7 @@ export class BridgeRouter {
       kind: KIND_EDIT,
       content,
       author: { pk: puppet.pk, signer: localIdentity(puppet.sk).signer },
-      tags: [["e", row.concordRumorId], proxyTag(msg.id)],
+      tags: [["e", row.concordRumorId], proxyTag(msg.guildId, msg.channelId, msg.id)],
     });
     return rumor.id;
   }
@@ -424,7 +424,7 @@ export class BridgeRouter {
       tags: [
         ["e", row.concordRumorId],
         ["k", String(KIND_MESSAGE)],
-        proxyTag(reaction.messageId),
+        proxyTag(reaction.guildId, reaction.channelId, reaction.messageId),
       ],
     });
     await this.store.insertReaction({
@@ -459,7 +459,7 @@ export class BridgeRouter {
       tags: [
         ["e", row.rumorId],
         ["k", String(KIND_REACTION)],
-        proxyTag(reaction.messageId),
+        proxyTag(reaction.guildId, reaction.channelId, reaction.messageId),
       ],
     });
     await this.store.deleteReaction(row.rumorId);

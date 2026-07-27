@@ -150,6 +150,12 @@ describe("BridgeRouter: Discord -> Concord", () => {
     expect(opened.content).toBe("hello armada");
     expect(opened.author).toBe(puppets.get("80351110224678912").pk);
     expect(hasProxyTag(opened)).toBe(true);
+    // NIP-48: full permalink as value, "web" as the protocol marker.
+    expect(opened.tags).toContainEqual([
+      "proxy",
+      "https://discord.com/channels/g1/c1/111222333",
+      "web",
+    ]);
 
     expect(store.rows).toHaveLength(1);
     expect(store.rows[0]).toMatchObject({
