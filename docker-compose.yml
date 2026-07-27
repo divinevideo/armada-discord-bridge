@@ -30,5 +30,23 @@ services:
       CONCORD_CHANNEL_ID: ${CONCORD_CHANNEL_ID:-}
     restart: unless-stopped
 
+  portal:
+    build: .
+    command: ["bun", "run", "packages/portal/src/index.ts"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8787:8787"
+    environment:
+      DATABASE_URL: postgres://bridge:bridge@postgres/bridge
+      PORTAL_SEAL_KEY: ${PORTAL_SEAL_KEY:?64 hex chars; seals per-bridge secrets}
+      PORTAL_BASE_URL: ${PORTAL_BASE_URL:-http://localhost:8787}
+      PORTAL_DEV_LOGIN: ${PORTAL_DEV_LOGIN:-0}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+    restart: unless-stopped
+
 volumes:
   pgdata:

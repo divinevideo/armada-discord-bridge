@@ -33,6 +33,35 @@ docker compose up --build
 Dev loop: `npm install` (Bun's own installer hangs on some resolvers; the
 runtime is still Bun), then `bun test` and `bun run packages/bridge/src/index.ts`.
 
+## Portal (local dev)
+
+The portal (`packages/portal`) is the web setup flow: Discord OAuth, the
+five-step wizard, in-channel Armada confirmation, and a dashboard. It runs
+bridges in-process, so it replaces the env-provisioned service when used.
+
+```sh
+# 1. Postgres
+docker compose up -d postgres
+
+# 2. API (terminal 1)
+DATABASE_URL=postgres://bridge:bridge@localhost:5432/bridge \
+PORTAL_SEAL_KEY=$(openssl rand -hex 32) \
+PORTAL_DEV_LOGIN=1 \
+DISCORD_CLIENT_ID=… DISCORD_CLIENT_SECRET=… DISCORD_TOKEN=… \
+bun run packages/portal/src/index.ts
+
+# 3. SPA with hot reload (terminal 2), proxies /api to :8787
+./node_modules/.bin/vite packages/portal/web
+# open http://localhost:5173
+```
+
+Without Discord credentials, `PORTAL_DEV_LOGIN=1` lets you click through the
+UI (dev login button); going live needs a real Discord application: client
+id/secret for OAuth, bot token with the MESSAGE_CONTENT intent enabled.
+Keep `PORTAL_SEAL_KEY` stable across restarts or existing bridges cannot be
+unsealed. In production, `vite build packages/portal/web` once and the API
+serves `web/dist` itself on :8787.
+
 The design lives in two documents:
 
 - [`armada-discord-bridge-PLAN.md`](./armada-discord-bridge-PLAN.md): the bridge
