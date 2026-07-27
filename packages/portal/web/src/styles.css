@@ -143,40 +143,72 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 .pick:hover { border-color: hsl(var(--border)); background: hsl(var(--card)); }
 .pick.on { border-color: hsl(var(--primary)); color: hsl(var(--primary)); background: hsl(var(--primary) / 0.06); }
 
-/* Signed-out hero: pitch left, a mocked bridged channel pair right. */
+/* Signed-out landing title. */
+.hero-title { margin: 2rem 0 0.25rem; }
+.hero-title h2 { font-size: 2.1rem; line-height: 1.15; margin: 0; letter-spacing: -0.02em; }
+.hero-title .swap { color: hsl(var(--primary)); font-weight: 400; }
+.hero-title p { font-size: 1.02rem; color: hsl(var(--muted-foreground)); margin: 0.5rem 0 0; }
+
+/* Hero: pitch left, a mocked bridged channel pair right. */
 .hero {
   display: grid; grid-template-columns: 1.1fr 1fr; gap: 1.75rem;
-  align-items: start; margin: 1.75rem 0 0.5rem;
+  align-items: start; margin: 1.25rem 0 0.5rem;
 }
 @media (max-width: 700px) { .hero { grid-template-columns: 1fr; } }
-.hero-copy h2 { font-size: 1.55rem; line-height: 1.2; margin: 0 0 0.7rem; letter-spacing: -0.015em; }
 .hero-copy .disclosure { margin-top: 1.1rem; font-size: 0.88rem; }
 
-/* Demo: two chrome panes joined by the live-status chip on a hairline mast. */
+/* Demo: each pane wears its own platform's chrome. Discord's side is
+   hardcoded to the real client palette (#313338 surface, blurple, the APP
+   badge webhooks get); the Armada side rides the portal's Corsair tokens. */
 .demo { display: flex; flex-direction: column; }
-.demo-pane {
-  background: hsl(var(--chrome));
-  border: 1px solid hsl(var(--chrome-divider));
-  border-radius: var(--radius-chrome);
-  padding: 0.55rem 0.75rem 0.7rem;
+.demo-pane { padding: 0.6rem 0.8rem 0.75rem; border: 1px solid; }
+.demo-pane.discord { background: #313338; border-color: #232428; border-radius: 8px; }
+.demo-pane.armada {
+  background: hsl(var(--card)); border-color: hsl(var(--chrome-divider));
+  border-radius: var(--radius);
 }
 .demo-head {
-  display: flex; justify-content: space-between; align-items: baseline;
-  font-size: 0.75rem; color: hsl(var(--muted-foreground));
-  border-bottom: 1px solid hsl(var(--chrome-divider));
-  padding-bottom: 0.4rem; margin-bottom: 0.2rem;
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 0.78rem; padding-bottom: 0.45rem; margin-bottom: 0.2rem;
+  border-bottom: 1px solid;
 }
-.demo-msg { display: flex; gap: 0.6rem; margin: 0.55rem 0 0; font-size: 0.85rem; }
-.demo-msg p { margin: 0.05rem 0 0; color: hsl(var(--foreground) / 0.92); }
-.demo-name { font-size: 0.76rem; font-weight: 600; }
-.demo-name em {
-  font-style: normal; font-weight: 400; font-family: var(--mono);
-  font-size: 0.9em; color: hsl(var(--muted-foreground)); margin-left: 0.3rem;
+.demo-pane.discord .demo-head { border-color: #26272b; color: #f2f3f5; }
+.demo-pane.armada .demo-head { border-color: hsl(var(--chrome-divider)); color: hsl(var(--foreground)); }
+.demo-chan { font-weight: 600; }
+.demo-chan b { font-weight: 400; opacity: 0.55; margin-right: 0.1rem; }
+.demo-pane.armada .demo-chan { font-family: var(--mono); font-weight: 500; }
+.demo-net { display: flex; align-items: center; gap: 0.32rem; font-size: 0.72rem; font-weight: 500; }
+.demo-pane.discord .demo-net { color: #949ba4; }
+.demo-pane.armada .demo-net { color: hsl(var(--muted-foreground)); }
+.demo-net svg { width: 15px; height: 15px; }
+.demo-pane.discord .demo-net svg { fill: #5865f2; }
+.demo-brandmark { display: flex; }
+.demo-brandmark .logo-mark { width: 15px; height: 15px; --logo-bg: hsl(var(--card)); }
+
+.demo-msg { display: flex; gap: 0.6rem; margin: 0.6rem 0 0; font-size: 0.85rem; }
+.demo-msg p { margin: 0.05rem 0 0; }
+.demo-pane.discord .demo-msg p { color: #dbdee1; }
+.demo-pane.armada .demo-msg p { color: hsl(var(--foreground) / 0.92); }
+.demo-avatar { flex: none; width: 28px; height: 28px; margin-top: 0.1rem; border-radius: 50%; }
+.demo-name {
+  font-size: 0.78rem; font-weight: 600;
+  display: flex; align-items: baseline; gap: 0.35rem; flex-wrap: wrap;
 }
-.demo-avatar {
-  flex: none; width: 26px; height: 26px; border-radius: 50%; margin-top: 0.1rem;
-  display: grid; place-items: center;
-  font: 600 0.7rem/1 var(--mono); color: hsl(0 0% 100%);
+.demo-pane.discord .demo-name { color: #f2f3f5; }
+.demo-pane.armada .demo-name { color: hsl(var(--primary)); }
+.demo-time { font-weight: 400; font-size: 0.66rem; }
+.demo-pane.discord .demo-time { color: #949ba4; }
+.demo-pane.armada .demo-time { font-family: var(--mono); color: hsl(var(--muted-foreground)); }
+.demo-app {
+  background: #5865f2; color: #fff; font-size: 0.58rem; font-weight: 700;
+  letter-spacing: 0.02em; padding: 0.08rem 0.3rem; border-radius: 3px;
+  align-self: center;
+}
+.demo-bridge-tag {
+  font-family: var(--mono); font-weight: 400; font-size: 0.62rem;
+  color: hsl(var(--muted-foreground));
+  border: 1px solid hsl(var(--border) / 0.6); border-radius: var(--radius-chrome);
+  padding: 0.02rem 0.3rem;
 }
 .demo-link { align-self: center; display: flex; flex-direction: column; align-items: center; }
 .demo-link::before, .demo-link::after {
