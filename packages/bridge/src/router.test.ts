@@ -253,6 +253,9 @@ describe("BridgeRouter: Concord -> Discord", () => {
     client.folded = { banned: new Set([banned]) } as unknown as typeof client.folded;
     expect(await router.onConcordChat(concordChat({ author: banned }), link)).toEqual([]);
 
+    // The bridge's own announcements (confirm requests etc.) stay Armada-side.
+    expect(await router.onConcordChat(concordChat({ author: client.primaryPk }), link)).toEqual([]);
+
     expect(webhooks.sent).toHaveLength(0);
   });
 });

@@ -250,6 +250,10 @@ export class BridgeRouter {
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (!link.enabled) return [];
     // Layer 1 + 2: bridge-originated or already-bridged rumors never bounce.
+    // The primary's own posts (confirm requests, announcements) stay
+    // Armada-side; mirroring them trips Discord's webhook username filter
+    // ("Discord <-> Armada Bridge Bot") and is noise regardless.
+    if (chat.author === this.client.primaryPk) return [];
     if (hasProxyTag(chat)) return [];
     if (this.puppets.isPuppetPubkey(chat.author)) return [];
     if (this.client.isBanned(chat.author)) return [];

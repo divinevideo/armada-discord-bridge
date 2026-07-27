@@ -109,6 +109,11 @@ export interface SendChatOptions {
 export class ConcordClient {
   folded?: FoldedControl;
 
+  /** The bridge's own posting identity; the router skips its messages. */
+  get primaryPk(): string {
+    return this.primary.pk;
+  }
+
   constructor(
     readonly community: CommunityV2,
     private readonly pool: RelayLike,

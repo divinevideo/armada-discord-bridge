@@ -188,15 +188,26 @@ export class DiscordAdapter implements WebhookSender {
     },
   ): Promise<string> {
     const webhook = await this.webhookFor(link.discordChannelId);
-    const created = await webhook.send({
+    const payload = (username: string) => ({
       content: message.content,
-      username: sanitizeUsername(message.username),
+      username,
       avatarURL: message.avatarUrl,
       embeds: message.embeds,
       files: message.files?.map((f) => ({ attachment: Buffer.from(f.data), name: f.name })),
-      allowedMentions: { parse: [] },
+      allowedMentions: { parse: [] as [] },
     });
-    return created.id;
+    try {
+      const created = await webhook.send(payload(sanitizeUsername(message.username)));
+      return created.id;
+    } catch (error) {
+      // Discord's username filter normalizes lookalike characters, so it can
+      // reject names our sanitizer passed. Never drop the message over a
+      // display name: retry once under a neutral one.
+      if (!isUsernameRejection(error)) throw error;
+      console.warn(`discord rejected webhook username ${JSON.stringify(message.username)}; retrying as "bridged member"`);
+      const created = await webhook.send(payload("bridged member"));
+      return created.id;
+    }
   }
 
   /** WebhookSender: edit a webhook-authored mirror in place. */
@@ -245,9 +256,22 @@ export class DiscordAdapter implements WebhookSender {
   }
 }
 
-/** Discord rejects usernames <2 or >80 chars or containing "discord". */
+/**
+ * Discord rejects webhook usernames <2 or >80 chars or containing "discord"
+ * or "clyde", and its filter normalizes lookalikes (leetspeak substitutions
+ * still match), so a letter is dropped rather than swapped.
+ */
 export function sanitizeUsername(name: string): string {
-  const cleaned = name.replace(/discord/gi, "d1scord").trim();
+  const cleaned = name
+    .replace(/discord/gi, "disc-rd")
+    .replace(/clyde/gi, "cly-e")
+    .trim();
   if (cleaned.length < 2) return `nostr ${cleaned}`.trim().padEnd(2, "_");
   return cleaned.slice(0, 80);
+}
+
+/** Error code 50035 with a USERNAME_INVALID flavored field error. */
+function isUsernameRejection(error: unknown): boolean {
+  const e = error as { code?: number; rawError?: unknown };
+  return e?.code === 50035 && JSON.stringify(e.rawError ?? "").includes("USERNAME_INVALID");
 }
