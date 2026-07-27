@@ -323,9 +323,10 @@ export class BridgeRouter {
     if ((await this.store.byRumorId(chat.rumorId)).length > 0) return [];
 
     const profile = await this.profiles.resolve(chat.author).catch(() => fallbackProfile(chat.author));
-    const parts = splitForDiscord(concordToDiscord(chat.content));
+    const media = await this.filesFromImeta(chat);
+    const parts = splitForDiscord(concordToDiscord(stripAttachedUrls(chat.content, media?.urls)));
     const reply = await this.replyEmbed(chat, link);
-    const files = await this.filesFromImeta(chat);
+    const files = media?.files;
 
     const ids: string[] = [];
     for (const [index, part] of parts.entries()) {
@@ -651,10 +652,11 @@ export class BridgeRouter {
   /** NIP-92 imeta tags -> downloaded webhook file uploads (URL fallback). */
   private async filesFromImeta(
     chat: OpenedChat,
-  ): Promise<Array<{ name: string; data: Uint8Array }> | undefined> {
+  ): Promise<{ files: Array<{ name: string; data: Uint8Array }>; urls: string[] } | undefined> {
     const blobs = this.options.blobs;
     if (!blobs) return undefined;
     const files: Array<{ name: string; data: Uint8Array }> = [];
+    const urls: string[] = [];
     for (const tag of chat.tags) {
       if (tag[0] !== "imeta") continue;
       const fields = new Map(tag.slice(1).map((f) => [f.split(" ")[0], f.slice(f.indexOf(" ") + 1)]));
@@ -666,12 +668,25 @@ export class BridgeRouter {
         const { data, mime } = await blobs.download(url, MAX_BLOB_BYTES);
         const name = new URL(url).pathname.split("/").pop() || `file.${(mime.split("/")[1] ?? "bin").split("+")[0]}`;
         files.push({ name, data });
+        urls.push(url);
       } catch (error) {
         console.warn(`bridge: imeta download failed for ${url}`, error);
       }
     }
-    return files.length > 0 ? files : undefined;
+    return files.length > 0 ? { files, urls } : undefined;
   }
+}
+
+/**
+ * URLs that ride as file uploads leave the content, or Discord renders the
+ * media twice (link unfurl + attachment). Oversized/failed blobs never make
+ * this list, so their links survive.
+ */
+function stripAttachedUrls(content: string, urls: string[] | undefined): string {
+  if (!urls || urls.length === 0) return content;
+  let text = content;
+  for (const url of urls) text = text.split(url).join("");
+  return text.replace(/[^\S\n]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /** In-memory store for tests and dry runs; Postgres implementation in db/. */

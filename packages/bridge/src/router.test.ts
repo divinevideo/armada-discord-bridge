@@ -671,7 +671,7 @@ describe("BridgeRouter: attachments via Blossom", () => {
     expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
   });
 
-  it("re-uploads Concord imeta blobs as Discord files", async () => {
+  it("re-uploads Concord imeta blobs as Discord files and drops their URLs from the text", async () => {
     const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
     await router.onConcordChat(
       concordChat({
@@ -683,5 +683,34 @@ describe("BridgeRouter: attachments via Blossom", () => {
     expect(webhooks.sent[0].files).toHaveLength(1);
     expect(webhooks.sent[0].files![0].name).toBe("abc123");
     expect(webhooks.sent[0].files![0].data).toEqual(new Uint8Array([1, 2, 3]));
+    expect(webhooks.sent[0].content).toBe("pic");
+  });
+
+  it("sends a media-only message as just the file, never URL plus file", async () => {
+    const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
+    const ids = await router.onConcordChat(
+      concordChat({
+        content: "https://blossom.example/abc123",
+        tags: [["imeta", "url https://blossom.example/abc123", "m image/gif", "size 3"]],
+      }),
+      link,
+    );
+    expect(ids).toHaveLength(1);
+    expect(webhooks.sent).toHaveLength(1);
+    expect(webhooks.sent[0].content).toBe("");
+    expect(webhooks.sent[0].files).toHaveLength(1);
+  });
+
+  it("keeps the URL in the text when the blob is too large to attach", async () => {
+    const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
+    await router.onConcordChat(
+      concordChat({
+        content: "https://blossom.example/abc123",
+        tags: [["imeta", "url https://blossom.example/abc123", "m image/gif", "size 99999999"]],
+      }),
+      link,
+    );
+    expect(webhooks.sent[0].content).toBe("https://blossom.example/abc123");
+    expect(webhooks.sent[0].files).toBeUndefined();
   });
 });
