@@ -143,6 +143,54 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 .pick:hover { border-color: hsl(var(--border)); background: hsl(var(--card)); }
 .pick.on { border-color: hsl(var(--primary)); color: hsl(var(--primary)); background: hsl(var(--primary) / 0.06); }
 
+/* Signed-out hero: pitch left, a mocked bridged channel pair right. */
+.hero {
+  display: grid; grid-template-columns: 1.1fr 1fr; gap: 1.75rem;
+  align-items: start; margin: 1.75rem 0 0.5rem;
+}
+@media (max-width: 700px) { .hero { grid-template-columns: 1fr; } }
+.hero-copy h2 { font-size: 1.55rem; line-height: 1.2; margin: 0 0 0.7rem; letter-spacing: -0.015em; }
+.hero-copy .disclosure { margin-top: 1.1rem; font-size: 0.88rem; }
+
+/* Demo: two chrome panes joined by the live-status chip on a hairline mast. */
+.demo { display: flex; flex-direction: column; }
+.demo-pane {
+  background: hsl(var(--chrome));
+  border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius-chrome);
+  padding: 0.55rem 0.75rem 0.7rem;
+}
+.demo-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 0.75rem; color: hsl(var(--muted-foreground));
+  border-bottom: 1px solid hsl(var(--chrome-divider));
+  padding-bottom: 0.4rem; margin-bottom: 0.2rem;
+}
+.demo-msg { display: flex; gap: 0.6rem; margin: 0.55rem 0 0; font-size: 0.85rem; }
+.demo-msg p { margin: 0.05rem 0 0; color: hsl(var(--foreground) / 0.92); }
+.demo-name { font-size: 0.76rem; font-weight: 600; }
+.demo-name em {
+  font-style: normal; font-weight: 400; font-family: var(--mono);
+  font-size: 0.9em; color: hsl(var(--muted-foreground)); margin-left: 0.3rem;
+}
+.demo-avatar {
+  flex: none; width: 26px; height: 26px; border-radius: 50%; margin-top: 0.1rem;
+  display: grid; place-items: center;
+  font: 600 0.7rem/1 var(--mono); color: hsl(0 0% 100%);
+}
+.demo-link { align-self: center; display: flex; flex-direction: column; align-items: center; }
+.demo-link::before, .demo-link::after {
+  content: ""; width: 1px; height: 0.5rem;
+  background: hsl(var(--accent2) / 0.45);
+}
+.demo-link::before { margin-bottom: 0.25rem; }
+.demo-link::after { margin-top: 0.25rem; }
+
+/* Consent flow, below the hero. */
+.landing ol { margin: 0.4rem 0 0.75rem; padding-left: 1.4rem; }
+.landing li { margin: 0.3rem 0; }
+.landing li::marker { color: hsl(var(--primary)); font-family: var(--mono); font-size: 0.85em; }
+
 .disclosure {
   border-left: 3px solid hsl(var(--destructive));
   border-radius: 0 var(--radius-chrome) var(--radius-chrome) 0;

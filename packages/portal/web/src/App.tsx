@@ -49,32 +49,101 @@ export function App() {
 
 function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSignedIn: () => void }) {
   return (
-    <div className="panel">
-      <h2>What this does, plainly</h2>
-      <p>
-        A bridge mirrors messages between one Discord channel and one Armada channel.
-        Discord users appear in Armada as individual bridged identities; Armada members
-        appear in Discord with their own name and avatar. Setup takes both sides'
-        consent: yours here, and an in-channel confirmation from the Armada community.
-      </p>
-      <p className="disclosure" style={{ marginTop: "0.75rem" }}>
-        The tradeoff, stated up front: bridged messages leave Armada's end-to-end
-        encryption and land on Discord's servers in plaintext.
-      </p>
-      <div className="row" style={{ marginTop: "1rem" }}>
-        {props.discordConfigured ? (
-          <a className="btn" href="/api/auth/discord">Sign in with Discord</a>
-        ) : (
-          <span className="muted">
-            Discord OAuth is not configured on this server (set DISCORD_CLIENT_ID and
-            DISCORD_CLIENT_SECRET, restart the API).
-          </span>
-        )}
-        {props.devLogin && (
-          <button className="ghost" onClick={() => void api("/api/auth/dev", { method: "POST" }).then(props.onSignedIn)}>
-            Dev login
-          </button>
-        )}
+    <>
+      <section className="hero">
+        <div className="hero-copy">
+          <h2>Mirror a Discord channel into your Armada community</h2>
+          <p>
+            Each Discord user posts in Armada under their own bridged identity; each
+            Armada member shows up in Discord with their own name and avatar. Replies,
+            reactions, deletes, and attachments follow the messages across.
+          </p>
+          <div className="row" style={{ marginTop: "1rem" }}>
+            {props.discordConfigured ? (
+              <a className="btn" href="/api/auth/discord">Sign in with Discord</a>
+            ) : (
+              <span className="muted">
+                Discord OAuth is not configured on this server (set DISCORD_CLIENT_ID and
+                DISCORD_CLIENT_SECRET, restart the API).
+              </span>
+            )}
+            {props.devLogin && (
+              <button className="ghost" onClick={() => void api("/api/auth/dev", { method: "POST" }).then(props.onSignedIn)}>
+                Dev login
+              </button>
+            )}
+          </div>
+          <p className="disclosure">
+            Bridged messages leave Armada's end-to-end encryption and land on Discord's
+            servers in plaintext, under Discord's terms and retention.
+          </p>
+        </div>
+        <BridgeDemo />
+      </section>
+
+      <section className="panel landing">
+        <h2>Both sides agree before anything is mirrored</h2>
+        <ol>
+          <li>Sign in with Discord.</li>
+          <li>Pick a server and channel you manage.</li>
+          <li>Paste an Armada invite link and pair the channels.</li>
+          <li>An Armada moderator runs <span className="mono">/bridge confirm</span> in the channel.</li>
+        </ol>
+        <p className="muted" style={{ marginBottom: 0 }}>
+          Either side can pause or unlink the bridge at any time. Unlinking destroys the
+          bridge's keys.
+        </p>
+      </section>
+    </>
+  );
+}
+
+/* A bridged channel pair, mocked with the real attribution the bridge produces. */
+function BridgeDemo() {
+  return (
+    <div className="demo" aria-hidden="true">
+      <div className="demo-pane">
+        <div className="demo-head">
+          <span className="mono">#releases</span>
+          <span className="mono">discord</span>
+        </div>
+        <div className="demo-msg">
+          <span className="demo-avatar" style={{ background: "hsl(226 58% 55%)" }}>K</span>
+          <div>
+            <span className="demo-name">kira</span>
+            <p>v2 ships tonight, patch notes incoming</p>
+          </div>
+        </div>
+        <div className="demo-msg">
+          <span className="demo-avatar" style={{ background: "hsl(292 45% 48%)" }}>M</span>
+          <div>
+            <span className="demo-name">mireille <em>via Armada</em></span>
+            <p>flagship is ready when you are ⚓</p>
+          </div>
+        </div>
+      </div>
+      <div className="demo-link">
+        <span className="status active">bridged</span>
+      </div>
+      <div className="demo-pane">
+        <div className="demo-head">
+          <span className="mono">#flagship</span>
+          <span className="mono">armada</span>
+        </div>
+        <div className="demo-msg">
+          <span className="demo-avatar" style={{ background: "hsl(226 58% 55%)" }}>K</span>
+          <div>
+            <span className="demo-name">kira <em>via Discord</em></span>
+            <p>v2 ships tonight, patch notes incoming</p>
+          </div>
+        </div>
+        <div className="demo-msg">
+          <span className="demo-avatar" style={{ background: "hsl(292 45% 48%)" }}>M</span>
+          <div>
+            <span className="demo-name">mireille</span>
+            <p>flagship is ready when you are ⚓</p>
+          </div>
+        </div>
       </div>
     </div>
   );
