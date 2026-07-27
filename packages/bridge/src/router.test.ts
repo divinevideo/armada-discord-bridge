@@ -16,7 +16,7 @@ import { ConcordClient, hasProxyTag } from "./concord/client";
 import type { RelayLike } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { PuppetCache } from "./puppets";
-import { BridgeRouter, MemoryMappingStore, fallbackProfile } from "./router";
+import { BridgeRouter, MemoryMappingStore, fallbackProfile, resolveGifVariant } from "./router";
 import type { ChannelLink, DiscordInboundMessage, RouterOptions } from "./router";
 
 const MASTER = "ab".repeat(32);
@@ -188,6 +188,27 @@ describe("BridgeRouter: Discord -> Concord", () => {
     expect(second).toBeDefined();
     const wraps = pool.published.filter((e) => e.kind === 1059);
     expect(openWrap(wraps[wraps.length - 1], channel.current.group).content).toBe("look at https://klipy.com/gifs/x");
+  });
+
+  it("resolveGifVariant probes for a real .gif and falls back to the mp4", async () => {
+    const gifOk = (async () =>
+      new Response(null, { status: 200, headers: { "content-type": "image/gif" } })) as unknown as typeof fetch;
+    const allDead = (async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+    const htmlTrap = (async () =>
+      new Response(null, { status: 200, headers: { "content-type": "text/html" } })) as unknown as typeof fetch;
+
+    // Already a gif: no probing.
+    expect(await resolveGifVariant("https://p", "https://cdn/x.gif", allDead)).toBe("https://cdn/x.gif");
+    // Extension swap verified by HEAD.
+    expect(await resolveGifVariant("https://klipy.com/gifs/x", "https://static.klipy.com/a.mp4", gifOk)).toBe(
+      "https://static.klipy.com/a.gif",
+    );
+    // A 200 that serves html is not a gif.
+    expect(await resolveGifVariant("https://tenor.com/view/x", "https://media.tenor.com/a.mp4", htmlTrap)).toBe(
+      "https://media.tenor.com/a.mp4",
+    );
+    // Nothing viable: keep the mp4.
+    expect(await resolveGifVariant("https://p/x", "https://cdn/a.mp4", allDead)).toBe("https://cdn/a.mp4");
   });
 
   it("skips own webhooks, own application, other bots, and disabled links", async () => {

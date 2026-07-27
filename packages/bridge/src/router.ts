@@ -18,6 +18,7 @@ import type { ConcordClient } from "./concord/client";
 import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
 import type { LocalIdentity } from "./concord/signer";
+import { ffmpegAvailable, mp4ToGif } from "./gif";
 
 type LocalIdentitySigner = LocalIdentity["signer"];
 import type { PuppetCache } from "./puppets";
@@ -160,6 +161,50 @@ export const fallbackProfile = (pk: string): { name: string; avatarUrl?: string 
   name: `nostr:${pk.slice(0, 8)}`,
 });
 
+/**
+ * GIF pickers (Tenor, Klipy) expose only an mp4 in the Discord embed; the
+ * provider almost always hosts a true .gif variant too. Probe the likely
+ * URLs (extension swap, Tenor's page-url + .gif redirect) and keep the mp4
+ * only when no candidate actually serves an image.
+ */
+export async function resolveGifVariant(
+  pageUrl: string,
+  mediaUrl: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<string> {
+  if (/\.gif(\?|$)/i.test(mediaUrl)) return mediaUrl;
+  const candidates = [
+    mediaUrl.replace(/\.mp4(\?|$)/i, ".gif$1"),
+    `${pageUrl.replace(/\/+$/, "")}.gif`,
+  ].filter((url) => url !== mediaUrl);
+  for (const url of candidates) {
+    try {
+      const res = await fetchFn(url, {
+        method: "HEAD",
+        redirect: "follow",
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (res.ok && (res.headers.get("content-type") ?? "").startsWith("image/")) return url;
+    } catch {
+      // dead candidate; try the next
+    }
+  }
+  return mediaUrl;
+}
+
+/** When the message is only a GIF-picker page link, upgrade its embed media to a true .gif. */
+export async function upgradeGifEmbed(
+  msg: DiscordInboundMessage,
+  fetchFn: typeof fetch = fetch,
+): Promise<DiscordInboundMessage> {
+  const bare = msg.content.trim();
+  if (!/^https?:\/\/\S+$/.test(bare)) return msg;
+  const embed = msg.embeds?.find((e) => e.url === bare && e.mediaUrl);
+  if (!embed?.mediaUrl) return msg;
+  const mediaUrl = await resolveGifVariant(bare, embed.mediaUrl, fetchFn);
+  return { ...msg, embeds: [{ url: embed.url, mediaUrl }] };
+}
+
 export class BridgeRouter {
   /** discord user id -> last published "name|avatar" (skip republishing). */
   private readonly publishedProfiles = new Map<string, string>();
@@ -209,8 +254,10 @@ export class BridgeRouter {
     const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
 
     const tags = [proxyTag(msg.id)];
-    const attachments = await this.rehostAttachments(msg, identity, tags);
-    const content = discordToConcord({ ...msg, attachments });
+    let source = await upgradeGifEmbed(msg);
+    source = await this.transcodedGifFallback(source, identity);
+    const attachments = await this.rehostAttachments(source, identity, tags);
+    const content = discordToConcord({ ...source, attachments });
     if (content.length === 0) return undefined;
 
     await this.syncPuppetProfile(msg.author, identity).catch((error) =>
@@ -553,6 +600,31 @@ export class BridgeRouter {
    * signed by the puppet, and record NIP-92 imeta tags. Any failure falls
    * back to the CDN link so the message still bridges.
    */
+  /**
+   * Last resort for gifv embeds with no real .gif anywhere (Klipy): download
+   * the short mp4, transcode with ffmpeg, rehost on Blossom. Skipped without
+   * ffmpeg or a Blossom server; any failure keeps the mp4 URL.
+   */
+  private async transcodedGifFallback(
+    msg: DiscordInboundMessage,
+    identity: LocalIdentity,
+  ): Promise<DiscordInboundMessage> {
+    const blobs = this.options.blobs;
+    const embed = msg.embeds?.[0];
+    if (!blobs || !embed?.mediaUrl || !/\.mp4(\?|$)/i.test(embed.mediaUrl)) return msg;
+    if (embed.url !== msg.content.trim() || !ffmpegAvailable()) return msg;
+    try {
+      const { data } = await blobs.download(embed.mediaUrl, MAX_BLOB_BYTES);
+      const gif = await mp4ToGif(data);
+      if (gif.length > MAX_BLOB_BYTES) return msg;
+      const { url } = await blobs.upload(gif, "image/gif", identity);
+      return { ...msg, embeds: [{ url: embed.url, mediaUrl: url }] };
+    } catch (error) {
+      console.warn(`gif transcode fallback failed for ${embed.mediaUrl}:`, error);
+      return msg;
+    }
+  }
+
   private async rehostAttachments(
     msg: DiscordInboundMessage,
     identity: LocalIdentity,
