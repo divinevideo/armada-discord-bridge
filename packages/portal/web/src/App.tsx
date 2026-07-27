@@ -86,9 +86,13 @@ function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSigned
             Armada member shows up in Discord with their own name and avatar. Replies,
             reactions, deletes, and attachments follow the messages across.
           </p>
+          <p className="disclosure">
+            Bridged messages leave Armada's end-to-end encryption and land on Discord's
+            servers in plaintext, under Discord's terms and retention.
+          </p>
           <div className="row" style={{ marginTop: "1rem" }}>
             {props.discordConfigured ? (
-              <a className="btn" href="/api/auth/discord">Sign in with Discord</a>
+              <a className="btn big" href="/api/auth/discord">Sign in with Discord to get started</a>
             ) : (
               <span className="muted">
                 Discord OAuth is not configured on this server (set DISCORD_CLIENT_ID and
@@ -101,28 +105,56 @@ function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSigned
               </button>
             )}
           </div>
-          <p className="disclosure">
-            Bridged messages leave Armada's end-to-end encryption and land on Discord's
-            servers in plaintext, under Discord's terms and retention.
-          </p>
         </div>
         <BridgeDemo />
       </section>
 
       <section className="panel landing">
-        <h2>Both sides agree before anything is mirrored</h2>
-        <ol>
-          <li>Sign in with Discord.</li>
-          <li>Pick a server and channel you manage.</li>
-          <li>Paste an Armada invite link and pair the channels.</li>
-          <li>An Armada moderator runs <span className="mono">/bridge confirm</span> in the channel.</li>
-        </ol>
-        <p className="muted" style={{ marginBottom: 0 }}>
-          Either side can pause or unlink the bridge at any time. Unlinking destroys the
-          bridge's keys.
-        </p>
+        <h2>FAQ</h2>
+        <div className="faq">
+          <details>
+            <summary>How do I set up a bridge?</summary>
+            <ol>
+              <li>Sign in with Discord.</li>
+              <li>Pick a server and channel you manage.</li>
+              <li>Paste an Armada invite link and pair the channels.</li>
+              <li>An Armada moderator runs <span className="mono">/bridge confirm</span> in the channel.</li>
+            </ol>
+          </details>
+          <details>
+            <summary>Who can set one up?</summary>
+            <p>
+              You need Manage Server on the Discord side, and a member with Manage
+              Channels on the Armada side has to confirm in the channel. Both communities
+              agree before anything is mirrored.
+            </p>
+          </details>
+          <details>
+            <summary>Are bridged messages still end-to-end encrypted?</summary>
+            <p>
+              No. Everything posted in the paired channel, in either direction, is
+              mirrored to Discord's servers in plaintext, under Discord's terms and
+              retention. The wizard asks for explicit consent to this, and the bridge
+              announces itself in the Armada channel.
+            </p>
+          </details>
+          <details>
+            <summary>What carries across?</summary>
+            <p>
+              Messages, replies, reactions, deletes, and attachments, in both directions.
+              Each Discord user posts in Armada under their own bridged identity, and each
+              Armada member appears in Discord with their own name and avatar.
+            </p>
+          </details>
+          <details>
+            <summary>How do we undo it?</summary>
+            <p>
+              Either side can pause or unlink the bridge at any time. Unlinking destroys
+              the bridge's keys, and its bridged identities are unrecoverable.
+            </p>
+          </details>
+        </div>
       </section>
-
     </>
   );
 }
