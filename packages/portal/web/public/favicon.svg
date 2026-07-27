@@ -1,0 +1,26 @@
+<svg width="256" height="256" viewBox="14 8 228 240" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Armada">
+  <title>Armada</title>
+  <!--
+    Favicon-optimized crest. Tuned for tiny tab sizes against any background:
+    visible crest edge, a bigger A, no glow blur (which mud at 16px). Tight
+    viewBox so the mark fills the icon slot edge-to-edge.
+  -->
+  <!-- Crest body — slightly lifted so the silhouette reads on dark tabs -->
+  <path d="M64 16 H232 a8 8 0 0 1 8 8 V192 L192 240 H24 a8 8 0 0 1 -8 -8 V64 Z" fill="#241a30"/>
+  <!-- Crest edge — full strength so the frame is unmistakable -->
+  <path d="M64 16 H232 a8 8 0 0 1 8 8 V192 L192 240 H24 a8 8 0 0 1 -8 -8 V64 Z"
+        fill="none" stroke="#e8d4a8" stroke-opacity="0.7" stroke-width="4"/>
+
+  <!-- Cyan wake -->
+  <g stroke="#19e6e6" stroke-linecap="round">
+    <path d="M82 188 H174" stroke-width="7" stroke-opacity="0.95"/>
+    <path d="M99 204 H157" stroke-width="5" stroke-opacity="0.55"/>
+  </g>
+
+  <!-- The A / approaching ship, scaled up to fill the crest -->
+  <path d="M128 84 L168 172 H88 Z" fill="#241a30"/>
+  <path d="M128 28 L196 172 H168 L128 84 L88 172 H60 Z" fill="#fb4d96"/>
+  <path d="M92 130 H164 L162 150 L128 172 L94 150 Z" fill="#241a30"/>
+  <path d="M104 148 L128 132 L152 148" fill="none" stroke="#fb4d96" stroke-opacity="0.75"
+        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

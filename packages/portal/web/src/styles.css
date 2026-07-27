@@ -1,89 +1,175 @@
-/* Harbor-master's console: dark, dense, brass accent, monospace for ids and
-   codes. No gradients, no glow, square-ish corners. */
+/* Armada "Corsair" skin for the Bridge Portal. Deep near-black violet hull,
+   electric rose-magenta blade (--primary), phosphor-cyan wake (--accent2)
+   reserved for live state. Token values are the static dark Corsair set
+   produced by the client's deriveTokensFromCore() (armada/src/themes.ts);
+   dark-only, matching the client's default mode.
+
+   Two radii carry the posture: near-sharp chrome frames (--radius-chrome)
+   around soft content surfaces (--radius). Hairline chrome dividers, no
+   heavy borders. */
 
 :root {
-  --bg: #101416;
-  --panel: #171c1f;
-  --line: #2a3236;
-  --text: #d6d2c4;
-  --muted: #8a938f;
-  --brass: #c9973f;
-  --brass-dim: #8a6a2f;
-  --danger: #c25b4e;
-  --ok: #7ba46c;
+  --background: 260 22% 9%;
+  --foreground: 42 38% 90%;
+  --card: 260 22% 11%;
+  --card-foreground: 42 38% 90%;
+  --primary: 330 90% 62%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 260 22% 17%;
+  --secondary-foreground: 42 38% 90%;
+  --muted: 260 22% 17%;
+  --muted-foreground: 42 26.6% 60%;
+  --accent2: 180 90% 55%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 95%;
+  --success: 142 60% 35%;
+  --success-foreground: 138 60% 94%;
+  --border: 330 36% 30%;
+  --input: 330 36% 30%;
+  --ring: 330 90% 62%;
+  --chrome: 257.1 21.2% 6.5%;
+  --chrome-deep: 260 21.4% 5.5%;
+  --chrome-divider: 253.3 9.7% 18.2%;
+
+  /* content/human surfaces: cards, buttons, inputs */
+  --radius: 0.75rem;
+  /* structural chrome: header bar, frames, step rail (3px) */
+  --radius-chrome: 0.1875rem;
   --mono: ui-monospace, "JetBrains Mono", "Fira Code", Menlo, monospace;
 }
 
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font: 15px/1.5 "IBM Plex Sans", system-ui, sans-serif;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font: 15px/1.5 system-ui, sans-serif;
 }
-#root { max-width: 860px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+#root { max-width: 860px; margin: 0 auto; padding: 1.25rem 1.25rem 4rem; }
 
 h1, h2, h3 { font-weight: 600; letter-spacing: -0.01em; }
-h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
-h2 { font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+h1 { font-size: 1.1rem; margin: 0; }
+h2 { font-size: 1.1rem; margin: 0.25rem 0 0.5rem; }
 p { margin: 0.4rem 0; }
-a { color: var(--brass); }
+a { color: hsl(var(--primary)); }
 
-.masthead { border-bottom: 1px solid var(--line); padding-bottom: 1rem; margin-bottom: 1.5rem;
-  display: flex; justify-content: space-between; align-items: baseline; }
-.masthead .word { color: var(--brass); font-family: var(--mono); }
-.muted { color: var(--muted); }
+/* Chrome bar: recessed hull plane framing the crest and session controls. */
+.masthead {
+  background: hsl(var(--chrome));
+  border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius-chrome);
+  padding: 0.6rem 0.9rem;
+  margin-bottom: 0.75rem;
+  display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
+}
+.brand { display: flex; align-items: center; gap: 0.6rem; }
+.logo-mark {
+  width: 28px; height: 28px; flex: none;
+  color: hsl(var(--primary));
+  /* waterline negative cut in the mark reads through to the chrome plane */
+  --logo-bg: hsl(var(--chrome));
+}
+.tagline { font-size: 0.85rem; margin: 0 0 1rem; }
+
+.muted { color: hsl(var(--muted-foreground)); }
 .mono { font-family: var(--mono); font-size: 0.85em; }
 
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 3px;
-  padding: 1rem 1.25rem; margin: 0.75rem 0; }
+/* Content card: soft surface riding on the hull. */
+.panel {
+  background: hsl(var(--card));
+  border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius);
+  padding: 1rem 1.25rem;
+  margin: 0.75rem 0;
+}
+
+/* Recessed chrome plane framing the dashboard bridge list. */
+.frame {
+  background: hsl(var(--chrome));
+  border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius-chrome);
+  padding: 0.75rem;
+  margin: 0.75rem 0;
+}
+.frame > .muted { margin: 0.25rem 0.35rem; }
+.frame .panel { margin: 0 0 0.75rem; }
+.frame .panel:last-child { margin-bottom: 0; }
 
 button, .btn {
-  background: var(--brass); color: #14110a; border: none; border-radius: 3px;
+  background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
+  border: none; border-radius: var(--radius);
   font: 600 0.95rem/1 inherit; padding: 0.6rem 1.1rem; cursor: pointer;
   text-decoration: none; display: inline-block;
 }
-button:hover, .btn:hover { background: #dcae55; }
-button:disabled { background: var(--brass-dim); cursor: default; opacity: 0.6; }
-button.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
-button.ghost:hover { border-color: var(--brass); color: var(--brass); }
-button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+button:hover, .btn:hover { background: hsl(330 90% 68%); }
+button:disabled { background: hsl(330 30% 35%); cursor: default; opacity: 0.7; }
+button.ghost { background: transparent; color: hsl(var(--foreground)); border: 1px solid hsl(var(--chrome-divider)); }
+button.ghost:hover { border-color: hsl(var(--primary)); color: hsl(var(--primary)); background: transparent; }
+button.danger { background: transparent; color: hsl(var(--destructive)); border: 1px solid hsl(var(--destructive) / 0.5); }
+button.danger:hover { background: hsl(var(--destructive) / 0.1); }
 
 input[type="text"], input[type="url"], select {
-  width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
-  border-radius: 3px; padding: 0.55rem 0.7rem; font: inherit;
+  width: 100%; background: hsl(var(--chrome-deep)); color: hsl(var(--foreground));
+  border: 1px solid hsl(var(--chrome-divider)); border-radius: var(--radius);
+  padding: 0.55rem 0.8rem; font: inherit;
 }
-input:focus, select:focus { outline: 1px solid var(--brass); }
+input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: hsl(var(--ring)); }
 
-.steps { display: flex; gap: 0.4rem; margin: 1rem 0 1.25rem; font-family: var(--mono); font-size: 0.8rem; }
-.steps span { padding: 0.2rem 0.55rem; border: 1px solid var(--line); border-radius: 2px; color: var(--muted); }
-.steps span.on { border-color: var(--brass); color: var(--brass); }
-.steps span.done { color: var(--ok); border-color: var(--ok); }
+/* Wizard step rail: a chrome strip; the current step burns rose. */
+.steps {
+  display: flex; flex-wrap: wrap; gap: 0.4rem; margin: 1rem 0 1.25rem;
+  font-family: var(--mono); font-size: 0.8rem;
+  background: hsl(var(--chrome));
+  border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius-chrome);
+  padding: 0.45rem 0.55rem;
+}
+.steps span {
+  padding: 0.2rem 0.55rem; border: 1px solid transparent;
+  border-radius: var(--radius-chrome); color: hsl(var(--muted-foreground));
+}
+.steps span.on { border-color: hsl(var(--primary)); color: hsl(var(--primary)); }
+.steps span.done { color: hsl(var(--success)); }
 
 .row { display: flex; gap: 0.75rem; align-items: center; }
 .row.wrap { flex-wrap: wrap; }
 .grow { flex: 1; }
 
-.pick { display: block; width: 100%; text-align: left; background: transparent; color: var(--text);
-  border: 1px solid var(--line); border-radius: 3px; padding: 0.6rem 0.8rem; margin: 0.3rem 0; }
-.pick:hover { border-color: var(--brass); background: var(--panel); }
-.pick.on { border-color: var(--brass); color: var(--brass); }
+.pick {
+  display: block; width: 100%; text-align: left; background: transparent;
+  color: hsl(var(--foreground)); border: 1px solid hsl(var(--chrome-divider));
+  border-radius: var(--radius); padding: 0.6rem 0.9rem; margin: 0.3rem 0;
+}
+.pick:hover { border-color: hsl(var(--border)); background: hsl(var(--card)); }
+.pick.on { border-color: hsl(var(--primary)); color: hsl(var(--primary)); background: hsl(var(--primary) / 0.06); }
 
-.disclosure { border-left: 3px solid var(--danger); padding: 0.6rem 0.9rem; margin: 0.75rem 0;
-  background: rgba(194, 91, 78, 0.07); }
+.disclosure {
+  border-left: 3px solid hsl(var(--destructive));
+  border-radius: 0 var(--radius-chrome) var(--radius-chrome) 0;
+  padding: 0.6rem 0.9rem; margin: 0.75rem 0;
+  background: hsl(var(--destructive) / 0.08);
+}
 label.consent { display: flex; gap: 0.6rem; align-items: flex-start; margin: 0.75rem 0; cursor: pointer; }
 
-.code { font-family: var(--mono); font-size: 1.4rem; letter-spacing: 0.12em; color: var(--brass);
-  background: var(--bg); border: 1px dashed var(--brass-dim); border-radius: 3px;
-  padding: 0.5rem 1rem; display: inline-block; margin: 0.5rem 0; }
+.code {
+  font-family: var(--mono); font-size: 1.4rem; letter-spacing: 0.12em;
+  color: hsl(var(--primary));
+  background: hsl(var(--chrome-deep));
+  border: 1px dashed hsl(var(--border)); border-radius: var(--radius-chrome);
+  padding: 0.5rem 1rem; display: inline-block; margin: 0.5rem 0;
+}
 
-.status { font-family: var(--mono); font-size: 0.78rem; padding: 0.15rem 0.5rem; border-radius: 2px;
-  border: 1px solid var(--line); text-transform: lowercase; }
-.status.active { color: var(--ok); border-color: var(--ok); }
-.status.pending_confirm { color: var(--brass); border-color: var(--brass); }
-.status.paused { color: var(--muted); }
-.status.severed { color: var(--danger); border-color: var(--danger); }
+.status {
+  font-family: var(--mono); font-size: 0.78rem; padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-chrome); border: 1px solid hsl(var(--chrome-divider));
+  text-transform: lowercase;
+}
+/* The phosphor wake: a live bridge is the one place the cyan accent burns. */
+.status.active { color: hsl(var(--accent2)); border-color: hsl(var(--accent2) / 0.6); }
+.status.pending_confirm { color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.6); }
+.status.paused { color: hsl(var(--muted-foreground)); }
+.status.severed { color: hsl(var(--destructive)); border-color: hsl(var(--destructive) / 0.6); }
 
 table { width: 100%; border-collapse: collapse; }
-td { padding: 0.5rem 0.4rem; border-top: 1px solid var(--line); vertical-align: top; }
-.error { color: var(--danger); }
+td { padding: 0.5rem 0.4rem; border-top: 1px solid hsl(var(--chrome-divider)); vertical-align: top; }
+.error { color: hsl(var(--destructive)); }

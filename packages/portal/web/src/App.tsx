@@ -16,9 +16,9 @@ export function App() {
   return (
     <>
       <header className="masthead">
-        <div>
-          <h1><span className="word">armada</span> bridge</h1>
-          <p className="muted">Connect a Discord channel to an Armada community channel.</p>
+        <div className="brand">
+          <LogoMark />
+          <h1>Bridge Portal</h1>
         </div>
         {me?.user && (
           <div className="row">
@@ -29,6 +29,7 @@ export function App() {
           </div>
         )}
       </header>
+      <p className="muted tagline">Connect a Discord channel to an Armada community channel.</p>
 
       {!me && <p className="muted">Loading…</p>}
       {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
@@ -108,12 +109,12 @@ function Dashboard(props: { onNew: () => void }) {
       </div>
       {error && <p className="error">{error}</p>}
       {bridges === null && <p className="muted">Loading…</p>}
-      {bridges?.length === 0 && (
-        <div className="panel">
-          <p className="muted">No bridges yet. Create one to link a Discord channel with an Armada channel.</p>
-        </div>
+      {bridges !== null && (
+      <div className="frame">
+      {bridges.length === 0 && (
+        <p className="muted">No bridges yet. Create one to link a Discord channel with an Armada channel.</p>
       )}
-      {bridges?.map((b) => (
+      {bridges.map((b) => (
         <div className="panel" key={b.bridge_id}>
           <div className="row" style={{ justifyContent: "space-between" }}>
             <strong>{b.community_name ?? "(unnamed community)"}</strong>
@@ -154,6 +155,26 @@ function Dashboard(props: { onNew: () => void }) {
           </div>
         </div>
       ))}
+      </div>
+      )}
     </div>
+  );
+}
+
+/* Armada crest (public/logo-mark.svg inlined so currentColor takes the theme). */
+function LogoMark() {
+  return (
+    <svg viewBox="0 0 256 256" fill="none" aria-hidden="true" className="logo-mark">
+      <path
+        d="M64 16 H232 a8 8 0 0 1 8 8 V192 L192 240 H24 a8 8 0 0 1 -8 -8 V64 Z"
+        fill="none" stroke="currentColor" strokeWidth="10"
+      />
+      <path d="M128 56 L180 162 H158 L128 100 L98 162 H76 Z" fill="currentColor" />
+      <path d="M106 134 H150 L158 150 H98 Z" fill="var(--logo-bg, #0e0a12)" />
+      <g stroke="currentColor" strokeLinecap="round" opacity="0.55">
+        <path d="M88 184 H168" strokeWidth="6" />
+        <path d="M104 200 H152" strokeWidth="4" opacity="0.7" />
+      </g>
+    </svg>
   );
 }
