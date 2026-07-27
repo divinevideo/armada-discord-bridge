@@ -115,8 +115,9 @@ describe("BridgeRouter: Discord -> Concord", () => {
     const rumorId = await router.onDiscordMessage(discordMsg(), link);
 
     expect(rumorId).toBeDefined();
-    expect(pool.published).toHaveLength(1);
-    const opened = openWrap(pool.published[0], channel.current.group);
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    expect(wraps).toHaveLength(1);
+    const opened = openWrap(wraps[0], channel.current.group);
     expect(opened.content).toBe("hello armada");
     expect(opened.author).toBe(puppets.get("80351110224678912").pk);
     expect(hasProxyTag(opened)).toBe(true);
@@ -174,7 +175,8 @@ describe("BridgeRouter: Discord -> Concord", () => {
       }),
       link,
     );
-    const opened = openWrap(pool.published[0], channel.current.group);
+    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const opened = openWrap(wrap, channel.current.group);
     expect(opened.content).toBe("hey @alice look :blob:\nhttps://cdn.discordapp.com/x.png");
   });
 });
