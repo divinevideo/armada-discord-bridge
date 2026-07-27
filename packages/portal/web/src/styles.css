@@ -224,7 +224,8 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 .demo-link::before { margin-bottom: 0.25rem; }
 .demo-link::after { margin-top: 0.25rem; }
 
-/* Consent flow, below the hero. */
+/* Consent flow, below the hero; top gap matches the hero's column gutter. */
+.panel.landing { margin-top: 1.75rem; }
 .landing ol { margin: 0.4rem 0 0.75rem; padding-left: 1.4rem; }
 .landing li { margin: 0.3rem 0; }
 .landing li::marker { color: hsl(var(--primary)); font-family: var(--mono); font-size: 0.85em; }
