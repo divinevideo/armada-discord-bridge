@@ -9,7 +9,7 @@ export function App() {
   const [view, setView] = useState<"dashboard" | "wizard">("dashboard");
 
   const refresh = useCallback(() => {
-    void api<Me>("/api/me").then(setMe).catch(() => setMe({ user: null, devLogin: false }));
+    void api<Me>("/api/me").then(setMe).catch(() => setMe({ user: null, devLogin: false, discordConfigured: false }));
   }, []);
   useEffect(refresh, [refresh]);
 

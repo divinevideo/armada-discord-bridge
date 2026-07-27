@@ -21,11 +21,13 @@ import {
   controlGroups,
   currentGuestbookGroup,
   foldControlState,
+  guestbookGroups,
   inviteRefOf,
   openChatBatch,
   openControlWraps,
   parseBundleEvent,
   parseInviteLink,
+  registerStreamKeys,
   rehydrateCommunity,
   sealGuestbook,
   sealRumor,
@@ -109,7 +111,14 @@ export class ConcordClient {
     readonly community: CommunityV2,
     private readonly pool: RelayLike,
     private readonly primary: LocalIdentity,
-  ) {}
+  ) {
+    // NIP-42-gated relays require AUTH as every queried stream author; the
+    // pool signs challenges with whatever is registered here (streamAuth).
+    registerStreamKeys(
+      [...controlGroups(community), ...guestbookGroups(community)],
+      community.relays,
+    );
+  }
 
   /** Fetch and fold the Control Plane (channels, roles, banlist). */
   async syncControl(opts?: { signal?: AbortSignal }): Promise<FoldedControl> {
@@ -125,7 +134,12 @@ export class ConcordClient {
 
   /** Channels readable with held keys, per the current fold. */
   channels(): ChannelV2[] {
-    return channelsView(this.community, this.folded);
+    const channels = channelsView(this.community, this.folded);
+    registerStreamKeys(
+      channels.flatMap((c) => c.streams.map((s) => s.group)),
+      this.community.relays,
+    );
+    return channels;
   }
 
   channel(idHex: string): ChannelV2 | undefined {

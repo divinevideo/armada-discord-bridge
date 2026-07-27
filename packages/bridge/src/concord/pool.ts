@@ -2,10 +2,25 @@
  * Relay pool with Concord broadcast semantics: reads merge across every
  * community relay; a publish succeeds when ANY relay accepts (matching
  * Armada's `broadcast` in useChannel2).
+ *
+ * NIP-42: relays that gate kind 1059 (ditto-relay's default) require every
+ * `authors` entry in a REQ to be an authenticated pubkey on the connection.
+ * Stream addresses are derived keys the client holds, so on each challenge
+ * we AUTH as every registered stream key (core `streamAuth` registry) plus
+ * an identity key, all on the same socket; NRelay1 then retries the REQ.
  */
 
+import { signStreamAuths } from "@armada-bridge/concord-core";
 import { NRelay1 } from "@nostrify/nostrify";
-import type { NostrEvent, NostrFilter } from "@nostrify/nostrify";
+import type { NostrClientMsg, NostrEvent, NostrFilter } from "@nostrify/nostrify";
+import { finalizeEvent, generateSecretKey } from "nostr-tools/pure";
+
+/** NRelay1 keeps `send` protected; the AUTH fan-out needs it. */
+class AuthedNRelay1 extends NRelay1 {
+  sendRaw(msg: NostrClientMsg): void {
+    this.send(msg);
+  }
+}
 
 export interface SubscriptionHandlers {
   onEvent(event: NostrEvent): void;
@@ -24,16 +39,37 @@ const QUERY_TIMEOUT_MS = 10_000;
 const PUBLISH_TIMEOUT_MS = 8_000;
 
 export class RelayPool implements RelayLike {
-  private readonly conns = new Map<string, NRelay1>();
+  private readonly conns = new Map<string, AuthedNRelay1>();
+  private readonly authSk: Uint8Array;
 
-  constructor(readonly urls: string[]) {
+  constructor(readonly urls: string[], opts?: { authSk?: Uint8Array }) {
     if (urls.length === 0) throw new Error("RelayPool needs at least one relay URL");
+    this.authSk = opts?.authSk ?? generateSecretKey();
   }
 
-  private relay(url: string): NRelay1 {
+  private relay(url: string): AuthedNRelay1 {
     let conn = this.conns.get(url);
     if (!conn) {
-      conn = new NRelay1(url);
+      const box: { conn?: AuthedNRelay1 } = {};
+      conn = new AuthedNRelay1(url, {
+        auth: async (challenge) => {
+          // Fan out one AUTH per registered stream key on the live challenge,
+          // then hand NRelay1 the identity auth it awaits an OK for.
+          for (const event of signStreamAuths(challenge, url)) {
+            box.conn?.sendRaw(["AUTH", event]);
+          }
+          return finalizeEvent(
+            {
+              kind: 22242,
+              content: "",
+              tags: [["relay", url], ["challenge", challenge]],
+              created_at: Math.floor(Date.now() / 1000),
+            },
+            this.authSk,
+          );
+        },
+      });
+      box.conn = conn;
       this.conns.set(url, conn);
     }
     return conn;
