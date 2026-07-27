@@ -7,9 +7,16 @@
 import { NRelay1 } from "@nostrify/nostrify";
 import type { NostrEvent, NostrFilter } from "@nostrify/nostrify";
 
+export interface SubscriptionHandlers {
+  onEvent(event: NostrEvent): void;
+  onError?(relayUrl: string, error: unknown): void;
+}
+
 export interface RelayLike {
   query(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
   publish(event: NostrEvent, opts?: { signal?: AbortSignal }): Promise<void>;
+  /** Standing REQ across relays, deduped by event id. Returns unsubscribe. */
+  subscribe(filters: NostrFilter[], handlers: SubscriptionHandlers): () => void;
   close(): Promise<void>;
 }
 
@@ -54,6 +61,28 @@ export class RelayPool implements RelayLike {
     } catch {
       throw new Error(`no relay accepted event ${event.id} (${this.urls.length} tried)`);
     }
+  }
+
+  subscribe(filters: NostrFilter[], handlers: SubscriptionHandlers): () => void {
+    const controller = new AbortController();
+    const seen = new Set<string>();
+    for (const url of this.urls) {
+      void (async () => {
+        try {
+          for await (const msg of this.relay(url).req(filters, { signal: controller.signal })) {
+            if (msg[0] !== "EVENT") continue;
+            const event = msg[2];
+            if (seen.has(event.id)) continue;
+            if (seen.size >= 65_536) seen.clear(); // bounded; re-delivery is harmless post-dedup downstream
+            seen.add(event.id);
+            handlers.onEvent(event);
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) handlers.onError?.(url, error);
+        }
+      })();
+    }
+    return () => controller.abort();
   }
 
   async close(): Promise<void> {

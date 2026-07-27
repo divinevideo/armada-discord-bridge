@@ -4,9 +4,12 @@ import {
   KIND_MESSAGE,
   STOCK_RELAYS,
   buildBundleEvent,
+  buildChannelEdition,
   buildInviteUrl,
   bytesToHex,
   channelGroupKey,
+  currentControlGroup,
+  sealEdition,
   guestbookGroups,
   mintCommunity,
   mintLinkSigner,
@@ -25,29 +28,50 @@ import { ConcordClient, hasProxyTag, proxyTag, resolveInvite } from "./client";
 import type { RelayLike } from "./pool";
 import { localIdentity } from "./signer";
 
-/** In-memory pool: canned query results, captured publishes. */
+/** In-memory pool: canned query results, captured publishes, manual emit. */
 class FakePool implements RelayLike {
   published: NostrEvent[] = [];
+  private subs: Array<{ filters: NostrFilter[]; onEvent: (e: NostrEvent) => void }> = [];
   constructor(private readonly canned: NostrEvent[] = []) {}
   async query(filters: NostrFilter[]): Promise<NostrEvent[]> {
-    return this.canned.filter((event) =>
-      filters.some(
-        (f) =>
-          (!f.kinds || f.kinds.includes(event.kind)) &&
-          (!f.authors || f.authors.includes(event.pubkey)),
-      ),
-    );
+    return this.canned.filter((event) => matches(filters, event));
   }
   async publish(event: NostrEvent): Promise<void> {
     this.published.push(event);
   }
+  subscribe(filters: NostrFilter[], handlers: { onEvent: (e: NostrEvent) => void }): () => void {
+    const sub = { filters, onEvent: handlers.onEvent };
+    this.subs.push(sub);
+    return () => {
+      this.subs = this.subs.filter((s) => s !== sub);
+    };
+  }
+  /** Push an event into every matching live subscription. */
+  emit(event: NostrEvent): void {
+    for (const sub of this.subs) {
+      if (matches(sub.filters, event)) sub.onEvent(event);
+    }
+  }
   async close(): Promise<void> {}
+}
+
+function matches(filters: NostrFilter[], event: NostrEvent): boolean {
+  return filters.some(
+    (f) =>
+      (!f.kinds || f.kinds.includes(event.kind)) &&
+      (!f.authors || f.authors.includes(event.pubkey)),
+  );
 }
 
 function makeCommunity() {
   const ownerSk = generateSecretKey();
   const { community } = mintCommunity("Bridge Test", getPublicKey(ownerSk), ["wss://relay.example"]);
   return { community, ownerSk };
+}
+
+function makeCommunity2(ownerSk: Uint8Array) {
+  const { community } = mintCommunity("Bridge Test", getPublicKey(ownerSk), ["wss://relay.example"]);
+  return { community };
 }
 
 function makeChannel(community: { root: Uint8Array }): ChannelV2 {
@@ -149,6 +173,48 @@ describe("ConcordClient", () => {
     expect(opened.content).toBe("hello from discord");
     expect(opened.tags).toContainEqual(["channel", channel.idHex]);
     expect(hasProxyTag(opened)).toBe(true);
+  });
+
+  it("streams live channel chat once per rumor, deduping wrap re-delivery", async () => {
+    const { community } = makeCommunity();
+    const channel = makeChannel(community);
+    const pool = new FakePool();
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const puppet = localIdentity(generateSecretKey());
+
+    const seen: string[] = [];
+    client.subscribeChannel(channel, (chat) => seen.push(`${chat.kind}:${chat.content}`));
+
+    const { wrap } = await client.sendChat(channel, { content: "live one", author: puppet });
+    pool.emit(wrap);
+    pool.emit(wrap); // relay re-delivery must not duplicate
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(seen).toEqual(["9:live one"]);
+  });
+
+  it("live-folds a channel edition from the owner into channelsView", async () => {
+    const ownerSk = generateSecretKey();
+    const { community } = makeCommunity2(ownerSk);
+    const pool = new FakePool();
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+
+    let folds = 0;
+    client.subscribeControl(() => folds++);
+
+    const owner = localIdentity(ownerSk);
+    const channelId = new Uint8Array(32).fill(9);
+    const edition = buildChannelEdition(channelId, { name: "bridged", private: false }, {
+      actorPubkey: owner.pk,
+      version: 1n,
+    });
+    const wrap = await sealEdition(edition, currentControlGroup(community), owner.signer);
+    pool.emit(wrap);
+
+    expect(folds).toBe(1);
+    const names = client.channels().map((c) => c.name);
+    expect(names).toContain("bridged");
+    expect(client.channel(bytesToHex(channelId))).toBeDefined();
   });
 
   it("refuses to publish for a banned puppet", async () => {

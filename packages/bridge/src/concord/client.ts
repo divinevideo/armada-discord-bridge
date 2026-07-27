@@ -22,6 +22,7 @@ import {
   currentGuestbookGroup,
   foldControlState,
   inviteRefOf,
+  openChatBatch,
   openControlWraps,
   parseBundleEvent,
   parseInviteLink,
@@ -37,6 +38,7 @@ import type {
   CommunityV2,
   FoldedControl,
   InviteBundle,
+  OpenedChat,
   Rumor,
 } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
@@ -143,6 +145,54 @@ export class ConcordClient {
     const wrap = await sealGuestbook(rumor, group, this.primary.signer);
     await this.pool.publish(wrap);
     return wrap;
+  }
+
+  /**
+   * Live-stream a channel's chat: standing REQ across every held epoch's
+   * stream address, opened and binding-checked, deduped by rumor id.
+   */
+  subscribeChannel(channel: ChannelV2, onChat: (chat: OpenedChat) => void): () => void {
+    const seenRumors = new Set<string>();
+    return this.pool.subscribe(
+      [{ kinds: [KIND_WRAP], authors: channel.streams.map((s) => s.group.pk) }],
+      {
+        onEvent: (wrap) => {
+          void openChatBatch([wrap], channel).then((opened) => {
+            for (const chat of opened) {
+              if (seenRumors.has(chat.rumorId)) continue;
+              if (seenRumors.size >= 65_536) seenRumors.clear();
+              seenRumors.add(chat.rumorId);
+              onChat(chat);
+            }
+          });
+        },
+      },
+    );
+  }
+
+  /**
+   * Live-fold the Control Plane: each incoming control wrap re-folds the
+   * accumulated edition set (control history is small by design; the fold
+   * itself is memoized in core). Keeps `this.folded` current so bans and
+   * channel changes apply to the very next send.
+   */
+  subscribeControl(onFold?: (folded: FoldedControl) => void): () => void {
+    const groups = controlGroups(this.community);
+    const wraps: NostrEvent[] = [];
+    const seen = new Set<string>();
+    return this.pool.subscribe(
+      [{ kinds: [KIND_WRAP], authors: groups.map((g) => g.pk) }],
+      {
+        onEvent: (wrap) => {
+          if (seen.has(wrap.id)) return;
+          seen.add(wrap.id);
+          wraps.push(wrap);
+          const editions = openControlWraps(wraps, groups);
+          this.folded = foldControlState(editions, this.community.id, this.community.owner);
+          onFold?.(this.folded);
+        },
+      },
+    );
   }
 
   /**
