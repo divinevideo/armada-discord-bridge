@@ -135,8 +135,10 @@ console.log("bridge: discord gateway up");
 const onChat = (chat: OpenedChat): void => {
   void router.onConcordChat(chat, link).catch((error) => console.error("bridge: concord->discord failed", error));
 };
+const onSubError = (relayUrl: string, error: unknown): void =>
+  console.error(`bridge: chat subscription ${relayUrl}:`, error);
 let currentChannel = channel;
-let unsubscribe = client.subscribeChannel(currentChannel, onChat);
+let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError);
 // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
 // goes silent while publishes (fresh channel lookup) keep working.
 const unsubControl = client.subscribeControl(() => {
@@ -146,7 +148,7 @@ const unsubControl = client.subscribeControl(() => {
   if (keys(fresh) === keys(currentChannel)) return;
   unsubscribe();
   currentChannel = fresh;
-  unsubscribe = client.subscribeChannel(fresh, onChat);
+  unsubscribe = client.subscribeChannel(fresh, onChat, onSubError);
   console.log("bridge: stream keys rotated; chat subscription refreshed");
 });
 console.log("bridge: live in both directions");

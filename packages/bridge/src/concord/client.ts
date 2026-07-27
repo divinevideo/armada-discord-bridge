@@ -196,11 +196,20 @@ export class ConcordClient {
    * Live-stream a channel's chat: standing REQ across every held epoch's
    * stream address, opened and binding-checked, deduped by rumor id.
    */
-  subscribeChannel(channel: ChannelV2, onChat: (chat: OpenedChat) => void): () => void {
+  subscribeChannel(
+    channel: ChannelV2,
+    onChat: (chat: OpenedChat) => void,
+    onError?: (relayUrl: string, error: unknown) => void,
+  ): () => void {
     const seenRumors = new Set<string>();
+    // Live tail only: without a floor, relays replay stored history into the
+    // router on every (re)subscribe. Catch-up after downtime is cursor work,
+    // not replay-everything. Small overlap absorbs clock skew.
+    const since = Math.floor(Date.now() / 1000) - 60;
     return this.pool.subscribe(
-      [{ kinds: [KIND_WRAP], authors: channel.streams.map((s) => s.group.pk) }],
+      [{ kinds: [KIND_WRAP], authors: channel.streams.map((s) => s.group.pk), since }],
       {
+        onError,
         onEvent: (wrap) => {
           void openChatBatch([wrap], channel).then((opened) => {
             for (const chat of opened) {

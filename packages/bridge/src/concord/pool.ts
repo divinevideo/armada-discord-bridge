@@ -10,7 +10,7 @@
  * an identity key, all on the same socket; NRelay1 then retries the REQ.
  */
 
-import { signStreamAuths } from "@armada-bridge/concord-core";
+import { onStreamKeysAdded, signStreamAuths, streamPubkeysForRelay } from "@armada-bridge/concord-core";
 import { NRelay1 } from "@nostrify/nostrify";
 import type { NostrClientMsg, NostrEvent, NostrFilter } from "@nostrify/nostrify";
 import { finalizeEvent, generateSecretKey } from "nostr-tools/pure";
@@ -40,11 +40,28 @@ const PUBLISH_TIMEOUT_MS = 8_000;
 
 export class RelayPool implements RelayLike {
   private readonly conns = new Map<string, AuthedNRelay1>();
+  private readonly challenges = new Map<string, string>();
   private readonly authSk: Uint8Array;
+  private readonly stopKeyListener: () => void;
 
   constructor(readonly urls: string[], opts?: { authSk?: Uint8Array }) {
     if (urls.length === 0) throw new Error("RelayPool needs at least one relay URL");
     this.authSk = opts?.authSk ?? generateSecretKey();
+    // Channel stream keys register only after the control fold, which is
+    // AFTER the socket answered its AUTH challenge with the keys known at
+    // that moment. Without this fan-out the chat REQ's authors were never
+    // authenticated, and the relay served it nothing, silently.
+    this.stopKeyListener = onStreamKeysAdded((pks) => {
+      for (const [url, challenge] of this.challenges) {
+        const conn = this.conns.get(url);
+        if (!conn) continue;
+        const scoped = new Set(streamPubkeysForRelay(url));
+        const late = pks.filter((pk) => scoped.has(pk));
+        for (const event of signStreamAuths(challenge, url, late)) {
+          conn.sendRaw(["AUTH", event]);
+        }
+      }
+    });
   }
 
   private relay(url: string): AuthedNRelay1 {
@@ -54,7 +71,10 @@ export class RelayPool implements RelayLike {
       conn = new AuthedNRelay1(url, {
         auth: async (challenge) => {
           // Fan out one AUTH per registered stream key on the live challenge,
-          // then hand NRelay1 the identity auth it awaits an OK for.
+          // then hand NRelay1 the identity auth it awaits an OK for. The
+          // challenge stays valid for the connection's lifetime; keep it so
+          // late-registered keys can AUTH on this socket too.
+          this.challenges.set(url, challenge);
           for (const event of signStreamAuths(challenge, url)) {
             box.conn?.sendRaw(["AUTH", event]);
           }
@@ -104,17 +124,37 @@ export class RelayPool implements RelayLike {
     const seen = new Set<string>();
     for (const url of this.urls) {
       void (async () => {
-        try {
-          for await (const msg of this.relay(url).req(filters, { signal: controller.signal })) {
-            if (msg[0] !== "EVENT") continue;
-            const event = msg[2];
-            if (seen.has(event.id)) continue;
-            if (seen.size >= 65_536) seen.clear(); // bounded; re-delivery is harmless post-dedup downstream
-            seen.add(event.id);
-            handlers.onEvent(event);
+        // One retry: an auth-required CLOSED can race the AUTH fan-out for
+        // late-registered stream keys; the second REQ runs post-auth.
+        for (let attempt = 0; attempt < 2; attempt++) {
+          let retry = false;
+          try {
+            for await (const msg of this.relay(url).req(filters, { signal: controller.signal })) {
+              if (msg[0] === "CLOSED") {
+                const reason = String(msg[2] ?? "");
+                if (attempt === 0 && /auth|restricted/i.test(reason)) {
+                  retry = true;
+                  break;
+                }
+                handlers.onError?.(url, new Error(`REQ closed by relay: ${reason}`));
+                return;
+              }
+              if (msg[0] !== "EVENT") continue;
+              const event = msg[2];
+              if (seen.has(event.id)) continue;
+              if (seen.size >= 65_536) seen.clear(); // bounded; re-delivery is harmless post-dedup downstream
+              seen.add(event.id);
+              handlers.onEvent(event);
+            }
+          } catch (error) {
+            if (!controller.signal.aborted) handlers.onError?.(url, error);
+            return;
           }
-        } catch (error) {
-          if (!controller.signal.aborted) handlers.onError?.(url, error);
+          if (!retry) {
+            if (!controller.signal.aborted) handlers.onError?.(url, new Error("subscription ended by relay"));
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
         }
       })();
     }
@@ -122,6 +162,8 @@ export class RelayPool implements RelayLike {
   }
 
   async close(): Promise<void> {
+    this.stopKeyListener();
+    this.challenges.clear();
     await Promise.allSettled([...this.conns.values()].map((conn) => conn.close()));
     this.conns.clear();
   }

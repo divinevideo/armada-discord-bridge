@@ -251,11 +251,15 @@ export class BridgeManager {
       unsubControl: () => {},
     };
 
-    rb.unsubChat = client.subscribeChannel(channel, (chat) => {
-      void this.onConcordChat(rb, chat, row.confirm_code ?? "").catch((error) =>
-        console.error(`bridge ${rb.id}: concord handler failed`, error),
-      );
-    });
+    rb.unsubChat = client.subscribeChannel(
+      channel,
+      (chat) => {
+        void this.onConcordChat(rb, chat, row.confirm_code ?? "").catch((error) =>
+          console.error(`bridge ${rb.id}: concord handler failed`, error),
+        );
+      },
+      (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
+    );
     // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
     // ones goes silent while publishes (fresh channel lookup) keep working.
     // Re-subscribe whenever the fold changes the channel's stream set.
@@ -286,11 +290,15 @@ export class BridgeManager {
     if (keys(fresh) === keys(rb.channel)) return;
     rb.unsubChat();
     rb.channel = fresh;
-    rb.unsubChat = rb.client.subscribeChannel(fresh, (chat) => {
-      void this.onConcordChat(rb, chat, confirmCode).catch((error) =>
-        console.error(`bridge ${rb.id}: concord handler failed`, error),
-      );
-    });
+    rb.unsubChat = rb.client.subscribeChannel(
+      fresh,
+      (chat) => {
+        void this.onConcordChat(rb, chat, confirmCode).catch((error) =>
+          console.error(`bridge ${rb.id}: concord handler failed`, error),
+        );
+      },
+      (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
+    );
     console.log(`bridge ${rb.id}: stream keys rotated; chat subscription refreshed`);
   }
 
