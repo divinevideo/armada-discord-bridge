@@ -301,15 +301,21 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void }) {
         <div className="panel" key={b.bridge_id}>
           <div className="row" style={{ justifyContent: "space-between" }}>
             <strong>
-              {b.community_name ?? "(unnamed community)"}
-              {b.discord_channel_name && b.concord_channel_name && (
-                <span className="muted pairing">
-                  {" "}#{b.discord_channel_name} &#8646; #{b.concord_channel_name}
-                </span>
+              {b.discord_channel_name && b.concord_channel_name ? (
+                <>
+                  #{b.discord_channel_name} <span className="swap">&#8646;</span> #{b.concord_channel_name}
+                </>
+              ) : (
+                b.community_name ?? "(unnamed community)"
               )}
             </strong>
             <span className={`status ${b.status}`}>{b.status}</span>
           </div>
+          {b.discord_channel_name && b.concord_channel_name && (
+            <div className="muted linkmeta">
+              {b.discord_guild_name ?? "Discord"} (Discord) &middot; {b.community_name ?? "community"} (Armada)
+            </div>
+          )}
           <table>
             <tbody>
               <tr>

@@ -225,9 +225,13 @@ export class BridgeManager {
     const discordName = row.discord_channel_id
       ? await this.adapter?.channelName(row.discord_channel_id).catch(() => null)
       : null;
+    const guildName = row.discord_guild_id
+      ? await this.adapter?.guildName(row.discord_guild_id).catch(() => null)
+      : null;
     await this.sql`
       UPDATE bridges SET concord_channel_name = ${channel.name},
-        discord_channel_name = ${discordName ?? null}
+        discord_channel_name = ${discordName ?? null},
+        discord_guild_name = ${guildName ?? null}
       WHERE bridge_id = ${row.bridge_id}`;
     await client.publishJoin().catch(() => {});
     await client

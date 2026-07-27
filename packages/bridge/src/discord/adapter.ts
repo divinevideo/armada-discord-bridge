@@ -221,6 +221,11 @@ export class DiscordAdapter implements WebhookSender {
     return (await this.textChannel(channelId)).name;
   }
 
+  /** Display name of a guild (dashboard labels). */
+  async guildName(guildId: string): Promise<string> {
+    return (await this.client.guilds.fetch(guildId)).name;
+  }
+
   private async textChannel(channelId: string): Promise<TextChannel> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || channel.type !== ChannelType.GuildText) {

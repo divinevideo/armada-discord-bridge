@@ -285,7 +285,8 @@ label.consent { display: flex; gap: 0.6rem; align-items: flex-start; margin: 0.7
 .footer-links a { color: hsl(var(--muted-foreground)); text-decoration: none; }
 .footer-links a:hover { color: hsl(var(--primary)); }
 
-.pairing { font-weight: 400; font-size: 0.85em; }
+.linkmeta { font-size: 0.8rem; margin: 0.2rem 0 0.5rem; }
+.panel .swap { color: hsl(var(--primary)); font-weight: 400; margin: 0 0.15rem; }
 
 table { width: 100%; border-collapse: collapse; }
 td { padding: 0.5rem 0.4rem; border-top: 1px solid hsl(var(--chrome-divider)); vertical-align: top; }
