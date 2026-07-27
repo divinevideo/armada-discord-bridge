@@ -146,10 +146,10 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 /* Signed-out landing header: the crest at full size beside the product name. */
 .hero-title { display: flex; align-items: center; gap: 1.1rem; margin: 2.25rem 0 0.25rem; }
 .hero-title .logo-mark { width: 52px; height: 52px; flex: none; --logo-bg: hsl(var(--background)); }
-.hero-title h2 { font-size: 2.1rem; line-height: 1.15; margin: 0; letter-spacing: -0.02em; }
+.hero-title h2 { font-size: 2.45rem; line-height: 1.15; margin: 0; letter-spacing: -0.02em; }
 .hero-title .swap { color: hsl(var(--primary)); font-weight: 400; }
-.hero-title p { font-size: 1.02rem; color: hsl(var(--muted-foreground)); margin: 0.4rem 0 0; }
-@media (max-width: 700px) { .hero-title { align-items: flex-start; } .hero-title h2 { font-size: 1.6rem; } }
+.hero-title p { font-size: 1.18rem; color: hsl(var(--muted-foreground)); margin: 0.4rem 0 0; }
+@media (max-width: 700px) { .hero-title { align-items: flex-start; } .hero-title h2 { font-size: 1.75rem; } }
 
 /* Hero: pitch left, a mocked bridged channel pair right. The copy column
    stretches to the demo's height and distributes pitch, action, and
@@ -160,8 +160,8 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 }
 @media (max-width: 700px) { .hero { grid-template-columns: 1fr; } }
 .hero-copy { display: flex; flex-direction: column; justify-content: space-between; }
-.hero-copy > p:first-child { margin-top: 0.25rem; }
-.hero-copy .disclosure { margin-bottom: 0; font-size: 0.88rem; }
+.hero-copy > p:first-child { margin-top: 0.25rem; font-size: 1.05rem; line-height: 1.55; }
+.hero-copy .disclosure { font-size: 0.98rem; }
 
 /* Demo: each pane wears its own platform's chrome. Discord's side is
    hardcoded to the real client palette (#313338 surface, blurple, the APP
@@ -229,6 +229,7 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 .landing ol { margin: 0.4rem 0 0.75rem; padding-left: 1.4rem; }
 .landing li { margin: 0.3rem 0; }
 .landing li::marker { color: hsl(var(--primary)); font-family: var(--mono); font-size: 0.85em; }
+.faq { padding: 0 0.9rem; }
 .faq details { border-top: 1px solid hsl(var(--chrome-divider)); }
 .faq details:first-child { border-top: none; }
 .faq summary {
