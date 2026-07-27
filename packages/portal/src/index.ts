@@ -180,8 +180,11 @@ app.get("/api/bridges", async (c) => {
   const rows = await sql`
     SELECT b.bridge_id, b.status, b.status_detail, b.community_name, b.community_id,
            b.discord_guild_id, b.discord_channel_id, b.concord_channel_id, b.confirm_code,
+           b.discord_channel_name, b.concord_channel_name,
            b.primary_pk, b.created_at,
-           (SELECT count(*) FROM messages m WHERE m.community_id = b.community_id) AS bridged_count
+           (SELECT count(*) FROM messages m
+            WHERE m.discord_channel_id = b.discord_channel_id
+              AND m.concord_channel_id = b.concord_channel_id) AS bridged_count
     FROM bridges b
     WHERE b.owner_discord_id = ${session.user.id} AND b.status <> 'unlinked'
     ORDER BY b.created_at DESC`;

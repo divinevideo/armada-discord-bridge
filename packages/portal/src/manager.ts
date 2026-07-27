@@ -220,6 +220,15 @@ export class BridgeManager {
       await pool.close();
       throw new Error("concord channel not found (deleted, or key not held)");
     }
+    // Refresh display names each start: renames heal on the next boot, and
+    // rows from before the name columns existed backfill themselves.
+    const discordName = row.discord_channel_id
+      ? await this.adapter?.channelName(row.discord_channel_id).catch(() => null)
+      : null;
+    await this.sql`
+      UPDATE bridges SET concord_channel_name = ${channel.name},
+        discord_channel_name = ${discordName ?? null}
+      WHERE bridge_id = ${row.bridge_id}`;
     await client.publishJoin().catch(() => {});
     await client
       .publishProfile(primary, {

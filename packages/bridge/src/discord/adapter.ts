@@ -216,6 +216,11 @@ export class DiscordAdapter implements WebhookSender {
     await webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } });
   }
 
+  /** Display name of a guild text channel (dashboard labels). */
+  async channelName(channelId: string): Promise<string> {
+    return (await this.textChannel(channelId)).name;
+  }
+
   private async textChannel(channelId: string): Promise<TextChannel> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || channel.type !== ChannelType.GuildText) {

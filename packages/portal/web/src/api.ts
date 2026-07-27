@@ -26,7 +26,9 @@ export interface BridgeSummary {
   community_id?: string;
   discord_guild_id?: string;
   discord_channel_id?: string;
+  discord_channel_name?: string;
   concord_channel_id?: string;
+  concord_channel_name?: string;
   confirm_code?: string;
   primary_pk?: string;
   bridged_count: string;

@@ -300,18 +300,31 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void }) {
       {bridges.map((b) => (
         <div className="panel" key={b.bridge_id}>
           <div className="row" style={{ justifyContent: "space-between" }}>
-            <strong>{b.community_name ?? "(unnamed community)"}</strong>
+            <strong>
+              {b.community_name ?? "(unnamed community)"}
+              {b.discord_channel_name && b.concord_channel_name && (
+                <span className="muted pairing">
+                  {" "}#{b.discord_channel_name} &#8646; #{b.concord_channel_name}
+                </span>
+              )}
+            </strong>
             <span className={`status ${b.status}`}>{b.status}</span>
           </div>
           <table>
             <tbody>
               <tr>
                 <td className="muted">discord channel</td>
-                <td className="mono">{b.discord_channel_id ?? "—"}</td>
+                <td>
+                  {b.discord_channel_name ? `#${b.discord_channel_name} ` : ""}
+                  <span className="mono muted">{b.discord_channel_id ?? "—"}</span>
+                </td>
               </tr>
               <tr>
                 <td className="muted">armada channel</td>
-                <td className="mono">{b.concord_channel_id ? `${b.concord_channel_id.slice(0, 16)}…` : "—"}</td>
+                <td>
+                  {b.concord_channel_name ? `#${b.concord_channel_name} ` : ""}
+                  <span className="mono muted">{b.concord_channel_id ? `${b.concord_channel_id.slice(0, 16)}…` : "—"}</span>
+                </td>
               </tr>
               <tr>
                 <td className="muted">bridge npub (for mods)</td>
