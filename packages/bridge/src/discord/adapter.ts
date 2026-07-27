@@ -16,7 +16,11 @@ import {
   GatewayIntentBits,
   Partials,
   type Message,
+  type MessageReaction,
+  type PartialMessageReaction,
+  type PartialUser,
   type TextChannel,
+  type User,
   type Webhook,
 } from "discord.js";
 
@@ -55,8 +59,10 @@ export function toInbound(message: Message): DiscordInboundMessage {
 
 export interface DiscordAdapterHandlers {
   onMessage(msg: DiscordInboundMessage): Promise<void>;
+  onMessageUpdate?(msg: DiscordInboundMessage): Promise<void>;
   onMessageDelete?(del: DiscordMessageDelete): Promise<void>;
   onReactionAdd?(reaction: DiscordReactionAdd): Promise<void>;
+  onReactionRemove?(reaction: DiscordReactionAdd): Promise<void>;
 }
 
 export class DiscordAdapter implements WebhookSender {
@@ -84,6 +90,12 @@ export class DiscordAdapter implements WebhookSender {
         console.error("bridge: onMessage failed", error);
       });
     });
+    this.client.on("messageUpdate", (_old, message) => {
+      void (async () => {
+        const full = message.partial ? await message.fetch() : message;
+        await this.handlers.onMessageUpdate?.(toInbound(full));
+      })().catch((error) => console.error("bridge: onMessageUpdate failed", error));
+    });
     this.client.on("messageDelete", (message) => {
       void this.handlers
         .onMessageDelete?.({
@@ -93,25 +105,34 @@ export class DiscordAdapter implements WebhookSender {
         })
         .catch((error) => console.error("bridge: onMessageDelete failed", error));
     });
-    this.client.on("messageReactionAdd", (reaction, user) => {
-      void (async () => {
-        if (user.id === this.client.user?.id) return; // our own bot reactions
-        const full = reaction.partial ? await reaction.fetch() : reaction;
-        const fullUser = user.partial ? await user.fetch() : user;
-        await this.handlers.onReactionAdd?.({
-          messageId: full.message.id,
-          channelId: full.message.channelId,
-          guildId: full.message.guildId ?? "",
-          emoji: { name: full.emoji.name, id: full.emoji.id },
-          user: {
-            id: fullUser.id,
-            display: fullUser.displayName ?? fullUser.username,
-            avatarUrl: fullUser.displayAvatarURL?.(),
-            bot: fullUser.bot,
-          },
-        });
-      })().catch((error) => console.error("bridge: onReactionAdd failed", error));
-    });
+    const bridgeReaction = (
+      handler: ((reaction: DiscordReactionAdd) => Promise<void>) | undefined,
+      label: string,
+    ) =>
+      (
+        reaction: MessageReaction | PartialMessageReaction,
+        user: User | PartialUser,
+      ) => {
+        void (async () => {
+          if (user.id === this.client.user?.id) return; // our own bot reactions
+          const full = reaction.partial ? await reaction.fetch() : reaction;
+          const fullUser = user.partial ? await user.fetch() : user;
+          await handler?.({
+            messageId: full.message.id,
+            channelId: full.message.channelId,
+            guildId: full.message.guildId ?? "",
+            emoji: { name: full.emoji.name, id: full.emoji.id },
+            user: {
+              id: fullUser.id,
+              display: fullUser.displayName ?? fullUser.username,
+              avatarUrl: fullUser.displayAvatarURL?.(),
+              bot: fullUser.bot,
+            },
+          });
+        })().catch((error) => console.error(`bridge: ${label} failed`, error));
+      };
+    this.client.on("messageReactionAdd", bridgeReaction((r) => this.handlers.onReactionAdd?.(r) ?? Promise.resolve(), "onReactionAdd"));
+    this.client.on("messageReactionRemove", bridgeReaction((r) => this.handlers.onReactionRemove?.(r) ?? Promise.resolve(), "onReactionRemove"));
   }
 
   get applicationId(): string {
@@ -163,6 +184,7 @@ export class DiscordAdapter implements WebhookSender {
       avatarUrl?: string;
       content: string;
       embeds?: Array<{ description: string }>;
+      files?: Array<{ name: string; data: Uint8Array }>;
     },
   ): Promise<string> {
     const webhook = await this.webhookFor(link.discordChannelId);
@@ -171,9 +193,16 @@ export class DiscordAdapter implements WebhookSender {
       username: sanitizeUsername(message.username),
       avatarURL: message.avatarUrl,
       embeds: message.embeds,
+      files: message.files?.map((f) => ({ attachment: Buffer.from(f.data), name: f.name })),
       allowedMentions: { parse: [] },
     });
     return created.id;
+  }
+
+  /** WebhookSender: edit a webhook-authored mirror in place. */
+  async edit(link: ChannelLink, discordMessageId: string, content: string): Promise<void> {
+    const webhook = await this.webhookFor(link.discordChannelId);
+    await webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } });
   }
 
   private async textChannel(channelId: string): Promise<TextChannel> {
@@ -204,6 +233,15 @@ export class DiscordAdapter implements WebhookSender {
     const channel = await this.textChannel(link.discordChannelId);
     const message = await channel.messages.fetch(discordMessageId);
     await message.react(emoji);
+  }
+
+  /** WebhookSender: remove the bot's own reaction. */
+  async unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
+    const channel = await this.textChannel(link.discordChannelId);
+    const message = await channel.messages.fetch(discordMessageId);
+    const botId = this.client.user?.id;
+    if (!botId) return;
+    await message.reactions.resolve(emoji)?.users.remove(botId);
   }
 }
 

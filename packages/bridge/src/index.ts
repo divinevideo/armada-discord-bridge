@@ -15,6 +15,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
 
+import { BlossomStore } from "./blossom";
 import { ConcordClient, resolveInvite } from "./concord/client";
 import { RelayPool } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
@@ -98,6 +99,10 @@ const adapter = new DiscordAdapter(config.discordToken, {
     if (msg.channelId !== link.discordChannelId) return;
     await router.onDiscordMessage(msg, link);
   },
+  async onMessageUpdate(msg) {
+    if (msg.channelId !== link.discordChannelId) return;
+    await router.onDiscordEdit(msg, link);
+  },
   async onMessageDelete(del) {
     if (del.channelId !== link.discordChannelId) return;
     await router.onDiscordDelete(del, link);
@@ -106,12 +111,24 @@ const adapter = new DiscordAdapter(config.discordToken, {
     if (reaction.channelId !== link.discordChannelId) return;
     await router.onDiscordReaction(reaction, link);
   },
+  async onReactionRemove(reaction) {
+    if (reaction.channelId !== link.discordChannelId) return;
+    await router.onDiscordReactionRemove(reaction, link);
+  },
 });
 await adapter.start();
-router = new BridgeRouter(client, puppets, store, adapter, profiles, {
-  applicationId: adapter.applicationId,
-  webhookIds: adapter.ownWebhookIds,
-});
+router = new BridgeRouter(
+  client,
+  puppets,
+  store,
+  adapter,
+  profiles,
+  { applicationId: adapter.applicationId, webhookIds: adapter.ownWebhookIds },
+  {
+    bridgeEdits: config.bridgeEdits,
+    blobs: config.blossomServer ? new BlossomStore(config.blossomServer) : undefined,
+  },
+);
 console.log("bridge: discord gateway up");
 
 client.subscribeControl();

@@ -17,6 +17,7 @@ import {
   parseInviteLink,
 } from "@armada-bridge/concord-core";
 import type { ChannelV2, OpenedChat } from "@armada-bridge/concord-core";
+import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/client";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
@@ -48,6 +49,7 @@ export interface BridgeRow {
   discord_channel_id: string | null;
   concord_channel_id: string | null;
   confirm_code: string | null;
+  options: Record<string, unknown> | null;
 }
 
 interface Running {
@@ -80,6 +82,10 @@ export class BridgeManager {
       try {
         this.adapter = new DiscordAdapter(this.env.discordBotToken, {
           onMessage: async (msg) => this.onDiscord(msg),
+          onMessageUpdate: async (msg) => {
+            const rb = this.activeRouterFor(msg.channelId);
+            if (rb) await rb.router!.onDiscordEdit(msg, rb.link);
+          },
           onMessageDelete: async (del) => {
             const rb = this.activeRouterFor(del.channelId);
             if (rb) await rb.router!.onDiscordDelete(del, rb.link);
@@ -87,6 +93,10 @@ export class BridgeManager {
           onReactionAdd: async (reaction) => {
             const rb = this.activeRouterFor(reaction.channelId);
             if (rb) await rb.router!.onDiscordReaction(reaction, rb.link);
+          },
+          onReactionRemove: async (reaction) => {
+            const rb = this.activeRouterFor(reaction.channelId);
+            if (rb) await rb.router!.onDiscordReactionRemove(reaction, rb.link);
           },
         });
         await this.adapter.start();
@@ -226,7 +236,7 @@ export class BridgeManager {
     });
 
     if (rb.status === "active") {
-      this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed));
+      this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed), row.options);
     } else {
       await client.sendChat(channel, {
         content:
@@ -254,7 +264,7 @@ export class BridgeManager {
         UPDATE bridges SET status = 'active', status_detail = NULL, updated_at = now()
         WHERE bridge_id = ${rb.id} RETURNING *`;
       rb.status = "active";
-      this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!));
+      this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
       await rb.client
         .sendChat(rb.channel, {
           content: "Bridge confirmed. This channel is now mirrored with Discord.",
@@ -266,7 +276,11 @@ export class BridgeManager {
     if (rb.router) await rb.router.onConcordChat(chat, rb.link);
   }
 
-  private attachRouting(rb: Running, masterSecretHex: string): void {
+  private attachRouting(
+    rb: Running,
+    masterSecretHex: string,
+    options?: Record<string, unknown> | null,
+  ): void {
     if (!this.adapter) {
       void this.markSevered(rb.id, "no Discord bot token configured");
       return;
@@ -278,6 +292,10 @@ export class BridgeManager {
       this.adapter,
       new Kind0ProfileResolver(rb.pool),
       { applicationId: this.adapter.applicationId, webhookIds: this.adapter.ownWebhookIds },
+      {
+        bridgeEdits: options?.edits === true,
+        blobs: this.env.blossomServer ? new BlossomStore(this.env.blossomServer) : undefined,
+      },
     );
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);
   }

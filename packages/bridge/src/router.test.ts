@@ -17,7 +17,7 @@ import type { RelayLike } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { PuppetCache } from "./puppets";
 import { BridgeRouter, MemoryMappingStore, fallbackProfile } from "./router";
-import type { ChannelLink, DiscordInboundMessage } from "./router";
+import type { ChannelLink, DiscordInboundMessage, RouterOptions } from "./router";
 
 const MASTER = "ab".repeat(32);
 
@@ -36,13 +36,23 @@ class FakePool implements RelayLike {
 }
 
 class FakeWebhooks {
-  sent: Array<{ username: string; content: string; embeds?: Array<{ description: string }> }> = [];
+  sent: Array<{
+    username: string;
+    content: string;
+    embeds?: Array<{ description: string }>;
+    files?: Array<{ name: string; data: Uint8Array }>;
+  }> = [];
   deleted: string[] = [];
   reactions: Array<{ messageId: string; emoji: string }> = [];
   private seq = 9000;
   async send(
     _link: ChannelLink,
-    message: { username: string; content: string; embeds?: Array<{ description: string }> },
+    message: {
+      username: string;
+      content: string;
+      embeds?: Array<{ description: string }>;
+      files?: Array<{ name: string; data: Uint8Array }>;
+    },
   ): Promise<string> {
     this.sent.push(message);
     return String(this.seq++);
@@ -50,12 +60,20 @@ class FakeWebhooks {
   async delete(_link: ChannelLink, discordMessageId: string): Promise<void> {
     this.deleted.push(discordMessageId);
   }
+  edited: Array<{ messageId: string; content: string }> = [];
+  async edit(_link: ChannelLink, messageId: string, content: string): Promise<void> {
+    this.edited.push({ messageId, content });
+  }
   async react(_link: ChannelLink, messageId: string, emoji: string): Promise<void> {
     this.reactions.push({ messageId, emoji });
   }
+  unreacted: Array<{ messageId: string; emoji: string }> = [];
+  async unreact(_link: ChannelLink, messageId: string, emoji: string): Promise<void> {
+    this.unreacted.push({ messageId, emoji });
+  }
 }
 
-function harness() {
+function harness(options?: RouterOptions) {
   const ownerSk = generateSecretKey();
   const { community } = mintCommunity("Test", getPublicKey(ownerSk), ["wss://relay.example"]);
   const channelId = new Uint8Array(32).fill(7);
@@ -87,7 +105,7 @@ function harness() {
   };
   const router = new BridgeRouter(client, puppets, store, webhooks, {
     resolve: async (pk: string) => fallbackProfile(pk),
-  }, { applicationId: "app1", webhookIds: new Set(["wh1"]) });
+  }, { applicationId: "app1", webhookIds: new Set(["wh1"]) }, options ?? {});
 
   return { community, channel, pool, client, puppets, store, webhooks, link, router };
 }
@@ -409,6 +427,53 @@ describe("BridgeRouter: reactions", () => {
     ]);
   });
 
+  it("Discord reaction remove tombstones the kind 7 with a k=7 delete", async () => {
+    const { router, pool, channel, puppets, store, link } = harness();
+    await router.onDiscordMessage(discordMsg(), link);
+    const reactionRumorId = await router.onDiscordReaction(reaction(), link);
+    expect(store.reactions).toHaveLength(1);
+
+    const deleteRumorId = await router.onDiscordReactionRemove(reaction(), link);
+    expect(deleteRumorId).toBeDefined();
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
+    expect(opened.kind).toBe(5);
+    expect(opened.author).toBe(puppets.get("80351110224678912").pk);
+    expect(opened.tags).toContainEqual(["e", reactionRumorId!]);
+    expect(opened.tags).toContainEqual(["k", "7"]);
+    expect(store.reactions).toHaveLength(0);
+
+    // Removing a never-bridged reaction is a no-op.
+    expect(await router.onDiscordReactionRemove(reaction(), link)).toBeUndefined();
+  });
+
+  it("Concord kind 5 on a reaction rumor un-reacts only when the last reactor leaves", async () => {
+    const { router, webhooks, link } = harness();
+    await router.onConcordChat(concordChat(), link); // mirror as id 9000
+
+    await router.onConcordChat(
+      concordChat({ rumorId: "e1".repeat(32), kind: 7, content: "🔥", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    await router.onConcordChat(
+      concordChat({ rumorId: "e2".repeat(32), kind: 7, content: "🔥", author: "c".repeat(64), tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.reactions).toHaveLength(2);
+
+    await router.onConcordChat(
+      concordChat({ rumorId: "d5".repeat(32), kind: 5, content: "", tags: [["e", "e1".repeat(32)], ["k", "7"]] }),
+      link,
+    );
+    expect(webhooks.unreacted).toHaveLength(0); // c's reaction still mirrored
+
+    await router.onConcordChat(
+      concordChat({ rumorId: "d6".repeat(32), kind: 5, content: "", author: "c".repeat(64), tags: [["e", "e2".repeat(32)], ["k", "7"]] }),
+      link,
+    );
+    expect(webhooks.unreacted).toEqual([{ messageId: "9000", emoji: "🔥" }]);
+  });
+
   it("skips NIP-30 shortcodes and non-emoji content", async () => {
     const { router, webhooks, link } = harness();
     await router.onConcordChat(concordChat(), link);
@@ -421,5 +486,141 @@ describe("BridgeRouter: reactions", () => {
       link,
     );
     expect(webhooks.reactions).toHaveLength(0);
+  });
+});
+
+describe("BridgeRouter: thread replies (kind 1111)", () => {
+  it("flattens a Concord thread reply to Discord with a parent jump link", async () => {
+    const { router, webhooks, store, link } = harness();
+    await router.onConcordChat(concordChat(), link); // parent mirrored as 9000
+
+    const ids = await router.onConcordChat(
+      concordChat({
+        rumorId: "t1".repeat(32),
+        kind: 1111,
+        content: "thread reply",
+        tags: [
+          ["K", "9"], ["E", "r".repeat(64), "", "f".repeat(64)], ["P", "f".repeat(64)],
+          ["k", "9"], ["e", "r".repeat(64), "", "f".repeat(64)], ["p", "f".repeat(64)],
+        ],
+      }),
+      link,
+    );
+    expect(ids).toHaveLength(1);
+    expect(webhooks.sent[1].content).toBe("thread reply");
+    expect(webhooks.sent[1].embeds![0].description).toContain("/9000");
+    // Mapped, so reactions/deletes on the comment resolve too.
+    expect(store.rows.some((r) => r.concordRumorId === "t1".repeat(32))).toBe(true);
+  });
+});
+
+describe("BridgeRouter: edits (kind 3302, behind flag)", () => {
+  it("does nothing in either direction by default", async () => {
+    const { router, pool, webhooks, link } = harness();
+    await router.onDiscordMessage(discordMsg(), link);
+    await router.onConcordChat(concordChat(), link);
+    const before = pool.published.filter((e) => e.kind === 1059).length;
+
+    expect(await router.onDiscordEdit(discordMsg({ content: "edited" }), link)).toBeUndefined();
+    await router.onConcordChat(
+      concordChat({ rumorId: "x1".repeat(32), kind: 3302, content: "fixed", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(pool.published.filter((e) => e.kind === 1059)).toHaveLength(before);
+    expect(webhooks.edited).toHaveLength(0);
+  });
+
+  it("Discord MESSAGE_UPDATE publishes a puppet kind 3302 naming the rumor", async () => {
+    const { router, pool, channel, puppets, link } = harness({ bridgeEdits: true });
+    const rumorId = await router.onDiscordMessage(discordMsg(), link);
+
+    const editRumorId = await router.onDiscordEdit(discordMsg({ content: "edited!" }), link);
+    expect(editRumorId).toBeDefined();
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
+    expect(opened.kind).toBe(3302);
+    expect(opened.content).toBe("edited!");
+    expect(opened.author).toBe(puppets.get("80351110224678912").pk);
+    expect(opened.tags).toContainEqual(["e", rumorId!]);
+    expect(hasProxyTag(opened)).toBe(true);
+  });
+
+  it("Concord kind 3302 edits the mirror in place, author-only", async () => {
+    const { router, webhooks, link } = harness({ bridgeEdits: true });
+    await router.onConcordChat(concordChat(), link); // mirror as 9000
+
+    await router.onConcordChat(
+      concordChat({ rumorId: "x2".repeat(32), kind: 3302, content: "not yours", author: "a".repeat(64), tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.edited).toHaveLength(0);
+
+    await router.onConcordChat(
+      concordChat({ rumorId: "x3".repeat(32), kind: 3302, content: "fixed", tags: [["e", "r".repeat(64)]] }),
+      link,
+    );
+    expect(webhooks.edited).toEqual([{ messageId: "9000", content: "fixed" }]);
+  });
+});
+
+class FakeBlobs {
+  uploads: Array<{ size: number; mime: string; author: string }> = [];
+  async download(_url: string, _maxBytes: number): Promise<{ data: Uint8Array; mime: string }> {
+    return { data: new Uint8Array([1, 2, 3]), mime: "image/png" };
+  }
+  async upload(
+    data: Uint8Array,
+    mime: string,
+    author: { pk: string },
+  ): Promise<{ url: string; sha256: string }> {
+    this.uploads.push({ size: data.length, mime, author: author.pk });
+    return { url: "https://blossom.example/abc123", sha256: "ab".repeat(32) };
+  }
+}
+
+describe("BridgeRouter: attachments via Blossom", () => {
+  it("rehosts Discord attachments and carries imeta tags on the rumor", async () => {
+    const blobs = new FakeBlobs();
+    const { router, pool, channel, puppets, link } = harness({ blobs });
+    await router.onDiscordMessage(
+      discordMsg({ content: "look", attachments: [{ url: "https://cdn.discordapp.com/x.png", filename: "x.png" }] }),
+      link,
+    );
+    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const opened = openWrap(wrap, channel.current.group);
+    expect(opened.content).toBe("look\nhttps://blossom.example/abc123");
+    const imeta = opened.tags.find((t) => t[0] === "imeta")!;
+    expect(imeta).toContain("url https://blossom.example/abc123");
+    expect(imeta).toContain("m image/png");
+    expect(blobs.uploads[0].author).toBe(puppets.get("80351110224678912").pk);
+  });
+
+  it("falls back to the CDN link when rehosting fails", async () => {
+    const blobs = new FakeBlobs();
+    blobs.upload = async () => {
+      throw new Error("server down");
+    };
+    const { router, pool, channel, link } = harness({ blobs });
+    await router.onDiscordMessage(
+      discordMsg({ content: "look", attachments: [{ url: "https://cdn.discordapp.com/x.png" }] }),
+      link,
+    );
+    const opened = openWrap(pool.published.find((e) => e.kind === 1059)!, channel.current.group);
+    expect(opened.content).toBe("look\nhttps://cdn.discordapp.com/x.png");
+    expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
+  });
+
+  it("re-uploads Concord imeta blobs as Discord files", async () => {
+    const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
+    await router.onConcordChat(
+      concordChat({
+        content: "pic https://blossom.example/abc123",
+        tags: [["imeta", "url https://blossom.example/abc123", "m image/png", "size 3"]],
+      }),
+      link,
+    );
+    expect(webhooks.sent[0].files).toHaveLength(1);
+    expect(webhooks.sent[0].files![0].name).toBe("abc123");
+    expect(webhooks.sent[0].files![0].data).toEqual(new Uint8Array([1, 2, 3]));
   });
 });

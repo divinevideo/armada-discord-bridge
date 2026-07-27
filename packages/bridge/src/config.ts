@@ -21,6 +21,10 @@ export interface BridgeConfig {
   primarySecretKey: string;
   /** Log verbosity: debug | info | warn | error. */
   logLevel: string;
+  /** Bridge message edits (kind 3302; payload not frozen in the CORDs). */
+  bridgeEdits: boolean;
+  /** Blossom server URL for attachment rehosting; empty leaves CDN links. */
+  blossomServer: string;
 }
 
 function required(name: string): string {
@@ -40,5 +44,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     masterSecretHex,
     primarySecretKey: required("BRIDGE_PRIMARY_KEY"),
     logLevel: env.LOG_LEVEL?.trim() || "info",
+    bridgeEdits: env.BRIDGE_EDITS === "1",
+    blossomServer: env.BLOSSOM_SERVER?.trim() ?? "",
   };
 }

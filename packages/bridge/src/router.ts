@@ -11,7 +11,7 @@
  *     and never bridge a rumor we already have a mapping row for.
  */
 
-import { KIND_DELETE, KIND_MESSAGE, KIND_REACTION } from "@armada-bridge/concord-core";
+import { KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 
 import type { ConcordClient } from "./concord/client";
@@ -69,10 +69,28 @@ export interface MessageMappingRow {
   partIndex: number;
 }
 
+export interface ReactionMappingRow {
+  /** The kind 7 rumor id. */
+  rumorId: string;
+  /** The Discord message the reaction sits on. */
+  discordMessageId: string;
+  /** Unicode emoji as it appears on Discord. */
+  emoji: string;
+  origin: "discord" | "concord";
+  /** Discord user id or Concord pubkey of the reactor. */
+  authorRef: string;
+}
+
 export interface MappingStore {
   insert(row: MessageMappingRow): Promise<void>;
   byRumorId(rumorId: string): Promise<MessageMappingRow[]>;
   byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]>;
+  insertReaction(row: ReactionMappingRow): Promise<void>;
+  reactionByDiscord(messageId: string, userId: string, emoji: string): Promise<ReactionMappingRow | undefined>;
+  reactionByRumorId(rumorId: string): Promise<ReactionMappingRow | undefined>;
+  deleteReaction(rumorId: string): Promise<void>;
+  /** Concord-origin reactions still mirrored onto this message with this emoji. */
+  countConcordReactions(messageId: string, emoji: string): Promise<number>;
 }
 
 export interface WebhookSender {
@@ -84,13 +102,39 @@ export interface WebhookSender {
       avatarUrl?: string;
       content: string;
       embeds?: Array<{ description: string }>;
+      files?: Array<{ name: string; data: Uint8Array }>;
     },
   ): Promise<string>;
   /** Remove a bridged message (webhook delete; bot delete for user posts). */
   delete(link: ChannelLink, discordMessageId: string): Promise<void>;
+  /** Edit a webhook-authored mirror in place. */
+  edit(link: ChannelLink, discordMessageId: string, content: string): Promise<void>;
   /** React as the bot account (webhooks cannot react). */
   react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
+  /** Remove the bot's own reaction. */
+  unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
 }
+
+/** Rehosting port: Discord CDN blobs -> durable storage and back (Blossom). */
+export interface BlobPort {
+  download(url: string, maxBytes: number): Promise<{ data: Uint8Array; mime: string }>;
+  /** Upload signed by the puppet; returns the durable URL and content hash. */
+  upload(
+    data: Uint8Array,
+    mime: string,
+    author: LocalIdentity,
+  ): Promise<{ url: string; sha256: string }>;
+}
+
+export interface RouterOptions {
+  /** Kind 3302 is not frozen in the CORDs yet; off by default. */
+  bridgeEdits?: boolean;
+  /** When set, attachments rehost through Blossom instead of rotting CDN links. */
+  blobs?: BlobPort;
+}
+
+/** Attachment ceiling both ways (webhook upload limit for standard guilds). */
+export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 
 /**
  * NIP-25 reaction content -> a Discord-reactable unicode emoji, or undefined
@@ -127,6 +171,7 @@ export class BridgeRouter {
     private readonly webhooks: WebhookSender,
     private readonly profiles: ProfileResolver,
     private readonly self: { applicationId: string; webhookIds: Set<string> },
+    private readonly options: RouterOptions = {},
   ) {}
 
   /**
@@ -161,15 +206,16 @@ export class BridgeRouter {
     if (!channel) return undefined; // deleted or key not held; nothing to do
 
     const puppet = this.puppets.get(msg.author.id);
-    const content = discordToConcord(msg);
+    const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
+
+    const tags = [proxyTag(msg.id)];
+    const attachments = await this.rehostAttachments(msg, identity, tags);
+    const content = discordToConcord({ ...msg, attachments });
     if (content.length === 0) return undefined;
 
-    const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
     await this.syncPuppetProfile(msg.author, identity).catch((error) =>
       console.warn(`bridge: puppet profile publish failed for ${msg.author.id}`, error),
     );
-
-    const tags = [proxyTag(msg.id)];
     if (msg.referencedMessageId) {
       // NIP-C7 inline quote-reply naming the mapped rumor and its author.
       // An unmapped reference (pre-bridge history) degrades to a bare message.
@@ -216,12 +262,19 @@ export class BridgeRouter {
       await this.onConcordReaction(chat, link);
       return [];
     }
-    if (chat.kind !== KIND_MESSAGE) return []; // threads/edits/zaps: not yet bridged
+    if (chat.kind === KIND_EDIT) {
+      await this.onConcordEdit(chat, link);
+      return [];
+    }
+    // Kind 9 messages and kind 1111 thread replies both bridge; Discord has
+    // no thread on our side yet, so comments flatten with a jump-link embed.
+    if (chat.kind !== KIND_MESSAGE && chat.kind !== KIND_COMMENT) return [];
     if ((await this.store.byRumorId(chat.rumorId)).length > 0) return [];
 
     const profile = await this.profiles.resolve(chat.author).catch(() => fallbackProfile(chat.author));
     const parts = splitForDiscord(concordToDiscord(chat.content));
     const reply = await this.replyEmbed(chat, link);
+    const files = await this.filesFromImeta(chat);
 
     const ids: string[] = [];
     for (const [index, part] of parts.entries()) {
@@ -230,6 +283,7 @@ export class BridgeRouter {
         avatarUrl: profile.avatarUrl,
         content: part,
         embeds: index === 0 && reply ? [reply] : undefined,
+        files: index === 0 ? files : undefined,
       });
       ids.push(discordMessageId);
       await this.store.insert({
@@ -269,6 +323,30 @@ export class BridgeRouter {
     return rumor.id;
   }
 
+  /**
+   * Discord MESSAGE_UPDATE -> kind 3302 from the original author's puppet.
+   * Off unless bridgeEdits: the 3302 payload is not frozen in the CORDs.
+   */
+  async onDiscordEdit(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
+    if (!this.options.bridgeEdits || !link.enabled) return undefined;
+    const [row] = await this.store.byDiscordId(msg.id);
+    if (!row || row.origin !== "discord") return undefined;
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) return undefined;
+
+    const content = discordToConcord(msg);
+    if (content.length === 0) return undefined;
+
+    const puppet = this.puppets.get(row.authorRef);
+    const { rumor } = await this.client.sendChat(channel, {
+      kind: KIND_EDIT,
+      content,
+      author: { pk: puppet.pk, signer: localIdentity(puppet.sk).signer },
+      tags: [["e", row.concordRumorId], proxyTag(msg.id)],
+    });
+    return rumor.id;
+  }
+
   /** Discord MESSAGE_REACTION_ADD -> kind 7 from the reactor's puppet. */
   async onDiscordReaction(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
     if (!link.enabled) return undefined;
@@ -298,6 +376,42 @@ export class BridgeRouter {
         proxyTag(reaction.messageId),
       ],
     });
+    await this.store.insertReaction({
+      rumorId: rumor.id,
+      discordMessageId: reaction.messageId,
+      emoji: reaction.emoji.name,
+      origin: "discord",
+      authorRef: reaction.user.id,
+    });
+    return rumor.id;
+  }
+
+  /**
+   * Discord MESSAGE_REACTION_REMOVE -> puppet kind 5 tombstoning the kind 7
+   * rumor. The `k` tag marks it a reaction delete for Armada's fold.
+   */
+  async onDiscordReactionRemove(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
+    if (!link.enabled) return undefined;
+    if (reaction.user.bot) return undefined;
+    if (reaction.emoji.id || !reaction.emoji.name) return undefined;
+
+    const row = await this.store.reactionByDiscord(reaction.messageId, reaction.user.id, reaction.emoji.name);
+    if (!row || row.origin !== "discord") return undefined;
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) return undefined;
+
+    const puppet = this.puppets.get(reaction.user.id);
+    const { rumor } = await this.client.sendChat(channel, {
+      kind: KIND_DELETE,
+      content: "",
+      author: { pk: puppet.pk, signer: localIdentity(puppet.sk).signer },
+      tags: [
+        ["e", row.rumorId],
+        ["k", String(KIND_REACTION)],
+        proxyTag(reaction.messageId),
+      ],
+    });
+    await this.store.deleteReaction(row.rumorId);
     return rumor.id;
   }
 
@@ -308,6 +422,25 @@ export class BridgeRouter {
   private async onConcordDelete(chat: OpenedChat, link: ChannelLink): Promise<void> {
     const targets = chat.tags.filter((t) => t[0] === "e" && t[1]).map((t) => t[1]);
     for (const target of targets) {
+      // A kind 7 tombstone: un-react on Discord once the last mirrored
+      // reaction with that emoji is gone (many reactors collapse into one
+      // bot reaction).
+      const reaction = await this.store.reactionByRumorId(target);
+      if (reaction) {
+        const own = reaction.origin === "concord" && reaction.authorRef === chat.author;
+        if (!own && !this.client.isModerator(chat.author)) continue;
+        await this.store.deleteReaction(target);
+        if (
+          reaction.origin === "concord" &&
+          (await this.store.countConcordReactions(reaction.discordMessageId, reaction.emoji)) === 0
+        ) {
+          await this.webhooks
+            .unreact(link, reaction.discordMessageId, reaction.emoji)
+            .catch((error) => console.warn(`bridge: discord unreact failed for ${reaction.discordMessageId}`, error));
+        }
+        continue;
+      }
+
       const rows = await this.store.byRumorId(target);
       if (rows.length === 0) continue;
       const own = rows[0].origin === "concord" && rows[0].authorRef === chat.author;
@@ -320,8 +453,9 @@ export class BridgeRouter {
     }
   }
 
-  /** Kind 7 -> bot reaction on the mapped Discord message (add-only). */
+  /** Kind 7 -> bot reaction on the mapped Discord message. */
   private async onConcordReaction(chat: OpenedChat, link: ChannelLink): Promise<void> {
+    if (await this.store.reactionByRumorId(chat.rumorId)) return; // relay echo
     const target = chat.tags.find((t) => t[0] === "e" && t[1])?.[1];
     if (!target) return;
     const emoji = reactionEmoji(chat.content);
@@ -330,14 +464,72 @@ export class BridgeRouter {
     const row = rows.find((r) => r.partIndex === 0) ?? rows[0];
     if (!row) return;
     await this.webhooks.react(link, row.discordMessageId, emoji);
+    await this.store.insertReaction({
+      rumorId: chat.rumorId,
+      discordMessageId: row.discordMessageId,
+      emoji,
+      origin: "concord",
+      authorRef: chat.author,
+    });
   }
 
-  /** A kind 9 `q` tag -> an embed linking the mapped Discord message. */
+  /**
+   * Kind 3302 -> edit the webhook mirrors in place. Author-only (matching
+   * Armada's apply-phase author check). Grown messages append fresh parts;
+   * shrunk ones blank the leftovers.
+   */
+  private async onConcordEdit(chat: OpenedChat, link: ChannelLink): Promise<void> {
+    if (!this.options.bridgeEdits) return;
+    const target = chat.tags.find((t) => t[0] === "e" && t[1])?.[1];
+    if (!target) return;
+    const rows = (await this.store.byRumorId(target)).sort((a, b) => a.partIndex - b.partIndex);
+    if (rows.length === 0) return;
+    if (rows[0].origin !== "concord" || rows[0].authorRef !== chat.author) return;
+
+    const parts = splitForDiscord(concordToDiscord(chat.content));
+    for (let i = 0; i < rows.length; i++) {
+      const content = i < parts.length ? parts[i] : "*(removed by edit)*";
+      await this.webhooks
+        .edit(link, rows[i].discordMessageId, content)
+        .catch((error) => console.warn(`bridge: discord edit failed for ${rows[i].discordMessageId}`, error));
+    }
+    if (parts.length > rows.length) {
+      const profile = await this.profiles.resolve(chat.author).catch(() => fallbackProfile(chat.author));
+      for (let i = rows.length; i < parts.length; i++) {
+        const discordMessageId = await this.webhooks.send(link, {
+          username: profile.name,
+          avatarUrl: profile.avatarUrl,
+          content: parts[i],
+        });
+        await this.store.insert({
+          discordMessageId,
+          discordChannelId: link.discordChannelId,
+          concordRumorId: target,
+          concordChannelId: link.concordChannelIdHex,
+          communityId: link.communityId,
+          origin: "concord",
+          authorRef: chat.author,
+          partIndex: i,
+        });
+      }
+    }
+  }
+
+  /**
+   * The replied-to rumor -> an embed linking the mapped Discord message.
+   * Kind 9 inline replies carry `q`; kind 1111 comments point at their
+   * immediate parent with lowercase `e` (thread root `E` as fallback).
+   */
   private async replyEmbed(
     chat: OpenedChat,
     link: ChannelLink,
   ): Promise<{ description: string } | undefined> {
-    const target = chat.tags.find((t) => t[0] === "q" && t[1])?.[1];
+    let target = chat.tags.find((t) => t[0] === "q" && t[1])?.[1];
+    if (!target && chat.kind === KIND_COMMENT) {
+      target =
+        chat.tags.find((t) => t[0] === "e" && t[1])?.[1] ??
+        chat.tags.find((t) => t[0] === "E" && t[1])?.[1];
+    }
     if (!target) return undefined;
     const rows = await this.store.byRumorId(target);
     const row = rows.find((r) => r.partIndex === 0) ?? rows[0];
@@ -350,6 +542,59 @@ export class BridgeRouter {
       return { description: `Replying to ${profile.name} ([view message](${url}))` };
     }
     return { description: `Replying to [this message](${url})` };
+  }
+
+  /**
+   * Rehost Discord CDN attachments (signed URLs expire in ~24h) on Blossom,
+   * signed by the puppet, and record NIP-92 imeta tags. Any failure falls
+   * back to the CDN link so the message still bridges.
+   */
+  private async rehostAttachments(
+    msg: DiscordInboundMessage,
+    identity: LocalIdentity,
+    tags: string[][],
+  ): Promise<DiscordInboundMessage["attachments"]> {
+    const blobs = this.options.blobs;
+    if (!blobs || !msg.attachments?.length) return msg.attachments;
+
+    const out: NonNullable<DiscordInboundMessage["attachments"]> = [];
+    for (const attachment of msg.attachments) {
+      try {
+        const { data, mime } = await blobs.download(attachment.url, MAX_BLOB_BYTES);
+        const { url, sha256 } = await blobs.upload(data, mime, identity);
+        tags.push(["imeta", `url ${url}`, `m ${mime}`, `x ${sha256}`, `size ${String(data.length)}`]);
+        out.push({ url, filename: attachment.filename });
+      } catch (error) {
+        console.warn(`bridge: blossom rehost failed for ${attachment.url}`, error);
+        out.push(attachment);
+      }
+    }
+    return out;
+  }
+
+  /** NIP-92 imeta tags -> downloaded webhook file uploads (URL fallback). */
+  private async filesFromImeta(
+    chat: OpenedChat,
+  ): Promise<Array<{ name: string; data: Uint8Array }> | undefined> {
+    const blobs = this.options.blobs;
+    if (!blobs) return undefined;
+    const files: Array<{ name: string; data: Uint8Array }> = [];
+    for (const tag of chat.tags) {
+      if (tag[0] !== "imeta") continue;
+      const fields = new Map(tag.slice(1).map((f) => [f.split(" ")[0], f.slice(f.indexOf(" ") + 1)]));
+      const url = fields.get("url");
+      if (!url) continue;
+      const size = Number(fields.get("size") ?? 0);
+      if (size > MAX_BLOB_BYTES) continue; // stays a link in the content
+      try {
+        const { data, mime } = await blobs.download(url, MAX_BLOB_BYTES);
+        const name = new URL(url).pathname.split("/").pop() || `file.${(mime.split("/")[1] ?? "bin").split("+")[0]}`;
+        files.push({ name, data });
+      } catch (error) {
+        console.warn(`bridge: imeta download failed for ${url}`, error);
+      }
+    }
+    return files.length > 0 ? files : undefined;
   }
 }
 
@@ -364,5 +609,25 @@ export class MemoryMappingStore implements MappingStore {
   }
   async byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]> {
     return this.rows.filter((r) => r.discordMessageId === discordMessageId);
+  }
+  reactions: ReactionMappingRow[] = [];
+  async insertReaction(row: ReactionMappingRow): Promise<void> {
+    this.reactions.push(row);
+  }
+  async reactionByDiscord(messageId: string, userId: string, emoji: string): Promise<ReactionMappingRow | undefined> {
+    return this.reactions.find(
+      (r) => r.discordMessageId === messageId && r.authorRef === userId && r.emoji === emoji,
+    );
+  }
+  async reactionByRumorId(rumorId: string): Promise<ReactionMappingRow | undefined> {
+    return this.reactions.find((r) => r.rumorId === rumorId);
+  }
+  async deleteReaction(rumorId: string): Promise<void> {
+    this.reactions = this.reactions.filter((r) => r.rumorId !== rumorId);
+  }
+  async countConcordReactions(messageId: string, emoji: string): Promise<number> {
+    return this.reactions.filter(
+      (r) => r.origin === "concord" && r.discordMessageId === messageId && r.emoji === emoji,
+    ).length;
   }
 }

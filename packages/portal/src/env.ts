@@ -8,6 +8,8 @@ export interface PortalEnv {
   discordClientId: string;
   discordClientSecret: string;
   discordBotToken: string;
+  /** Blossom server URL for attachment rehosting; empty leaves CDN links. */
+  blossomServer: string;
   /** When "1", /api/auth/dev issues a fake session for UI development. */
   devLogin: boolean;
 }
@@ -30,6 +32,7 @@ export function loadPortalEnv(): PortalEnv {
     discordClientId: process.env.DISCORD_CLIENT_ID?.trim() ?? "",
     discordClientSecret: process.env.DISCORD_CLIENT_SECRET?.trim() ?? "",
     discordBotToken: process.env.DISCORD_TOKEN?.trim() ?? "",
+    blossomServer: process.env.BLOSSOM_SERVER?.trim() ?? "",
     devLogin: process.env.PORTAL_DEV_LOGIN === "1",
   };
 }
