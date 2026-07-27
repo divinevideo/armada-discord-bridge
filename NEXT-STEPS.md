@@ -4,60 +4,30 @@ What is not built yet, in rough priority order. Companion to the two plan
 documents (`armada-discord-bridge-PLAN.md`, `armada-bridge-portal-PLAN.md`);
 this file tracks the gap between those plans and the code on `main`.
 
-Baseline that works today: two-way text between one Discord channel and one
-Armada channel per bridge, per-user attribution both ways (puppet keypairs
-with kind 0 profiles / webhook personas), loop prevention, banlist
-enforcement, live control-plane folds, NIP-42 stream-key relay auth, portal
-wizard with Discord OAuth and the in-channel `/bridge confirm` consent gate,
-per-bridge sealed secrets, Postgres mapping store.
+Baseline that works today (hosted at bridge.armada.buzz, systemd +
+cloudflared on discord-bridge.lan): two-way text, replies, deletes,
+reactions with removal, edits behind a flag, attachments rehosted through
+Blossom, GIF-picker sends resolved to real gifs (with an ffmpeg transcode
+fallback), per-user attribution both ways (puppet keypairs shared per
+community+guild pairing, kind 0 profiles / webhook personas), NIP-48
+permalink proxy tags, loop prevention, banlist enforcement, live
+control-plane folds with re-subscribe on stream-key rotation, NIP-42
+stream-key relay auth including late-key re-AUTH (the silent-subscription
+bug class), portal wizard with Discord OAuth, add-a-channel reuse of stored
+invites, the in-channel `/bridge confirm` consent gate, sealed secrets,
+Postgres mapping store, and a dashboard with per-link names and counts.
 
 ## 1. Message fidelity
 
-### Replies
-Not bridged in either direction; a reply arrives as a bare message.
-- Discord -> Concord: `MESSAGE_CREATE` with `message_reference` -> look up
-  the referenced id in `messages`, attach a `q` tag (kind 9 inline quote)
-  naming the mapped rumor id and author.
-- Concord -> Discord: kind 9 `q` tags and kind 1111 thread replies -> look
-  up the rumor id, webhook-post with an embed quoting the mapped Discord
-  message (webhooks cannot use native replies; an embed with a message link
-  is the standard workaround).
-- The mapping store already supports both lookups (`byRumorId`; add
-  `byDiscordId`).
-
-### Edits
-Not bridged. `MESSAGE_UPDATE` -> kind 3302 from the same puppet naming the
-original rumor; Concord kind 3302 -> `PATCH /webhooks/.../messages/{id}`.
-Ship behind a config flag: kind 3302's payload is explicitly not frozen in
-the CORDs yet. Split messages need the N-rows-per-rumor mapping honored.
-
-### Deletes
-Not bridged. `MESSAGE_DELETE` -> kind 5 from the puppet (own messages only,
-which holds by construction). Concord kind 5 -> webhook/bot delete of every
-mapped part. Moderator deletes on the Concord side (MANAGE_MESSAGES) should
-also delete on Discord; the reverse needs the bot's Manage Messages
-permission and a decision about whether Discord mods may delete Armada
-members' mirrored posts (recommend: yes, it only removes the mirror).
-
-### Reactions
-Not bridged. Discord `MESSAGE_REACTION_ADD/REMOVE` -> kind 7 from the
-puppet (`e` target rumor, `k` "9", content = unicode emoji). Concord kind 7
--> bot `PUT /channels/.../reactions` for unicode; custom NIP-30 emoji have
-no Discord equivalent, skip or fall back to a `:shortcode:` text reply.
-Removal on the Concord side has no dedicated kind (kind 5 on the reaction
-rumor); map both directions carefully or ship add-only first.
-
-### Attachments
-Currently flattened to CDN URLs in text. Discord attachment URLs are signed
-and expire (~24 h), so links in Armada history rot.
-- Discord -> Concord: download from the CDN at receive time, upload to
-  Blossom (BUD-02, mirror per BUD-04), optionally AES-256-GCM encrypt the
-  blob Armada-style (`encryption-algorithm`/`decryption-key`/
-  `decryption-nonce` in imeta), attach NIP-92 `imeta` tags to the rumor.
-- Concord -> Discord: resolve imeta, decrypt if encrypted, re-upload as a
-  webhook file attachment (<= 25 MB) or fall back to the URL.
-- Needs: size caps, MIME allowlist, a Blossom server config knob, and
-  rate limiting on the download path.
+### DONE: replies, edits (flagged), deletes, reactions, attachments
+Shipped through `98c272c`: replies both ways (kind 9 `q` tags / jump-link
+embeds, kind 1111 flattening), deletes with moderator propagation, reactions
+including removal (`reaction_mappings`), edits behind `BRIDGE_EDITS` /
+`options.edits`, Blossom rehosting (BUD-02, puppet-signed; live with
+`BLOSSOM_SERVER=https://blossom.primal.net`), and GIF-picker resolution
+(embed media swap, .gif probing, ffmpeg mp4->gif transcode + rehost).
+Still open from the original attachment plan: AES-256-GCM blob encryption
+Armada-style, BUD-04 mirroring, MIME allowlist, download-path rate limit.
 
 ### Mentions, emoji, formatting polish
 - Concord -> Discord: `nostr:npub...` mentions of puppet identities could
@@ -74,25 +44,27 @@ cheap to add, needs the ephemeral 21059 wrap path (core supports it).
 
 ## 2. Protocol robustness (the dangerous gaps)
 
-### Rekey / refounding rollover
-The biggest correctness gap. The client folds control state live but does
-NOT subscribe to the precomputed rekey addresses (`concord/rekey-pseudonym`),
-does not verify `prevcommit` continuity, and does not roll epochs at
-runtime. Today a rekey mid-flight silences the bridge until restart, and a
-Refounding severs it permanently unless the rotator included the bridge's
-primary npub (which is by design the community's kill switch, but the
-SURVIVABLE rekeys must be survived). Core has the pieces (`rekey.ts`:
-`parseRekey`, `groupRotations`, `checkContinuity`, locators); the client
-needs the subscription, key rollover, re-derivation of stream keys, and
-re-registration for NIP-42 auth. Detect exclusion and mark the bridge
-`severed` with the honest "community revoked access" copy.
+### Rekey / refounding rollover (partially done)
+DONE: chat subscriptions rebuild when the control fold shows a new stream
+set (`894f21a`), and the NIP-42 late-key re-AUTH fix (`fe46162`) removed
+the failure mode where every restart silently killed Armada->Discord (keys
+registered after the socket's AUTH challenge were never authenticated;
+freshly-created bridges only worked because the wizard pre-registered keys).
+STILL OPEN: root-epoch rotations. The client does not subscribe to the
+precomputed rekey addresses (`concord/rekey-pseudonym`), verify `prevcommit`
+continuity, or roll root epochs at runtime, so a Refounding still severs the
+bridge until relink. Core has the pieces (`rekey.ts`: `parseRekey`,
+`groupRotations`, `checkContinuity`, locators). Detect exclusion and mark
+the bridge `severed` with honest "community revoked access" copy. Latent
+risk only: no live community has rotated yet.
 
-### Cursor persistence and backfill
-The `cursors` table exists but nothing writes it. On restart the bridge
-relies on live subscriptions only: messages sent while it was down are
-lost. Persist per-(stream, relay) high-water marks, and on boot run a
-bounded backfill (paginate `until`/`limit`) through the router with the
-mapping table deduplicating.
+### Cursor persistence and backfill  <- NEXT UP
+The `cursors` table exists but nothing writes it. Chat subscriptions now
+carry a `since` floor (deliberate: restored delivery must not replay stored
+history into Discord on every boot), so messages sent while the bridge is
+down are lost. Persist per-(stream, relay) high-water marks, advance them as
+the router mirrors, and on boot run a bounded backfill (paginate
+`until`/`limit`) through the router with the mapping table deduplicating.
 
 ### Delivery guarantees
 `sendChat` is fire-and-forget past the any-accept broadcast; a Discord
@@ -117,9 +89,12 @@ sever itself and say why.
   intent revoked). Health state should reach the portal dashboard.
 - Threads and forum channels: v1 ignores messages in threads entirely
   (`ChannelType.GuildText` only). Minimum: flatten thread messages with a
-  prefix; real mapping needs a design pass.
-- Multiple channel pairs per guild/community: the schema supports it, the
-  portal wizard and manager assume one pair per bridge.
+  prefix; real mapping needs a design pass. (Armada kind 1111 thread
+  replies DO flatten to Discord with jump-link embeds already.)
+- DONE: multiple channel pairs per guild/community. One bridge row per
+  pair, "Add channel" reuses the stored invite (`c97cb9b`), and puppet
+  master secrets are shared per (community, guild) so one Discord user is
+  one npub across pairs (`3b90bd8`).
 - Slash commands on the Discord side (`/bridge status`, `/bridge unlink`):
   planned as the self-host provisioning surface; nothing implemented.
 - Webhook hygiene: recreate the webhook if a Discord admin deletes it
@@ -145,36 +120,24 @@ sever itself and say why.
   clients: unpublished, so the command is discoverable only via the posted
   message text.
 
-### Frontend: on-brand with Armada
-The portal SPA is a generic placeholder; it should read as an Armada
-companion tool. Brand source of truth is the Armada client itself
-(soapbox.pub's Armada repo; local clone at `../armada`):
-- Adopt the "Corsair" theme system from `armada/src/themes.ts`: three core
-  HSL colors (near-black violet background `~260deg`, violet-ink/parchment
-  foreground, electric rose-magenta primary `330 80% 52%`) with the full
-  token set (`chrome`, `chromeDeep`, `chromeDivider`, phosphor-cyan
-  `accent2`) derived via `deriveTokensFromCore`. Light + dark.
-- Adopt the two-radii posture from `armada/src/index.css`: `--radius:
-  0.75rem` for content surfaces ("the people"), `--radius-chrome: 3px` for
-  structural chrome ("the hull").
-- Use Armada's logo/mark assets (`armada/public/logo*.svg`) in the header
-  and favicon; wizard and dashboard should visually echo Armada's
-  chrome/rail framing rather than a plain centered card.
-- Rewrite portal copy in Armada's voice; the wizard's Discord-purple-ish
-  default styling goes.
+### Frontend: on-brand with Armada (DONE)
+Shipped: Corsair theme tokens + two-radii posture throughout, crest assets,
+a real landing page (hero with a platform-true mocked bridged pair, FAQ,
+footer with source/Soapbox links), and dashboard cards titled by channel
+pair with guild/community subtitles and per-link counts. Dark-only for now;
+a light mode remains unbuilt.
 
 ### UX: more features and control
-The dashboard is read-mostly today; give operators real controls:
-- Pause/resume a bridge without deleting it, and one-way modes
-  (Discord -> Armada only, or the reverse).
+Pause/resume and per-card "Add channel" exist; still open:
+- One-way modes (Discord -> Armada only, or the reverse).
 - Wire the stored `options` jsonb into the wizard and a per-bridge
-  settings page (edits/reactions/attachments/typing toggles, once those
-  features exist), plus rename the bridge and set its bot avatar.
+  settings page (edits toggle has a working backend; reactions/
+  attachments/typing toggles once split out), plus rename the bridge and
+  set its bot avatar.
 - Live activity view: recent bridged messages, per-direction counters,
   relay connectivity, last-event timestamps (pairs with the metrics work
   in section 5).
-- Manage multiple channel pairs per bridge from the dashboard (schema
-  already supports it; see section 3).
+- Group dashboard cards by community/guild once pair counts grow.
 - Recovery actions: re-run invite resolution, regenerate the confirm
   code, recreate a deleted webhook, force-reconnect the gateway.
 
@@ -200,24 +163,28 @@ The dashboard is read-mostly today; give operators real controls:
 ## 6. Testing debt
 
 - No integration test against a real relay (a dockerized ditto-relay or
-  strfry with AUTH would catch the NIP-42 class of bug that shipped).
+  strfry with AUTH). The late-key AUTH bug (`fe46162`) shipped and was
+  diagnosed only live; its fix (challenge replay, CLOSED retry) is itself
+  untested against a real AUTH relay. Highest-value test to add.
 - No end-to-end test of the confirm flow (manager is only exercised live).
-- Discord adapter is untested (needs a gateway mock or thin-slice tests of
-  `toInbound`/`sanitizeUsername`, which are pure).
+- Discord adapter has thin-slice tests (`sanitizeUsername`) only; gateway
+  paths and the `toInbound` embed mapping are not covered.
 - Load test: one busy Discord channel (10 msg/s bursts) against relay
   publish latency.
 
-## Suggested order
+## Suggested order (updated 2026-07-27)
 
-1. Rekey rollover + cursors/backfill + outbox (section 2): correctness
-   before features; everything else builds on a bridge that cannot silently
-   lose messages or die mid-epoch.
-2. Replies, deletes, reactions, then edits-behind-flag (section 1): the
-   visible fidelity gaps users hit daily.
-3. Attachments via Blossom (section 1): kills the expiring-CDN-link wart.
-4. Portal options wiring + severance detail + webhook recreate (sections 3
-   and 4): makes the portal trustworthy for non-authors.
-   Fold in the Armada rebrand and dashboard controls (section 4 frontend/UX
-   subsections) here; the settings surface and the options wiring are the
-   same screen.
-5. Ops pass (section 5) before inviting anyone else to the hosted instance.
+1. Cursors + bounded backfill (section 2): restarts currently lose
+   messages; the mapping table already dedupes, the `cursors` table is
+   waiting. Agreed as the next work.
+2. Postgres outbox for both directions (section 2): relay flaps and
+   Discord 429s stop dropping messages.
+3. Relay integration test with AUTH (section 6): retire the risk in the
+   hand-verified re-AUTH/retry code before building more on it.
+4. Portal options wiring + severance detail + webhook recreate (sections
+   3 and 4): the settings surface and options wiring are one screen.
+5. Root-epoch rekey rollover (section 2): larger design, latent risk only.
+6. Ops pass (section 5) before inviting anyone else to the hosted
+   instance. Also still open: rotate the Discord client secret + bot token
+   that were exposed in a dev chat session, then update `.env.portal` on
+   the host.
