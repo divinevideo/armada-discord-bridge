@@ -151,13 +151,17 @@ input:focus, select:focus { outline: 1px solid hsl(var(--ring)); border-color: h
 .hero-title p { font-size: 1.02rem; color: hsl(var(--muted-foreground)); margin: 0.4rem 0 0; }
 @media (max-width: 700px) { .hero-title { align-items: flex-start; } .hero-title h2 { font-size: 1.6rem; } }
 
-/* Hero: pitch left, a mocked bridged channel pair right. */
+/* Hero: pitch left, a mocked bridged channel pair right. The copy column
+   stretches to the demo's height and distributes pitch, action, and
+   disclosure across it. */
 .hero {
   display: grid; grid-template-columns: 1.1fr 1fr; gap: 1.75rem;
-  align-items: start; margin: 1.25rem 0 0.5rem;
+  margin: 1.25rem 0 0.5rem;
 }
 @media (max-width: 700px) { .hero { grid-template-columns: 1fr; } }
-.hero-copy .disclosure { margin-top: 1.1rem; font-size: 0.88rem; }
+.hero-copy { display: flex; flex-direction: column; justify-content: space-between; }
+.hero-copy > p:first-child { margin-top: 0.25rem; }
+.hero-copy .disclosure { margin-bottom: 0; font-size: 0.88rem; }
 
 /* Demo: each pane wears its own platform's chrome. Discord's side is
    hardcoded to the real client palette (#313338 surface, blurple, the APP
