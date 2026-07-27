@@ -62,6 +62,8 @@ Keep `PORTAL_SEAL_KEY` stable across restarts or existing bridges cannot be
 unsealed. In production, `vite build packages/portal/web` once and the API
 serves `web/dist` itself on :8787.
 
+The gap between plans and code is tracked in [`NEXT-STEPS.md`](./NEXT-STEPS.md).
+
 The design lives in two documents:
 
 - [`armada-discord-bridge-PLAN.md`](./armada-discord-bridge-PLAN.md): the bridge
