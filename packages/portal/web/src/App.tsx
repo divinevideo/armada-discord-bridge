@@ -123,21 +123,6 @@ function SignIn(props: { devLogin: boolean; discordConfigured: boolean; onSigned
         </p>
       </section>
 
-      <section className="panel landing">
-        <h2>About Armada</h2>
-        <p>
-          <a href="https://soapbox.pub/armada" target="_blank" rel="noreferrer">Armada</a> is
-          an end-to-end encrypted community chat by{" "}
-          <a href="https://soapbox.pub" target="_blank" rel="noreferrer">Soapbox</a>, built
-          on the Concord protocol over Nostr. Each community holds its own keys and runs
-          its own moderation.
-        </p>
-        <p style={{ marginBottom: 0 }}>
-          No Armada community yet? Create one at{" "}
-          <a href="https://armada.buzz" target="_blank" rel="noreferrer">armada.buzz</a>,
-          then come back here with an invite link.
-        </p>
-      </section>
     </>
   );
 }
