@@ -20,7 +20,7 @@ control plane and a data plane.
                           |
                     HTTPS / JSON API
                           |
-            control-plane API (Fastify + Postgres)
+          control-plane API (Hono on Bun + Postgres)
         auth, bridge CRUD, consent state, status streaming
                           |
               work assignment (lease per community)
@@ -35,7 +35,7 @@ control plane and a data plane.
 
 Concrete deltas from the single-tenant plan:
 
-1. Postgres from day one (replaces SQLite); every table gains a `tenant_id`.
+1. The service is Postgres-native already; every table gains a `tenant_id`.
 2. The bridge service grows an internal REST/queue interface: create, pause,
    unlink, report status. No config files.
 3. One Discord application serves all tenants. Consequences: the bot must pass
@@ -158,12 +158,13 @@ Banlist as it affects bridging), audit log, usage charts.
 ## 7. Implementation phases
 
 ### Phase A: API-ify the bridge service
-1. Swap SQLite for Postgres, add `tenant_id` everywhere, add the lease table.
+1. Add `tenant_id` everywhere and the lease table (the service runs Postgres
+   already).
 2. Internal control API: create/pause/unlink/status per bridge; workers consume it.
 3. Multi-community worker: N concord clients in one process, shared Discord gateway.
 
 ### Phase B: control plane
-1. Fastify (or Hono) API: Discord OAuth, sessions, bridge CRUD, guild/channel
+1. Hono API on Bun: Discord OAuth, sessions, bridge CRUD, guild/channel
    listing proxied through the bot, invite-join endpoint, SSE status stream.
 2. Secret sealing, quotas, permission re-checks.
 

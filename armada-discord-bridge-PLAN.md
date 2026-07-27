@@ -86,12 +86,12 @@ and Mostr for Nostr identity derivation).
                                 |  (headless client)  |
                                 +---------+-----------+
                                           |
-                                     SQLite/Postgres
+                                       Postgres
                               (mappings, keys, cursors, config)
 ```
 
-One Node/TypeScript process (matches Armada's stack so we can reuse its protocol
-code), three modules:
+One Bun/TypeScript process (TypeScript matches Armada's stack so we can reuse its
+protocol code), three modules:
 
 1. **concord adapter**: a headless Concord client. Ported/extracted from
    `armada/src/concord-v2/lib/` (`stream.ts`, `derive.ts`, `chat.ts`, `control.ts`,
@@ -151,9 +151,9 @@ cursors(...)          -- last seen per relay/channel for backfill-free restarts
 communities(...)      -- invite-derived key material, encrypted at rest
 ```
 
-SQLite (better-sqlite3) for the single-tenant/self-host case. Keep the schema
-Postgres-compatible: the hosted portal (`armada-bridge-portal-PLAN.md`) runs
-Postgres with a `tenant_id` on every table from day one.
+Postgres everywhere, including self-host (the compose file ships a postgres
+container). Every table carries a `tenant_id` from day one so the hosted portal
+(`armada-bridge-portal-PLAN.md`) needs no migration.
 
 ### Loop prevention (two layers, per Mostr)
 
@@ -217,7 +217,8 @@ which no frontend can bypass.
 ## 5. Implementation phases
 
 ### Phase 0: extract the protocol core
-1. New repo scaffold: TypeScript, Node 22, vitest, Dockerfile, config via env.
+1. New repo scaffold: TypeScript on Bun, `bun test`, Dockerfile (oven/bun base
+   image), config via env.
 2. Vendor/extract `armada/src/concord-v2/lib/` into a `concord-core` package: strip
    React deps, keep `stream.ts`, `derive.ts`, `chat.ts`, `control.ts`,
    `guestbook.ts`, `invite.ts`, kinds/types. Upstream this as a shared package later
@@ -274,8 +275,7 @@ which no frontend can bypass.
 5. Portal readiness: drive bridge lifecycle (create, pause, unlink, status)
    through an internal control interface instead of startup config, so the portal
    control plane (portal plan, phase A) can adopt this service without a rewrite.
-   Postgres migration, typing indicators, and multiple channel pairs ride along
-   here as stretch goals.
+   Typing indicators and multiple channel pairs ride along here as stretch goals.
 
 ---
 
