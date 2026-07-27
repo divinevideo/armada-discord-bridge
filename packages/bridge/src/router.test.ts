@@ -159,6 +159,37 @@ describe("BridgeRouter: Discord -> Concord", () => {
     });
   });
 
+  it("swaps a GIF-picker page link for the embed's direct media URL", async () => {
+    const { router, pool, channel, link } = harness();
+    await router.onDiscordMessage(
+      discordMsg({
+        content: "https://klipy.com/gifs/monday-already-monday-again-1",
+        embeds: [
+          {
+            url: "https://klipy.com/gifs/monday-already-monday-again-1",
+            mediaUrl: "https://static.klipy.com/monday.gif",
+          },
+        ],
+      }),
+      link,
+    );
+    const opened = openWrap(pool.published.filter((e) => e.kind === 1059)[0], channel.current.group);
+    expect(opened.content).toBe("https://static.klipy.com/monday.gif");
+
+    // Prose containing a link keeps its content untouched.
+    const second = await router.onDiscordMessage(
+      discordMsg({
+        id: "111222334",
+        content: "look at https://klipy.com/gifs/x",
+        embeds: [{ url: "https://klipy.com/gifs/x", mediaUrl: "https://static.klipy.com/x.gif" }],
+      }),
+      link,
+    );
+    expect(second).toBeDefined();
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    expect(openWrap(wraps[wraps.length - 1], channel.current.group).content).toBe("look at https://klipy.com/gifs/x");
+  });
+
   it("skips own webhooks, own application, other bots, and disabled links", async () => {
     const { router, pool, link } = harness();
     expect(await router.onDiscordMessage(discordMsg({ webhookId: "wh1" }), link)).toBeUndefined();

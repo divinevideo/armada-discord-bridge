@@ -47,6 +47,13 @@ export function toInbound(message: Message): DiscordInboundMessage {
     },
     content: message.content,
     attachments: [...message.attachments.values()].map((a) => ({ url: a.url, filename: a.name })),
+    embeds: message.embeds.map((e) => {
+      const urls = [e.video?.url, e.image?.url, e.thumbnail?.url].filter((u): u is string => !!u);
+      // Prefer an actual .gif so Armada inlines motion; mp4 renders as video
+      // or falls back to a direct-media link either way.
+      const mediaUrl = urls.find((u) => /\.gif(\?|$)/i.test(u)) ?? urls[0];
+      return { url: e.url ?? undefined, mediaUrl };
+    }),
     mentions: [...message.mentions.users.values()].map((u) => ({
       id: u.id,
       display: message.mentions.members?.get(u.id)?.displayName ?? u.displayName ?? u.username,

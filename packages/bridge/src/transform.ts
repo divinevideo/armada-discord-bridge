@@ -21,6 +21,8 @@ export interface DiscordMessageContent {
   attachments?: DiscordAttachmentIn[];
   mentions?: DiscordMentionIn[];
   channelNames?: Record<string, string>;
+  /** Unfurled embeds; GIF-picker messages hide the real media URL here. */
+  embeds?: Array<{ url?: string; mediaUrl?: string }>;
 }
 
 /** Keep well under the 65,535-byte NIP-44 plaintext cap (multi-layer overhead). */
@@ -32,6 +34,15 @@ export const DISCORD_MAX_CHARS = 2_000;
 /** Discord markup -> Concord plain text. */
 export function discordToConcord(msg: DiscordMessageContent): string {
   let text = msg.content;
+
+  // GIF-picker sends (Tenor, Klipy): the content is a provider PAGE url that
+  // Discord renders via its embed. Armada only inlines direct media, so swap
+  // in the embed's actual media URL when the message is just that page link.
+  const bare = text.trim();
+  if (/^https?:\/\/\S+$/.test(bare)) {
+    const embed = msg.embeds?.find((e) => e.url === bare && e.mediaUrl);
+    if (embed?.mediaUrl) text = embed.mediaUrl;
+  }
 
   // <@id> and <@!id> user mentions -> @display
   text = text.replace(/<@!?(\d+)>/g, (raw, id: string) => {
