@@ -155,16 +155,38 @@ export class BridgeManager {
     }
   }
 
+  /**
+   * One sealed master secret per (community, guild); first channel mints,
+   * rest reuse, so a Discord user keeps one npub across every channel
+   * bridged between the same server and community. The primary key makes
+   * concurrent activations race-proof: both insert, one wins, both read
+   * back the same row.
+   */
+  private async sharedMasterSecret(communityId: string, guildId: string): Promise<Uint8Array> {
+    const candidate = seal(this.env.sealKeyHex, randomBytes(32).toString("hex"));
+    await this.sql`
+      INSERT INTO guild_community_secrets (community_id, discord_guild_id, master_secret_sealed)
+      VALUES (${communityId}, ${guildId}, ${candidate})
+      ON CONFLICT (community_id, discord_guild_id) DO NOTHING`;
+    const [row] = await this.sql<{ master_secret_sealed: Uint8Array }[]>`
+      SELECT master_secret_sealed FROM guild_community_secrets
+      WHERE community_id = ${communityId} AND discord_guild_id = ${guildId}`;
+    return row.master_secret_sealed;
+  }
+
   /** Mint per-bridge secrets and move draft -> pending_confirm. */
   async activate(row: BridgeRow): Promise<void> {
-    const masterSecret = randomBytes(32).toString("hex");
+    if (!row.community_id || !row.discord_guild_id) {
+      throw new Error("bridge must be linked (community + guild) before activation");
+    }
     const primarySk = generateSecretKey();
     const primary = localIdentity(primarySk);
     const confirmCode = randomBytes(4).toString("hex");
+    const masterSecretSealed = await this.sharedMasterSecret(row.community_id, row.discord_guild_id);
 
     await this.sql`
       UPDATE bridges SET
-        master_secret_sealed = ${seal(this.env.sealKeyHex, masterSecret)},
+        master_secret_sealed = ${masterSecretSealed},
         primary_sk_sealed = ${seal(this.env.sealKeyHex, bytesToHex(primarySk))},
         primary_pk = ${primary.pk},
         confirm_code = ${confirmCode},
