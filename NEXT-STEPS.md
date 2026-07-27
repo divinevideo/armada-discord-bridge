@@ -145,6 +145,39 @@ sever itself and say why.
   clients: unpublished, so the command is discoverable only via the posted
   message text.
 
+### Frontend: on-brand with Armada
+The portal SPA is a generic placeholder; it should read as an Armada
+companion tool. Brand source of truth is the Armada client itself
+(soapbox.pub's Armada repo; local clone at `../armada`):
+- Adopt the "Corsair" theme system from `armada/src/themes.ts`: three core
+  HSL colors (near-black violet background `~260deg`, violet-ink/parchment
+  foreground, electric rose-magenta primary `330 80% 52%`) with the full
+  token set (`chrome`, `chromeDeep`, `chromeDivider`, phosphor-cyan
+  `accent2`) derived via `deriveTokensFromCore`. Light + dark.
+- Adopt the two-radii posture from `armada/src/index.css`: `--radius:
+  0.75rem` for content surfaces ("the people"), `--radius-chrome: 3px` for
+  structural chrome ("the hull").
+- Use Armada's logo/mark assets (`armada/public/logo*.svg`) in the header
+  and favicon; wizard and dashboard should visually echo Armada's
+  chrome/rail framing rather than a plain centered card.
+- Rewrite portal copy in Armada's voice; the wizard's Discord-purple-ish
+  default styling goes.
+
+### UX: more features and control
+The dashboard is read-mostly today; give operators real controls:
+- Pause/resume a bridge without deleting it, and one-way modes
+  (Discord -> Armada only, or the reverse).
+- Wire the stored `options` jsonb into the wizard and a per-bridge
+  settings page (edits/reactions/attachments/typing toggles, once those
+  features exist), plus rename the bridge and set its bot avatar.
+- Live activity view: recent bridged messages, per-direction counters,
+  relay connectivity, last-event timestamps (pairs with the metrics work
+  in section 5).
+- Manage multiple channel pairs per bridge from the dashboard (schema
+  already supports it; see section 3).
+- Recovery actions: re-run invite resolution, regenerate the confirm
+  code, recreate a deleted webhook, force-reconnect the gateway.
+
 ## 5. Ops and hardening
 
 - Rate limiting: no self-throttle on either direction yet (plan section 5).
@@ -184,4 +217,7 @@ sever itself and say why.
 3. Attachments via Blossom (section 1): kills the expiring-CDN-link wart.
 4. Portal options wiring + severance detail + webhook recreate (sections 3
    and 4): makes the portal trustworthy for non-authors.
+   Fold in the Armada rebrand and dashboard controls (section 4 frontend/UX
+   subsections) here; the settings surface and the options wiring are the
+   same screen.
 5. Ops pass (section 5) before inviting anyone else to the hosted instance.
