@@ -11,6 +11,7 @@
  */
 
 import { STOCK_RELAYS, parseInviteLink } from "@armada-bridge/concord-core";
+import type { OpenedChat } from "@armada-bridge/concord-core";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
@@ -131,15 +132,29 @@ router = new BridgeRouter(
 );
 console.log("bridge: discord gateway up");
 
-client.subscribeControl();
-const unsubscribe = client.subscribeChannel(channel, (chat) => {
+const onChat = (chat: OpenedChat): void => {
   void router.onConcordChat(chat, link).catch((error) => console.error("bridge: concord->discord failed", error));
+};
+let currentChannel = channel;
+let unsubscribe = client.subscribeChannel(currentChannel, onChat);
+// A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
+// goes silent while publishes (fresh channel lookup) keep working.
+const unsubControl = client.subscribeControl(() => {
+  const fresh = client.channel(link.concordChannelIdHex);
+  if (!fresh) return;
+  const keys = (c: typeof channel) => c.streams.map((s) => s.group.pk).join(",");
+  if (keys(fresh) === keys(currentChannel)) return;
+  unsubscribe();
+  currentChannel = fresh;
+  unsubscribe = client.subscribeChannel(fresh, onChat);
+  console.log("bridge: stream keys rotated; chat subscription refreshed");
 });
 console.log("bridge: live in both directions");
 
 async function shutdown(): Promise<void> {
   console.log("bridge: shutting down");
   unsubscribe();
+  unsubControl();
   await adapter.stop().catch(() => {});
   await pool.close().catch(() => {});
   await sql.end().catch(() => {});

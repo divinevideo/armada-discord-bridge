@@ -226,13 +226,19 @@ export class BridgeManager {
       primary,
       status: row.status === "active" ? "active" : "pending_confirm",
       unsubChat: () => {},
-      unsubControl: client.subscribeControl(),
+      unsubControl: () => {},
     };
 
     rb.unsubChat = client.subscribeChannel(channel, (chat) => {
       void this.onConcordChat(rb, chat, row.confirm_code ?? "").catch((error) =>
         console.error(`bridge ${rb.id}: concord handler failed`, error),
       );
+    });
+    // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
+    // ones goes silent while publishes (fresh channel lookup) keep working.
+    // Re-subscribe whenever the fold changes the channel's stream set.
+    rb.unsubControl = client.subscribeControl(() => {
+      this.refreshChatSubscription(rb, row.confirm_code ?? "");
     });
 
     if (rb.status === "active") {
@@ -248,6 +254,22 @@ export class BridgeManager {
       });
     }
     this.running.set(rb.id, rb);
+  }
+
+  /** Tear down and rebuild the chat REQ when the channel's stream set changes. */
+  private refreshChatSubscription(rb: Running, confirmCode: string): void {
+    const fresh = rb.client.channel(rb.link.concordChannelIdHex);
+    if (!fresh) return; // channel left the fold; severance detection is separate work
+    const keys = (c: ChannelV2) => c.streams.map((s) => s.group.pk).join(",");
+    if (keys(fresh) === keys(rb.channel)) return;
+    rb.unsubChat();
+    rb.channel = fresh;
+    rb.unsubChat = rb.client.subscribeChannel(fresh, (chat) => {
+      void this.onConcordChat(rb, chat, confirmCode).catch((error) =>
+        console.error(`bridge ${rb.id}: concord handler failed`, error),
+      );
+    });
+    console.log(`bridge ${rb.id}: stream keys rotated; chat subscription refreshed`);
   }
 
   private async onConcordChat(rb: Running, chat: OpenedChat, confirmCode: string): Promise<void> {
