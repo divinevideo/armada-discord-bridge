@@ -862,18 +862,18 @@ export class Importer {
       session.user.id,
     );
 
-    // Level 2: current Discord roles -> imported Armada roles (op-signed grant).
+    // Level 2: current Discord roles -> imported Armada roles (op-signed
+    // grant). Optional: a stale OAuth scope, a plain (non-imported) bridge,
+    // or a member with no mapped roles all degrade to "no roles granted"
+    // rather than failing the claim.
     let rolesGranted: string[] = [];
-    if (levels.roles) {
-      if (!importRow?.owner_sk_sealed || !importRow.community_sealed) {
-        throw new Error("role grants need an imported community with its operational key");
-      }
-      if (!session.accessToken) throw new Error("sign out and back in (a new permission is needed to read your roles)");
-      const member = await fetchMyGuildMember(session.accessToken, bridge.discord_guild_id);
-      rolesGranted = importRow.plan.roles
-        .filter((r) => member.roles.includes(r.discordId))
-        .map((r) => r.roleIdHex!);
-      if (rolesGranted.length > 0) {
+    if (levels.roles && importRow?.owner_sk_sealed && importRow.community_sealed && session.accessToken) {
+      try {
+        const member = await fetchMyGuildMember(session.accessToken, bridge.discord_guild_id);
+        rolesGranted = importRow.plan.roles
+          .filter((r) => member.roles.includes(r.discordId))
+          .map((r) => r.roleIdHex!);
+        if (rolesGranted.length > 0) {
         const op = localIdentity(
           Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, importRow.owner_sk_sealed), "hex")),
         );
@@ -910,13 +910,26 @@ export class Importer {
         } finally {
           await pool.close();
         }
+        }
+      } catch (error) {
+        console.warn(`claim: role grant failed for ${session.user.id}:`, error);
       }
     }
 
     // Level 1: link the puppet's profile to the claimant, dual-signed.
+    // Needs the community relays: an imported community carries them, and a
+    // plain bridge's sealed invite supplies them.
     let linkPublished = false;
     if (levels.link) {
-      const relays = importRow?.plan.relays ?? [];
+      let relays = importRow?.plan.relays ?? [];
+      if (relays.length === 0 && bridge.invite_url_sealed) {
+        try {
+          const parsed = parseInviteLink(unseal(this.env.sealKeyHex, bridge.invite_url_sealed));
+          relays = parsed?.bootstrapRelays ?? [];
+        } catch {
+          relays = [];
+        }
+      }
       if (relays.length > 0) {
         const puppetIdentity = localIdentity(puppet.sk);
         const pool = this.poolFactory(relays);

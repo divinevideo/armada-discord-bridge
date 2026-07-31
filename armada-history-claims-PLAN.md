@@ -166,17 +166,17 @@ A claim has three levels, each independently useful:
 - Not offered for communities whose master secret was destroyed (unlinked
   bridges).
 
-### 3.4 Claim UX
+### 3.4 Claim UX (revised: bot command)
 
-- New portal page "Claim your history": Discord login (existing) → list of
-  communities where this Discord user has bridged/imported messages (query
-  `messages` by `author_ref` + `origin='discord'` joined to
-  `guild_community_secrets`) → Armada login (existing component) → pick
-  levels → sign the claim challenge (+ receive the nsec for Level 3).
-- New `claims` table: (tenant, community_id, discord_guild_id,
-  discord_user_id, npub, levels, created_at). One claim per (community,
-  discord user); re-claiming to a different npub requires revoking first
-  (Open Question 3).
+- The claimant posts `/claim` in any bridged channel. The bot replies with a
+  personal link (`<portal>/claim/<communityId>`, or "not bridged" otherwise,
+  or "already claimed").
+- The link opens the portal: Discord sign-in proves the old account, the
+  Armada login signs the ownership challenge, the result screen reports the
+  link, the granted roles, and (opt-in) the puppet key.
+- The bot-command route replaces the original OAuth-based "list my
+  communities" lookup: anyone in a bridged guild can claim, with no extra
+  OAuth scope and no portal account needed beforehand.
 
 ## 4. Changes by package
 

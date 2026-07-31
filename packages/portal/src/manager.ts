@@ -82,6 +82,7 @@ export class BridgeManager {
       try {
         this.adapter = new DiscordAdapter(this.env.discordBotToken, {
           onMessage: async (msg) => this.onDiscord(msg),
+          onBotCommand: (message) => this.handleBotCommand(message),
           onMessageUpdate: async (msg) => {
             const rb = this.activeRouterFor(msg.channelId);
             if (rb) await rb.router!.onDiscordEdit(msg, rb.link);
@@ -437,5 +438,36 @@ export class BridgeManager {
   routerFor(discordChannelId: string): { router: BridgeRouter; link: ChannelLink } | undefined {
     const rb = this.activeRouterFor(discordChannelId);
     return rb?.router ? { router: rb.router, link: rb.link } : undefined;
+  }
+
+  /**
+   * Bot commands posted in any bridged channel. `/claim` turns the poster's
+   * Discord identity into a claim link they open to connect their Armada
+   * account; other commands return false and fall through to the router.
+   */
+  private handleBotCommand(message: import("discord.js").Message): boolean {
+    const content = message.content.trim();
+    if (!/^\/claim\b/.test(content)) return false;
+    void this.replyClaimLink(message).catch((error) =>
+      console.error("portal: /claim reply failed", error),
+    );
+    return true;
+  }
+
+  private async replyClaimLink(message: import("discord.js").Message): Promise<void> {
+    const rb = this.activeRouterFor(message.channelId);
+    if (!rb) {
+      await message.reply(
+        "This channel isn't bridged to Armada. Run /claim in a bridged channel.",
+      );
+      return;
+    }
+    const [existing] = await this.sql<{ npub: string }[]>`
+      SELECT npub FROM claims
+      WHERE community_id = ${rb.link.communityId} AND discord_user_id = ${message.author.id}`;
+    const claimed = existing ? ` You've already claimed ${existing.npub.slice(0, 12)}… there.` : "";
+    await message.reply(
+      `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and log in with your Armada key.${claimed}`,
+    );
   }
 }

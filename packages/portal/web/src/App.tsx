@@ -10,6 +10,16 @@ export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [view, setView] = useState<"dashboard" | "wizard" | "import" | "claims">("dashboard");
   const [wizardFrom, setWizardFrom] = useState<BridgeSummary | undefined>();
+  const [claimCommunityId, setClaimCommunityId] = useState<string | null>(null);
+
+  // A /claim bot link lands here: /claim/<communityId>.
+  useEffect(() => {
+    const match = /^\/claim\/([0-9a-f]{64})$/.exec(window.location.pathname);
+    if (match) {
+      setClaimCommunityId(match[1]);
+      window.history.replaceState(null, "", "/");
+    }
+  }, []);
 
   const refresh = useCallback(() => {
     void api<Me>("/api/me").then(setMe).catch(() => setMe({ user: null, devLogin: false, discordConfigured: false }));
@@ -38,11 +48,10 @@ export function App() {
 
       {!me && <p className="muted">Loading…</p>}
       {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
-      {me?.user && view === "dashboard" && (
+      {me?.user && view === "dashboard" && !claimCommunityId && (
         <Dashboard
           onNew={(from) => { setWizardFrom(from); setView("wizard"); }}
           onImport={() => setView("import")}
-          onClaim={() => setView("claims")}
         />
       )}
       {me?.user && view === "wizard" && (
@@ -60,7 +69,9 @@ export function App() {
           onCancel={() => setView("dashboard")}
         />
       )}
-      {me?.user && view === "claims" && <Claims onDone={() => setView("dashboard")} />}
+      {me?.user && claimCommunityId && (
+        <Claims communityId={claimCommunityId} onDone={() => setClaimCommunityId(null)} />
+      )}
       <Footer />
     </>
   );
@@ -280,7 +291,7 @@ function AvatarMireille({ id }: { id: string }) {
   );
 }
 
-function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () => void; onClaim: () => void }) {
+function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () => void }) {
   const [bridges, setBridges] = useState<BridgeSummary[] | null>(null);
   const [error, setError] = useState("");
 
@@ -306,7 +317,6 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () 
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2>Your bridges</h2>
         <div className="row">
-          <button className="ghost" onClick={props.onClaim}>Claim your history</button>
           <button className="ghost" onClick={props.onImport}>Import a server</button>
           <button onClick={() => props.onNew()}>Create a bridge</button>
         </div>

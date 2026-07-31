@@ -179,12 +179,26 @@ app.post("/api/imports/:id/retry", async (c) => {
 
 // ── Claims ──────────────────────────────────────────────────────────────────
 
-app.get("/api/claims", async (c) => {
+/** The community a /claim link points at: name, plus the caller's status. */
+app.get("/api/claims/:communityId", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
-  const targets = await importer.claimTargets(session.user.id);
+  const [row] = await sql`
+    SELECT b.community_id, MAX(b.community_name) AS community_name,
+           count(m.discord_message_id) AS message_count,
+           EXISTS(SELECT 1 FROM claims cl
+                  WHERE cl.community_id = b.community_id AND cl.discord_user_id = ${session.user.id}) AS claimed
+    FROM bridges b
+    LEFT JOIN messages m ON m.community_id = b.community_id AND m.origin = 'discord' AND m.author_ref = ${session.user.id}
+    WHERE b.community_id = ${c.req.param("communityId")}
+    GROUP BY b.community_id`;
+  if (!row) return c.json({ error: "no such community" }, 404);
   return c.json({
-    targets: targets.map((t) => ({ ...t, challenge: claimChallenge(t.communityId, session.user.id) })),
+    communityId: row.community_id,
+    communityName: row.community_name,
+    messageCount: String(row.message_count),
+    claimed: row.claimed,
+    challenge: claimChallenge(row.community_id as string, session.user.id),
   });
 });
 

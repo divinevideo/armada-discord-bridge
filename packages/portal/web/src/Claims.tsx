@@ -4,11 +4,11 @@ import { api } from "./api";
 import { NostrLogin } from "./NostrLogin";
 import { useNostrLogin } from "./useNostrLogin";
 
-interface ClaimTarget {
+interface ClaimContext {
   communityId: string;
-  communityName: string;
-  guildId: string;
+  communityName: string | null;
   messageCount: string;
+  claimed: boolean;
   challenge: string;
 }
 
@@ -19,51 +19,48 @@ interface ClaimResult {
 }
 
 /**
- * Claim your history (armada-history-claims-PLAN.md §3): your Discord session
- * proves which account you were, your Nostr login proves which Armada account
- * you are. One claim links the puppet, grants your imported roles, and can
- * hand over the puppet key.
+ * Claim your old account (armada-history-claims-PLAN.md §3). Arrived at from
+ * a /claim bot-command link in a bridged channel: the community comes from
+ * the URL, Discord sign-in proves the old account, the Nostr login signs the
+ * ownership challenge.
  */
-export function Claims(props: { onDone: () => void }) {
-  const [targets, setTargets] = useState<ClaimTarget[] | null>(null);
+export function Claims(props: { communityId: string; onDone: () => void }) {
+  const [context, setContext] = useState<ClaimContext | null>(null);
+  const [contextError, setContextError] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<(ClaimResult & { communityName: string }) | null>(null);
+  const [result, setResult] = useState<ClaimResult | null>(null);
   const [keyConsent, setKeyConsent] = useState(false);
-  const [selected, setSelected] = useState("");
   const login = useNostrLogin([]);
 
   useEffect(() => {
-    void api<{ targets: ClaimTarget[] }>("/api/claims")
-      .then((r) => {
-        setTargets(r.targets);
-        if (r.targets.length > 0) setSelected(r.targets[0].communityId);
-      })
-      .catch((e) => setError(String((e as Error).message)));
-  }, []);
+    void api<ClaimContext>(`/api/claims/${props.communityId}`)
+      .then(setContext)
+      .catch((e) => setContextError(String((e as Error).message)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.communityId]);
 
   async function claim() {
-    const target = targets?.find((t) => t.communityId === selected);
-    if (!target || !login.pk) return;
+    if (!context || !login.pk) return;
     setBusy(true);
     setError("");
     try {
       const signedProof = await login.signTemplate({
         kind: 30078,
-        content: target.challenge,
+        content: context.challenge,
         tags: [],
         created_at: Math.floor(Date.now() / 1000),
       });
       const res = await api<ClaimResult>("/api/claims", {
         method: "POST",
         body: JSON.stringify({
-          communityId: target.communityId,
+          communityId: context.communityId,
           npub: login.pk,
           signedProof,
           levels: { link: true, roles: true, key: keyConsent },
         }),
       });
-      setResult({ ...res, communityName: target.communityName ?? "the community" });
+      setResult(res);
     } catch (e) {
       setError(String((e as Error).message));
     } finally {
@@ -74,7 +71,7 @@ export function Claims(props: { onDone: () => void }) {
   if (result) {
     return (
       <div className="panel">
-        <h2>Your history is now yours in {result.communityName}</h2>
+        <h2>Your history is now yours in {context?.communityName ?? "the community"}</h2>
         <table>
           <tbody>
             <tr>
@@ -122,32 +119,23 @@ export function Claims(props: { onDone: () => void }) {
     <div className="panel">
       <h2>Claim your old account</h2>
       <p className="muted">
-        If you talked on a Discord server that was bridged or imported, prove both
-        accounts and your imported history becomes yours: your profile links to your
-        real Armada account, and your Discord roles carry over.
+        The bridge saw you on Discord. Prove both accounts and your history there
+        becomes yours: your profile links to your real Armada account, and your
+        Discord roles carry over.
       </p>
+      {contextError && <p className="error">{contextError}</p>}
       {error && <p className="error">{error}</p>}
 
-      {targets === null && <p className="muted">Looking up your bridged history…</p>}
-      {targets !== null && targets.length === 0 && (
-        <p>
-          No bridged or imported communities found for this Discord account. Once a
-          server you talked on is bridged, your history appears here.
-        </p>
-      )}
-      {targets !== null && targets.length > 0 && (
+      {!context && !contextError && <p className="muted">Looking up the community…</p>}
+      {context && (
         <>
-          <h3>Your history</h3>
-          {targets.map((t) => (
-            <button
-              key={t.communityId}
-              className={`pick ${selected === t.communityId ? "on" : ""}`}
-              onClick={() => setSelected(t.communityId)}
-            >
-              {t.communityName ?? "community"}{" "}
-              <span className="muted">{t.messageCount} messages</span>
-            </button>
-          ))}
+          <h3>{context.communityName ?? "Community"}</h3>
+          <p className="muted">
+            {Number(context.messageCount) > 0
+              ? `The bridge has ${context.messageCount} of your messages there.`
+              : "Your messages appear here once you talk in a bridged channel."}
+            {context.claimed && " You already claimed this one."}
+          </p>
 
           <h3>Your Armada account</h3>
           <NostrLogin login={login} />
@@ -160,8 +148,8 @@ export function Claims(props: { onDone: () => void }) {
             </span>
           </label>
           <div className="row" style={{ marginTop: "0.6rem" }}>
-            <button disabled={!login.pk || !selected || busy} onClick={() => void claim()}>
-              {busy ? "Claiming…" : "Claim my account"}
+            <button disabled={!login.pk || busy || context.claimed} onClick={() => void claim()}>
+              {busy ? "Claiming…" : context.claimed ? "Already claimed" : "Claim my account"}
             </button>
             <button className="ghost" onClick={props.onDone}>Cancel</button>
           </div>

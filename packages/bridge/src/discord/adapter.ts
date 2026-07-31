@@ -66,6 +66,8 @@ export function toInbound(message: Message): DiscordInboundMessage {
 
 export interface DiscordAdapterHandlers {
   onMessage(msg: DiscordInboundMessage): Promise<void>;
+  /** Return true when the message was handled (consumed). */
+  onBotCommand?(message: Message): boolean | Promise<boolean>;
   onMessageUpdate?(msg: DiscordInboundMessage): Promise<void>;
   onMessageDelete?(del: DiscordMessageDelete): Promise<void>;
   onReactionAdd?(reaction: DiscordReactionAdd): Promise<void>;
@@ -93,6 +95,9 @@ export class DiscordAdapter implements WebhookSender {
       partials: [Partials.Message, Partials.Reaction, Partials.User],
     });
     this.client.on("messageCreate", (message) => {
+      // Guild-scoped bot commands the host intercepts BEFORE any router
+      // (claims, etc.); returning true consumes the message.
+      if (this.handlers.onBotCommand?.(message)) return;
       void this.handlers.onMessage(toInbound(message)).catch((error) => {
         console.error("bridge: onMessage failed", error);
       });
