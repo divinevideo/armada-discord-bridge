@@ -67,15 +67,39 @@ interface Running {
 
 export const CONFIRM_RE = /^\/bridge confirm ([0-9a-f]{8})$/i;
 
+/** The kind 10304 command manifest every bridge primary advertises. */
+export const BRIDGE_COMMANDS = [
+  {
+    name: "bridge",
+    description: "Manage this channel's Discord bridge. /bridge confirm <code> approves a pending link.",
+    args: [
+      { name: "action", type: "choice", description: "What to do", required: true, choices: ["confirm"] },
+      { name: "code", type: "string", description: "The 8-character confirm code", required: true },
+    ],
+  },
+  {
+    name: "claim",
+    description: "Link your Discord identity to your own npub (run it on the Discord side).",
+  },
+  {
+    name: "help",
+    description: "What this bridge bot does and which commands it answers.",
+  },
+];
+
 export class BridgeManager {
   private adapter?: DiscordAdapter;
   private readonly running = new Map<string, Running>();
   private readonly byDiscordChannel = new Map<string, string>();
+  /** One shared store: mapping rows for every router, plus catch-up cursors. */
+  private readonly store: PostgresMappingStore;
 
   constructor(
     private readonly sql: postgres.Sql,
     private readonly env: PortalEnv,
-  ) {}
+  ) {
+    this.store = new PostgresMappingStore(sql);
+  }
 
   async init(): Promise<void> {
     if (this.env.discordBotToken) {
@@ -98,6 +122,11 @@ export class BridgeManager {
           onReactionRemove: async (reaction) => {
             const rb = this.activeRouterFor(reaction.channelId);
             if (rb) await rb.router!.onDiscordReactionRemove(reaction, rb.link);
+          },
+          onTyping: async (typing) => {
+            if (typing.bot) return;
+            const rb = this.activeRouterFor(typing.channelId);
+            if (rb) await rb.router!.onDiscordTyping(typing.userId, rb.link);
           },
         });
         await this.adapter.start();
@@ -270,6 +299,7 @@ export class BridgeManager {
         bot: true,
       })
       .catch(() => {});
+    await client.publishManifest(BRIDGE_COMMANDS).catch(() => {});
 
     const link: ChannelLink = {
       discordGuildId: row.discord_guild_id ?? "",
@@ -299,6 +329,9 @@ export class BridgeManager {
         );
       },
       (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
+      (streamPk, wrapAt) => {
+        void this.store.cursorSet(community.idHex, streamPk, wrapAt).catch(() => {});
+      },
     );
     // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
     // ones goes silent while publishes (fresh channel lookup) keep working.
@@ -309,6 +342,9 @@ export class BridgeManager {
 
     if (rb.status === "active") {
       this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed), row.options);
+      this.backfillMissed(rb).catch((error) =>
+        console.warn(`bridge ${rb.id}: catch-up backfill failed:`, error),
+      );
     } else {
       await client.sendChat(channel, {
         content:
@@ -320,6 +356,37 @@ export class BridgeManager {
       });
     }
     this.running.set(rb.id, rb);
+  }
+
+  /**
+   * Bounded catch-up after downtime: replay wraps newer than the stored
+   * cursor through the router (the mapping table dedupes). A channel with no
+   * cursor has never been tailed; it starts live-only, deliberately, so a
+   * fresh bridge does not replay stored history into Discord.
+   */
+  private async backfillMissed(rb: Running): Promise<void> {
+    const streamPks = rb.channel.streams.map((s) => s.group.pk);
+    const cursor = await this.store.cursorGet(rb.link.communityId, streamPks);
+    if (cursor === undefined) return;
+    // Small overlap absorbs relay/pool clock skew; dedupe eats the rest.
+    const { chats, newestWrapAt } = await rb.client.backfillChannel(rb.channel, cursor - 60);
+    let mirrored = 0;
+    for (const chat of chats) {
+      if (!rb.router) break;
+      const ids = await rb.router
+        .onConcordChat(chat, rb.link)
+        .catch((error) => {
+          console.warn(`bridge ${rb.id}: backfill mirror failed for ${chat.rumorId}:`, error);
+          return [];
+        });
+      mirrored += ids.length > 0 ? 1 : 0;
+    }
+    if (newestWrapAt !== undefined) {
+      for (const pk of streamPks) {
+        await this.store.cursorSet(rb.link.communityId, pk, newestWrapAt).catch(() => {});
+      }
+    }
+    if (mirrored > 0) console.log(`bridge ${rb.id}: backfilled ${mirrored} missed messages`);
   }
 
   /** Tear down and rebuild the chat REQ when the channel's stream set changes. */
@@ -380,7 +447,7 @@ export class BridgeManager {
     rb.router = new BridgeRouter(
       rb.client,
       new PuppetCache(masterSecretHex),
-      new PostgresMappingStore(this.sql),
+      this.store,
       this.adapter,
       new Kind0ProfileResolver(rb.pool),
       { applicationId: this.adapter.applicationId, webhookIds: this.adapter.ownWebhookIds },

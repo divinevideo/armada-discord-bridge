@@ -116,6 +116,10 @@ const adapter = new DiscordAdapter(config.discordToken, {
     if (reaction.channelId !== link.discordChannelId) return;
     await router.onDiscordReactionRemove(reaction, link);
   },
+  async onTyping(typing) {
+    if (typing.bot || typing.channelId !== link.discordChannelId) return;
+    await router.onDiscordTyping(typing.userId, link);
+  },
 });
 await adapter.start();
 router = new BridgeRouter(
@@ -137,8 +141,31 @@ const onChat = (chat: OpenedChat): void => {
 };
 const onSubError = (relayUrl: string, error: unknown): void =>
   console.error(`bridge: chat subscription ${relayUrl}:`, error);
+const onCursor = (streamPk: string, wrapAt: number): void => {
+  void store.cursorSet(community.idHex, streamPk, wrapAt).catch(() => {});
+};
 let currentChannel = channel;
-let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError);
+
+// Bounded catch-up for messages missed while down (no cursor = fresh link,
+// live-only on purpose). The mapping table dedupes anything already mirrored.
+{
+  const streamPks = channel.streams.map((s) => s.group.pk);
+  const cursor = await store.cursorGet(community.idHex, streamPks);
+  if (cursor !== undefined) {
+    const { chats, newestWrapAt } = await client.backfillChannel(channel, cursor - 60);
+    for (const chat of chats) {
+      await router.onConcordChat(chat, link).catch((error) =>
+        console.warn(`bridge: backfill mirror failed for ${chat.rumorId}:`, error),
+      );
+    }
+    if (newestWrapAt !== undefined) {
+      for (const pk of streamPks) await store.cursorSet(community.idHex, pk, newestWrapAt).catch(() => {});
+    }
+    if (chats.length > 0) console.log(`bridge: backfilled ${chats.length} wraps missed while down`);
+  }
+}
+
+let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);
 // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
 // goes silent while publishes (fresh channel lookup) keep working.
 const unsubControl = client.subscribeControl(() => {
@@ -148,7 +175,7 @@ const unsubControl = client.subscribeControl(() => {
   if (keys(fresh) === keys(currentChannel)) return;
   unsubscribe();
   currentChannel = fresh;
-  unsubscribe = client.subscribeChannel(fresh, onChat, onSubError);
+  unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, onCursor);
   console.log("bridge: stream keys rotated; chat subscription refreshed");
 });
 console.log("bridge: live in both directions");

@@ -72,6 +72,7 @@ export interface DiscordAdapterHandlers {
   onMessageDelete?(del: DiscordMessageDelete): Promise<void>;
   onReactionAdd?(reaction: DiscordReactionAdd): Promise<void>;
   onReactionRemove?(reaction: DiscordReactionAdd): Promise<void>;
+  onTyping?(typing: { channelId: string; guildId: string; userId: string; bot: boolean }): Promise<void>;
 }
 
 /** Commands a plain `/command` message maps to; "/" alone is not one. */
@@ -95,6 +96,7 @@ export class DiscordAdapter implements WebhookSender {
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.GuildMessageTyping,
         GatewayIntentBits.MessageContent,
       ],
       // Deletes and reactions arrive for uncached (pre-boot) messages too.
@@ -151,6 +153,16 @@ export class DiscordAdapter implements WebhookSender {
       };
     this.client.on("messageReactionAdd", bridgeReaction((r) => this.handlers.onReactionAdd?.(r) ?? Promise.resolve(), "onReactionAdd"));
     this.client.on("messageReactionRemove", bridgeReaction((r) => this.handlers.onReactionRemove?.(r) ?? Promise.resolve(), "onReactionRemove"));
+    this.client.on("typingStart", (typing) => {
+      void this.handlers
+        .onTyping?.({
+          channelId: typing.channel.id,
+          guildId: typing.guild?.id ?? "",
+          userId: typing.user.id,
+          bot: typing.user.bot ?? false,
+        })
+        .catch((error) => console.error("bridge: onTyping failed", error));
+    });
   }
 
   get applicationId(): string {
@@ -265,6 +277,12 @@ export class DiscordAdapter implements WebhookSender {
       const channel = await this.textChannel(link.discordChannelId);
       await channel.messages.delete(discordMessageId);
     }
+  }
+
+  /** WebhookSender: show the bot's typing indicator (lasts ~10s or until a send). */
+  async sendTyping(link: ChannelLink): Promise<void> {
+    const channel = await this.textChannel(link.discordChannelId);
+    await channel.sendTyping();
   }
 
   /** WebhookSender: react as the bot account (webhooks cannot react). */

@@ -84,6 +84,8 @@ export const KIND_REKEY = 3303;
 
 /** Public invite bundle: addressable, signed by the per-link keypair, empty `d`. */
 export const KIND_INVITE_BUNDLE = 33301;
+/** Bot command manifest (Armada draft NIP): replaceable, bot-key-signed, no `d`. */
+export const KIND_BOT_MANIFEST = 10304;
 /** A member's self-encrypted Community List (replaceable, one per user). */
 export const KIND_COMMUNITY_LIST = 13302;
 /** A creator's self-encrypted Invite List (replaceable, one per user). */

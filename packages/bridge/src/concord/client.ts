@@ -9,10 +9,13 @@
  */
 
 import {
+  KIND_BOT_MANIFEST,
   KIND_INVITE_BUNDLE,
   KIND_MESSAGE,
   KIND_SEAL_ENCRYPTED,
+  KIND_TYPING,
   KIND_WRAP,
+  KIND_WRAP_EPHEMERAL,
   Permissions,
   buildJoinRumor,
   buildRumor,
@@ -186,14 +189,75 @@ export class ConcordClient {
     await this.pool.publish(event);
   }
 
-  /** Publish the primary identity's Guestbook join (kind 3306). */
-  async publishJoin(ms = Date.now()): Promise<NostrEvent> {
+  /**
+   * Publish a Guestbook join (kind 3306) for an identity: the primary by
+   * default, or a puppet so bridged Discord users appear in the member list
+   * before they are looked up by a message.
+   */
+  async publishJoin(ms = Date.now(), author: LocalIdentity = this.primary): Promise<NostrEvent> {
     const group = currentGuestbookGroup(this.community);
-    const rumor = buildJoinRumor(this.primary.pk, ms);
+    const rumor = buildJoinRumor(author.pk, ms);
     // sealGuestbook signs the encrypted seal AND wraps it in one step.
-    const wrap = await sealGuestbook(rumor, group, this.primary.signer);
+    const wrap = await sealGuestbook(rumor, group, author.signer);
     await this.pool.publish(wrap);
     return wrap;
+  }
+
+  /**
+   * Publish the primary identity's kind 10304 command manifest (Armada's
+   * draft bot NIP). Replaceable: each publish supersedes the last, so boot
+   * republish is the update mechanism.
+   */
+  async publishManifest(
+    commands: Array<{
+      name: string;
+      description: string;
+      args?: Array<{
+        name: string;
+        type: string;
+        description?: string;
+        required?: boolean;
+        choices?: string[];
+      }>;
+    }>,
+  ): Promise<void> {
+    const event = await this.primary.signer.signEvent({
+      kind: KIND_BOT_MANIFEST,
+      content: JSON.stringify({
+        v: 1,
+        commands: commands.map((c) => ({
+          name: c.name,
+          description: c.description,
+          args: (c.args ?? []).map((a) => ({
+            name: a.name,
+            type: a.type,
+            description: a.description ?? "",
+            required: a.required ?? false,
+            ...(a.choices ? { choices: a.choices } : {}),
+          })),
+        })),
+      }),
+      tags: [],
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    await this.pool.publish(event);
+  }
+
+  /**
+   * Publish an ephemeral typing signal (kind 23311 in a 21059 wrap) into a
+   * channel. Relays never store it; failure is not worth surfacing.
+   */
+  async sendTyping(channel: ChannelV2, author: LocalIdentity, ms = Date.now()): Promise<void> {
+    const rumor = buildRumor({
+      kind: KIND_TYPING,
+      content: "",
+      pubkey: author.pk,
+      ms,
+      tags: channelBindingTags(channel.idHex, channel.current.epoch),
+    });
+    const seal = await sealRumor(rumor, KIND_SEAL_ENCRYPTED, channel.current.group, author.signer);
+    const wrap = wrapSeal(seal, channel.current.group, { ephemeral: true });
+    await this.pool.publish(wrap);
   }
 
   /**
@@ -204,6 +268,8 @@ export class ConcordClient {
     channel: ChannelV2,
     onChat: (chat: OpenedChat) => void,
     onError?: (relayUrl: string, error: unknown) => void,
+    /** Called per durable wrap that opened; feeds the catch-up cursor. */
+    onCursor?: (streamPk: string, wrapCreatedAt: number) => void,
   ): () => void {
     const seenRumors = new Set<string>();
     // Live tail only: without a floor, relays replay stored history into the
@@ -211,7 +277,14 @@ export class ConcordClient {
     // not replay-everything. Small overlap absorbs clock skew.
     const since = Math.floor(Date.now() / 1000) - 60;
     return this.pool.subscribe(
-      [{ kinds: [KIND_WRAP], authors: channel.streams.map((s) => s.group.pk), since }],
+      // Both wrap kinds: 1059 durable chat and 21059 ephemeral (typing).
+      [
+        {
+          kinds: [KIND_WRAP, KIND_WRAP_EPHEMERAL],
+          authors: channel.streams.map((s) => s.group.pk),
+          since,
+        },
+      ],
       {
         onError,
         onEvent: (wrap) => {
@@ -222,10 +295,42 @@ export class ConcordClient {
               seenRumors.add(chat.rumorId);
               onChat(chat);
             }
+            if (opened.length > 0 && wrap.kind === KIND_WRAP) {
+              onCursor?.(wrap.pubkey, wrap.created_at);
+            }
           });
         },
       },
     );
+  }
+
+  /**
+   * Bounded catch-up: every durable wrap on the channel's streams newer than
+   * `sinceSec`, opened and sorted oldest-first so the caller can replay them
+   * through the router in order (the mapping table dedupes already-mirrored
+   * rumors). Returns the chats and the newest wrap timestamp seen, the next
+   * cursor value.
+   */
+  async backfillChannel(
+    channel: ChannelV2,
+    sinceSec: number,
+    limit = 500,
+  ): Promise<{ chats: OpenedChat[]; newestWrapAt?: number }> {
+    const wraps = await this.pool.query([
+      {
+        kinds: [KIND_WRAP],
+        authors: channel.streams.map((s) => s.group.pk),
+        since: sinceSec,
+        limit,
+      },
+    ]);
+    const chats = await openChatBatch(wraps, channel);
+    chats.sort((a, b) => a.ms - b.ms);
+    const newestWrapAt = wraps.reduce<number | undefined>(
+      (max, w) => (max === undefined || w.created_at > max ? w.created_at : max),
+      undefined,
+    );
+    return { chats, newestWrapAt };
   }
 
   /**

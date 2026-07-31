@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
+  KIND_BOT_MANIFEST,
   KIND_JOIN_LEAVE,
   KIND_MESSAGE,
+  KIND_TYPING,
+  KIND_WRAP_EPHEMERAL,
   STOCK_RELAYS,
   buildBundleEvent,
   buildChannelEdition,
@@ -227,5 +230,118 @@ describe("ConcordClient", () => {
     await expect(
       client.sendChat(channel, { content: "nope", author: puppet }),
     ).rejects.toThrow(/banned/);
+  });
+});
+
+describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
+  it("publishes a guestbook join for a puppet identity", async () => {
+    const { community } = makeCommunity();
+    const pool = new FakePool();
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const puppet = localIdentity(generateSecretKey());
+
+    await client.publishJoin(Date.now(), puppet);
+    const [join] = openGuestbookWraps(pool.published, guestbookGroups(community));
+    expect(join.kind).toBe(KIND_JOIN_LEAVE);
+    expect(join.author).toBe(puppet.pk);
+  });
+
+  it("sendTyping publishes an ephemeral 21059 wrap with a bound 23311 rumor", async () => {
+    const { community } = makeCommunity();
+    const channel = makeChannel(community);
+    const pool = new FakePool();
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey());
+
+    await client.sendTyping(channel, author);
+    expect(pool.published).toHaveLength(1);
+    expect(pool.published[0].kind).toBe(KIND_WRAP_EPHEMERAL);
+    const opened = openWrap(pool.published[0], channel.current.group);
+    expect(opened.kind).toBe(KIND_TYPING);
+    expect(opened.author).toBe(author.pk);
+    expect(opened.tags).toContainEqual(["channel", channel.idHex]);
+  });
+
+  it("subscribeChannel delivers ephemeral typing wraps and durable chat, cursors durable only", async () => {
+    const { community } = makeCommunity();
+    const channel = makeChannel(community);
+    const pool = new FakePool();
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey());
+
+    const kinds: number[] = [];
+    const cursors: Array<{ pk: string; at: number }> = [];
+    client.subscribeChannel(
+      channel,
+      (chat) => kinds.push(chat.kind),
+      undefined,
+      (pk, at) => cursors.push({ pk, at }),
+    );
+
+    await client.sendTyping(channel, author);
+    const { wrap } = await client.sendChat(channel, { content: "hi", author });
+    for (const event of pool.published) pool.emit(event);
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(kinds.sort()).toEqual([KIND_MESSAGE, KIND_TYPING].sort());
+    // Only the durable chat wrap advances the cursor.
+    expect(cursors).toHaveLength(1);
+    expect(cursors[0].pk).toBe(channel.current.group.pk);
+    expect(cursors[0].at).toBe(wrap.created_at);
+  });
+
+  it("publishManifest publishes a valid kind 10304 command manifest", async () => {
+    const { community } = makeCommunity();
+    const pool = new FakePool();
+    const primary = localIdentity(generateSecretKey());
+    const client = new ConcordClient(community, pool, primary);
+
+    await client.publishManifest([
+      {
+        name: "bridge",
+        description: "Manage the bridge",
+        args: [
+          { name: "action", type: "choice", required: true, choices: ["confirm"] },
+          { name: "code", type: "string", required: true },
+        ],
+      },
+      { name: "help", description: "Show help" },
+    ]);
+
+    expect(pool.published).toHaveLength(1);
+    const event = pool.published[0];
+    expect(event.kind).toBe(KIND_BOT_MANIFEST);
+    expect(event.pubkey).toBe(primary.pk);
+    const manifest = JSON.parse(event.content);
+    expect(manifest.v).toBe(1);
+    expect(manifest.commands.map((c: { name: string }) => c.name)).toEqual(["bridge", "help"]);
+    // Producer contract: description/required always present, choices only on choice args.
+    expect(manifest.commands[0].args[0]).toEqual({
+      name: "action",
+      type: "choice",
+      description: "",
+      required: true,
+      choices: ["confirm"],
+    });
+    expect(manifest.commands[0].args[1].choices).toBeUndefined();
+  });
+
+  it("backfillChannel returns opened chats oldest-first with the newest wrap timestamp", async () => {
+    const { community } = makeCommunity();
+    const channel = makeChannel(community);
+    const scratch = new FakePool();
+    const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey());
+
+    const now = Date.now();
+    await writer.sendChat(channel, { content: "older", author, ms: now - 60_000 });
+    await writer.sendChat(channel, { content: "newer", author, ms: now });
+
+    const pool = new FakePool([...scratch.published].reverse()); // relay order: newest first
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const { chats, newestWrapAt } = await client.backfillChannel(channel, 0);
+
+    expect(chats.map((c) => c.content)).toEqual(["older", "newer"]);
+    expect(newestWrapAt).toBe(Math.max(...scratch.published.map((e) => e.created_at)));
   });
 });

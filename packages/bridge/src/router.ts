@@ -11,7 +11,7 @@
  *     and never bridge a rumor we already have a mapping row for.
  */
 
-import { KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION } from "@armada-bridge/concord-core";
+import { KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION, KIND_TYPING } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 
 import type { ConcordClient } from "./concord/client";
@@ -119,6 +119,8 @@ export interface WebhookSender {
   react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
   /** Remove the bot's own reaction. */
   unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
+  /** Show the bot's typing indicator in the channel (lasts ~10s on Discord). */
+  sendTyping(link: ChannelLink): Promise<void>;
 }
 
 /** Rehosting port: Discord CDN blobs -> durable storage and back (Blossom). */
@@ -177,6 +179,24 @@ export function customEmojiTags(content: string): string[][] {
     tags.push(["emoji", name, discordEmojiUrl(id, animated === "a")]);
   }
   return tags;
+}
+
+/**
+ * The reverse of customEmojiTags: an Armada message's NIP-30 `:shortcode:`
+ * whose emoji tag points at Discord's emoji CDN becomes native Discord
+ * markup (`<:name:id>` / `<a:name:id>`), so mirrors render the image
+ * instead of a bare shortcode. Foreign emoji URLs stay as text.
+ */
+export function applyCustomEmoji(content: string, tags: string[][]): string {
+  let out = content;
+  for (const tag of tags) {
+    if (tag[0] !== "emoji" || !tag[1] || !tag[2]) continue;
+    const match = /cdn\.discordapp\.com\/emojis\/(\d+)\.(\w+)/.exec(tag[2]);
+    if (!match) continue;
+    const animated = match[2] === "gif" ? "a" : "";
+    out = out.split(`:${tag[1]}:`).join(`<${animated}:${tag[1]}:${match[1]}>`);
+  }
+  return out;
 }
 
 /**
@@ -245,9 +265,16 @@ export async function upgradeGifEmbed(
   return { ...msg, embeds: [{ url: embed.url, mediaUrl }] };
 }
 
+/** Minimum gap between forwarded typing signals, per direction key. */
+const TYPING_THROTTLE_MS = 4_000;
+
 export class BridgeRouter {
   /** discord user id -> last published "name|avatar" (skip republishing). */
   private readonly publishedProfiles = new Map<string, string>();
+  /** discord user ids whose puppet published a Guestbook join this run. */
+  private readonly joinedPuppets = new Set<string>();
+  /** throttle state: direction key -> last forwarded typing signal (ms). */
+  private readonly lastTyping = new Map<string, number>();
 
   constructor(
     private readonly client: ConcordClient,
@@ -278,6 +305,42 @@ export class BridgeRouter {
     this.publishedProfiles.set(author.id, fingerprint);
   }
 
+  /**
+   * Guestbook join (kind 3306) the first time a puppet speaks, so bridged
+   * users show in the Armada member list. Backdated to the message for
+   * history imports. Failure tolerated: retried on the puppet's next message.
+   */
+  private async publishPuppetJoin(
+    discordUserId: string,
+    identity: LocalIdentity,
+    ms?: number,
+  ): Promise<void> {
+    if (this.joinedPuppets.has(discordUserId)) return;
+    try {
+      await this.client.publishJoin(ms ?? Date.now(), identity);
+      this.joinedPuppets.add(discordUserId);
+    } catch (error) {
+      console.warn(`bridge: guestbook join failed for ${discordUserId}`, error);
+    }
+  }
+
+  /**
+   * Discord TYPING_START -> ephemeral kind 23311 from the user's puppet.
+   * Throttled per user+channel to Armada's own publisher cadence.
+   */
+  async onDiscordTyping(userId: string, link: ChannelLink): Promise<void> {
+    if (!link.enabled) return;
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) return;
+    const key = `d:${link.discordChannelId}:${userId}`;
+    const now = Date.now();
+    if (now - (this.lastTyping.get(key) ?? 0) < TYPING_THROTTLE_MS) return;
+    this.lastTyping.set(key, now);
+    const puppet = this.puppets.get(userId);
+    if (this.client.isBanned(puppet.pk)) return;
+    await this.client.sendTyping(channel, { pk: puppet.pk, signer: localIdentity(puppet.sk).signer });
+  }
+
   /** Discord -> Concord. Returns the rumor id, or undefined when skipped. */
   async onDiscordMessage(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
     if (!link.enabled) return undefined;
@@ -303,6 +366,7 @@ export class BridgeRouter {
     await this.syncPuppetProfile(msg.author, identity).catch((error) =>
       console.warn(`bridge: puppet profile publish failed for ${msg.author.id}`, error),
     );
+    await this.publishPuppetJoin(msg.author.id, identity, msg.timestampMs);
     if (msg.referencedMessageId) {
       // NIP-C7 inline quote-reply naming the mapped rumor and its author.
       // An unmapped reference (pre-bridge history) degrades to a bare message.
@@ -346,6 +410,17 @@ export class BridgeRouter {
     if (this.puppets.isPuppetPubkey(chat.author)) return [];
     if (this.client.isBanned(chat.author)) return [];
 
+    if (chat.kind === KIND_TYPING) {
+      // Ephemeral: forward as the bot's typing indicator, throttled per
+      // channel (Discord's indicator lasts ~10s; Armada publishes every 4s).
+      const key = `c:${link.discordChannelId}`;
+      const now = Date.now();
+      if (now - (this.lastTyping.get(key) ?? 0) >= TYPING_THROTTLE_MS) {
+        this.lastTyping.set(key, now);
+        await this.webhooks.sendTyping(link).catch(() => {});
+      }
+      return [];
+    }
     if (chat.kind === KIND_DELETE) {
       await this.onConcordDelete(chat, link);
       return [];
@@ -365,7 +440,9 @@ export class BridgeRouter {
 
     const profile = await this.profiles.resolve(chat.author).catch(() => fallbackProfile(chat.author));
     const media = await this.filesFromImeta(chat);
-    const parts = splitForDiscord(concordToDiscord(stripAttachedUrls(chat.content, media?.urls)));
+    const parts = splitForDiscord(
+      applyCustomEmoji(concordToDiscord(stripAttachedUrls(chat.content, media?.urls)), chat.tags),
+    );
     const reply = await this.replyEmbed(chat, link);
     const files = media?.files;
 

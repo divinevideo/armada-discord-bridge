@@ -1,8 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
+  KIND_JOIN_LEAVE,
+  KIND_TYPING,
+  KIND_WRAP_EPHEMERAL,
   bytesToHex,
   channelGroupKey,
+  guestbookGroups,
   mintCommunity,
+  openGuestbookWraps,
   openWrap,
   voiceGroupKey,
   voiceMediaKey,
@@ -16,7 +21,7 @@ import { ConcordClient, hasProxyTag } from "./concord/client";
 import type { RelayLike } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { PuppetCache } from "./puppets";
-import { BridgeRouter, MemoryMappingStore, fallbackProfile, resolveGifVariant } from "./router";
+import { BridgeRouter, MemoryMappingStore, applyCustomEmoji, fallbackProfile, resolveGifVariant } from "./router";
 import type { ChannelLink, DiscordInboundMessage, RouterOptions } from "./router";
 
 const MASTER = "ab".repeat(32);
@@ -70,6 +75,10 @@ class FakeWebhooks {
   unreacted: Array<{ messageId: string; emoji: string }> = [];
   async unreact(_link: ChannelLink, messageId: string, emoji: string): Promise<void> {
     this.unreacted.push({ messageId, emoji });
+  }
+  typing = 0;
+  async sendTyping(_link: ChannelLink): Promise<void> {
+    this.typing++;
   }
 }
 
@@ -144,7 +153,7 @@ describe("BridgeRouter: Discord -> Concord", () => {
     const rumorId = await router.onDiscordMessage(discordMsg(), link);
 
     expect(rumorId).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     expect(wraps).toHaveLength(1);
     const opened = openWrap(wraps[0], channel.current.group);
     expect(opened.content).toBe("hello armada");
@@ -179,7 +188,7 @@ describe("BridgeRouter: Discord -> Concord", () => {
       }),
       link,
     );
-    const opened = openWrap(pool.published.filter((e) => e.kind === 1059)[0], channel.current.group);
+    const opened = openWrap(pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)[0], channel.current.group);
     expect(opened.content).toBe("https://static.klipy.com/monday.gif");
 
     // Prose containing a link keeps its content untouched.
@@ -192,7 +201,7 @@ describe("BridgeRouter: Discord -> Concord", () => {
       link,
     );
     expect(second).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     expect(openWrap(wraps[wraps.length - 1], channel.current.group).content).toBe("look at https://klipy.com/gifs/x");
   });
 
@@ -262,7 +271,7 @@ describe("BridgeRouter: Discord -> Concord", () => {
       }),
       link,
     );
-    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const wrap = pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!;
     const opened = openWrap(wrap, channel.current.group);
     expect(opened.content).toBe("hey @alice look :blob:\nhttps://cdn.discordapp.com/x.png");
   });
@@ -329,7 +338,7 @@ describe("BridgeRouter: replies", () => {
       discordMsg({ id: "2", content: "replying!", referencedMessageId: "9000" }),
       link,
     );
-    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const wrap = pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!;
     const opened = openWrap(wrap, channel.current.group);
     expect(opened.tags).toContainEqual(["q", "r".repeat(64), "", "f".repeat(64)]);
   });
@@ -339,7 +348,7 @@ describe("BridgeRouter: replies", () => {
     const rumorId = await router.onDiscordMessage(discordMsg({ id: "1" }), link);
     await router.onDiscordMessage(discordMsg({ id: "2", referencedMessageId: "1" }), link);
 
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     const opened = openWrap(wraps[1], channel.current.group);
     expect(opened.tags).toContainEqual(["q", rumorId!, "", puppets.get("80351110224678912").pk]);
     expect(store.rows).toHaveLength(2);
@@ -348,7 +357,7 @@ describe("BridgeRouter: replies", () => {
   it("unmapped references degrade to a bare message", async () => {
     const { router, pool, channel, link } = harness();
     await router.onDiscordMessage(discordMsg({ referencedMessageId: "404404" }), link);
-    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const wrap = pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!;
     const opened = openWrap(wrap, channel.current.group);
     expect(opened.tags.some((t) => t[0] === "q")).toBe(false);
   });
@@ -375,14 +384,14 @@ describe("BridgeRouter: deletes", () => {
   it("Discord delete of a bridged message publishes a puppet kind 5 with proxy tag", async () => {
     const { router, pool, channel, puppets, link } = harness();
     const rumorId = await router.onDiscordMessage(discordMsg(), link);
-    const before = pool.published.filter((e) => e.kind === 1059).length;
+    const before = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk).length;
 
     const deleteRumorId = await router.onDiscordDelete(
       { id: "111222333", channelId: "c1", guildId: "g1" },
       link,
     );
     expect(deleteRumorId).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     expect(wraps).toHaveLength(before + 1);
     const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
     expect(opened.kind).toBe(5);
@@ -394,9 +403,9 @@ describe("BridgeRouter: deletes", () => {
   it("Discord delete of an Armada member's mirror stops at Discord", async () => {
     const { router, pool, link } = harness();
     await router.onConcordChat(concordChat(), link); // mirror as id 9000
-    const before = pool.published.filter((e) => e.kind === 1059).length;
+    const before = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk).length;
     expect(await router.onDiscordDelete({ id: "9000", channelId: "c1", guildId: "g1" }, link)).toBeUndefined();
-    expect(pool.published.filter((e) => e.kind === 1059)).toHaveLength(before);
+    expect(pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)).toHaveLength(before);
   });
 
   it("Concord kind 5 removes every mapped part for the author, ignores strangers, honors moderators", async () => {
@@ -447,7 +456,7 @@ describe("BridgeRouter: reactions", () => {
 
     const reactionRumorId = await router.onDiscordReaction(reaction(), link);
     expect(reactionRumorId).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
     expect(opened.kind).toBe(7);
     expect(opened.content).toBe("🔥");
@@ -466,7 +475,7 @@ describe("BridgeRouter: reactions", () => {
       link,
     );
     expect(id).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
     expect(opened.kind).toBe(7);
     expect(opened.content).toBe(":blob:");
@@ -475,15 +484,15 @@ describe("BridgeRouter: reactions", () => {
   });
 
   it("skips bots and unmapped messages", async () => {
-    const { router, pool, link } = harness();
+    const { router, pool, channel, link } = harness();
     await router.onDiscordMessage(discordMsg(), link);
-    const before = pool.published.filter((e) => e.kind === 1059).length;
+    const before = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk).length;
 
     expect(
       await router.onDiscordReaction(reaction({ user: { id: "1", display: "bot", bot: true } }), link),
     ).toBeUndefined();
     expect(await router.onDiscordReaction(reaction({ messageId: "404404" }), link)).toBeUndefined();
-    expect(pool.published.filter((e) => e.kind === 1059)).toHaveLength(before);
+    expect(pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)).toHaveLength(before);
   });
 
   it("Concord kind 7 reacts on the mapped Discord message, mapping NIP-25 likes", async () => {
@@ -512,7 +521,7 @@ describe("BridgeRouter: reactions", () => {
 
     const deleteRumorId = await router.onDiscordReactionRemove(reaction(), link);
     expect(deleteRumorId).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
     expect(opened.kind).toBe(5);
     expect(opened.author).toBe(puppets.get("80351110224678912").pk);
@@ -593,17 +602,17 @@ describe("BridgeRouter: thread replies (kind 1111)", () => {
 
 describe("BridgeRouter: edits (kind 3302, behind flag)", () => {
   it("does nothing in either direction by default", async () => {
-    const { router, pool, webhooks, link } = harness();
+    const { router, pool, webhooks, channel, link } = harness();
     await router.onDiscordMessage(discordMsg(), link);
     await router.onConcordChat(concordChat(), link);
-    const before = pool.published.filter((e) => e.kind === 1059).length;
+    const before = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk).length;
 
     expect(await router.onDiscordEdit(discordMsg({ content: "edited" }), link)).toBeUndefined();
     await router.onConcordChat(
       concordChat({ rumorId: "x1".repeat(32), kind: 3302, content: "fixed", tags: [["e", "r".repeat(64)]] }),
       link,
     );
-    expect(pool.published.filter((e) => e.kind === 1059)).toHaveLength(before);
+    expect(pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)).toHaveLength(before);
     expect(webhooks.edited).toHaveLength(0);
   });
 
@@ -613,7 +622,7 @@ describe("BridgeRouter: edits (kind 3302, behind flag)", () => {
 
     const editRumorId = await router.onDiscordEdit(discordMsg({ content: "edited!" }), link);
     expect(editRumorId).toBeDefined();
-    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const wraps = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk);
     const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
     expect(opened.kind).toBe(3302);
     expect(opened.content).toBe("edited!");
@@ -663,7 +672,7 @@ describe("BridgeRouter: attachments via Blossom", () => {
       discordMsg({ content: "look", attachments: [{ url: "https://cdn.discordapp.com/x.png", filename: "x.png" }] }),
       link,
     );
-    const wrap = pool.published.find((e) => e.kind === 1059)!;
+    const wrap = pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!;
     const opened = openWrap(wrap, channel.current.group);
     expect(opened.content).toBe("look\nhttps://blossom.example/abc123");
     const imeta = opened.tags.find((t) => t[0] === "imeta")!;
@@ -682,7 +691,7 @@ describe("BridgeRouter: attachments via Blossom", () => {
       discordMsg({ content: "look", attachments: [{ url: "https://cdn.discordapp.com/x.png" }] }),
       link,
     );
-    const opened = openWrap(pool.published.find((e) => e.kind === 1059)!, channel.current.group);
+    const opened = openWrap(pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!, channel.current.group);
     expect(opened.content).toBe("look\nhttps://cdn.discordapp.com/x.png");
     expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
   });
@@ -728,5 +737,80 @@ describe("BridgeRouter: attachments via Blossom", () => {
     );
     expect(webhooks.sent[0].content).toBe("https://blossom.example/abc123");
     expect(webhooks.sent[0].files).toBeUndefined();
+  });
+});
+
+describe("BridgeRouter: guestbook joins", () => {
+  it("publishes one kind 3306 join per puppet, on first message only", async () => {
+    const { router, pool, community, puppets, link } = harness();
+    await router.onDiscordMessage(discordMsg({ id: "1" }), link);
+    await router.onDiscordMessage(discordMsg({ id: "2" }), link);
+
+    const joins = openGuestbookWraps(pool.published, guestbookGroups(community));
+    expect(joins).toHaveLength(1);
+    expect(joins[0].kind).toBe(KIND_JOIN_LEAVE);
+    expect(joins[0].author).toBe(puppets.get("80351110224678912").pk);
+  });
+
+  it("backdates the join to a history message's timestamp", async () => {
+    const { router, pool, community, link } = harness();
+    const ms = Date.parse("2024-03-01T12:00:00Z");
+    await router.onDiscordMessage(discordMsg({ timestampMs: ms }), link);
+
+    const [join] = openGuestbookWraps(pool.published, guestbookGroups(community));
+    expect(join.ms).toBe(ms);
+  });
+});
+
+describe("BridgeRouter: typing", () => {
+  it("Discord typing becomes an ephemeral 23311 wrap from the puppet, throttled", async () => {
+    const { router, pool, channel, puppets, link } = harness();
+    await router.onDiscordTyping("80351110224678912", link);
+    await router.onDiscordTyping("80351110224678912", link); // inside throttle window
+
+    const ephemeral = pool.published.filter((e) => e.kind === KIND_WRAP_EPHEMERAL);
+    expect(ephemeral).toHaveLength(1);
+    const opened = openWrap(ephemeral[0], channel.current.group);
+    expect(opened.kind).toBe(KIND_TYPING);
+    expect(opened.author).toBe(puppets.get("80351110224678912").pk);
+    expect(opened.tags).toContainEqual(["channel", channel.idHex]);
+  });
+
+  it("Concord typing becomes the bot's Discord indicator, throttled per channel", async () => {
+    const { router, webhooks, link } = harness();
+    await router.onConcordChat(concordChat({ kind: KIND_TYPING, content: "" }), link);
+    await router.onConcordChat(
+      concordChat({ kind: KIND_TYPING, content: "", rumorId: "t".repeat(64) }),
+      link,
+    );
+    expect(webhooks.typing).toBe(1);
+    expect(webhooks.sent).toHaveLength(0); // never mirrored as a message
+  });
+});
+
+describe("custom emoji round-trip", () => {
+  it("applyCustomEmoji rewrites shortcodes with Discord CDN emoji tags", () => {
+    expect(
+      applyCustomEmoji("hi :pepe: bye :pepe:", [["emoji", "pepe", "https://cdn.discordapp.com/emojis/123.png"]]),
+    ).toBe("hi <:pepe:123> bye <:pepe:123>");
+    expect(
+      applyCustomEmoji("go :party:", [["emoji", "party", "https://cdn.discordapp.com/emojis/9.gif"]]),
+    ).toBe("go <a:party:9>");
+    // Foreign emoji hosts stay as plain shortcodes.
+    expect(
+      applyCustomEmoji("hm :blob:", [["emoji", "blob", "https://example.com/blob.png"]]),
+    ).toBe("hm :blob:");
+  });
+
+  it("mirrors an Armada message with a Discord-CDN emoji tag as native markup", async () => {
+    const { router, webhooks, link } = harness();
+    await router.onConcordChat(
+      concordChat({
+        content: "hello :pepe:",
+        tags: [["emoji", "pepe", "https://cdn.discordapp.com/emojis/456.png"]],
+      }),
+      link,
+    );
+    expect(webhooks.sent[0].content).toBe("hello <:pepe:456>");
   });
 });

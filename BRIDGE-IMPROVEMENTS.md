@@ -5,7 +5,14 @@ Work the bridge can ship now, using protocol pieces that exist in
 to `NEXT-STEPS.md`; this file is scoped to items where the Armada side is
 done and the gap is purely in this repo.
 
-## Do now
+## Do now (SHIPPED 2026-07-31)
+
+All five landed: cursors + bounded backfill (Concord -> Discord), puppet
+guestbook joins, the custom-emoji reverse direction (`applyCustomEmoji`;
+the forward direction already existed), typing both ways, and the kind
+10304 manifest. Remainders moved to `NEXT-STEPS.md`: Discord -> Concord
+downtime catch-up, guestbook leaves, and per-relay cursor granularity.
+Original items kept below for the reasoning.
 
 ### 1. Cursor persistence and bounded backfill
 Messages sent while the bridge is down are lost. The `cursors` table

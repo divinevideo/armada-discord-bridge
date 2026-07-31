@@ -30,17 +30,20 @@ Still open from the original attachment plan: AES-256-GCM blob encryption
 Armada-style, BUD-04 mirroring, MIME allowlist, download-path rate limit.
 
 ### Mentions, emoji, formatting polish
+- DONE: custom emoji round-trip. Discord -> Concord messages carry NIP-30
+  `emoji` tags (CDN-backed); Concord -> Discord mirrors rewrite
+  `:shortcode:` with a Discord-CDN emoji tag to native `<:name:id>` markup
+  (`applyCustomEmoji`). Foreign emoji hosts stay as text shortcodes.
 - Concord -> Discord: `nostr:npub...` mentions of puppet identities could
   resolve back to real `<@id>` pings (reverse puppet lookup is already
   possible via the derivation); everyone-mention mapping deliberately off.
-- Discord -> Concord: custom emoji currently flatten to `:name:`; could
-  carry NIP-30 `emoji` tags pointing at the Discord CDN image.
 - Markdown edge cases (code fences split across the 2,000-char boundary,
   spoilers, block quotes) need a fidelity pass with real corpus samples.
 
-### Typing indicators
-Ephemeral kind 23311 <-> Discord `TYPING_START` / `POST /typing`. Low value,
-cheap to add, needs the ephemeral 21059 wrap path (core supports it).
+### Typing indicators (DONE)
+Both directions: `TYPING_START` (GuildMessageTyping intent) -> ephemeral
+kind 23311 from the puppet in a 21059 wrap; incoming 23311 -> the bot's
+`sendTyping`. Throttled 4s per direction key, matching Armada's publisher.
 
 ## 2. Protocol robustness (the dangerous gaps)
 
@@ -58,13 +61,16 @@ bridge until relink. Core has the pieces (`rekey.ts`: `parseRekey`,
 the bridge `severed` with honest "community revoked access" copy. Latent
 risk only: no live community has rotated yet.
 
-### Cursor persistence and backfill  <- NEXT UP
-The `cursors` table exists but nothing writes it. Chat subscriptions now
-carry a `since` floor (deliberate: restored delivery must not replay stored
-history into Discord on every boot), so messages sent while the bridge is
-down are lost. Persist per-(stream, relay) high-water marks, advance them as
-the router mirrors, and on boot run a bounded backfill (paginate
-`until`/`limit`) through the router with the mapping table deduplicating.
+### Cursor persistence and backfill (DONE, Concord -> Discord)
+Chat subscriptions advance a per-stream high-water mark (wrap `created_at`,
+one sentinel `relay_url = 'pool'` row since the pool merges relays), and an
+active bridge runs a bounded backfill on boot (`backfillChannel`, 500-wrap
+cap) through the router with the mapping table deduplicating. A channel
+with no cursor starts live-only on purpose (fresh bridges must not replay
+stored history into Discord). Still open: per-relay cursor granularity if
+one relay lags the pool, and the Discord -> Concord direction (messages
+sent in Discord while the bridge is down; needs REST catch-up like the
+history importer's pagination).
 
 ### Delivery guarantees
 `sendChat` is fire-and-forget past the any-accept broadcast; a Discord
@@ -72,11 +78,12 @@ message that fails to publish is dropped with a log line. Add a retry queue
 (Postgres-backed outbox per direction) so relay flaps and Discord 5xx/429
 responses do not lose messages, with poison-message capping.
 
-### Guestbook joins for puppets
-Puppets appear in the member list only after speaking. Publish a kind 3306
-join on first message (planned, unimplemented); consider a leave when the
-Discord member leaves the guild (`GUILD_MEMBER_REMOVE`, needs the
-GUILD_MEMBERS privileged intent, so make it optional).
+### Guestbook joins for puppets (DONE, join side)
+Each puppet publishes a kind 3306 join on its first message per run,
+backdated to the message timestamp so history imports place joins
+correctly. Still open: a leave when the Discord member leaves the guild
+(`GUILD_MEMBER_REMOVE`, needs the GUILD_MEMBERS privileged intent, so make
+it optional).
 
 ### Dissolution handling
 Kind 3308 vsk 10 (community dissolved) is not watched; the bridge should
@@ -116,9 +123,9 @@ sever itself and say why.
   for Armada-side management: designed in the portal plan, absent.
 - Alerts: email/DM when a bridge severs; nothing today beyond the dashboard.
 - Session sweep job (`Sessions.sweep` exists, never scheduled).
-- The bot manifest (kind 10304) advertising `/bridge confirm` to Armada
-  clients: unpublished, so the command is discoverable only via the posted
-  message text.
+- DONE: the bot manifest (kind 10304) publishes at every bridge start
+  (replaceable, primary-signed), advertising `/bridge confirm`, `/claim`,
+  and `/help` per the draft NIP in armada's `NIP.md`.
 
 ### Frontend: on-brand with Armada (DONE)
 Shipped: Corsair theme tokens + two-radii posture throughout, crest assets,
@@ -174,9 +181,8 @@ Pause/resume and per-card "Add channel" exist; still open:
 
 ## Suggested order (updated 2026-07-27)
 
-1. Cursors + bounded backfill (section 2): restarts currently lose
-   messages; the mapping table already dedupes, the `cursors` table is
-   waiting. Agreed as the next work.
+1. DONE: cursors + bounded backfill, Concord -> Discord (section 2).
+   Still open there: the Discord -> Concord catch-up direction.
 2. Postgres outbox for both directions (section 2): relay flaps and
    Discord 429s stop dropping messages.
 3. Relay integration test with AUTH (section 6): retire the risk in the

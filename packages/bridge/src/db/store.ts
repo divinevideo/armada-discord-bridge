@@ -85,6 +85,30 @@ export class PostgresMappingStore implements MappingStore {
     return (row?.n as number) ?? 0;
   }
 
+  /**
+   * Newest processed wrap timestamp across a channel's stream addresses, or
+   * undefined when this channel has never been tailed (fresh bridges do NOT
+   * backfill: restored delivery must not replay history into Discord).
+   * The pool merges relays, so cursors live under one sentinel relay_url.
+   */
+  async cursorGet(communityId: string, streamPks: string[]): Promise<number | undefined> {
+    if (streamPks.length === 0) return undefined;
+    const [row] = await this.sql`
+      SELECT max(last_seen_at)::bigint AS at FROM cursors
+      WHERE tenant_id = ${this.tenantId} AND community_id = ${communityId}
+        AND stream_pk IN ${this.sql(streamPks)} AND relay_url = 'pool'`;
+    return row?.at == null ? undefined : Number(row.at);
+  }
+
+  /** Advance (never rewind) the high-water mark for one stream address. */
+  async cursorSet(communityId: string, streamPk: string, lastSeenAt: number): Promise<void> {
+    await this.sql`
+      INSERT INTO cursors (tenant_id, community_id, stream_pk, relay_url, last_seen_at)
+      VALUES (${this.tenantId}, ${communityId}, ${streamPk}, 'pool', ${lastSeenAt})
+      ON CONFLICT (tenant_id, community_id, stream_pk, relay_url)
+      DO UPDATE SET last_seen_at = GREATEST(cursors.last_seen_at, EXCLUDED.last_seen_at)`;
+  }
+
   private toReactionRow(r: Record<string, unknown>): ReactionMappingRow {
     return {
       rumorId: r.rumor_id as string,
