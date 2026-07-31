@@ -744,7 +744,68 @@ export class Importer {
     }
   }
 
+  /**
+   * Re-run history backfill for an import that already completed (recovery
+   * for the silent-skip bug: clears the done markers so opted-in channels
+   * backfill again, deduped against the messages table). The community and
+   * its bridges are reused as-is; nothing is re-minted.
+   */
+  async rerunHistory(importId: string, ownerDiscordId: string): Promise<void> {
+    const [row] = await this.sql<ImportRow[]>`
+      SELECT * FROM imports WHERE import_id = ${importId} AND owner_discord_id = ${ownerDiscordId}`;
+    if (!row) throw new Error("no such import");
+    if (row.status !== "done" && row.status !== "failed") {
+      throw new Error(`import is ${row.status}; only a finished import can re-run history`);
+    }
+    const plan = row.plan;
+    if (!plan.historyAllowed) throw new Error("history is not allowed for this server");
+    let any = false;
+    for (const channel of plan.channels) {
+      if (channel.selected && channel.bridge && channel.bridgeable && channel.history) {
+        channel.historyDoneAt = undefined;
+        // Start over from the top: the cursor may have been advanced past
+        // messages that never published (the pre-fix run counted deduped
+        // messages as done). The per-community dedupe absorbs the overlap.
+        channel.historyCursor = undefined;
+        channel.historyImported = 0;
+        any = true;
+      }
+    }
+    if (!any) throw new Error("no channels opted into history");
+    // Flip the status here (synchronously) so a client polling right after
+    // this request never sees the stale 'done'.
+    await this.sql`
+      UPDATE imports SET plan = ${this.sql.json(plan as never)}, status = 'history',
+        status_detail = NULL, updated_at = now()
+      WHERE import_id = ${importId}`;
+    this.launchHistoryOnly(importId);
+  }
+
+  /** Backfill-only pipeline for rerunHistory (no re-mint, no re-wire). */
+  private launchHistoryOnly(importId: string): void {
+    if (this.running.has(importId)) return;
+    this.running.add(importId);
+    void (async () => {
+      const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
+      await this.importHistory(importId, row!.plan);
+      await this.sql`
+        UPDATE imports SET status = 'done', status_detail = NULL, updated_at = now()
+        WHERE import_id = ${importId}`;
+    })()
+      .catch(async (error) => {
+        console.error(`import ${importId}: history re-run failed:`, error);
+        await this.sql`
+          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
+          WHERE import_id = ${importId}`;
+      })
+      .finally(() => this.running.delete(importId));
+  }
+
   private async backfillChannel(importId: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> {
+    // Re-fold control so the running bridge knows the channels the import
+    // just created; without this client.channel() returns undefined and the
+    // router silently skips every history message (the invisible-history bug).
+    await this.manager.resyncFor(channel.discordId).catch(() => {});
     const running = this.manager.routerFor(channel.discordId);
     if (!running) {
       console.warn(`import ${importId}: no live bridge for #${channel.name}; history skipped`);
@@ -776,20 +837,42 @@ export class Importer {
 
     collected.reverse(); // oldest first, so reply targets exist when cited
     let published = channel.historyImported ?? 0;
+    let skipped = 0;
     for (const message of collected) {
       if (message.type !== 0 && message.type !== 19) continue;
+      // Scoped to this community: re-importing the same guild elsewhere left
+      // rows for the same discord_message_id, which made every history
+      // message look already-imported and silently skipped the whole backfill.
       const [exists] = await this.sql`
-        SELECT 1 FROM messages WHERE discord_message_id = ${message.id} LIMIT 1`;
+        SELECT 1 FROM messages
+        WHERE discord_message_id = ${message.id}
+          AND community_id = ${running.link.communityId} LIMIT 1`;
       if (!exists) {
-        await running.router
+        const rumorId = await running.router
           .onDiscordMessage(restToInbound(message, running.link.discordGuildId, channel.discordId), running.link)
-          .catch((error) => console.warn(`import ${importId}: history message ${message.id} failed:`, error));
+          .catch((error) => {
+            console.warn(`import ${importId}: history message ${message.id} failed:`, error);
+            return undefined;
+          });
+        if (rumorId === undefined) {
+          // A skip, not a success: the channel wasn't in the bridge's fold
+          // (router.ts:291) or the message was otherwise unbridgeable. Do NOT
+          // count it or advance the cursor past it, or a resume will never
+          // retry it — that was the silent-history-loss bug.
+          skipped++;
+          continue;
+        }
         await new Promise((resolve) => setTimeout(resolve, 25)); // relay pacing
       }
       published++;
       channel.historyImported = published;
       channel.historyCursor = message.id;
       if (published % 20 === 0) await this.savePlan(importId, plan);
+    }
+    if (skipped > 0) {
+      console.warn(
+        `import ${importId}: #${channel.name}: ${skipped} history messages skipped (bot/webhook-authored, empty after conversion, or channel not in bridge fold)`,
+      );
     }
     channel.historyDoneAt = Date.now();
     await this.savePlan(importId, plan);
@@ -1027,6 +1110,13 @@ export class Importer {
       }
       if (lastError) throw lastError;
       channel.bridgeId = bridge.bridge_id;
+      // Wait until the running bridge's fold actually contains this channel,
+      // so the backfill that follows doesn't skip every message (router.ts:291).
+      for (let attempt = 0; attempt < 5; attempt++) {
+        await this.manager.resyncFor(channel.discordId).catch(() => {});
+        if (this.manager.channelKnown(channel.discordId, channel.channelIdHex!)) break;
+        if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 2000));
+      }
       await this.sql`
         UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
         WHERE import_id = ${importId}`;

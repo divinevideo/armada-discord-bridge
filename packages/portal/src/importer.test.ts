@@ -180,6 +180,8 @@ describe("importer pipeline", () => {
     const routed: Array<{ channelId: string; id: string; timestampMs?: number }> = [];
     const manager = {
       activateImported: async (row: BridgeRow) => void activated.push(row),
+      resyncFor: async () => {},
+      channelKnown: () => true,
       routerFor: (discordChannelId: string) => ({
         router: {
           onDiscordMessage: async (m: { channelId: string; id: string; timestampMs?: number }) => {

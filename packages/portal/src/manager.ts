@@ -464,6 +464,22 @@ export class BridgeManager {
   }
 
   /**
+   * Re-fold the control plane for the live bridge on a Discord channel, so a
+   * just-imported channel is known before the backfill publishes into it
+   * (the fold at start() can precede the channel editions' propagation).
+   */
+  async resyncFor(discordChannelId: string): Promise<void> {
+    const rb = this.activeRouterFor(discordChannelId);
+    if (rb) await rb.client.syncControl();
+  }
+
+  /** Whether the live bridge's fold knows this Concord channel. */
+  channelKnown(discordChannelId: string, concordChannelIdHex: string): boolean {
+    const rb = this.activeRouterFor(discordChannelId);
+    return rb?.client.channel(concordChannelIdHex) !== undefined;
+  }
+
+  /**
    * Any `/command` posted in a bridged channel gets handled or answered
    * (never silently swallowed): /claim is the one real command today; /help
    * and unknown commands get the same help text. Unbridged channels stay

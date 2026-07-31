@@ -177,6 +177,39 @@ app.post("/api/imports/:id/retry", async (c) => {
   }
 });
 
+/** Re-run only the history backfill (recovery for the silent-skip bug). */
+app.post("/api/imports/:id/rerun-history", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  try {
+    await importer.rerunHistory(c.req.param("id"), session.user.id);
+    return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: String(error) }, 400);
+  }
+});
+
+/**
+ * Same re-run, addressed by the minted community instead of the import id,
+ * so the dashboard (which only knows bridges) can trigger it.
+ */
+app.post("/api/communities/:communityId/rerun-history", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const [row] = await sql`
+    SELECT import_id FROM imports
+    WHERE owner_discord_id = ${session.user.id}
+      AND plan->'checkpoints'->>'communityIdHex' = ${c.req.param("communityId")}
+    ORDER BY updated_at DESC LIMIT 1`;
+  if (!row) return c.json({ error: "no import found for this community" }, 404);
+  try {
+    await importer.rerunHistory(row.import_id as string, session.user.id);
+    return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: String(error) }, 400);
+  }
+});
+
 // ── Claims ──────────────────────────────────────────────────────────────────
 
 /** The community a /claim link points at: name, plus the caller's status. */

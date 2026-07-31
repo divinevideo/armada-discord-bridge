@@ -167,6 +167,17 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
     }
   }
 
+  async function rerunHistory() {
+    setError("");
+    try {
+      await api(`/api/imports/${importId}/rerun-history`, { method: "POST" });
+      setStatus(null);
+      setStep(2); // back to the progress screen; polling picks it up
+    } catch (e) {
+      setError(String((e as Error).message));
+    }
+  }
+
   const newRelayValid = /^wss?:\/\/\S+$/.test(newRelay.trim()) && !relayList.includes(newRelay.trim());
 
   function addRelay() {
@@ -473,6 +484,11 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
                 </p>
               ))}
             </>
+          )}
+          {plan?.historyAllowed && plan.channels.some((c) => c.selected && c.bridge && c.history) && (
+            <button className="ghost" onClick={() => void rerunHistory()}>
+              Re-run history import
+            </button>
           )}
           <button onClick={props.onDone}>Go to dashboard</button>
         </div>

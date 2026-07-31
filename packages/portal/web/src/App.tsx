@@ -302,6 +302,18 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () 
   }, []);
   useEffect(load, [load]);
 
+  const [notice, setNotice] = useState("");
+  async function rerunHistory(communityId: string) {
+    setError("");
+    setNotice("");
+    try {
+      await api(`/api/communities/${communityId}/rerun-history`, { method: "POST" });
+      setNotice("History re-import started; messages appear in Armada as they publish.");
+    } catch (e) {
+      setError(String((e as Error).message));
+    }
+  }
+
   async function act(id: string, action: "pause" | "resume" | "unlink") {
     if (action === "unlink" && !confirm("Unlink this bridge? Its keys are destroyed; the puppet identities are unrecoverable.")) return;
     try {
@@ -322,6 +334,7 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () 
         </div>
       </div>
       {error && <p className="error">{error}</p>}
+      {notice && <p className="muted">{notice}</p>}
       {bridges === null && <p className="muted">Loading…</p>}
       {bridges !== null && (
       <div className="frame">
@@ -382,6 +395,11 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () 
           <div className="row" style={{ marginTop: "0.6rem" }}>
             {b.community_id && b.discord_guild_id && (
               <button className="ghost" onClick={() => props.onNew(b)}>Add channel</button>
+            )}
+            {b.community_id && (
+              <button className="ghost" onClick={() => void rerunHistory(b.community_id!)}>
+                Re-run history import
+              </button>
             )}
             {b.status === "active" && <button className="ghost" onClick={() => void act(b.bridge_id, "pause")}>Pause</button>}
             {(b.status === "paused" || b.status === "severed") && (
