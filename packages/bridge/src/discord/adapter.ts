@@ -74,6 +74,12 @@ export interface DiscordAdapterHandlers {
   onReactionRemove?(reaction: DiscordReactionAdd): Promise<void>;
 }
 
+/** Commands a plain `/command` message maps to; "/" alone is not one. */
+export function parseBotCommand(content: string): string | undefined {
+  const match = /^\/([a-z][a-z0-9-]*)\b/i.exec(content.trim());
+  return match?.[1].toLowerCase();
+}
+
 export class DiscordAdapter implements WebhookSender {
   readonly client: Client;
   /** Webhook ids we created; the router uses this set for echo suppression. */

@@ -22,7 +22,7 @@ import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
-import { DiscordAdapter } from "@armada-bridge/bridge/src/discord/adapter";
+import { DiscordAdapter, parseBotCommand } from "@armada-bridge/bridge/src/discord/adapter";
 import { Kind0ProfileResolver } from "@armada-bridge/bridge/src/profiles";
 import { PuppetCache } from "@armada-bridge/bridge/src/puppets";
 import { BridgeRouter } from "@armada-bridge/bridge/src/router";
@@ -390,6 +390,29 @@ export class BridgeManager {
       },
     );
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);
+    this.announceBridge(rb).catch(() => {});
+  }
+
+  /**
+   * One-time welcome in both directions when a bridge goes live: tells
+   * everyone the channel is mirrored and teaches /claim. Fire-and-forget.
+   */
+  private async announceBridge(rb: Running): Promise<void> {
+    await rb.client
+      .sendChat(rb.channel, {
+        content:
+          "This channel is now mirrored with Discord. Members can run /claim there " +
+          "to connect their Discord account to their Armada account.",
+        author: rb.primary,
+      })
+      .catch(() => {});
+    await this.adapter!.send(rb.link, {
+      username: "Armada Bridge",
+      content:
+        "This channel is now mirrored with an Armada community. " +
+        "Run /claim to connect your Discord account to your Armada account " +
+        "(your history, roles, and puppet key), or /help for commands.",
+    }).catch(() => {});
   }
 
   async stop(bridgeId: string, status: "paused" | "unlinked", detail?: string): Promise<void> {
@@ -441,33 +464,48 @@ export class BridgeManager {
   }
 
   /**
-   * Bot commands posted in any bridged channel. `/claim` turns the poster's
-   * Discord identity into a claim link they open to connect their Armada
-   * account; other commands return false and fall through to the router.
+   * Any `/command` posted in a bridged channel gets handled or answered
+   * (never silently swallowed): /claim is the one real command today; /help
+   * and unknown commands get the same help text. Unbridged channels stay
+   * silent.
    */
   private handleBotCommand(message: import("discord.js").Message): boolean {
-    const content = message.content.trim();
-    if (!/^\/claim\b/.test(content)) return false;
-    void this.replyClaimLink(message).catch((error) =>
-      console.error("portal: /claim reply failed", error),
+    const command = parseBotCommand(message.content);
+    if (!command) return false;
+    const rb = this.activeRouterFor(message.channelId);
+    if (!rb) return false; // not ours: stay silent, another bot may own it
+    void this.replyToCommand(message, command, rb).catch((error) =>
+      console.error(`portal: /${command} reply failed`, error),
     );
     return true;
   }
 
-  private async replyClaimLink(message: import("discord.js").Message): Promise<void> {
-    const rb = this.activeRouterFor(message.channelId);
-    if (!rb) {
-      await message.reply(
-        "This channel isn't bridged to Armada. Run /claim in a bridged channel.",
-      );
+  private async replyToCommand(
+    message: import("discord.js").Message,
+    command: string,
+    rb: Running,
+  ): Promise<void> {
+    if (command === "help") {
+      await message.reply(this.helpText());
+      return;
+    }
+    if (command !== "claim") {
+      await message.reply(`Unknown command /${command}. ${this.helpText()}`);
       return;
     }
     const [existing] = await this.sql<{ npub: string }[]>`
       SELECT npub FROM claims
       WHERE community_id = ${rb.link.communityId} AND discord_user_id = ${message.author.id}`;
-    const claimed = existing ? ` You've already claimed ${existing.npub.slice(0, 12)}… there.` : "";
+    if (existing) {
+      await message.reply(`You've already claimed ${existing.npub.slice(0, 12)}… in this community.`);
+      return;
+    }
     await message.reply(
-      `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and log in with your Armada key.${claimed}`,
+      `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and log in with your Armada key.`,
     );
+  }
+
+  private helpText(): string {
+    return "Commands: /claim connects your Discord account to your Armada account (your history, roles, and puppet key).";
   }
 }
