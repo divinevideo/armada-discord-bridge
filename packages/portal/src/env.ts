@@ -12,6 +12,10 @@ export interface PortalEnv {
   blossomServer: string;
   /** When "1", /api/auth/dev issues a fake session for UI development. */
   devLogin: boolean;
+  /** Cosmetic base for minted invite URLs (any deeplink domain parses). */
+  inviteBaseUrl: string;
+  /** Default relay set for imported communities; empty falls back to stock. */
+  importRelays: string[];
 }
 
 function required(name: string): string {
@@ -34,5 +38,10 @@ export function loadPortalEnv(): PortalEnv {
     discordBotToken: process.env.DISCORD_TOKEN?.trim() ?? "",
     blossomServer: process.env.BLOSSOM_SERVER?.trim() ?? "",
     devLogin: process.env.PORTAL_DEV_LOGIN === "1",
+    inviteBaseUrl: process.env.INVITE_BASE_URL?.trim() || "https://armada.buzz",
+    importRelays: (process.env.IMPORT_DEFAULT_RELAYS ?? "")
+      .split(",")
+      .map((r) => r.trim())
+      .filter(Boolean),
   };
 }

@@ -197,6 +197,32 @@ export class BridgeManager {
     await this.start(fresh);
   }
 
+  /**
+   * Activate a bridge minted by the server importer: same secret minting as
+   * `activate`, but straight to `active` with no in-channel confirm — the
+   * portal custodially owns the imported community, so the Armada-side
+   * consent the confirm gate exists for is implicit (plan D4).
+   */
+  async activateImported(row: BridgeRow): Promise<void> {
+    if (!row.community_id || !row.discord_guild_id) {
+      throw new Error("bridge must be linked (community + guild) before activation");
+    }
+    const primarySk = generateSecretKey();
+    const primary = localIdentity(primarySk);
+    const masterSecretSealed = await this.sharedMasterSecret(row.community_id, row.discord_guild_id);
+
+    await this.sql`
+      UPDATE bridges SET
+        master_secret_sealed = ${masterSecretSealed},
+        primary_sk_sealed = ${seal(this.env.sealKeyHex, bytesToHex(primarySk))},
+        primary_pk = ${primary.pk},
+        status = 'active', status_detail = NULL, updated_at = now()
+      WHERE bridge_id = ${row.bridge_id}`;
+
+    const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${row.bridge_id}`;
+    await this.start(fresh);
+  }
+
   private async start(row: BridgeRow): Promise<void> {
     if (this.running.has(row.bridge_id)) return;
     if (!row.invite_url_sealed || !row.master_secret_sealed || !row.primary_sk_sealed) {

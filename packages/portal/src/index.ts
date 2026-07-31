@@ -22,6 +22,8 @@ import {
   oauthUrl,
 } from "./discordRest";
 import { loadPortalEnv } from "./env";
+import { Importer } from "./importer";
+import type { ConfirmBody, PrepareBody } from "./importer";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
 import { seal, unseal } from "./seal";
@@ -32,6 +34,7 @@ const sql = postgres(env.databaseUrl, { onnotice: () => {} });
 const sessions = new Sessions(sql);
 const manager = new BridgeManager(sql, env);
 await manager.init();
+const importer = new Importer(sql, env, manager);
 
 const app = new Hono();
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;
@@ -106,6 +109,71 @@ app.get("/api/guilds/:id/channels", async (c) => {
   const channels = await botGuildTextChannels(env.discordBotToken, c.req.param("id"));
   if (!channels) return c.json({ present: false, installUrl: botInstallUrl(env.discordClientId, c.req.param("id")) });
   return c.json({ present: true, channels });
+});
+
+// ── Server import ────────────────────────────────────────────────────────────
+
+app.post("/api/imports", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const { guildId } = (await c.req.json()) as { guildId?: string };
+  if (!guildId) return c.json({ error: "guildId required" }, 400);
+  const guild = session.guilds.find((g) => g.id === guildId);
+  if (!guild?.canManage) return c.json({ error: "you do not hold Manage Server in that guild" }, 403);
+  try {
+    return c.json(await importer.preview(session.user.id, guildId));
+  } catch (error) {
+    return c.json({ error: String(error) }, 502);
+  }
+});
+
+app.get("/api/imports/:id", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const row = await importer.get(c.req.param("id"), session.user.id);
+  if (!row) return c.json({ error: "not found" }, 404);
+  return c.json({
+    importId: row.import_id,
+    status: row.status,
+    statusDetail: row.status_detail,
+    plan: row.plan,
+    communityId: row.community_id,
+    inviteUrl: row.inviteUrl,
+  });
+});
+
+app.post("/api/imports/:id/prepare", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json()) as PrepareBody;
+  try {
+    return c.json(await importer.prepare(c.req.param("id"), session.user.id, body));
+  } catch (error) {
+    return c.json({ error: String(error) }, 400);
+  }
+});
+
+app.post("/api/imports/:id/confirm", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json()) as ConfirmBody;
+  try {
+    await importer.confirm(c.req.param("id"), session.user.id, body);
+    return c.json({ ok: true, status: "publishing" });
+  } catch (error) {
+    return c.json({ error: String(error) }, 400);
+  }
+});
+
+app.post("/api/imports/:id/retry", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  try {
+    await importer.retry(c.req.param("id"), session.user.id);
+    return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: String(error) }, 400);
+  }
 });
 
 // ── Bridges ──────────────────────────────────────────────────────────────────

@@ -2,11 +2,12 @@ import { useCallback, useEffect, useState } from "react";
 
 import { api } from "./api";
 import type { BridgeSummary, Me } from "./api";
+import { ImportWizard } from "./ImportWizard";
 import { Wizard } from "./Wizard";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
-  const [view, setView] = useState<"dashboard" | "wizard">("dashboard");
+  const [view, setView] = useState<"dashboard" | "wizard" | "import">("dashboard");
   const [wizardFrom, setWizardFrom] = useState<BridgeSummary | undefined>();
 
   const refresh = useCallback(() => {
@@ -23,6 +24,9 @@ export function App() {
             <h1>Armada &#8646; Discord Bridge</h1>
           </div>
           <div className="row">
+            {me.user.avatarUrl && (
+              <img className="session-avatar" src={me.user.avatarUrl} alt="" referrerPolicy="no-referrer" />
+            )}
             <span className="muted">{me.user.username}</span>
             <button className="ghost" onClick={() => void api("/api/auth/logout", { method: "POST" }).then(refresh)}>
               Sign out
@@ -34,12 +38,22 @@ export function App() {
       {!me && <p className="muted">Loading…</p>}
       {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
       {me?.user && view === "dashboard" && (
-        <Dashboard onNew={(from) => { setWizardFrom(from); setView("wizard"); }} />
+        <Dashboard
+          onNew={(from) => { setWizardFrom(from); setView("wizard"); }}
+          onImport={() => setView("import")}
+        />
       )}
       {me?.user && view === "wizard" && (
         <Wizard
           guilds={me.guilds ?? []}
           from={wizardFrom}
+          onDone={() => setView("dashboard")}
+          onCancel={() => setView("dashboard")}
+        />
+      )}
+      {me?.user && view === "import" && (
+        <ImportWizard
+          guilds={me.guilds ?? []}
           onDone={() => setView("dashboard")}
           onCancel={() => setView("dashboard")}
         />
@@ -263,7 +277,7 @@ function AvatarMireille({ id }: { id: string }) {
   );
 }
 
-function Dashboard(props: { onNew: (from?: BridgeSummary) => void }) {
+function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () => void }) {
   const [bridges, setBridges] = useState<BridgeSummary[] | null>(null);
   const [error, setError] = useState("");
 
@@ -288,7 +302,10 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void }) {
     <div>
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2>Your bridges</h2>
-        <button onClick={() => props.onNew()}>Create a bridge</button>
+        <div className="row">
+          <button className="ghost" onClick={props.onImport}>Import a server</button>
+          <button onClick={() => props.onNew()}>Create a bridge</button>
+        </div>
       </div>
       {error && <p className="error">{error}</p>}
       {bridges === null && <p className="muted">Loading…</p>}

@@ -18,6 +18,41 @@ export interface Me {
   discordConfigured: boolean;
 }
 
+/** The import plan as the API returns it (see portal/src/importPlan.ts). */
+export interface ImportPlanView {
+  guild: { id: string; name: string; description?: string; iconUrl?: string };
+  communityName: string;
+  channels: Array<{
+    discordId: string;
+    name: string;
+    category?: string;
+    kind?: "voice";
+    bridgeable: boolean;
+    bridge: boolean;
+    selected: boolean;
+    publishedAt?: number;
+    bridgeId?: string;
+  }>;
+  roles: Array<{ discordId: string; name: string; dropped: string[]; publishedAt?: number }>;
+  skipped: Array<{ kind: string; name: string; reason: string }>;
+  checkpoints?: { communityIdHex?: string; ownerPkHex?: string };
+}
+
+/** An unsigned seal template the owner signs in-browser (NIP-07 shape). */
+export interface OwnerSignTemplate {
+  purpose: string;
+  template: { kind: number; content: string; tags: string[][]; created_at: number };
+}
+
+export interface ImportStatus {
+  importId: string;
+  status: "previewed" | "minting" | "publishing" | "wiring" | "done" | "failed";
+  statusDetail?: string | null;
+  plan: ImportPlanView;
+  communityId?: string | null;
+  inviteUrl?: string;
+}
+
 export interface BridgeSummary {
   bridge_id: string;
   status: string;

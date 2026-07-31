@@ -15,14 +15,17 @@ services:
 
   bridge:
     build: .
+    # Legacy env-provisioned single-link daemon; opt in with --profile bridge.
+    # The portal hosts bridges in-process and does not need this service.
+    profiles: ["bridge"]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://bridge:bridge@postgres/bridge
       # Required to go live; without them the service validates and exits.
-      BRIDGE_MASTER_SECRET: ${BRIDGE_MASTER_SECRET:?64 hex chars; puppet key root}
-      BRIDGE_PRIMARY_KEY: ${BRIDGE_PRIMARY_KEY:?nsec or hex; the invited member identity}
+      BRIDGE_MASTER_SECRET: ${BRIDGE_MASTER_SECRET:-}
+      BRIDGE_PRIMARY_KEY: ${BRIDGE_PRIMARY_KEY:-}
       BRIDGE_INVITE_URL: ${BRIDGE_INVITE_URL:-}
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
@@ -46,6 +49,9 @@ services:
       DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
       DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      BLOSSOM_SERVER: ${BLOSSOM_SERVER:-}
+      INVITE_BASE_URL: ${INVITE_BASE_URL:-}
+      IMPORT_DEFAULT_RELAYS: ${IMPORT_DEFAULT_RELAYS:-}
     restart: unless-stopped
 
 volumes:

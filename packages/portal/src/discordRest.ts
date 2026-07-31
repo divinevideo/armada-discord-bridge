@@ -106,3 +106,68 @@ export async function botGuildTextChannels(
   if (!channels) return undefined;
   return channels.filter((c) => c.type === 0).sort((a, b) => a.position - b.position);
 }
+
+// ── Full-guild snapshot (server import) ─────────────────────────────────────
+
+/** One channel permission overwrite: role (type 0) or member (type 1). */
+export interface ChannelOverwrite {
+  id: string;
+  type: number;
+  allow: string;
+  deny: string;
+}
+
+/** A guild channel with everything the import mapper reads. */
+export interface SnapshotChannel {
+  id: string;
+  name: string;
+  type: number;
+  position: number;
+  parent_id?: string | null;
+  topic?: string | null;
+  permission_overwrites?: ChannelOverwrite[];
+}
+
+/** A guild role as returned inline on the guild object. */
+export interface SnapshotRole {
+  id: string;
+  name: string;
+  permissions: string;
+  color: number;
+  hoist: boolean;
+  position: number;
+  managed: boolean;
+  tags?: Record<string, unknown>;
+}
+
+export interface SnapshotGuild {
+  id: string;
+  name: string;
+  description?: string | null;
+  icon?: string | null;
+  banner?: string | null;
+  splash?: string | null;
+  owner_id?: string;
+  roles: SnapshotRole[];
+}
+
+export interface GuildSnapshot {
+  guild: SnapshotGuild;
+  channels: SnapshotChannel[];
+}
+
+/**
+ * Read a guild's full structure (settings, roles, channels with overwrites)
+ * with the bot token. Undefined when the bot is not installed in the guild.
+ * Two REST calls; roles arrive inline on the guild object.
+ */
+export async function botGuildSnapshot(
+  botToken: string,
+  guildId: string,
+): Promise<GuildSnapshot | undefined> {
+  const guild = await botGet<SnapshotGuild>(botToken, `/guilds/${guildId}`);
+  if (!guild) return undefined;
+  const channels = await botGet<SnapshotChannel[]>(botToken, `/guilds/${guildId}/channels`);
+  if (!channels) return undefined;
+  return { guild, channels };
+}

@@ -291,3 +291,100 @@ label.consent { display: flex; gap: 0.6rem; align-items: flex-start; margin: 0.7
 table { width: 100%; border-collapse: collapse; }
 td { padding: 0.5rem 0.4rem; border-top: 1px solid hsl(var(--chrome-divider)); vertical-align: top; }
 .error { color: hsl(var(--destructive)); }
+
+/* ── Armada client login, copied from armada.buzz (LoginDialog) ─────────────
+   Clipped-corner glyph tile over a mono lowercase "log in", extension button
+   above an "or" hairline, one password field, one full-width submit. */
+.clip-corner-lg {
+  --cut: 0.7rem;
+  clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+  border-radius: 0.55rem;
+}
+.login-card {
+  max-width: 24rem;
+  margin: 0.75rem auto;
+  padding: 1.5rem 1.25rem;
+  background: hsl(var(--card));
+}
+.login-head { display: flex; flex-direction: column; align-items: center; gap: 0.5rem; text-align: center; }
+.login-glyph {
+  display: flex;
+  width: 3rem;
+  height: 3rem;
+  align-items: center;
+  justify-content: center;
+  background: hsl(var(--primary) / 0.15);
+  color: hsl(var(--primary));
+}
+.login-glyph svg { width: 1.5rem; height: 1.5rem; }
+.login-title {
+  font-family: var(--mono);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-size: 1.35rem;
+  margin: 0;
+  color: hsl(var(--foreground));
+}
+.login-note { text-align: center; font-size: 0.85rem; color: hsl(var(--muted-foreground)); margin: 1.1rem 0 0; }
+.login-note a { color: hsl(var(--primary)); font-weight: 500; text-decoration: none; }
+.login-note a:hover { text-decoration: underline; }
+.login-ext {
+  width: 100%;
+  height: 3rem;
+  margin-top: 1rem;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  border: none;
+  font-weight: 600;
+  cursor: pointer;
+}
+.login-ext:disabled { opacity: 0.6; cursor: default; }
+.login-or { display: flex; align-items: center; gap: 0.75rem; margin: 0.9rem 0; }
+.login-or .line { height: 1px; flex: 1; background: hsl(var(--chrome-divider)); }
+.login-or span:not(.line) {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: hsl(var(--muted-foreground));
+}
+.login-form { display: flex; flex-direction: column; gap: 0.75rem; margin-top: 1rem; }
+.login-input {
+  width: 100%;
+  height: 2.75rem;
+  padding: 0 0.85rem;
+  background: hsl(var(--background) / 0.4);
+  border: 1px solid transparent;
+  color: hsl(var(--foreground));
+  font: inherit;
+}
+.login-input:focus { outline: 2px solid hsl(var(--ring)); outline-offset: -1px; }
+.login-input.err { border-color: hsl(var(--destructive)); }
+.login-error { color: hsl(var(--destructive)); font-size: 0.85rem; margin: 0; }
+.login-submit {
+  width: 100%;
+  height: 3rem;
+  background: hsl(var(--primary));
+  color: hsl(var(--primary-foreground));
+  border: none;
+  font-weight: 600;
+  cursor: pointer;
+}
+.login-submit:disabled { opacity: 0.5; cursor: default; }
+.login-user {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  max-width: 24rem;
+  margin: 0.75rem 0;
+  padding: 0.7rem 0.9rem;
+  background: hsl(var(--card));
+}
+.login-user .login-glyph { width: 2.25rem; height: 2.25rem; }
+.login-user .login-glyph svg { width: 1.1rem; height: 1.1rem; }
+.login-user .who { flex: 1; min-width: 0; }
+.login-user .who .name { font-weight: 600; font-size: 0.9rem; }
+.login-user .who .id { font-family: var(--mono); font-size: 0.78rem; color: hsl(var(--muted-foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Session + login avatars: Discord in the masthead, Nostr in the login chip. */
+.session-avatar { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; }
+.login-avatar { width: 2.25rem; height: 2.25rem; border-radius: 50%; object-fit: cover; flex-shrink: 0; }
