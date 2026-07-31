@@ -500,8 +500,15 @@ export class BridgeManager {
       await message.reply(`You've already claimed ${existing.npub.slice(0, 12)}… in this community.`);
       return;
     }
+    // A one-time code bound to the INVOKING user: only the Discord account
+    // that asked can claim the npub, even if the link is forwarded.
+    const code = randomBytes(4).toString("hex");
+    await this.sql`
+      INSERT INTO claim_codes (code, community_id, discord_guild_id, discord_user_id)
+      VALUES (${code}, ${rb.link.communityId}, ${rb.link.discordGuildId}, ${message.author.id})
+      ON CONFLICT (code) DO NOTHING`;
     await message.reply(
-      `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and log in with your Armada key.`,
+      `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and enter code ${code} (expires in 30 minutes).`,
     );
   }
 

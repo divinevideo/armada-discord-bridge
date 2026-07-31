@@ -198,7 +198,6 @@ app.get("/api/claims/:communityId", async (c) => {
     communityName: row.community_name,
     messageCount: String(row.message_count),
     claimed: row.claimed,
-    challenge: claimChallenge(row.community_id as string, session.user.id),
   });
 });
 
@@ -212,6 +211,19 @@ app.post("/api/claims", async (c) => {
   } catch (error) {
     return c.json({ error: String(error) }, 400);
   }
+});
+
+/** Resolve a claim code into the challenge the claimant signs. */
+app.get("/api/claims/:communityId/challenge", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const code = (c.req.query("code") ?? "").trim().toLowerCase();
+  const [row] = await sql<{ discord_user_id: string }[]>`
+    SELECT discord_user_id FROM claim_codes
+    WHERE code = ${code} AND community_id = ${c.req.param("communityId")}
+      AND consumed_at IS NULL AND expires_at > now()`;
+  if (!row) return c.json({ error: "that code is wrong, used, or expired; run /claim again" }, 400);
+  return c.json({ challenge: claimChallenge(c.req.param("communityId"), row.discord_user_id) });
 });
 
 // ── Bridges ──────────────────────────────────────────────────────────────────

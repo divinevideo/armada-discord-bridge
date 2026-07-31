@@ -116,6 +116,8 @@ export interface ClaimBody {
   signedProof?: SignedSeal;
   /** Which levels to run. */
   levels?: { link?: boolean; roles?: boolean; key?: boolean };
+  /** The one-time code the bot handed to the invoking Discord user. */
+  code?: string;
 }
 
 const KIND_CLAIM_PROOF = 30078;
@@ -831,12 +833,25 @@ export class Importer {
   ): Promise<{ linkPublished: boolean; rolesGranted: string[]; puppetNsec?: string }> {
     const npub = parseAdminPubkey(body.npub ?? "");
     if (!npub) throw new Error("log in with your Armada account first");
+
+    // The one-time code from /claim binds the claim to the Discord account
+    // that INVOKED the command, not whoever holds the session or the link.
+    const code = (body.code ?? "").trim().toLowerCase();
+    if (!/^[0-9a-f]{8}$/.test(code)) throw new Error("enter the code the bot gave you");
+    const [claimCode] = await this.sql<{ discord_user_id: string }[]>`
+      UPDATE claim_codes SET consumed_at = now()
+      WHERE code = ${code} AND community_id = ${communityId}
+        AND consumed_at IS NULL AND expires_at > now()
+      RETURNING discord_user_id`;
+    if (!claimCode) throw new Error("that code is wrong, used, or expired; run /claim again");
+    const discordUserId = claimCode.discord_user_id;
+
     const proof = body.signedProof;
     if (
       !proof ||
       proof.kind !== KIND_CLAIM_PROOF ||
       proof.pubkey !== npub ||
-      proof.content !== claimChallenge(communityId, session.user.id) ||
+      proof.content !== claimChallenge(communityId, discordUserId) ||
       !verifyEvent(proof as NostrEvent)
     ) {
       throw new Error("invalid ownership proof");
@@ -859,7 +874,7 @@ export class Importer {
 
     const puppet = derivePuppet(
       unseal(this.env.sealKeyHex, bridge.master_secret_sealed),
-      session.user.id,
+      discordUserId,
     );
 
     // Level 2: current Discord roles -> imported Armada roles (op-signed
@@ -912,7 +927,7 @@ export class Importer {
         }
         }
       } catch (error) {
-        console.warn(`claim: role grant failed for ${session.user.id}:`, error);
+        console.warn(`claim: role grant failed for ${discordUserId}:`, error);
       }
     }
 
@@ -935,7 +950,7 @@ export class Importer {
         const pool = this.poolFactory(relays);
         try {
           const now = Math.floor(Date.now() / 1000);
-          const challenge = claimChallenge(communityId, session.user.id);
+          const challenge = claimChallenge(communityId, discordUserId);
           await pool.publish(
             await puppetIdentity.signer.signEvent({
               kind: 0,
@@ -961,7 +976,7 @@ export class Importer {
 
     const [row] = await this.sql<{ claim_id: string }[]>`
       INSERT INTO claims (community_id, discord_guild_id, discord_user_id, npub, linked, roles_granted, key_revealed)
-      VALUES (${communityId}, ${bridge.discord_guild_id}, ${session.user.id}, ${npub},
+      VALUES (${communityId}, ${bridge.discord_guild_id}, ${discordUserId}, ${npub},
               ${linkPublished}, ${rolesGranted}, ${levels.key})
       ON CONFLICT (tenant_id, community_id, discord_user_id)
       DO UPDATE SET npub = EXCLUDED.npub,

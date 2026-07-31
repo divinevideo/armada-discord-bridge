@@ -9,7 +9,6 @@ interface ClaimContext {
   communityName: string | null;
   messageCount: string;
   claimed: boolean;
-  challenge: string;
 }
 
 interface ClaimResult {
@@ -19,14 +18,14 @@ interface ClaimResult {
 }
 
 /**
- * Claim your old account (armada-history-claims-PLAN.md §3). Arrived at from
- * a /claim bot-command link in a bridged channel: the community comes from
- * the URL, Discord sign-in proves the old account, the Nostr login signs the
- * ownership challenge.
+ * Claim your old account (armada-history-claims-PLAN.md §3). You arrive from
+ * a /claim bot link with a one-time code; the code proves you're the Discord
+ * account that asked, your Nostr login proves which Armada account you are.
  */
 export function Claims(props: { communityId: string; onDone: () => void }) {
   const [context, setContext] = useState<ClaimContext | null>(null);
   const [contextError, setContextError] = useState("");
+  const [code, setCode] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ClaimResult | null>(null);
@@ -45,9 +44,12 @@ export function Claims(props: { communityId: string; onDone: () => void }) {
     setBusy(true);
     setError("");
     try {
+      const { challenge } = await api<{ challenge: string }>(
+        `/api/claims/${props.communityId}/challenge?code=${encodeURIComponent(code.trim())}`,
+      );
       const signedProof = await login.signTemplate({
         kind: 30078,
-        content: context.challenge,
+        content: challenge,
         tags: [],
         created_at: Math.floor(Date.now() / 1000),
       });
@@ -57,6 +59,7 @@ export function Claims(props: { communityId: string; onDone: () => void }) {
           communityId: context.communityId,
           npub: login.pk,
           signedProof,
+          code: code.trim(),
           levels: { link: true, roles: true, key: keyConsent },
         }),
       });
@@ -119,9 +122,8 @@ export function Claims(props: { communityId: string; onDone: () => void }) {
     <div className="panel">
       <h2>Claim your old account</h2>
       <p className="muted">
-        The bridge saw you on Discord. Prove both accounts and your history there
-        becomes yours: your profile links to your real Armada account, and your
-        Discord roles carry over.
+        The bridge saw you on Discord. Enter the code the bot gave you and log in with
+        your Armada key; your history there becomes yours.
       </p>
       {contextError && <p className="error">{contextError}</p>}
       {error && <p className="error">{error}</p>}
@@ -137,6 +139,16 @@ export function Claims(props: { communityId: string; onDone: () => void }) {
             {context.claimed && " You already claimed this one."}
           </p>
 
+          <label>
+            The code the bot gave you
+            <input
+              type="text"
+              placeholder="e.g. a1b2c3d4"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+            />
+          </label>
+
           <h3>Your Armada account</h3>
           <NostrLogin login={login} />
 
@@ -148,7 +160,10 @@ export function Claims(props: { communityId: string; onDone: () => void }) {
             </span>
           </label>
           <div className="row" style={{ marginTop: "0.6rem" }}>
-            <button disabled={!login.pk || busy || context.claimed} onClick={() => void claim()}>
+            <button
+              disabled={!login.pk || !code.trim() || busy || context.claimed}
+              onClick={() => void claim()}
+            >
               {busy ? "Claiming…" : context.claimed ? "Already claimed" : "Claim my account"}
             </button>
             <button className="ghost" onClick={props.onDone}>Cancel</button>
