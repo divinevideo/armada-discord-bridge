@@ -36,6 +36,17 @@ services:
   portal:
     build: .
     command: ["bun", "run", "packages/portal/src/index.ts"]
+    # `docker compose watch portal` rebuilds + restarts on any source change
+    # (the SPA is built inside the image, so web edits are picked up too).
+    develop:
+      watch:
+        - action: rebuild
+          path: ./packages
+          ignore:
+            - "**/*.test.ts"
+            - portal/web/dist/
+        - action: rebuild
+          path: ./package.json
     depends_on:
       postgres:
         condition: service_healthy
