@@ -64,6 +64,12 @@ export interface PlannedChannel {
   bridge: boolean;
   /** User toggle: include this channel in the import at all. */
   selected: boolean;
+  /** User toggle: backfill message history (bridged text channels only). */
+  history: boolean;
+  /** Backfill progress: messages published so far + resume cursor. */
+  historyImported?: number;
+  historyCursor?: string;
+  historyDoneAt?: number;
   /** Minted at import time (hex32); checkpoint for the edition publish. */
   channelIdHex?: string;
   /** Unix ms when the channel edition was accepted by a relay. */
@@ -139,12 +145,31 @@ export interface ImportCheckpoints {
   /** Public invite link: bundle published under this signer. */
   inviteLinkSignerPk?: string;
   invitePublishedAt?: number;
+  /** kind 30030 guild emoji pack, addressable at `30030:<opPk>:discord-import`. */
+  emojiPackAddress?: string;
+  emojiPackPublishedAt?: number;
+}
+
+/** History import gates (armada-history-claims-PLAN.md §2.2). */
+export const HISTORY_MEMBER_CAP = 100;
+export const HISTORY_MESSAGE_CAP = 10_000;
+
+export interface PlannedEmoji {
+  id: string;
+  name: string;
+  animated: boolean;
 }
 
 export interface ImportPlan {
   guild: { id: string; name: string; description?: string; iconUrl?: string; bannerUrl?: string };
   /** Community name (defaults to the guild name, 64-byte capped). */
   communityName: string;
+  /** approximate_member_count at snapshot time; gates history import. */
+  memberCount?: number;
+  /** False for servers above HISTORY_MEMBER_CAP members. */
+  historyAllowed: boolean;
+  /** Guild custom emoji, published as a kind 30030 pack. */
+  emojis: PlannedEmoji[];
   channels: PlannedChannel[];
   roles: PlannedRole[];
   skipped: SkippedItem[];
@@ -227,6 +252,7 @@ function planChannels(snapshot: GuildSnapshot, skipped: SkippedItem[]): PlannedC
       bridgeable,
       bridge: bridgeable,
       selected: true,
+      history: false, // flipped on below when the member gate allows
     });
   }
   return out;
@@ -308,10 +334,25 @@ export function buildImportPlan(snapshot: GuildSnapshot): ImportPlan {
   const channels = planChannels(snapshot, skipped);
   const roles = planRoles(snapshot, skipped);
 
+  const memberCount = snapshot.guild.approximate_member_count;
+  const historyAllowed = memberCount !== undefined && memberCount <= HISTORY_MEMBER_CAP;
+  if (historyAllowed) {
+    for (const channel of channels) if (channel.bridgeable) channel.history = true;
+  } else {
+    skipped.push({
+      kind: "feature",
+      name: "Message history",
+      reason: `not currently available for servers with more than ${HISTORY_MEMBER_CAP} members`,
+    });
+  }
+
+  const emojis: PlannedEmoji[] = (snapshot.guild.emojis ?? [])
+    .filter((e) => e.available !== false && /^\w+$/.test(e.name))
+    .map((e) => ({ id: e.id, name: e.name, animated: e.animated === true }));
+
   skipped.push(
-    { kind: "feature", name: "Message history", reason: "not imported; bridged channels mirror new messages" },
     { kind: "feature", name: "Members", reason: "members join via the Armada invite; bridged senders appear as puppets" },
-    { kind: "feature", name: "Emoji, stickers, soundboard", reason: "no Armada equivalent yet" },
+    { kind: "feature", name: "Stickers, soundboard", reason: "no Armada equivalent yet" },
     { kind: "feature", name: "Onboarding, welcome screen, integrations", reason: "no Armada equivalent" },
   );
 
@@ -331,6 +372,9 @@ export function buildImportPlan(snapshot: GuildSnapshot): ImportPlan {
           : undefined,
     },
     communityName: capName(snapshot.guild.name),
+    memberCount,
+    historyAllowed,
+    emojis,
     channels,
     roles,
     skipped,

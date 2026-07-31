@@ -25,6 +25,8 @@ export interface SessionData {
   guilds: SessionGuild[];
   oauthState?: string;
   dev?: boolean;
+  /** OAuth bearer, kept for claim-time member lookups (guilds.members.read). */
+  accessToken?: string;
 }
 
 export class Sessions {

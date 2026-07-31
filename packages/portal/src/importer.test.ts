@@ -26,7 +26,7 @@ import type { NostrEvent } from "nostr-tools/pure";
 import { finalizeEvent } from "nostr-tools/pure";
 import type { EventTemplate } from "nostr-tools/pure";
 
-import type { GuildSnapshot } from "./discordRest";
+import type { GuildSnapshot, RestMessage } from "./discordRest";
 import type { PortalEnv } from "./env";
 import { buildImportPlan } from "./importPlan";
 import type { SignedSeal } from "./importPlan";
@@ -59,6 +59,9 @@ function fakeSql(store: { imports: Map<string, Record<string, unknown>>; bridges
     let p = 0;
     const next = () => params[p++];
 
+    if (text.startsWith("SELECT 1 FROM messages")) {
+      return []; // nothing pre-imported in tests
+    }
     if (text.startsWith("SELECT * FROM imports")) {
       const row = store.imports.get(next() as string);
       if (!row) return [];
@@ -117,6 +120,8 @@ const snapshot: GuildSnapshot = {
     name: "Test Fleet",
     description: "hello",
     icon: null,
+    approximate_member_count: 42,
+    emojis: [{ id: "7777", name: "blob", animated: false }],
     roles: [
       { id: "100", name: "@everyone", permissions: "0", color: 0, hoist: false, position: 0, managed: false },
       { id: "r1", name: "Chief", permissions: (1n << 3n).toString(), color: 1, hoist: true, position: 5, managed: false },
@@ -138,6 +143,16 @@ const snapshot: GuildSnapshot = {
     },
   ],
 };
+
+function restMsg(id: string, timestamp: string): RestMessage {
+  return {
+    id,
+    type: 0,
+    content: `history message ${id}`,
+    timestamp,
+    author: { id: "80351110224678912", username: "mk" },
+  };
+}
 
 async function waitFor(cond: () => boolean, ms = 8000): Promise<void> {
   const start = Date.now();
@@ -162,8 +177,41 @@ describe("importer pipeline", () => {
     const store = { imports: new Map<string, Record<string, unknown>>(), bridges: [] as Array<Record<string, unknown>> };
     const wire: NostrEvent[] = [];
     const activated: BridgeRow[] = [];
-    const manager = { activateImported: async (row: BridgeRow) => void activated.push(row) };
-    const importer = new Importer(fakeSql(store), env, manager as never, () => wirePool(wire));
+    const routed: Array<{ channelId: string; id: string; timestampMs?: number }> = [];
+    const manager = {
+      activateImported: async (row: BridgeRow) => void activated.push(row),
+      routerFor: (discordChannelId: string) => ({
+        router: {
+          onDiscordMessage: async (m: { channelId: string; id: string; timestampMs?: number }) => {
+            routed.push({ channelId: m.channelId, id: m.id, timestampMs: m.timestampMs });
+            return `rumor-${m.id}`;
+          },
+        },
+        link: {
+          discordGuildId: "100",
+          discordChannelId,
+          communityId: "",
+          concordChannelIdHex: "",
+          enabled: true,
+        },
+      }),
+    };
+    // Two pages of history for #general (id "1"), newest first; none elsewhere.
+    const historyPages = new Map<string, RestMessage[][]>([
+      ["1", [
+        [restMsg("1005", "2023-04-02T10:00:00Z"), restMsg("1004", "2023-04-01T10:00:00Z")],
+        [restMsg("1003", "2023-03-02T10:00:00Z"), restMsg("1002", "2023-03-01T10:00:00Z")],
+        [],
+      ]],
+    ]);
+    const pageIndex = new Map<string, number>();
+    const historyFetch = async (channelId: string) => {
+      const pages = historyPages.get(channelId) ?? [[]];
+      const i = pageIndex.get(channelId) ?? 0;
+      pageIndex.set(channelId, i + 1);
+      return pages[Math.min(i, pages.length - 1)];
+    };
+    const importer = new Importer(fakeSql(store), env, manager as never, () => wirePool(wire), historyFetch);
 
     const plan = buildImportPlan(snapshot);
     store.imports.set("imp1", {
@@ -259,6 +307,24 @@ describe("importer pipeline", () => {
     expect(activated.map((b) => b.concord_channel_id)).toContain(general.channelIdHex!);
     expect(activated.every((b) => b.discord_guild_id === "100")).toBe(true);
     expect(planNow.channels.filter((c) => c.bridgeId).length).toBe(2);
+
+    // History: #general backfilled oldest -> newest with original timestamps,
+    // via the same router the live bridge uses.
+    expect(routed.map((m) => m.id)).toEqual(["1002", "1003", "1004", "1005"]);
+    expect(routed.every((m) => m.channelId === "1")).toBe(true);
+    expect(routed[0].timestampMs).toBe(Date.parse("2023-03-01T10:00:00Z"));
+    const generalPlan = planNow.channels.find((c) => c.name === "general")!;
+    expect(generalPlan.historyImported).toBe(4);
+    expect(generalPlan.historyDoneAt).toBeDefined();
+
+    // Guild emoji: one kind 30030 pack signed by the op key, CDN image URLs,
+    // and the metadata points at it.
+    const pack = wire.find((e) => e.kind === 30030)!;
+    expect(pack).toBeDefined();
+    expect(pack.pubkey).toBe(opPk);
+    expect(pack.tags).toContainEqual(["d", "discord-import"]);
+    expect(pack.tags).toContainEqual(["emoji", "blob", "https://cdn.discordapp.com/emojis/7777.png"]);
+    expect(fold.metadata?.custom?.emojiPack).toBe(`30030:${opPk}:discord-import`);
 
     // Idempotency: a re-run from checkpoints publishes nothing new.
     const wireLen = wire.length;

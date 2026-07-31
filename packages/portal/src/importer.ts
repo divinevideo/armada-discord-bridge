@@ -59,6 +59,9 @@ import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import type { LocalIdentity } from "@armada-bridge/bridge/src/concord/signer";
+import { discordEmojiUrl } from "@armada-bridge/bridge/src/router";
+import type { DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
+import { derivePuppet } from "@armada-bridge/bridge/src/puppets";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { encrypt as nip44Encrypt } from "nostr-tools/nip44";
@@ -67,10 +70,12 @@ import { generateSecretKey, verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type postgres from "postgres";
 
-import { botGuildSnapshot, botInstallUrl } from "./discordRest";
+import { fetchMyGuildMember } from "./discordRest";
+import { botChannelMessagesBefore, botGuildSnapshot, botInstallUrl } from "./discordRest";
+import type { RestMessage } from "./discordRest";
 import type { PortalEnv } from "./env";
-import { buildImportPlan } from "./importPlan";
-import type { ImportPlan, OwnerSignTemplate, SignedSeal } from "./importPlan";
+import { HISTORY_MESSAGE_CAP, buildImportPlan } from "./importPlan";
+import type { ImportPlan, OwnerSignTemplate, PlannedChannel, SignedSeal } from "./importPlan";
 import type { BridgeManager, BridgeRow } from "./manager";
 import { seal, unseal } from "./seal";
 
@@ -95,7 +100,29 @@ export interface PrepareBody {
   /** Community relay set; defaults to IMPORT_DEFAULT_RELAYS, then stock. */
   relays?: string[];
   /** Per-channel toggles keyed by Discord channel id. */
-  channels?: Array<{ discordId: string; selected?: boolean; bridge?: boolean }>;
+  channels?: Array<{ discordId: string; selected?: boolean; bridge?: boolean; history?: boolean }>;
+}
+
+export interface ClaimTarget {
+  communityId: string;
+  communityName: string;
+  guildId: string;
+  messageCount: number;
+}
+
+export interface ClaimBody {
+  npub?: string;
+  /** kind 30078 signed by the npub, content exactly the challenge string. */
+  signedProof?: SignedSeal;
+  /** Which levels to run. */
+  levels?: { link?: boolean; roles?: boolean; key?: boolean };
+}
+
+const KIND_CLAIM_PROOF = 30078;
+
+/** The exact content the claimant signs; versioned, community-scoped. */
+export function claimChallenge(communityId: string, discordUserId: string): string {
+  return `armada-bridge claim v1\ncommunity ${communityId}\ndiscord ${discordUserId}`;
 }
 
 export interface ConfirmBody {
@@ -128,6 +155,34 @@ function plaintextSealTemplate(rumor: Rumor): OwnerSignTemplate["template"] {
 
 /** The Armada client's stock blob host, used when BLOSSOM_SERVER is unset. */
 const DEFAULT_BLOSSOM = "https://blossom.ditto.pub";
+
+/** A REST history message -> the router's inbound shape (same as gateway). */
+export function restToInbound(message: RestMessage, guildId: string, channelId: string): DiscordInboundMessage {
+  return {
+    id: message.id,
+    channelId,
+    guildId,
+    content: message.content ?? "",
+    author: {
+      id: message.author.id,
+      display: message.author.global_name || message.author.username,
+      avatarUrl: message.author.avatar
+        ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`
+        : undefined,
+      bot: message.author.bot === true,
+    },
+    webhookId: message.webhook_id,
+    applicationId: message.application_id ?? undefined,
+    referencedMessageId: message.message_reference?.message_id,
+    timestampMs: Date.parse(message.timestamp),
+    attachments: message.attachments?.map((a) => ({ url: a.url, filename: a.filename })),
+    embeds: message.embeds?.map((e) => ({
+      url: e.url,
+      mediaUrl: e.video?.url ?? e.image?.url ?? e.thumbnail?.url,
+    })),
+    mentions: message.mentions?.map((m) => ({ id: m.id, display: m.global_name || m.username })),
+  };
+}
 
 /** Largest icon/banner we bother rehosting. */
 const MAX_ASSET_BYTES = 8 * 1024 * 1024;
@@ -175,6 +230,12 @@ export class Importer {
     private readonly manager: BridgeManager,
     /** Test seam: swap the relay pool for an in-memory wire. */
     private readonly poolFactory: (relays: string[]) => RelayLike = (relays) => new RelayPool(relays),
+    /** Test seam: history pages without the Discord REST API. */
+    private readonly historyFetch: (
+      channelId: string,
+      beforeId?: string,
+    ) => Promise<RestMessage[] | undefined> = (channelId, beforeId) =>
+      botChannelMessagesBefore(this.env.discordBotToken, channelId, beforeId),
   ) {}
 
   /** Snapshot the guild and store a previewed plan. */
@@ -239,7 +300,9 @@ export class Importer {
       if (!channel) continue;
       if (toggle.selected !== undefined) channel.selected = toggle.selected;
       if (toggle.bridge !== undefined) channel.bridge = toggle.bridge && channel.bridgeable;
+      if (toggle.history !== undefined) channel.history = toggle.history && channel.bridgeable && plan.historyAllowed;
       if (!channel.selected) channel.bridge = false;
+      if (!channel.bridge) channel.history = false;
     }
     if (!plan.channels.some((c) => c.selected)) throw new Error("select at least one channel");
 
@@ -392,6 +455,7 @@ export class Importer {
     const { community, opSk, plan } = await this.load(importId);
     await this.publishEditions(importId, community, opSk, plan);
     await this.wireBridges(importId, community, plan);
+    await this.importHistory(importId, plan);
     await this.sql`
       UPDATE imports SET status = 'done', status_detail = NULL, updated_at = now()
       WHERE import_id = ${importId}`;
@@ -516,6 +580,8 @@ export class Importer {
           relays: community.relays,
           ...(cp.iconPointer ? { icon: cp.iconPointer } : {}),
           ...(cp.bannerPointer ? { banner: cp.bannerPointer } : {}),
+          // Forward-compatible pointer to the guild emoji pack (30030).
+          ...(plan.emojis.length > 0 ? { custom: { emojiPack: `30030:${op.pk}:discord-import` } } : {}),
         };
         await pool.publish(
           await sealEdition(buildMetadataEdition(community.id, metadata, opV1), control, op.signer),
@@ -561,6 +627,27 @@ export class Importer {
           ),
         );
         role.publishedAt = Date.now();
+        await save();
+      }
+
+      // Guild custom emoji: one kind 30030 emoji-set event (NIP-30 pack)
+      // members can add to their palette; stable CDN image URLs so bridged
+      // reactions round-trip back to the native Discord emoji.
+      if (plan.emojis.length > 0 && !cp.emojiPackPublishedAt) {
+        await pool.publish(
+          await op.signer.signEvent({
+            kind: 30030,
+            content: "",
+            tags: [
+              ["d", "discord-import"],
+              ["title", `${plan.communityName} emoji`],
+              ...plan.emojis.map((e) => ["emoji", e.name, discordEmojiUrl(e.id, e.animated)]),
+            ],
+            created_at: Math.floor(Date.now() / 1000),
+          }),
+        );
+        cp.emojiPackAddress = `30030:${op.pk}:discord-import`;
+        cp.emojiPackPublishedAt = Date.now();
         await save();
       }
 
@@ -632,6 +719,252 @@ export class Importer {
     } finally {
       await pool.close();
     }
+  }
+
+  // ── History backfill (armada-history-claims-PLAN.md §2) ───────────────────
+
+  /**
+   * Backfill the newest HISTORY_MESSAGE_CAP messages of every bridged
+   * channel that opted in, oldest → newest so replies resolve, through the
+   * SAME router the live bridge uses (same puppets, transforms, rehosting,
+   * mapping rows). Only offered under the member-count gate (§2.2).
+   */
+  private async importHistory(importId: string, plan: ImportPlan): Promise<void> {
+    if (!plan.historyAllowed) return;
+    const channels = plan.channels.filter(
+      (c) => c.selected && c.bridge && c.bridgeable && c.history && !c.historyDoneAt,
+    );
+    if (channels.length === 0) return;
+    await this.sql`
+      UPDATE imports SET status = 'history', updated_at = now() WHERE import_id = ${importId}`;
+    for (const channel of channels) {
+      await this.backfillChannel(importId, plan, channel);
+    }
+  }
+
+  private async backfillChannel(importId: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> {
+    const running = this.manager.routerFor(channel.discordId);
+    if (!running) {
+      console.warn(`import ${importId}: no live bridge for #${channel.name}; history skipped`);
+      channel.historyDoneAt = Date.now();
+      await this.savePlan(importId, plan);
+      return;
+    }
+
+    // Collect the newest cap-worth of messages, stopping at the resume
+    // cursor (everything at/below it already published on a prior run).
+    const cursor = channel.historyCursor ? BigInt(channel.historyCursor) : undefined;
+    const collected: RestMessage[] = [];
+    let before: string | undefined;
+    while (collected.length < HISTORY_MESSAGE_CAP) {
+      const page = await this.historyFetch(channel.discordId, before);
+      if (!page || page.length === 0) break;
+      let stop = false;
+      for (const message of page) {
+        if (cursor !== undefined && BigInt(message.id) <= cursor) {
+          stop = true;
+          break;
+        }
+        collected.push(message);
+        if (collected.length >= HISTORY_MESSAGE_CAP) break;
+      }
+      if (stop || collected.length >= HISTORY_MESSAGE_CAP) break;
+      before = page[page.length - 1].id;
+    }
+
+    collected.reverse(); // oldest first, so reply targets exist when cited
+    let published = channel.historyImported ?? 0;
+    for (const message of collected) {
+      if (message.type !== 0 && message.type !== 19) continue;
+      const [exists] = await this.sql`
+        SELECT 1 FROM messages WHERE discord_message_id = ${message.id} LIMIT 1`;
+      if (!exists) {
+        await running.router
+          .onDiscordMessage(restToInbound(message, running.link.discordGuildId, channel.discordId), running.link)
+          .catch((error) => console.warn(`import ${importId}: history message ${message.id} failed:`, error));
+        await new Promise((resolve) => setTimeout(resolve, 25)); // relay pacing
+      }
+      published++;
+      channel.historyImported = published;
+      channel.historyCursor = message.id;
+      if (published % 20 === 0) await this.savePlan(importId, plan);
+    }
+    channel.historyDoneAt = Date.now();
+    await this.savePlan(importId, plan);
+  }
+
+  private async savePlan(importId: string, plan: ImportPlan): Promise<void> {
+    await this.sql`
+      UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
+      WHERE import_id = ${importId}`;
+  }
+
+  // ── Claims (armada-history-claims-PLAN.md §3) ─────────────────────────────
+
+  /**
+   * Communities where this Discord user has bridged/imported messages and
+   * whose puppet master secret exists (i.e. the puppet is derivable).
+   */
+  async claimTargets(discordUserId: string): Promise<ClaimTarget[]> {
+    return this.sql<ClaimTarget[]>`
+      SELECT DISTINCT s.community_id AS "communityId",
+             MAX(b.community_name) AS "communityName",
+             s.discord_guild_id AS "guildId",
+             count(m.discord_message_id) AS "messageCount"
+      FROM guild_community_secrets s
+      JOIN bridges b ON b.community_id = s.community_id AND b.discord_guild_id = s.discord_guild_id
+      LEFT JOIN messages m ON m.community_id = s.community_id AND m.origin = 'discord' AND m.author_ref = ${discordUserId}
+      GROUP BY s.community_id, s.discord_guild_id
+      ORDER BY MAX(b.created_at) DESC`;
+  }
+
+  /**
+   * Execute a claim: Level 1 (puppet profile link + dual attestations),
+   * Level 2 (imported Discord roles granted to the claimant), Level 3
+   * (puppet key revealed once, marked shared-custody). The npub is verified
+   * against the signed challenge; the Discord side is the caller's session.
+   */
+  async claim(
+    communityId: string,
+    session: { user: { id: string }; accessToken?: string },
+    body: ClaimBody,
+  ): Promise<{ linkPublished: boolean; rolesGranted: string[]; puppetNsec?: string }> {
+    const npub = parseAdminPubkey(body.npub ?? "");
+    if (!npub) throw new Error("log in with your Armada account first");
+    const proof = body.signedProof;
+    if (
+      !proof ||
+      proof.kind !== KIND_CLAIM_PROOF ||
+      proof.pubkey !== npub ||
+      proof.content !== claimChallenge(communityId, session.user.id) ||
+      !verifyEvent(proof as NostrEvent)
+    ) {
+      throw new Error("invalid ownership proof");
+    }
+
+    const levels = { link: body.levels?.link !== false, roles: body.levels?.roles !== false, key: body.levels?.key === true };
+
+    const [bridge] = await this.sql<BridgeRow[]>`
+      SELECT b.*, s.master_secret_sealed AS shared_secret_sealed FROM bridges b
+      JOIN guild_community_secrets s ON s.community_id = b.community_id AND s.discord_guild_id = b.discord_guild_id
+      WHERE b.community_id = ${communityId} AND b.invite_url_sealed IS NOT NULL
+      LIMIT 1`;
+    if (!bridge?.invite_url_sealed || !bridge.master_secret_sealed || !bridge.discord_guild_id) {
+      throw new Error("no claimable community found");
+    }
+
+    const [importRow] = await this.sql<ImportRow[]>`
+      SELECT * FROM imports WHERE community_id = ${communityId} AND discord_guild_id = ${bridge.discord_guild_id}
+      AND status = 'done' ORDER BY created_at DESC LIMIT 1`;
+
+    const puppet = derivePuppet(
+      unseal(this.env.sealKeyHex, bridge.master_secret_sealed),
+      session.user.id,
+    );
+
+    // Level 2: current Discord roles -> imported Armada roles (op-signed grant).
+    let rolesGranted: string[] = [];
+    if (levels.roles) {
+      if (!importRow?.owner_sk_sealed || !importRow.community_sealed) {
+        throw new Error("role grants need an imported community with its operational key");
+      }
+      if (!session.accessToken) throw new Error("sign out and back in (a new permission is needed to read your roles)");
+      const member = await fetchMyGuildMember(session.accessToken, bridge.discord_guild_id);
+      rolesGranted = importRow.plan.roles
+        .filter((r) => member.roles.includes(r.discordId))
+        .map((r) => r.roleIdHex!);
+      if (rolesGranted.length > 0) {
+        const op = localIdentity(
+          Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, importRow.owner_sk_sealed), "hex")),
+        );
+        const secrets = JSON.parse(unseal(this.env.sealKeyHex, importRow.community_sealed)) as CommunitySecrets;
+        const community: CommunityV2 = {
+          id: hex32(importRow.community_id!),
+          idHex: importRow.community_id!,
+          owner: importRow.plan.checkpoints.ownerPkHex!,
+          ownerSalt: hex32(secrets.owner_salt),
+          root: hex32(secrets.community_root),
+          rootEpoch: 0n,
+          heldRoots: [{ epoch: 0n, key: hex32(secrets.community_root) }],
+          privateChannels: [],
+          relays: importRow.plan.relays,
+          name: importRow.plan.communityName,
+        };
+        const control = currentControlGroup(community);
+        registerStreamKeys([...controlGroups(community), ...guestbookGroups(community)], community.relays);
+        const pool = this.poolFactory(community.relays);
+        try {
+          const vac: AuthorityCitation = {
+            entityId: grantLocator(community.id, hex32(op.pk)),
+            version: 1n,
+            editionHash: hex32(importRow.plan.checkpoints.grantHashHex!),
+          };
+          await pool.publish(
+            await sealEdition(
+              buildGrantEdition(community.id, { member: npub, roleIds: rolesGranted },
+                { actorPubkey: op.pk, version: 1n, authority: vac }),
+              control,
+              op.signer,
+            ),
+          );
+        } finally {
+          await pool.close();
+        }
+      }
+    }
+
+    // Level 1: link the puppet's profile to the claimant, dual-signed.
+    let linkPublished = false;
+    if (levels.link) {
+      const relays = importRow?.plan.relays ?? [];
+      if (relays.length > 0) {
+        const puppetIdentity = localIdentity(puppet.sk);
+        const pool = this.poolFactory(relays);
+        try {
+          const now = Math.floor(Date.now() / 1000);
+          const challenge = claimChallenge(communityId, session.user.id);
+          await pool.publish(
+            await puppetIdentity.signer.signEvent({
+              kind: 0,
+              content: JSON.stringify({ claimed_by: npub }),
+              tags: [["p", npub]],
+              created_at: now,
+            }),
+          );
+          await pool.publish(
+            await puppetIdentity.signer.signEvent({
+              kind: KIND_CLAIM_PROOF,
+              content: challenge,
+              tags: [["p", npub]],
+              created_at: now,
+            }),
+          );
+          linkPublished = true;
+        } finally {
+          await pool.close();
+        }
+      }
+    }
+
+    const [row] = await this.sql<{ claim_id: string }[]>`
+      INSERT INTO claims (community_id, discord_guild_id, discord_user_id, npub, linked, roles_granted, key_revealed)
+      VALUES (${communityId}, ${bridge.discord_guild_id}, ${session.user.id}, ${npub},
+              ${linkPublished}, ${rolesGranted}, ${levels.key})
+      ON CONFLICT (tenant_id, community_id, discord_user_id)
+      DO UPDATE SET npub = EXCLUDED.npub,
+        linked = claims.linked OR EXCLUDED.linked,
+        roles_granted = EXCLUDED.roles_granted,
+        key_revealed = claims.key_revealed OR EXCLUDED.key_revealed
+      RETURNING claim_id`;
+
+    const result: { linkPublished: boolean; rolesGranted: string[]; puppetNsec?: string } = {
+      linkPublished,
+      rolesGranted,
+    };
+    if (levels.key) {
+      result.puppetNsec = nip19.nsecEncode(puppet.sk);
+    }
+    return result;
   }
 
   /** Create + activate a bridges row per selected text channel, no consent gate (D4). */

@@ -22,8 +22,8 @@ import {
   oauthUrl,
 } from "./discordRest";
 import { loadPortalEnv } from "./env";
-import { Importer } from "./importer";
-import type { ConfirmBody, PrepareBody } from "./importer";
+import { Importer, claimChallenge } from "./importer";
+import type { ClaimBody, ConfirmBody, PrepareBody } from "./importer";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
 import { seal, unseal } from "./seal";
@@ -68,6 +68,7 @@ app.get("/api/auth/discord/callback", async (c) => {
       icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : undefined,
       canManage: canManage(g),
     })),
+    accessToken: token,
   };
   await sessions.update(c, data);
   return c.redirect("/");
@@ -171,6 +172,29 @@ app.post("/api/imports/:id/retry", async (c) => {
   try {
     await importer.retry(c.req.param("id"), session.user.id);
     return c.json({ ok: true });
+  } catch (error) {
+    return c.json({ error: String(error) }, 400);
+  }
+});
+
+// ── Claims ──────────────────────────────────────────────────────────────────
+
+app.get("/api/claims", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const targets = await importer.claimTargets(session.user.id);
+  return c.json({
+    targets: targets.map((t) => ({ ...t, challenge: claimChallenge(t.communityId, session.user.id) })),
+  });
+});
+
+app.post("/api/claims", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json()) as ClaimBody & { communityId?: string };
+  if (!body.communityId) return c.json({ error: "communityId required" }, 400);
+  try {
+    return c.json(await importer.claim(body.communityId, session, body));
   } catch (error) {
     return c.json({ error: String(error) }, 400);
   }

@@ -432,4 +432,10 @@ export class BridgeManager {
   isLive(bridgeId: string): boolean {
     return this.running.has(bridgeId);
   }
+
+  /** The live router + link for a Discord channel (history backfill hook). */
+  routerFor(discordChannelId: string): { router: BridgeRouter; link: ChannelLink } | undefined {
+    const rb = this.activeRouterFor(discordChannelId);
+    return rb?.router ? { router: rb.router, link: rb.link } : undefined;
+  }
 }

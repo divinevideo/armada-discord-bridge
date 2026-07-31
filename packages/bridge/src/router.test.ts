@@ -457,12 +457,28 @@ describe("BridgeRouter: reactions", () => {
     expect(hasProxyTag(opened)).toBe(true);
   });
 
-  it("skips custom emoji, bots, and unmapped messages", async () => {
+  it("bridges custom emoji reactions as NIP-30 :shortcode: with an emoji tag", async () => {
+    const { router, pool, channel, link } = harness();
+    const rumorId = await router.onDiscordMessage(discordMsg(), link);
+
+    const id = await router.onDiscordReaction(
+      reaction({ emoji: { name: "blob", id: "999", animated: false } }),
+      link,
+    );
+    expect(id).toBeDefined();
+    const wraps = pool.published.filter((e) => e.kind === 1059);
+    const opened = openWrap(wraps[wraps.length - 1], channel.current.group);
+    expect(opened.kind).toBe(7);
+    expect(opened.content).toBe(":blob:");
+    expect(opened.tags).toContainEqual(["e", rumorId!]);
+    expect(opened.tags).toContainEqual(["emoji", "blob", "https://cdn.discordapp.com/emojis/999.png"]);
+  });
+
+  it("skips bots and unmapped messages", async () => {
     const { router, pool, link } = harness();
     await router.onDiscordMessage(discordMsg(), link);
     const before = pool.published.filter((e) => e.kind === 1059).length;
 
-    expect(await router.onDiscordReaction(reaction({ emoji: { name: "blob", id: "999" } }), link)).toBeUndefined();
     expect(
       await router.onDiscordReaction(reaction({ user: { id: "1", display: "bot", bot: true } }), link),
     ).toBeUndefined();

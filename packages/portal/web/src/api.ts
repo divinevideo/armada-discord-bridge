@@ -22,6 +22,9 @@ export interface Me {
 export interface ImportPlanView {
   guild: { id: string; name: string; description?: string; iconUrl?: string };
   communityName: string;
+  memberCount?: number;
+  historyAllowed: boolean;
+  emojis: Array<{ id: string; name: string }>;
   channels: Array<{
     discordId: string;
     name: string;
@@ -30,12 +33,15 @@ export interface ImportPlanView {
     bridgeable: boolean;
     bridge: boolean;
     selected: boolean;
+    history: boolean;
+    historyImported?: number;
+    historyDoneAt?: number;
     publishedAt?: number;
     bridgeId?: string;
   }>;
   roles: Array<{ discordId: string; name: string; dropped: string[]; publishedAt?: number }>;
   skipped: Array<{ kind: string; name: string; reason: string }>;
-  checkpoints?: { communityIdHex?: string; ownerPkHex?: string };
+  checkpoints?: { communityIdHex?: string; ownerPkHex?: string; emojiPackAddress?: string };
 }
 
 /** An unsigned seal template the owner signs in-browser (NIP-07 shape). */
@@ -46,7 +52,7 @@ export interface OwnerSignTemplate {
 
 export interface ImportStatus {
   importId: string;
-  status: "previewed" | "minting" | "publishing" | "wiring" | "done" | "failed";
+  status: "previewed" | "awaiting_sigs" | "minting" | "publishing" | "wiring" | "history" | "done" | "failed";
   statusDetail?: string | null;
   plan: ImportPlanView;
   communityId?: string | null;

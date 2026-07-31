@@ -1,36 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import * as nip19 from "nostr-tools/nip19";
-import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
-import type { EventTemplate, NostrEvent } from "nostr-tools/pure";
+import type { NostrEvent } from "nostr-tools/pure";
 
 import { api } from "./api";
 import type { ImportPlanView, ImportStatus, OwnerSignTemplate } from "./api";
-import { fetchNostrProfile } from "./nostrProfile";
-import type { NostrProfile } from "./nostrProfile";
+import { NostrLogin } from "./NostrLogin";
+import { useNostrLogin } from "./useNostrLogin";
 
 interface GuildOpt { id: string; name: string }
 
-/** NIP-07 browser extension surface, if one is installed. */
-interface Nip07 {
-  getPublicKey(): Promise<string>;
-  signEvent(template: EventTemplate): Promise<NostrEvent>;
-}
-declare global {
-  interface Window { nostr?: Nip07 }
-}
-
 const STEPS = ["server", "review", "import", "done"] as const;
-
-/* Lucide log-in, the glyph Armada's login dialog leads with. */
-function LogInGlyph() {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
-      <polyline points="10 17 15 12 10 7" />
-      <line x1="15" x2="3" y1="12" y2="12" />
-    </svg>
-  );
-}
 
 export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; onCancel: () => void }) {
   const [step, setStep] = useState(0);
@@ -42,11 +21,8 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
   const [importId, setImportId] = useState("");
   const [plan, setPlan] = useState<ImportPlanView | null>(null);
 
-  // The user's Armada account. The nsec never leaves this component: local
-  // signing only, exactly like logging into Armada itself.
-  const [ownerPk, setOwnerPk] = useState("");
-  const [signWith, setSignWith] = useState<"extension" | "nsec" | null>(null);
-  const [nsec, setNsec] = useState("");
+  // The user's Armada account (shared login hook; key never leaves the browser).
+  const login = useNostrLogin([]);
   const [signingStep, setSigningStep] = useState("");
 
   const [defaultRelays, setDefaultRelays] = useState<string[]>([]);
@@ -82,7 +58,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
     }
   }
 
-  function toggleChannel(discordId: string, field: "selected" | "bridge") {
+  function toggleChannel(discordId: string, field: "selected" | "bridge" | "history") {
     if (!plan) return;
     setPlan({
       ...plan,
@@ -90,115 +66,21 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
         if (c.discordId !== discordId) return c;
         if (field === "selected") {
           const selected = !c.selected;
-          return { ...c, selected, bridge: selected && c.bridge };
+          return { ...c, selected, bridge: selected && c.bridge, history: selected && c.history };
         }
-        return { ...c, bridge: !c.bridge };
+        if (field === "bridge") {
+          const bridge = !c.bridge;
+          return { ...c, bridge, history: bridge && c.history };
+        }
+        return { ...c, history: !c.history };
       }),
     });
-  }
-
-  // ── Armada account ─────────────────────────────────────────────────────────
-
-  const [loginError, setLoginError] = useState("");
-  const [loggingIn, setLoggingIn] = useState(false);
-  const [profile, setProfile] = useState<NostrProfile>({});
-
-  // Stay logged in like Armada does: the login (method + local key) persists
-  // in this browser's localStorage and restores on mount.
-  const LOGIN_STORE = "portal:nostr-login";
-  useEffect(() => {
-    const raw = localStorage.getItem(LOGIN_STORE);
-    if (!raw) return;
-    try {
-      const stored = JSON.parse(raw) as { method: "extension" | "nsec"; nsec?: string };
-      if (stored.method === "nsec" && stored.nsec) {
-        const decoded = nip19.decode(stored.nsec);
-        if (decoded.type !== "nsec") throw new Error("bad stored key");
-        setNsec(stored.nsec);
-        setOwnerPk(getPublicKey(decoded.data as Uint8Array));
-        setSignWith("nsec");
-      } else if (stored.method === "extension" && window.nostr) {
-        void window.nostr.getPublicKey().then((pk) => {
-          setOwnerPk(pk);
-          setSignWith("extension");
-        }).catch(() => localStorage.removeItem(LOGIN_STORE));
-      }
-    } catch {
-      localStorage.removeItem(LOGIN_STORE);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Look up the owner's kind 0 (avatar + name) once they log in.
-  useEffect(() => {
-    if (!ownerPk) {
-      setProfile({});
-      return;
-    }
-    let stale = false;
-    void fetchNostrProfile(ownerPk, defaultRelays).then((p) => {
-      if (!stale) setProfile(p);
-    });
-    return () => {
-      stale = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ownerPk]);
-
-  async function connectExtension() {
-    setLoginError("");
-    setLoggingIn(true);
-    try {
-      const pk = await window.nostr!.getPublicKey();
-      setOwnerPk(pk);
-      setSignWith("extension");
-      localStorage.setItem(LOGIN_STORE, JSON.stringify({ method: "extension" }));
-    } catch (e) {
-      setLoginError(String((e as Error).message));
-    } finally {
-      setLoggingIn(false);
-    }
-  }
-
-  function nsecKey(): Uint8Array | null {
-    try {
-      const decoded = nip19.decode(nsec.trim());
-      return decoded.type === "nsec" ? (decoded.data as Uint8Array) : null;
-    } catch {
-      return null;
-    }
-  }
-
-  function unlockNsec() {
-    setLoginError("");
-    const sk = nsecKey();
-    if (!sk) {
-      setLoginError("Enter a secret key starting with nsec1.");
-      return;
-    }
-    setOwnerPk(getPublicKey(sk));
-    setSignWith("nsec");
-    localStorage.setItem(LOGIN_STORE, JSON.stringify({ method: "nsec", nsec: nsec.trim() }));
-  }
-
-  function disconnect() {
-    setOwnerPk("");
-    setSignWith(null);
-    setNsec("");
-    localStorage.removeItem(LOGIN_STORE);
-  }
-
-  async function signTemplate(template: EventTemplate): Promise<NostrEvent> {
-    if (signWith === "extension") return window.nostr!.signEvent(template);
-    const sk = nsecKey();
-    if (!sk) throw new Error("your key is no longer available; unlock again");
-    return finalizeEvent(template, sk);
   }
 
   // ── Prepare → sign → confirm ───────────────────────────────────────────────
 
   async function startImport() {
-    if (!plan || !ownerPk) return;
+    if (!plan || !login.pk) return;
     setBusy(true);
     setError("");
     try {
@@ -208,16 +90,21 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
         {
           method: "POST",
           body: JSON.stringify({
-            ownerNpub: ownerPk,
+            ownerNpub: login.pk,
             relays: editRelays ? relayList : undefined,
-            channels: plan.channels.map((c) => ({ discordId: c.discordId, selected: c.selected, bridge: c.bridge })),
+            channels: plan.channels.map((c) => ({
+            discordId: c.discordId,
+            selected: c.selected,
+            bridge: c.bridge,
+            history: c.history,
+          })),
           }),
         },
       );
       const signedEvents: NostrEvent[] = [];
       for (let i = 0; i < prep.templates.length; i++) {
         setSigningStep(`signing as owner (${i + 1} / ${prep.templates.length})…`);
-        signedEvents.push(await signTemplate(prep.templates[i].template));
+        signedEvents.push(await login.signTemplate(prep.templates[i].template));
       }
       setSigningStep("");
       await api(`/api/imports/${importId}/confirm`, {
@@ -293,7 +180,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
   const bridgeCount = plan?.channels.filter((c) => c.selected && c.bridge).length ?? 0;
   const publishedCount = plan?.channels.filter((c) => c.selected && c.publishedAt).length ?? 0;
   const wiredCount = plan?.channels.filter((c) => c.bridgeId).length ?? 0;
-  const npub = ownerPk ? nip19.npubEncode(ownerPk) : "";
+  const npub = login.npub;
 
   return (
     <div>
@@ -352,75 +239,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
             Armada. Your key signs the founding events here in your browser and never
             reaches our server.
           </p>
-          {!ownerPk && (
-            <div className="login-card clip-corner-lg">
-              <div className="login-head">
-                <div className="login-glyph clip-corner-lg"><LogInGlyph /></div>
-                <h2 className="login-title">Log in with Nostr</h2>
-              </div>
-              <p className="login-note">
-                New here?{" "}
-                <a href="https://armada.buzz" target="_blank" rel="noreferrer">Create account</a>
-              </p>
-              {typeof window !== "undefined" && window.nostr && (
-                <>
-                  <button
-                    type="button"
-                    className="login-ext clip-corner-lg"
-                    disabled={loggingIn}
-                    onClick={() => void connectExtension()}
-                  >
-                    {loggingIn ? "Logging in..." : "Log in with Extension"}
-                  </button>
-                  <div className="login-or">
-                    <span className="line" />
-                    <span>or</span>
-                    <span className="line" />
-                  </div>
-                </>
-              )}
-              <form
-                className="login-form"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  unlockNsec();
-                }}
-              >
-                <input
-                  type="password"
-                  className={`login-input clip-corner-lg ${loginError ? "err" : ""}`}
-                  placeholder="nsec1…"
-                  autoComplete="off"
-                  value={nsec}
-                  onChange={(e) => {
-                    setNsec(e.target.value);
-                    if (loginError) setLoginError("");
-                  }}
-                />
-                {loginError && <p className="login-error">{loginError}</p>}
-                <button type="submit" className="login-submit clip-corner-lg" disabled={!nsec.trim() || loggingIn}>
-                  Log in
-                </button>
-              </form>
-            </div>
-          )}
-          {ownerPk && (
-            <div className="login-user clip-corner-lg">
-              {profile.picture ? (
-                <img className="login-avatar" src={profile.picture} alt="" referrerPolicy="no-referrer" />
-              ) : (
-                <div className="login-glyph clip-corner-lg"><LogInGlyph /></div>
-              )}
-              <div className="who">
-                <div className="name">
-                  {profile.name ?? "Logged in"}
-                  <span className="muted"> · {signWith === "extension" ? "extension" : "your key"}</span>
-                </div>
-                <div className="id">{npub}</div>
-              </div>
-              <button className="ghost" onClick={disconnect}>Log out</button>
-            </div>
-          )}
+          <NostrLogin login={login} />
 
           <h3>Channels</h3>
           {plan.channels.map((c) => (
@@ -444,8 +263,36 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
                   <span className="muted">bridge live</span>
                 </label>
               )}
+              {c.bridgeable && plan.historyAllowed && (
+                <label className="consent">
+                  <input
+                    type="checkbox"
+                    checked={c.history}
+                    disabled={!c.selected || !c.bridge}
+                    onChange={() => toggleChannel(c.discordId, "history")}
+                  />
+                  <span className="muted">history</span>
+                </label>
+              )}
             </div>
           ))}
+          {!plan.historyAllowed && (
+            <p className="muted">
+              Message history is not currently available for servers with more than 100
+              members{plan.memberCount ? ` (this server has ~${plan.memberCount})` : ""}.
+            </p>
+          )}
+          {plan.historyAllowed && (
+            <p className="muted">
+              History imports the newest 10,000 messages per channel with their original
+              times and authors.
+            </p>
+          )}
+          {plan.emojis.length > 0 && (
+            <p className="muted">
+              {plan.emojis.length} custom emoji will be published as an Armada emoji pack.
+            </p>
+          )}
 
           {plan.roles.length > 0 && (
             <>
@@ -530,7 +377,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
           </label>
           <div className="row" style={{ marginTop: "0.6rem" }}>
             <button
-              disabled={!consent || !ownerPk || selectedCount === 0 || relayList.length === 0 || busy}
+              disabled={!consent || !login.pk || selectedCount === 0 || relayList.length === 0 || busy}
               onClick={() => void startImport()}
             >
               {signingStep || "Import the server"}
@@ -566,6 +413,15 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
                 <td className="muted">bridges wired</td>
                 <td className="mono">{wiredCount} / {bridgeCount}</td>
               </tr>
+              {plan?.historyAllowed && plan.channels.some((c) => c.history) && (
+                <tr>
+                  <td className="muted">history messages</td>
+                  <td className="mono">
+                    {plan.channels.reduce((n, c) => n + (c.historyImported ?? 0), 0)}
+                    {status?.status === "history" ? " (importing…)" : ""}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
           {status?.status === "failed" && (
@@ -581,8 +437,12 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
         <div className="panel">
           <h2>{plan?.communityName} is live on Armada</h2>
           <p>
-            {publishedCount} channels created, {wiredCount} live bridges running, owned
-            by <span className="mono">{npub ? `${npub.slice(0, 16)}…` : "your key"}</span>.
+            {publishedCount} channels created, {wiredCount} live bridges running
+            {plan && plan.channels.some((c) => c.historyImported) && (
+              <>, {plan.channels.reduce((n, c) => n + (c.historyImported ?? 0), 0)} history messages imported</>
+            )}
+            {plan && plan.emojis.length > 0 && <>, {plan.emojis.length} custom emoji packed</>}
+            , owned by <span className="mono">{npub ? `${npub.slice(0, 16)}…` : "your key"}</span>.
             Your community should have opened in a new tab; if it did not:
           </p>
           {status?.inviteUrl && (

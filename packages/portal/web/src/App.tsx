@@ -2,12 +2,13 @@ import { useCallback, useEffect, useState } from "react";
 
 import { api } from "./api";
 import type { BridgeSummary, Me } from "./api";
+import { Claims } from "./Claims";
 import { ImportWizard } from "./ImportWizard";
 import { Wizard } from "./Wizard";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
-  const [view, setView] = useState<"dashboard" | "wizard" | "import">("dashboard");
+  const [view, setView] = useState<"dashboard" | "wizard" | "import" | "claims">("dashboard");
   const [wizardFrom, setWizardFrom] = useState<BridgeSummary | undefined>();
 
   const refresh = useCallback(() => {
@@ -41,6 +42,7 @@ export function App() {
         <Dashboard
           onNew={(from) => { setWizardFrom(from); setView("wizard"); }}
           onImport={() => setView("import")}
+          onClaim={() => setView("claims")}
         />
       )}
       {me?.user && view === "wizard" && (
@@ -58,6 +60,7 @@ export function App() {
           onCancel={() => setView("dashboard")}
         />
       )}
+      {me?.user && view === "claims" && <Claims onDone={() => setView("dashboard")} />}
       <Footer />
     </>
   );
@@ -277,7 +280,7 @@ function AvatarMireille({ id }: { id: string }) {
   );
 }
 
-function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () => void }) {
+function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () => void; onClaim: () => void }) {
   const [bridges, setBridges] = useState<BridgeSummary[] | null>(null);
   const [error, setError] = useState("");
 
@@ -303,6 +306,7 @@ function Dashboard(props: { onNew: (from?: BridgeSummary) => void; onImport: () 
       <div className="row" style={{ justifyContent: "space-between" }}>
         <h2>Your bridges</h2>
         <div className="row">
+          <button className="ghost" onClick={props.onClaim}>Claim your history</button>
           <button className="ghost" onClick={props.onImport}>Import a server</button>
           <button onClick={() => props.onNew()}>Create a bridge</button>
         </div>

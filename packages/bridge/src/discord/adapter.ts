@@ -128,7 +128,7 @@ export class DiscordAdapter implements WebhookSender {
             messageId: full.message.id,
             channelId: full.message.channelId,
             guildId: full.message.guildId ?? "",
-            emoji: { name: full.emoji.name, id: full.emoji.id },
+            emoji: { name: full.emoji.name, id: full.emoji.id, animated: full.emoji.animated ?? false },
             user: {
               id: fullUser.id,
               display: fullUser.displayName ?? fullUser.username,
@@ -263,8 +263,10 @@ export class DiscordAdapter implements WebhookSender {
     await message.react(emoji);
   }
 
-  /** WebhookSender: remove the bot's own reaction. */
+  /** WebhookSender: remove the bot's own reaction (custom emoji resolve by id). */
   async unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
+    const custom = /^.+:(\d+)$/.exec(emoji);
+    if (custom) emoji = custom[1];
     const channel = await this.textChannel(link.discordChannelId);
     const message = await channel.messages.fetch(discordMessageId);
     const botId = this.client.user?.id;

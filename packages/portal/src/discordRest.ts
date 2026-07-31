@@ -36,7 +36,7 @@ export function oauthUrl(clientId: string, redirectUri: string, state: string): 
     client_id: clientId,
     redirect_uri: redirectUri,
     response_type: "code",
-    scope: "identify guilds",
+    scope: "identify guilds guilds.members.read",
     state,
   });
   return `${API}/oauth2/authorize?${q}`;
@@ -82,6 +82,10 @@ async function userGet<T>(accessToken: string, path: string): Promise<T> {
 
 export const fetchMe = (token: string) => userGet<DiscordUser>(token, "/users/@me");
 export const fetchMyGuilds = (token: string) => userGet<OAuthGuild[]>(token, "/users/@me/guilds");
+
+/** The user's own member object in one guild (roles + nick); needs guilds.members.read. */
+export const fetchMyGuildMember = (token: string, guildId: string) =>
+  userGet<{ roles: string[]; nick?: string | null }>(token, `/users/@me/guilds/${guildId}/member`);
 
 async function botGet<T>(botToken: string, path: string): Promise<T | undefined> {
   const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bot ${botToken}` } });
@@ -140,6 +144,14 @@ export interface SnapshotRole {
   tags?: Record<string, unknown>;
 }
 
+export interface SnapshotEmoji {
+  id: string;
+  name: string;
+  animated?: boolean;
+  managed?: boolean;
+  available?: boolean;
+}
+
 export interface SnapshotGuild {
   id: string;
   name: string;
@@ -148,7 +160,9 @@ export interface SnapshotGuild {
   banner?: string | null;
   splash?: string | null;
   owner_id?: string;
+  approximate_member_count?: number;
   roles: SnapshotRole[];
+  emojis?: SnapshotEmoji[];
 }
 
 export interface GuildSnapshot {
@@ -159,15 +173,53 @@ export interface GuildSnapshot {
 /**
  * Read a guild's full structure (settings, roles, channels with overwrites)
  * with the bot token. Undefined when the bot is not installed in the guild.
- * Two REST calls; roles arrive inline on the guild object.
+ * Two REST calls; roles, emojis, and member counts arrive inline.
  */
 export async function botGuildSnapshot(
   botToken: string,
   guildId: string,
 ): Promise<GuildSnapshot | undefined> {
-  const guild = await botGet<SnapshotGuild>(botToken, `/guilds/${guildId}`);
+  const guild = await botGet<SnapshotGuild>(botToken, `/guilds/${guildId}?with_counts=true`);
   if (!guild) return undefined;
   const channels = await botGet<SnapshotChannel[]>(botToken, `/guilds/${guildId}/channels`);
   if (!channels) return undefined;
   return { guild, channels };
+}
+
+// ── Message history (server import backfill) ─────────────────────────────────
+
+export interface RestMessage {
+  id: string;
+  /** 0 = DEFAULT, 19 = REPLY; everything else is a system message. */
+  type: number;
+  content: string;
+  timestamp: string;
+  author: { id: string; username: string; global_name?: string | null; avatar?: string | null; bot?: boolean };
+  attachments?: Array<{ url: string; filename: string }>;
+  embeds?: Array<{
+    url?: string;
+    video?: { url?: string };
+    image?: { url?: string };
+    thumbnail?: { url?: string };
+  }>;
+  mentions?: Array<{ id: string; username: string; global_name?: string | null }>;
+  message_reference?: { message_id?: string };
+  webhook_id?: string;
+  application_id?: string | null;
+}
+
+/**
+ * One page of channel history, NEWEST first, strictly before `beforeId`
+ * (omit for the newest page). Empty array when the channel has no more;
+ * undefined when the bot cannot read the channel.
+ */
+export async function botChannelMessagesBefore(
+  botToken: string,
+  channelId: string,
+  beforeId?: string,
+  limit = 100,
+): Promise<RestMessage[] | undefined> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (beforeId) q.set("before", beforeId);
+  return botGet<RestMessage[]>(botToken, `/channels/${channelId}/messages?${q}`);
 }

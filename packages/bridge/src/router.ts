@@ -42,6 +42,11 @@ export interface DiscordInboundMessage extends DiscordMessageContent {
   applicationId?: string;
   /** message_reference: the Discord message this one replies to. */
   referencedMessageId?: string;
+  /**
+   * Original send time (epoch ms). Live gateway traffic omits it (now);
+   * history backfill sets it so the rumor carries the historical timestamp.
+   */
+  timestampMs?: number;
 }
 
 export interface DiscordMessageDelete {
@@ -55,7 +60,7 @@ export interface DiscordReactionAdd {
   channelId: string;
   guildId: string;
   /** Unicode emoji have only a name; custom emoji carry an id. */
-  emoji: { name: string | null; id: string | null };
+  emoji: { name: string | null; id: string | null; animated?: boolean };
   user: { id: string; display: string; avatarUrl?: string; bot: boolean };
 }
 
@@ -149,6 +154,41 @@ export function reactionEmoji(content: string): string | undefined {
   if (/^:.+:$/.test(c)) return undefined;
   if (/\p{Extended_Pictographic}/u.test(c)) return c;
   return undefined;
+}
+
+/** Stable, public CDN URL for a Discord custom emoji. */
+export function discordEmojiUrl(id: string, animated: boolean): string {
+  return `https://cdn.discordapp.com/emojis/${id}.${animated ? "gif" : "png"}`;
+}
+
+/**
+ * Custom emoji in raw Discord content (`<:name:id>` / `<a:name:id>`) ->
+ * NIP-30 `["emoji", shortcode, url]` tags, one per distinct shortcode. The
+ * transform flattens the markup to `:name:`; these tags let Armada render
+ * the image (the client reads a message's own emoji tags first).
+ */
+export function customEmojiTags(content: string): string[][] {
+  const tags: string[][] = [];
+  const seen = new Set<string>();
+  for (const match of content.matchAll(/<(a?):(\w+):(\d+)>/g)) {
+    const [, animated, name, id] = match;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    tags.push(["emoji", name, discordEmojiUrl(id, animated === "a")]);
+  }
+  return tags;
+}
+
+/**
+ * An Armada custom-emoji reaction whose image lives on Discord's emoji CDN
+ * maps back to the native emoji (`name:id`, reactable by the bot). Foreign
+ * custom emoji have no Discord equivalent and stay Armada-side.
+ */
+export function concordCustomEmojiToDiscord(tags: string[][]): string | undefined {
+  const tag = tags.find((t) => t[0] === "emoji" && t[1] && t[2]);
+  if (!tag) return undefined;
+  const match = /cdn\.discordapp\.com\/emojis\/(\d+)\./.exec(tag[2]);
+  return match ? `${tag[1]}:${match[1]}` : undefined;
 }
 
 export interface ProfileResolver {
@@ -253,7 +293,7 @@ export class BridgeRouter {
     const puppet = this.puppets.get(msg.author.id);
     const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
 
-    const tags = [proxyTag(msg.guildId, msg.channelId, msg.id)];
+    const tags = [proxyTag(msg.guildId, msg.channelId, msg.id), ...customEmojiTags(msg.content)];
     let source = await upgradeGifEmbed(msg);
     source = await this.transcodedGifFallback(source, identity);
     const attachments = await this.rehostAttachments(source, identity, tags);
@@ -278,6 +318,7 @@ export class BridgeRouter {
       content,
       author: identity,
       tags,
+      ms: msg.timestampMs,
     });
 
     await this.store.insert({
@@ -399,13 +440,19 @@ export class BridgeRouter {
     return rumor.id;
   }
 
-  /** Discord MESSAGE_REACTION_ADD -> kind 7 from the reactor's puppet. */
+  /**
+   * Discord MESSAGE_REACTION_ADD -> kind 7 from the reactor's puppet.
+   * Custom guild emoji carry NIP-30: content `:name:` + an `emoji` tag with
+   * the stable CDN image, self-contained for any Armada reader.
+   */
   async onDiscordReaction(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
-    // Custom Discord emoji have an id and no unicode form; skip until NIP-30
-    // emoji tags are carried (NEXT-STEPS section 1).
-    if (reaction.emoji.id || !reaction.emoji.name) return undefined;
+    if (!reaction.emoji.name) return undefined;
+    const custom = reaction.emoji.id !== null;
+    const content = custom ? `:${reaction.emoji.name}:` : reaction.emoji.name;
+    // Mapping key: unicode as-is; custom as name:id (what the bot reacts with).
+    const emojiKey = custom ? `${reaction.emoji.name}:${reaction.emoji.id}` : reaction.emoji.name;
 
     const [row] = await this.store.byDiscordId(reaction.messageId);
     if (!row) return undefined;
@@ -418,20 +465,24 @@ export class BridgeRouter {
       console.warn(`bridge: puppet profile publish failed for ${reaction.user.id}`, error),
     );
 
+    const tags = [
+      ["e", row.concordRumorId],
+      ["k", String(KIND_MESSAGE)],
+      proxyTag(reaction.guildId, reaction.channelId, reaction.messageId),
+    ];
+    if (custom) {
+      tags.push(["emoji", reaction.emoji.name, discordEmojiUrl(reaction.emoji.id!, reaction.emoji.animated === true)]);
+    }
     const { rumor } = await this.client.sendChat(channel, {
       kind: KIND_REACTION,
-      content: reaction.emoji.name,
+      content,
       author: identity,
-      tags: [
-        ["e", row.concordRumorId],
-        ["k", String(KIND_MESSAGE)],
-        proxyTag(reaction.guildId, reaction.channelId, reaction.messageId),
-      ],
+      tags,
     });
     await this.store.insertReaction({
       rumorId: rumor.id,
       discordMessageId: reaction.messageId,
-      emoji: reaction.emoji.name,
+      emoji: emojiKey,
       origin: "discord",
       authorRef: reaction.user.id,
     });
@@ -445,9 +496,10 @@ export class BridgeRouter {
   async onDiscordReactionRemove(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
-    if (reaction.emoji.id || !reaction.emoji.name) return undefined;
+    if (!reaction.emoji.name) return undefined;
+    const emojiKey = reaction.emoji.id ? `${reaction.emoji.name}:${reaction.emoji.id}` : reaction.emoji.name;
 
-    const row = await this.store.reactionByDiscord(reaction.messageId, reaction.user.id, reaction.emoji.name);
+    const row = await this.store.reactionByDiscord(reaction.messageId, reaction.user.id, emojiKey);
     if (!row || row.origin !== "discord") return undefined;
     const channel = this.client.channel(link.concordChannelIdHex);
     if (!channel) return undefined;
@@ -510,7 +562,9 @@ export class BridgeRouter {
     if (await this.store.reactionByRumorId(chat.rumorId)) return; // relay echo
     const target = chat.tags.find((t) => t[0] === "e" && t[1])?.[1];
     if (!target) return;
-    const emoji = reactionEmoji(chat.content);
+    // Unicode maps directly; an Armada custom emoji maps back only when its
+    // image is a Discord CDN emoji (i.e. originally bridged from Discord).
+    const emoji = reactionEmoji(chat.content) ?? concordCustomEmojiToDiscord(chat.tags);
     if (!emoji) return;
     const rows = await this.store.byRumorId(target);
     const row = rows.find((r) => r.partIndex === 0) ?? rows[0];
