@@ -75,7 +75,8 @@ export function circadian(now = new Date()): number {
 const SYSTEM = `You ghost-write single chat messages for fictional personas seeding a Discord-style community app.
 Output ONLY the message text: no surrounding quotes, no name prefix, no explanation.
 Match the persona's typing style exactly (capitalization, punctuation, emoji habits, typical length). Most messages are one or two short casual sentences.
-Never use hashtags, never sound like marketing, never mention AI or being generated.`;
+Never use hashtags, never sound like marketing, never mention AI or being generated.
+Never use em dashes; casual chat uses commas, periods, or just runs on.`;
 
 function personaBlock(p: Persona): string {
   return `PERSONA @${p.handle}\nbio: ${p.about}\nvoice: ${p.voice}\ninterests: ${p.interests.join(", ")}`;
