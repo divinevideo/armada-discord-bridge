@@ -171,11 +171,20 @@ async function actReddit(ctx: Ctx): Promise<boolean> {
   const post = pick(candidates);
   const persona = choosePersona(ctx);
   const inChannel = ctx.recent.filter((c) => c.channelIdHex === channel.idHex);
+  // Reddit is the idea source, never the destination: memes and external
+  // links are shared directly, discussions become topics raised in the
+  // persona's own words. No reddit.com URL and no "saw this on reddit".
+  const task =
+    post.kind === "image"
+      ? `TASK: You want to drop a meme/photo in #${channel.name} (elsewhere it was titled "${post.title}"). Write the short caption you'd post above it. Don't say where you found it, don't include any URL; the image link is appended automatically.`
+      : post.kind === "link"
+        ? `TASK: Share a link you ran across: "${post.title}". Write a short comment in your own voice on why it's worth a look. Don't say where you found it, don't include any URL; it is appended automatically.`
+        : `TASK: People online are talking about this right now: "${post.title}"${post.blurb ? ` (gist: ${post.blurb})` : ""}. Bring it up in #${channel.name} as your OWN thought or question, in your own words. Don't mention reddit or any website, no links.`;
   const text = await generate(
     SYSTEM,
-    `${personaBlock(persona)}\n\nCOMMUNITY channel: #${channel.name}\n${contextBlock(inChannel, pkToHandleMap(ctx))}\n\nTASK: You found this on reddit r/${post.sub}: "${post.title}" (${post.kind} post). Share it in #${channel.name} with a short comment in your own voice. Do NOT include any URL; it is appended automatically.${avoidBlock(ctx.state, ctx.cfg.key)}`,
+    `${personaBlock(persona)}\n\nCOMMUNITY channel: #${channel.name}\n${contextBlock(inChannel, pkToHandleMap(ctx))}\n\n${task}${avoidBlock(ctx.state, ctx.cfg.key)}`,
   );
-  const content = `${trunc(text, 400)}\n${post.shareUrl}`;
+  const content = post.shareUrl ? `${trunc(text, 400)}\n${post.shareUrl}` : trunc(text, 400);
   const sent = await publish(ctx, channel, persona, KIND_MESSAGE, content, []);
   ctx.state.seenReddit.push(`${post.sub}/${post.id}`);
   noteSent(ctx, channel, persona, text);
@@ -296,8 +305,12 @@ async function actOnce(cfg: CommunityLiveness, master: string, state: LivenessSt
 
     const ctx: Ctx = { cfg, client, channelsByName, members, ids, pkToPersona, recent, state, dry };
     const roll = Math.random();
-    const order =
-      roll < 0.3
+    const forced = { reddit: actReddit, reply: actReply, chatter: actChatter, reaction: actReaction }[
+      process.env.LIVENESS_ACTION?.trim() ?? ""
+    ];
+    const order = forced
+      ? [forced, actChatter]
+      : roll < 0.3
         ? [actReddit, actChatter]
         : roll < 0.7
           ? [actReply, actChatter]

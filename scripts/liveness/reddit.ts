@@ -9,9 +9,16 @@
 export interface RedditPost {
   id: string;
   title: string;
-  /** What actually gets appended to the message for clients to embed. */
+  /**
+   * What actually gets appended to the message for clients to embed: a direct
+   * image (meme/photo) or the EXTERNAL article/video URL. Empty for "topic"
+   * posts — reddit discussions are inspiration for a conversation, and a
+   * reddit.com link is never posted.
+   */
   shareUrl: string;
-  kind: "image" | "link" | "self";
+  kind: "image" | "link" | "topic";
+  /** For topic posts: a plain-text snippet of the discussion body. */
+  blurb?: string;
   /** Inverse hot-rank (higher = hotter); feeds carry no vote counts. */
   score: number;
   sub: string;
@@ -69,19 +76,29 @@ export async function fetchHot(sub: string, limit = 25): Promise<RedditPost[]> {
     const url = target ? unescapeXml(target) : permalink;
     let kind: RedditPost["kind"];
     let shareUrl: string;
+    let blurb: string | undefined;
     if (IMAGE_HOSTS.some((h) => url.includes(`://${h}/`))) {
       kind = "image";
       shareUrl = url;
-    } else if (url.includes("www.reddit.com/r/")) {
-      kind = "self";
-      shareUrl = permalink;
+    } else if (url.includes("reddit.com/")) {
+      kind = "topic";
+      shareUrl = "";
+      const rawContent = /<content[^>]*>([\s\S]*?)<\/content>/.exec(entry)?.[1];
+      if (rawContent) {
+        blurb = unescapeXml(unescapeXml(rawContent))
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\[link\]|\[comments\]|submitted by\s+\/u\/\S+/g, " ")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 300);
+      }
     } else if (url.startsWith("http") && !url.includes("v.redd.it")) {
       kind = "link";
       shareUrl = url;
     } else {
       continue;
     }
-    posts.push({ id, title, shareUrl, kind, score: entries.length - i, sub });
+    posts.push({ id, title, shareUrl, kind, blurb, score: entries.length - i, sub });
   }
   return posts;
 }
