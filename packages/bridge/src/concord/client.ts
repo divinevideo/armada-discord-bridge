@@ -336,15 +336,19 @@ export class ConcordClient {
     channel: ChannelV2,
     sinceSec: number,
     limit = 500,
+    opts?: { signal?: AbortSignal },
   ): Promise<{ chats: OpenedChat[]; newestWrapAt?: number }> {
-    const wraps = await this.pool.query([
-      {
-        kinds: [KIND_WRAP],
-        authors: channel.streams.map((s) => s.group.pk),
-        since: sinceSec,
-        limit,
-      },
-    ]);
+    const wraps = await this.pool.query(
+      [
+        {
+          kinds: [KIND_WRAP],
+          authors: channel.streams.map((s) => s.group.pk),
+          since: sinceSec,
+          limit,
+        },
+      ],
+      opts,
+    );
     const chats = await openChatBatch(wraps, channel);
     chats.sort((a, b) => a.ms - b.ms);
     const newestWrapAt = wraps.reduce<number | undefined>(
