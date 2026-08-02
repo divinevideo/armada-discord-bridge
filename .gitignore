@@ -4,3 +4,4 @@ dist/
 .env
 .env.*
 *.log
+scripts/liveness/state.json
