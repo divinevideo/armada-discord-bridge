@@ -35,5 +35,15 @@ export async function generate(system: string, user: string): Promise<string> {
     .trim();
   if (!text) throw new Error("llm: empty response");
   // Strip wrapping quotes / a leading "handle:" a model sometimes adds.
-  return text.replace(/^["“](.*)["”]$/s, "$1").replace(/^@?[\w-]{2,20}:\s+/, "").trim();
+  // Em/en dashes are enforced away in code — the prompt bans them but the
+  // model ignores that often enough. Digit ranges keep a plain hyphen;
+  // everything else becomes a comma, which is how casual chat actually reads.
+  return text
+    .replace(/^["“](.*)["”]$/s, "$1")
+    .replace(/^@?[\w-]{2,20}:\s+/, "")
+    .replace(/(\d)\s*[—–]\s*(\d)/g, "$1-$2")
+    .replace(/\s*[—–]+\s*/g, ", ")
+    .replace(/,\s*,/g, ",")
+    .replace(/^,\s*/, "")
+    .trim();
 }
