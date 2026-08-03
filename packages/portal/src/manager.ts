@@ -13,12 +13,14 @@ import { randomBytes } from "node:crypto";
 import {
   Permissions,
   STOCK_RELAYS,
+  inviteDeliveryRelays,
   isAuthorized,
   parseInviteLink,
 } from "@armada-bridge/concord-core";
 import type { ChannelV2, OpenedChat } from "@armada-bridge/concord-core";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/client";
+import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyIntake";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
@@ -268,7 +270,16 @@ export class BridgeManager {
     const pool = new RelayPool(community.relays);
     const primarySkHex = unseal(this.env.sealKeyHex, row.primary_sk_sealed);
     const primary = localIdentity(Uint8Array.from(Buffer.from(primarySkHex, "hex")));
-    const client = new ConcordClient(community, pool, primary);
+
+    // Private-channel keys granted to THIS bridge's npub since it was linked,
+    // delivered as Direct Invites (see keyIntake.ts). Runs before the fold so
+    // a gated channel is present in `client.channels()` on the first pass.
+    const floor = new RelayPool(inviteDeliveryRelays([]));
+    const intake = await intakeDirectInviteKeys([pool, floor], primary, community).finally(
+      () => void floor.close(),
+    );
+
+    const client = new ConcordClient(intake.community, pool, primary);
     await client.syncControl();
 
     const channel = row.concord_channel_id ? client.channel(row.concord_channel_id) : undefined;
@@ -290,6 +301,9 @@ export class BridgeManager {
         discord_guild_name = ${guildName ?? null}
       WHERE bridge_id = ${row.bridge_id}`;
     await client.publishJoin().catch(() => {});
+    // Our giftwrap inbox, so the next key handoff is delivered to the relays
+    // we actually watch rather than the stock interop floor.
+    await client.publishDmRelays(primary, community.relays).catch(() => {});
     await client
       .publishProfile(primary, {
         name: "Discord <-> Armada Bridge Bot",

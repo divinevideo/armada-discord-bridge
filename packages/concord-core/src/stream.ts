@@ -213,7 +213,10 @@ export function resolveMs(createdAtSecs: number, tags: string[][]): number {
 /**
  * Open and fully verify one stream wrap under its plane's group key:
  *
- *   1. the wrap's author must be the stream address (else it isn't ours);
+  *   1. the wrap's author must be the stream address (else it isn't ours);
+ *      the wrap's OWN signature is never checked — it is made by a throwaway
+ *      ephemeral key and proves nothing, which is why this takes a rumor and
+ *      not a signed event;
  *   2. decrypt the wrap → the seal; verify the seal's Schnorr signature
  *      (authorship proof) and that its kind declares a known seal form;
  *   3. recover the rumor (decrypting again for 20013); verify the rumor's id
@@ -221,7 +224,7 @@ export function resolveMs(createdAtSecs: number, tags: string[][]): number {
  *      claimed one) and that the rumor's pubkey equals the seal's signer (or a
  *      keyholder could re-seal another member's rumor under their own name).
  */
-export function openWrap(wrap: NostrEvent, stream: GroupKey): OpenedEvent {
+export function openWrap(wrap: Rumor, stream: GroupKey): OpenedEvent {
   if (wrap.kind !== KIND_WRAP && wrap.kind !== KIND_WRAP_EPHEMERAL) {
     throw new StreamError("bad-wrap-kind", `not a stream wrap: kind ${wrap.kind}`);
   }

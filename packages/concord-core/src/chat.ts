@@ -12,12 +12,15 @@
  * store costs near-nothing after the first pass.
  */
 
-import type { NostrEvent } from "nostr-tools/pure";
 
-import { KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_ONCHAIN_ZAP, KIND_REACTION, KIND_SEAL_ENCRYPTED, KIND_ZAP } from "./kinds";
+
+import { KIND_CALENDAR_DATE, KIND_CALENDAR_RSVP, KIND_CALENDAR_TIME, KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_ONCHAIN_ZAP, KIND_POLL, KIND_POLL_VOTE, KIND_REACTION, KIND_SEAL_ENCRYPTED, KIND_ZAP } from "./kinds";
 import { reactionContentKey } from "./vendor/reactions";
+import type { RsvpVote } from "./vendor/calendar";
+import type { PollVote } from "./vendor/polls";
 import { verifyOnchainZapRumor, verifyZapRumor, type ZapEntry } from "./vendor/zaps";
-import { checkChannelBinding, openWrap, type OpenedEvent } from "./stream";
+import { citationFromTags, type AuthorityCitation } from "./edition";
+import { checkChannelBinding, openWrap, type OpenedEvent, type Rumor } from "./stream";
 import type { ChannelV2 } from "./types";
 
 /** An opened chat event with its verified channel/epoch coordinate. */
@@ -40,7 +43,7 @@ export function forgetChatSkips(): void {
   skippedNoKey.clear();
 }
 
-function openOne(wrap: NostrEvent, channel: ChannelV2): OpenedChat | null {
+function openOne(wrap: Rumor, channel: ChannelV2): OpenedChat | null {
   const memoKey = `${wrap.id}|${channel.idHex}`;
   const cached = decodeMemo.get(memoKey);
   if (cached !== undefined) return cached;
@@ -58,12 +61,41 @@ function openOne(wrap: NostrEvent, channel: ChannelV2): OpenedChat | null {
     // the message a standalone signed artifact any relay could display.
     if (ev.sealKind !== KIND_SEAL_ENCRYPTED) throw new Error("chat seal must be encrypted");
     checkChannelBinding(ev, channel.idHex, stream.epoch);
+    // A retired epoch is sealed history, not a live channel: the superseding
+    // rotation's publish time is a hard cutoff, and anything sealed under the
+    // old key but dated after it is refused. Key possession alone must not
+    // keep an ejected member writing into epochs the community rotated away
+    // from — the roster/banlist can't drop what it can't attribute in time.
+    if (stream.retiredAt !== undefined && ev.createdAt > stream.retiredAt) {
+      throw new Error("sealed under a retired epoch after its rotation");
+    }
     opened = { ...ev, channelIdHex: channel.idHex, epoch: stream.epoch };
   } catch {
     opened = null;
   }
   decodeMemo.set(memoKey, opened);
   return opened;
+}
+
+/**
+ * Drop stored events that violate their epoch's retirement cutoff. The decode
+ * path ({@link openOne}) refuses these at ingest, but rows written before the
+ * rotation was adopted locally (or by a client that predates cutoffs) are
+ * already in the store — the read side applies the same rule so a retired
+ * epoch is history everywhere, not just for freshly-arriving wraps.
+ */
+export function filterEpochCutoff(events: OpenedChat[], channel: ChannelV2): OpenedChat[] {
+  let cutoffs: Map<string, number> | undefined;
+  for (const s of channel.streams) {
+    if (s.retiredAt === undefined) continue;
+    (cutoffs ??= new Map()).set(s.epoch.toString(), s.retiredAt);
+  }
+  if (!cutoffs) return events;
+  const caps = cutoffs;
+  return events.filter((ev) => {
+    const cap = caps.get(ev.epoch.toString());
+    return cap === undefined || ev.createdAt <= cap;
+  });
 }
 
 /** Max unbroken main-thread time (ms) to spend decoding before yielding.
@@ -83,15 +115,24 @@ const DECODE_SLICE_MS = 5;
  * silent, as in Vector's read path.
  */
 export async function openChatBatch(
-  wraps: NostrEvent[],
+  wraps: Rumor[],
   channel: ChannelV2,
   opts?: { signal?: AbortSignal },
 ): Promise<OpenedChat[]> {
   const out: OpenedChat[] = [];
   let sliceStart = performance.now();
+  // Crypto time only — the yields between slices are deliberately NOT counted,
+  // so this reads as "main thread spent decrypting" rather than wall clock. Both
+  // numbers matter and they are very different: `setTimeout(0)` is clamped to
+  // ~4ms once nesting passes 5, so a thousand wraps at a 5ms slice adds seconds
+  // of wall clock the CPU total will not show. Compare against the wall-clock
+  // mark the caller records.
+  let cryptoMs = 0;
   for (let i = 0; i < wraps.length; i++) {
     if (opts?.signal?.aborted) break;
+    const openStart = performance.now();
     const opened = openOne(wraps[i], channel);
+    cryptoMs += performance.now() - openStart;
     if (opened) out.push(opened);
     // Yield once this slice has run long enough (and more work remains), so the
     // main thread stays responsive during a large backfill decode.
@@ -160,10 +201,28 @@ export function eTargetOf(ev: { tags: string[][] }): string | undefined {
 
 /** Moderation context the read path applies while folding. */
 export interface ChatModeration {
-  /** Banned author pubkeys — every event from them is dropped (CORD-04 §4). */
+  /**
+   * Banned author pubkeys — every event from them is dropped (CORD-04 §4).
+   *
+   * This is the ONLY author-identity drop an honest client performs. Nothing
+   * here filters on epoch: a retired epoch's key is held by everyone who ever
+   * had it, but CORD-02 §5 makes an author seen publishing *observably
+   * present* and a self-signed Join unsuppressable, and CORD-04 §6 makes the
+   * Banlist (plus its Refounding) the removal that enforces. An allow-list
+   * gate over retired-epoch history would invert both — and would hide real
+   * history from exactly the clients whose local anchors are thinnest.
+   */
   banned: Set<string>;
-  /** Whether `deleter` may delete a message by `author` (MANAGE_MESSAGES). */
-  canDelete: (deleter: string, author: string) => boolean;
+  /**
+   * Whether `deleter` may delete a message by `author` (MANAGE_MESSAGES).
+   *
+   * `citation` is the delete rumor's `vac` (CORD-04 §5) — the Grant the deleter
+   * claims their rank under. A non-owner moderation delete without a resolvable
+   * one PARKS: the permission check alone would honor an actor whose demotion
+   * this client has not synced yet. A self-delete is not an authority action and
+   * never carries one.
+   */
+  canDelete: (deleter: string, author: string, action?: { citation?: AuthorityCitation; ms: number }) => boolean;
 }
 
 /** A tallied reaction: reactors (pubkey→rumorId) plus the NIP-30 custom-emoji URL (if any). */
@@ -179,6 +238,12 @@ export interface FoldedTimeline {
   reactions: Map<string, Map<string, ReactionEntry>>;
   /** target rumor id → VERIFIED zaps (CORD.md §4; unverified never enter). */
   zaps: Map<string, ZapEntry[]>;
+  /** poll rumor id → its raw votes (tallied per poll by the transport). */
+  pollVotes: Map<string, PollVote[]>;
+  /** Surviving calendar events (kinds 31922/31923); NOT timeline messages. */
+  calendarEvents: OpenedChat[];
+  /** event rumor id → its raw RSVPs (tallied per event by the transport). */
+  rsvps: Map<string, RsvpVote[]>;
 }
 
 /**
@@ -229,12 +294,26 @@ export function markReactionDeleted(rumorId: string): void {
  */
 export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration): FoldedTimeline {
   const byId = new Map<string, OpenedChat>();
-  const deletes = new Map<string, Set<string>>();
+  // target rumor id → (deleter → their citation + the delete's own ms). Both
+  // have to survive the fold: collapsing to a bare author set is what made the
+  // authority check permission-only, and the ms is what lets the check tell a
+  // pre-flag-day delete (honored uncited) from a fresh one, and a delete that
+  // predates a tombstone from one published after it.
+  const deletes = new Map<string, Map<string, { citation?: AuthorityCitation; ms: number }>>();
   // ALL edits per target (author validity is judged against the message in the
   // apply phase — otherwise a non-author's later "edit" would suppress the
   // author's legitimate one).
   const edits = new Map<string, Array<{ author: string; content: string; ms: number }>>();
   const reactions = new Map<string, Map<string, ReactionEntry>>();
+  // Raw votes bucketed by their poll's rumor id. Left untallied here (the
+  // transport folds them against each poll's declared options + endsAt), and
+  // kept even when the poll itself isn't in this window — an orphan vote resolves
+  // automatically once its poll decodes and the next fold re-runs.
+  const pollVotes = new Map<string, PollVote[]>();
+  // Calendar events (kinds 31922/31923), addressably folded downstream, and
+  // their RSVPs bucketed by the event rumor id they `e`-reference.
+  const calendarById = new Map<string, OpenedChat>();
+  const rsvps = new Map<string, RsvpVote[]>();
   // Verified zap candidates, deduped by payment hash (Lightning) or txid
   // (on-chain) after the loop: an announced proof or txid is visible to every
   // member, so without this anyone could replay someone else's and inflate
@@ -250,8 +329,11 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
         if (t[0] !== "e" || !t[1]) continue;
         const target = t[1];
         let authors = deletes.get(target);
-        if (!authors) deletes.set(target, (authors = new Set()));
-        authors.add(ev.author);
+        if (!authors) deletes.set(target, (authors = new Map()));
+        // Prefer a cited delete when the same actor published both — an uncited
+        // duplicate must never mask the one that carries authority.
+        const cite = citationFromTags(ev.tags);
+        if (cite || !authors.has(ev.author)) authors.set(ev.author, { citation: cite, ms: ev.ms });
         // Track deleted reaction rumor ids across fold invocations so a
         // relay-echoed reaction (re-added to the store in a later write
         // batch) stays removed. The `k` tag identifies the target kind.
@@ -338,9 +420,41 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
       });
       continue;
     }
-    if (ev.kind === KIND_MESSAGE || ev.kind === KIND_COMMENT) {
-      // kind-9 top-level messages and kind-1111 threaded replies both land in
-      // the timeline pool; the reader splits them by their NIP-22 root pointer.
+    if (ev.kind === KIND_POLL_VOTE) {
+      // A vote is an `e`-referencing side event (like a reaction): bucket it
+      // under its poll, latest-per-pubkey resolved by the tally downstream.
+      const target = eTargetOf(ev);
+      if (!target) continue;
+      const optionIds = ev.tags.filter(([n, v]) => n === "response" && v).map(([, v]) => v);
+      if (optionIds.length === 0) continue;
+      let list = pollVotes.get(target);
+      if (!list) pollVotes.set(target, (list = []));
+      list.push({ pubkey: ev.author, optionIds, ms: ev.ms });
+      continue;
+    }
+    if (ev.kind === KIND_CALENDAR_RSVP) {
+      // An RSVP `e`-references its event's rumor id (v2 has no `a`-coordinate);
+      // bucket it like a poll vote, latest-per-pubkey resolved by the tally.
+      const target = eTargetOf(ev);
+      if (!target) continue;
+      const status = ev.tags.find((t) => t[0] === "status")?.[1];
+      if (status !== "accepted" && status !== "declined" && status !== "tentative") continue;
+      let list = rsvps.get(target);
+      if (!list) rsvps.set(target, (list = []));
+      list.push({ pubkey: ev.author, status, ms: ev.ms });
+      continue;
+    }
+    if (ev.kind === KIND_CALENDAR_DATE || ev.kind === KIND_CALENDAR_TIME) {
+      // A calendar event is NOT a timeline message — it surfaces in the events
+      // bar. Deletes/moderation are applied below, then parsing + addressable
+      // dedup happen in the transport (shared with the NIP-29 path).
+      calendarById.set(ev.rumorId, ev);
+      continue;
+    }
+    if (ev.kind === KIND_MESSAGE || ev.kind === KIND_COMMENT || ev.kind === KIND_POLL) {
+      // kind-9 top-level messages, kind-1111 threaded replies, and kind-1068
+      // polls all land in the timeline pool; the reader splits them by their
+      // NIP-22 root pointer (a poll has none, so it's always top-level).
       byId.set(ev.rumorId, ev);
     }
   }
@@ -354,7 +468,11 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
       if (e.author !== msg.author) continue;
       if (!best || e.ms > best.ms) best = e;
     }
-    if (best) byId.set(id, { ...msg, content: best.content });
+    if (best) {
+      const tags = msg.tags.filter(([name]) => name !== "edited");
+      tags.push(["edited", String(Math.floor(best.ms / 1000))]);
+      byId.set(id, { ...msg, content: best.content, tags });
+    }
   }
 
   // In-batch deletes: self-delete, or an authorized moderator delete.
@@ -363,8 +481,20 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
     if (!deleters) continue;
     const deleted =
       deleters.has(msg.author) ||
-      (moderation && [...deleters].some((d) => moderation.canDelete(d, msg.author)));
+      (moderation && [...deleters].some(([d, act]) => moderation.canDelete(d, msg.author, act)));
     if (deleted) byId.delete(id);
+  }
+
+  // Calendar deletes: same authorization as messages (self, or a moderator with
+  // MANAGE_MESSAGES). The store's NIP-09 covers the durable case; this handles a
+  // delete folded alongside its target before the async removal commits.
+  for (const [id, ev] of calendarById) {
+    const deleters = deletes.get(id);
+    if (!deleters) continue;
+    const deleted =
+      deleters.has(ev.author) ||
+      (moderation && [...deleters].some(([d, act]) => moderation.canDelete(d, ev.author, act)));
+    if (deleted) calendarById.delete(id);
   }
 
   // In-batch reaction deletes: a kind-5 targeting a reaction rumor removes
@@ -401,5 +531,8 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
     messages: [...byId.values()].sort((a, b) => (a.ms !== b.ms ? a.ms - b.ms : a.rumorId < b.rumorId ? -1 : 1)),
     reactions,
     zaps,
+    pollVotes,
+    calendarEvents: [...calendarById.values()],
+    rsvps,
   };
 }

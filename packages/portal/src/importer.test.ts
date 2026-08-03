@@ -11,13 +11,21 @@ import { describe, expect, it } from "bun:test";
 import {
   ADMIN_ALL,
   Permissions,
+  channelCategory,
+  channelRoles,
+  isEntitled,
+  channelPosition,
+  compareChannelOrder,
   controlGroups,
   effectivePermissions,
   foldControlState,
   isCommunityPublic,
   openControlWraps,
+  parseDirectInviteRumor,
+  unwrapDirectInvite,
 } from "@armada-bridge/concord-core";
 import { resolveInvite } from "@armada-bridge/bridge/src/concord/client";
+import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
 import * as nip19 from "nostr-tools/nip19";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
@@ -257,7 +265,7 @@ describe("importer pipeline", () => {
 
     // Join through the minted invite exactly like a client (or the bridge) would.
     const inviteUrl = unseal(SEAL_KEY, row().invite_url_sealed!);
-    const { community } = await resolveInvite(inviteUrl, wirePool(wire));
+    const { community, bundle } = await resolveInvite(inviteUrl, wirePool(wire));
     expect(community.idHex).toBe(row().community_id!);
     // The USER's key is the proven owner, baked into the community id.
     expect(community.owner).toBe(userPk);
@@ -271,19 +279,81 @@ describe("importer pipeline", () => {
     expect(fold.metadata?.name).toBe("Test Fleet");
     expect(fold.metadata?.description).toBe("hello");
 
-    // Channels: private skipped; voice suffixed + tagged; category recorded.
+    // Channels: voice suffixed + tagged; the private one imported, gated.
     const channels = [...fold.channels.values()].filter((c) => !c.deleted);
-    expect(channels.map((c) => c.name).sort()).toEqual(["briefing", "general", "hangout-voice", "news"]);
+    expect(channels.map((c) => c.name).sort()).toEqual([
+      "briefing",
+      "general",
+      "hangout-voice",
+      "mods-only",
+      "news",
+    ]);
     const briefing = channels.find((c) => c.name === "briefing")!;
-    expect(briefing.metadata.custom?.category).toBe("Ops");
     const hangout = channels.find((c) => c.name === "hangout-voice")!;
-    expect(hangout.metadata.custom?.kind).toBe("voice");
     const generalFolded = channels.find((c) => c.name === "general")!;
-    expect(generalFolded.metadata.custom?.topic).toBe("plans, chaos, and everything else");
-    expect(typeof generalFolded.metadata.custom?.position).toBe("number");
+
+    // The sidebar arrangement has to land where ARMADA reads it, so these go
+    // through the client's own accessors rather than poking at `custom`: the
+    // importer computed a category and an order for years while writing them
+    // under key names (`custom.category`, `custom.position`) that
+    // channelCategory/channelOrder never look at, so every imported server
+    // rendered as a flat alphabetical list.
+    expect(channelCategory(briefing.metadata)).toBe("Ops");
+    expect(channelCategory(generalFolded.metadata)).toBeUndefined();
+    // Discord order (category position, then channel position), preserved.
+    expect(
+      channels
+        .slice()
+        .sort((a, b) =>
+          compareChannelOrder(
+            { position: channelPosition(a.metadata), name: a.name },
+            { position: channelPosition(b.metadata), name: b.name },
+          ),
+        )
+        .map((c) => c.name),
+    ).toEqual(["general", "news", "hangout-voice", "mods-only", "briefing"]);
+
+    // Discord-only facts ride our own namespace, not `armada.*`.
+    const discordOf = (m: { custom?: Record<string, unknown> }) =>
+      m.custom?.["discord.import"] as { topic?: string; type?: string } | undefined;
+    expect(discordOf(hangout.metadata)?.type).toBe("voice");
+    expect(discordOf(generalFolded.metadata)?.topic).toBe("plans, chaos, and everything else");
+
+    // The private channel: @everyone was denied VIEW_CHANNEL on Discord, so it
+    // imports as a CORD-03 Private Channel — `private: true`, and a Role scoped
+    // to it that is its access list (CORD-04 §2). It is NOT in the public
+    // bundle: a key every joiner reads gates nothing.
+    const modsOnly = channels.find((c) => c.name === "mods-only")!;
+    expect(modsOnly.metadata.private).toBe(true);
+    expect(channelRoles(fold.roster, modsOnly.channelIdHex).map((r) => r.name)).toEqual(["mods-only"]);
+    expect(bundle.channels).toEqual([]);
+    // Only the owner is entitled at import time (position 0, supreme); nobody
+    // else has an npub yet.
+    expect(isEntitled(fold.roster, fold.ownerHex, userPk, modsOnly.channelIdHex)).toBe(true);
+    expect(
+      isEntitled(fold.roster, fold.ownerHex, row().plan.checkpoints.opPkHex!, modsOnly.channelIdHex),
+    ).toBe(false);
+
+    // ...and the owner is handed its key as a Direct Invite (CORD-05 §6),
+    // giftwrapped to them and indexable by the `k` tag.
+    const directInvite = wire.find(
+      (e) => e.kind === 1059 && e.tags.some(([n, v]) => n === "k" && v === "3313"),
+    )!;
+    expect(directInvite).toBeDefined();
+    expect(directInvite.tags).toContainEqual(["p", userPk]);
+    const delivered = await unwrapDirectInvite(directInvite, localIdentity(userSk).signer);
+    expect(delivered?.sender).toBe(row().plan.checkpoints.opPkHex!);
+    const keyBundle = parseDirectInviteRumor(delivered!.rumor.kind, delivered!.rumor.content)!;
+    expect(keyBundle.channels.map((c) => [c.id, c.name])).toEqual([[modsOnly.channelIdHex, "mods-only"]]);
+    // A real 32-byte secret, independent of the community root (CORD-03 §1).
+    expect(keyBundle.channels[0].key).toMatch(/^[0-9a-f]{64}$/);
+    expect(keyBundle.channels[0].key).not.toBe(bundle.community_root);
 
     // Roles: stock Admin at 1, then Chief (ADMINISTRATOR → ADMIN_ALL), then Mod.
-    const byPosition = [...fold.roster.roles].sort((a, b) => a.position - b.position);
+    // The channel-access Role sits below them all and is scoped, not server-wide.
+    const byPosition = [...fold.roster.roles]
+      .filter((r) => r.scope.kind === "server")
+      .sort((a, b) => a.position - b.position);
     expect(byPosition.map((r) => [r.name, r.position])).toEqual([
       ["Admin", 1],
       ["Chief", 2],
@@ -326,7 +396,9 @@ describe("importer pipeline", () => {
     expect(pack.pubkey).toBe(opPk);
     expect(pack.tags).toContainEqual(["d", "discord-import"]);
     expect(pack.tags).toContainEqual(["emoji", "blob", "https://cdn.discordapp.com/emojis/7777.png"]);
-    expect(fold.metadata?.custom?.emojiPack).toBe(`30030:${opPk}:discord-import`);
+    expect((fold.metadata?.custom?.["discord.import"] as { emojiPack?: string })?.emojiPack).toBe(
+      `30030:${opPk}:discord-import`,
+    );
 
     // Idempotency: a re-run from checkpoints publishes nothing new.
     const wireLen = wire.length;

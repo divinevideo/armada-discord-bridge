@@ -187,3 +187,49 @@ export function parseDirectInviteRumor(kind: number, content: string): InviteBun
 export function directInviteExpired(bundle: InviteBundle, nowMs = Date.now()): boolean {
   return typeof bundle.expires_at === "number" && nowMs > bundle.expires_at;
 }
+
+/** What an already-joined member currently holds, for catch-up classification. */
+export interface HeldMembership {
+  rootEpoch: number;
+  /** channel id (hex) → held channel epoch. */
+  channelEpochs: ReadonlyMap<string, number>;
+  /**
+   * channel id (hex) → the channel epoch whose rotation cut me out. A key
+   * BELOW that epoch is the access I was revoked, not a vend: without this
+   * floor, an old bundle still in my inbox would look like a fresh key for a
+   * channel I no longer hold and quietly restore it.
+   */
+  channelCuts?: ReadonlyMap<string, number>;
+}
+
+/**
+ * Is an incoming bundle for an already-joined community a CATCH-UP worth
+ * parking (vs. noise to skip)? Two shapes qualify:
+ *
+ *  - a strictly fresher root epoch — an admin healing a stranded member
+ *    (CORD-05 §6 re-handoff);
+ *  - a same-or-newer root carrying a private-channel key the member lacks, or
+ *    holds at an older channel epoch — a role-gate key vend (CORD.md).
+ *
+ * Both merge monotonically on accept (epoch-forward roots, per-channel
+ * epoch-max union), so neither can move the membership backward. A LOWER-epoch
+ * root is stale and never a catch-up, whatever channels it claims.
+ */
+export function isCatchUpBundle(
+  held: HeldMembership | undefined,
+  bundle: Pick<InviteBundle, "root_epoch" | "channels">,
+): boolean {
+  if (held === undefined) return false;
+  if (bundle.root_epoch > held.rootEpoch) return true;
+  if (bundle.root_epoch < held.rootEpoch) return false;
+  // A bundle is another client's document: normalize its id spelling before
+  // consulting the cut floor (CORD-01: hex is lowercase; foreign input may
+  // not be, and an unmatched spelling here would re-park revoked access).
+  return bundle.channels.some((c) => {
+    const id = c.id.toLowerCase();
+    const cut = held.channelCuts?.get(id);
+    if (cut !== undefined && c.epoch < cut) return false; // revoked access, not a vend
+    const heldEpoch = held.channelEpochs.get(id);
+    return heldEpoch === undefined || c.epoch > heldEpoch;
+  });
+}

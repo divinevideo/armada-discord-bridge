@@ -39,6 +39,15 @@ Armada emitting them consistently and documenting the expected client
 reaction. The bridge wants to say "this community revoked access" rather
 than "severed"; it can only be as precise as the signals it receives.
 
+### 5. A way to grant a bot/bridge npub a channel key without a human
+Adding the bridge to a Private Channel means a person opening Armada and
+granting its npub the channel's Role, which vends the key as a Direct
+Invite. That works (the bridge takes delivery of it), but it makes every
+gated room a manual step, and there is no way for the portal to ask on the
+operator's behalf. A capability an owner could delegate once — "this npub
+may be vended keys for channels it is granted" — would let the import wire
+private channels end to end instead of stopping at the structure.
+
 ## Nice to have
 
 - Ephemeral rendering: typing (23311) and voice presence (23313) only

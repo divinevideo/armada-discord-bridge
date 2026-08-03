@@ -45,6 +45,7 @@ export interface InviteBundle {
   /** Preview, so a parked invite can render; the Control fold is the authority. */
   name: string;
   icon?: ImagePointer;
+  banner?: ImagePointer;
   /** Optional, unix ms: past it the preview still renders, joining refuses. */
   expires_at?: number;
   /** Optional attribution, echoed in the joiner's Guestbook Join. */

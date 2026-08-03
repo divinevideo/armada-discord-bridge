@@ -25,3 +25,10 @@ export * from "./roles";
 export { NAME_MAX_BYTES } from "./types";
 export * from "./rekey";
 export * from "./join";
+export * from "./channelCategory";
+export * from "./channelOrder";
+export * from "./channelAccess";
+export * from "./vendor/botCommands";
+// NIP-17 DM relays: where a Direct Invite is delivered, so a headless member
+// has to be able to both read and publish the list.
+export * from "./vendor/dmRelays";

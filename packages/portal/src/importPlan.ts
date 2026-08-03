@@ -52,12 +52,32 @@ export interface PlannedChannel {
   discordType: number;
   /** Final Concord channel name (voice suffix applied, 64-byte capped). */
   name: string;
-  /** Discord channel topic, recorded in ChannelMetadata.custom.topic. */
+  /** Discord channel topic, recorded under `custom["discord.import"].topic`. */
   topic?: string;
-  /** Parent category name, recorded in ChannelMetadata.custom.category. */
+  /** Parent category name, published as `custom["armada.category"].name`. */
   category?: string;
-  /** "voice" for imported voice/stage rooms (ChannelMetadata.custom.kind). */
+  /** "voice" for imported voice/stage rooms (`custom["discord.import"].type`). */
   kind?: "voice";
+  /**
+   * Discord denied @everyone VIEW_CHANNEL, so this imports as a CORD-03
+   * Private Channel: its own random key (never derived from the community
+   * root) plus a channel-scoped Role that is its access list (CORD-04 §2).
+   *
+   * The key lands with the OWNER alone. Discord's per-channel allow list names
+   * Discord roles held by Discord accounts, and an import has no npub for any
+   * of them — members arrive later through the invite, and claim their npub
+   * later still. Vending the key to anyone else at import time would mean
+   * vending it to everyone who joins, which is a public channel with extra
+   * steps. The owner distributes it from Armada, which is where the grant and
+   * the rekey-on-revoke live.
+   */
+  private?: boolean;
+  /** The channel-scoped Role that gates a private channel (minted at prepare). */
+  accessRoleIdHex?: string;
+  /** Its independent 32-byte key, sealed with the portal KMS key. */
+  keySealed?: string;
+  /** Unix ms when the access Role edition was accepted by a relay. */
+  accessRolePublishedAt?: number;
   /** Only GuildText channels can be live-bridged (webhook mirroring). */
   bridgeable: boolean;
   /** User toggle: create a live bridge for this channel. */
@@ -145,6 +165,14 @@ export interface ImportCheckpoints {
   /** Public invite link: bundle published under this signer. */
   inviteLinkSignerPk?: string;
   invitePublishedAt?: number;
+  /**
+   * The Direct Invite that handed the owner their private-channel keys.
+   * `Error` records a delivery that failed after everything else landed — the
+   * community is intact, the owner is just missing their copy, and re-running
+   * the import retries with the SAME checkpointed keys.
+   */
+  ownerChannelKeysSentAt?: number;
+  ownerChannelKeysError?: string;
   /** kind 30030 guild emoji pack, addressable at `30030:<opPk>:discord-import`. */
   emojiPackAddress?: string;
   emojiPackPublishedAt?: number;
@@ -197,9 +225,12 @@ const label = (c: SnapshotChannel) => `#${c.name}`;
 /**
  * Whether a channel is private on the Discord side: an @everyone (role id ==
  * guild id) overwrite denying VIEW_CHANNEL, on the channel itself or inherited
- * from its category when the channel doesn't explicitly re-allow it. READ
- * access in Concord is key possession, which v1 does not distribute, so
- * private channels are skipped (plan Q2).
+ * from its category when the channel doesn't explicitly re-allow it.
+ *
+ * These used to be dropped ("READ access in Concord is key possession, which
+ * v1 does not distribute" — plan Q2). Armada 0.45.0 ships role-gated Private
+ * Channels, so they now import as one: see `PlannedChannel.private` for who
+ * ends up holding the key.
  */
 function isPrivate(channel: SnapshotChannel, guildId: string, categories: Map<string, SnapshotChannel>): boolean {
   const everyoneOf = (c: SnapshotChannel | undefined) =>
@@ -237,11 +268,20 @@ function planChannels(snapshot: GuildSnapshot, skipped: SkippedItem[]): PlannedC
       skipped.push({ kind: "channel", name: label(channel), reason: `unsupported channel type ${channel.type}` });
       continue;
     }
-    if (isPrivate(channel, snapshot.guild.id, categories)) {
-      skipped.push({ kind: "channel", name: label(channel), reason: "private channels are not supported yet" });
-      continue;
+    const priv = isPrivate(channel, snapshot.guild.id, categories);
+    if (priv) {
+      // Imported, but not mirrored: a live bridge reads a private channel only
+      // if the bridge's own npub holds the key, and the bridge learns keys
+      // exactly once — from the invite bundle it joined with. Until it follows
+      // CORD-06 rekey deliveries, wiring one would produce a bridge that
+      // silently mirrors nothing.
+      skipped.push({
+        kind: "channel",
+        name: label(channel),
+        reason: "private channel: imported gated, but not live-bridged to Discord yet",
+      });
     }
-    const bridgeable = channel.type === TEXT;
+    const bridgeable = channel.type === TEXT && !priv;
     out.push({
       discordId: channel.id,
       discordType: channel.type,
@@ -249,6 +289,7 @@ function planChannels(snapshot: GuildSnapshot, skipped: SkippedItem[]): PlannedC
       topic: channel.topic?.trim() ? channel.topic.trim().slice(0, 1024) : undefined,
       category: channel.parent_id ? categories.get(channel.parent_id)?.name : undefined,
       kind: voice ? "voice" : undefined,
+      private: priv || undefined,
       bridgeable,
       bridge: bridgeable,
       selected: true,

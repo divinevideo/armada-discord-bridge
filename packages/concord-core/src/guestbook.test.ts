@@ -102,7 +102,7 @@ describe("guestbook coalesce (CORD-02 §5)", () => {
     const coalesced = coalesceGuestbook(openGuestbookWraps(wraps, [gb]), {
       nowMs: 10_000,
       canKick: denyAllKicks,
-      snapshotAuthority: refounder.pubkey,
+      snapshotAuthorities: new Set([refounder.pubkey]),
     });
     expect(coalesced.get(alice.pubkey)?.state).toBe("join");
     expect(coalesced.get(alice.pubkey)?.fromSnapshot).toBe(true);
@@ -119,14 +119,42 @@ describe("guestbook coalesce (CORD-02 §5)", () => {
     const coalesced = coalesceGuestbook(openGuestbookWraps(wraps, [gb]), {
       nowMs: 10_000,
       canKick: allowAllKicks,
-      snapshotAuthority: refounder.pubkey,
+      snapshotAuthorities: new Set([refounder.pubkey]),
     });
     expect(coalesced.size).toBe(0);
   });
 
+  it("honors a PRIOR epoch's refounder — the sweep spans every held guestbook", async () => {
+    // guestbookGroups() reads every held epoch's guestbook, and each was minted
+    // by its own refounder (CORD-02 §5). Passing only the current epoch's
+    // dropped every earlier snapshot; the authority is the recorded set.
+    const past = signer();
+    const current = signer();
+    const alice = signer();
+    const rumors = buildSnapshotRumors(past.pubkey, [alice.pubkey], bytesToHex(random32()), 5000);
+    const wraps: NostrEvent[] = [];
+    for (const r of rumors) wraps.push(await sealGuestbook(r, gb, past));
+
+    const opened = openGuestbookWraps(wraps, [gb]);
+    expect(
+      coalesceGuestbook(opened, {
+        nowMs: 10_000,
+        canKick: denyAllKicks,
+        snapshotAuthorities: new Set([current.pubkey]),
+      }).size,
+    ).toBe(0);
+    expect(
+      coalesceGuestbook(opened, {
+        nowMs: 10_000,
+        canKick: denyAllKicks,
+        snapshotAuthorities: new Set([current.pubkey, past.pubkey]),
+      }).get(alice.pubkey)?.state,
+    ).toBe("join");
+  });
+
   it("no snapshot authority (unknown refounder) means NO snapshot is honored — never a blanket owner fallback", async () => {
-    // The hook (useGuestbook2) must pass the epoch's true minting refounder, or
-    // `undefined` when unknown — NEVER the owner as a fallback for a
+    // The hook (useGuestbook2) must pass the recorded minting refounders, or
+    // nothing when none is known — NEVER the owner as a fallback for a
     // post-genesis epoch. With no authority, even an owner-signed snapshot
     // can't seed a ghost member (CORD-02 §5).
     const owner = signer();
@@ -137,7 +165,7 @@ describe("guestbook coalesce (CORD-02 §5)", () => {
     const coalesced = coalesceGuestbook(openGuestbookWraps(wraps, [gb]), {
       nowMs: 10_000,
       canKick: denyAllKicks,
-      snapshotAuthority: undefined,
+      snapshotAuthorities: undefined,
     });
     expect(coalesced.has(ghost.pubkey)).toBe(false);
   });

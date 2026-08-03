@@ -71,7 +71,7 @@ describe("channel planning", () => {
     ]);
   });
 
-  it("skips private channels (own overwrite) and reports them", () => {
+  it("plans a private channel (own overwrite) gated, and does not bridge it", () => {
     const plan = buildImportPlan(
       snapshot([
         channel({
@@ -82,8 +82,8 @@ describe("channel planning", () => {
         }),
       ]),
     );
-    expect(plan.channels).toEqual([]);
-    expect(plan.skipped.find((s) => s.name === "#mods-only")?.reason).toContain("private");
+    expect(plan.channels.map((c) => [c.name, c.private, c.bridgeable])).toEqual([["mods-only", true, false]]);
+    expect(plan.skipped.find((s) => s.name === "#mods-only")?.reason).toContain("not live-bridged");
   });
 
   it("inherits privacy from the category unless the channel re-allows", () => {
@@ -101,8 +101,10 @@ describe("channel planning", () => {
         }),
       ]),
     );
-    expect(plan.channels.map((c) => c.name)).toEqual(["made-public"]);
-    expect(plan.skipped.find((s) => s.name === "#staff-chat")?.reason).toContain("private");
+    expect(plan.channels.map((c) => [c.name, c.private ?? false])).toEqual([
+      ["staff-chat", true],
+      ["made-public", false],
+    ]);
   });
 
   it("skips forum channels with a reason", () => {

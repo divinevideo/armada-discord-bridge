@@ -47,6 +47,35 @@ kind 23311 from the puppet in a 21059 wrap; incoming 23311 -> the bot's
 
 ## 2. Protocol robustness (the dangerous gaps)
 
+### Channel structure: categories, ordering, private channels (DONE 2026-08-02)
+Armada 0.45.0 added role-gated Private Channels, and CORD.md added the
+`armada.category` / `armada.order` channel-metadata conventions. Three
+things landed here in response:
+- The importer publishes the sidebar arrangement it already computed under
+  the key names Armada actually reads (`custom["armada.category"].name`,
+  `custom["armada.order"].position`). It had been writing bare
+  `category`/`position`, which nothing reads, so every imported server
+  rendered as a flat alphabetical list. Discord-only facts (topic, the
+  originating channel type, the emoji-pack pointer) moved under a
+  `discord.import` namespace we own instead of squatting on `armada.*`.
+- Discord channels that deny @everyone VIEW_CHANNEL now import as CORD-03
+  Private Channels — independent key, plus the channel-scoped Role that is
+  their access list — instead of being dropped. The key goes to the OWNER
+  alone, as a Direct Invite: an import has no npub for any Discord member,
+  and a key in the public bundle gates nothing.
+- The bridge scans its giftwrap inbox for Direct Invites at boot
+  (`concord/keyIntake.ts`) and publishes a kind-10050 inbox list, so
+  "add the bridge to #mods-only" in Armada works. Nothing is persisted: a
+  Direct Invite is a durable relay event sealed to us, so re-scanning
+  recovers it.
+
+STILL OPEN: private channels are imported but not live-bridged (the plan
+marks them `bridgeable: false` with that reason), because a rotation would
+strand the bridge — see the rekey item below. The portal's pairing wizard
+also can't list a private channel for a DRAFT bridge: it inspects the
+invite with a throwaway key, and the bridge's real npub is not minted until
+activation, so there is nothing for Armada to have granted yet.
+
 ### Rekey / refounding rollover (partially done)
 DONE: chat subscriptions rebuild when the control fold shows a new stream
 set (`894f21a`), and the NIP-42 late-key re-AUTH fix (`fe46162`) removed
@@ -58,8 +87,14 @@ precomputed rekey addresses (`concord/rekey-pseudonym`), verify `prevcommit`
 continuity, or roll root epochs at runtime, so a Refounding still severs the
 bridge until relink. Core has the pieces (`rekey.ts`: `parseRekey`,
 `groupRotations`, `checkContinuity`, locators). Detect exclusion and mark
-the bridge `severed` with honest "community revoked access" copy. Latent
-risk only: no live community has rotated yet.
+the bridge `severed` with honest "community revoked access" copy.
+
+No longer purely latent: this is what keeps imported Private Channels from
+being live-bridged. Their whole point is that access is revocable, and a
+revoke rotates the channel key (CORD-06 §1 works exactly this example) — a
+bridge that cannot follow a rotation would go silently quiet on the channel
+it was mirroring. Channel-scoped rotations matter here as much as root
+ones.
 
 ### Cursor persistence and backfill (DONE, Concord -> Discord)
 Chat subscriptions advance a per-stream high-water mark (wrap `created_at`,
@@ -189,7 +224,9 @@ Pause/resume and per-card "Add channel" exist; still open:
    hand-verified re-AUTH/retry code before building more on it.
 4. Portal options wiring + severance detail + webhook recreate (sections
    3 and 4): the settings surface and options wiring are one screen.
-5. Root-epoch rekey rollover (section 2): larger design, latent risk only.
+5. Rekey rollover, root AND channel scope (section 2): larger design, and
+   now the blocker for live-bridging the Private Channels the importer
+   creates.
 6. Ops pass (section 5) before inviting anyone else to the hosted
    instance. Also still open: rotate the Discord client secret + bot token
    that were exposed in a dev chat session, then update `.env.portal` on

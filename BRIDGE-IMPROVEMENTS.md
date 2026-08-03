@@ -42,12 +42,25 @@ The `/bridge confirm` and `/claim` commands are only discoverable through
 posted message text. Publishing the manifest makes them first-class in
 Armada clients that read it.
 
+## Do now (SHIPPED 2026-08-02)
+
+Channel structure caught up with Armada 0.45.0: the importer publishes
+categories and ordering under the `armada.category` / `armada.order`
+metadata members the client reads, imports role-gated Private Channels
+instead of skipping them, and the bridge takes delivery of private-channel
+keys from its Direct Invite inbox. `concord-core` was re-vendored from
+`concord-v2/lib` (it had drifted far enough to be missing the CORD-04 §5
+citation check the client shipped in 0.43.0); `sync-from-armada.sh` makes
+that repeatable. See NEXT-STEPS.md section 2 for what is still open.
+
 ## Later
 
 - Rekey rollover: `rekey.ts` has `parseRekey`, `groupRotations`, and
   `checkContinuity`, but the client never subscribes to the rekey
-  addresses, so a Refounding severs the bridge until relink. Latent risk
-  only today; no live community has rotated.
+  addresses, so a Refounding severs the bridge until relink — and a
+  channel-scope rotation (what a revoke does) leaves a Private Channel
+  silently unreadable. This is now the gate on live-bridging the Private
+  Channels the importer creates, not just a latent risk.
 - Dissolution watch: kind 3308 vsk 10 is not observed; the bridge should
   sever itself with honest copy instead of erroring per message.
 - Mentions: `nostr:npub...` references to puppet identities can resolve

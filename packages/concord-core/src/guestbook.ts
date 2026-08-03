@@ -15,8 +15,9 @@
 import type { NostrEvent } from "nostr-tools/pure";
 
 import { guestbookGroupKey, type GroupKey } from "./derive";
+import { citationFromTags, type AuthorityCitation } from "./edition";
 import { KIND_JOIN_LEAVE, KIND_KICK, KIND_SEAL_ENCRYPTED, KIND_SNAPSHOT } from "./kinds";
-import { buildRumor, openWrap, sealRumor, wrapSeal, type OpenedEvent, type Rumor, type StreamSigner } from "./stream";
+import { buildRumor, openWrap, sealRumor, wrapSeal, type OpenedEvent, type StreamSigner, type Rumor } from "./stream";
 import type { CommunityV2 } from "./types";
 
 /** Entries dated further than this ahead of the local clock are dropped outright. */
@@ -34,6 +35,27 @@ export function guestbookGroups(community: CommunityV2): GroupKey[] {
 /** The CURRENT guestbook stream key (where new entries publish). */
 export function currentGuestbookGroup(community: CommunityV2): GroupKey {
   return guestbookGroupKey(community.root, community.id, community.rootEpoch);
+}
+
+/**
+ * The npubs whose Refoundings minted the epochs this client holds — the
+ * snapshot authorities for the guestbooks {@link guestbookGroups} sweeps
+ * (CORD-02 §5).
+ *
+ * Genesis (epoch 0) has no snapshot, so it contributes no authority. An epoch
+ * whose refounder was never recorded (adopted before `HeldRoot.refounder`
+ * existed) contributes none either: accepting NO snapshot is the safe miss —
+ * §5 heals it by observation and by the member's own unsuppressable Join —
+ * whereas falling back to the owner would let an npub who never minted an
+ * epoch seed arbitrary members into it.
+ */
+export function snapshotAuthorities(community: CommunityV2): Set<string> {
+  const out = new Set<string>();
+  for (const r of community.heldRoots) {
+    if (r.epoch > 0n && r.refounder) out.add(r.refounder);
+  }
+  if (community.rootEpoch > 0n && community.refounder) out.add(community.refounder);
+  return out;
 }
 
 // ── Builders ─────────────────────────────────────────────────────────────────
@@ -157,16 +179,38 @@ export function openGuestbookOpened(opened: OpenedEvent[]): OpenedEvent[] {
  *   - latest wins by ms; ties break by the LOWER rumor id;
  *   - a Kick is honored only when `canKick(actor, target)` (KICK bit + strict
  *     outrank, resolved against the caller's folded roster);
- *   - a snapshot chunk is honored only from `snapshotAuthority` (the refounder
- *     whose Refounding minted the epoch), and merely SEEDS an npub's state —
- *     any self-signed entry (or authorized kick) newer than it supersedes it.
+ *   - a snapshot chunk is honored only from a `snapshotAuthorities` npub (a
+ *     refounder whose Refounding minted one of the held epochs), and merely
+ *     SEEDS an npub's state — any self-signed entry (or authorized kick) newer
+ *     than it supersedes it.
  */
 export function coalesceGuestbook(
   opened: OpenedEvent[],
   opts: {
     nowMs: number;
-    canKick: (actorHex: string, targetHex: string) => boolean;
-    snapshotAuthority?: string;
+    /**
+     * KICK bit + strict outrank, PLUS the CORD-04 §5 sync floor: `citation` is
+     * the kick's `vac`. A kick is an authority action, so a client whose roster
+     * is one sweep stale must not honor one from an already-demoted admin.
+     */
+    canKick: (actorHex: string, targetHex: string, citation: AuthorityCitation | undefined, atMs: number) => boolean;
+    /**
+     * The npubs whose Refoundings minted the held epochs (CORD-02 §5: a
+     * snapshot "is honored only from the npub whose Refounding minted that
+     * epoch"). A SET, because the sweep spans every held epoch's guestbook
+     * (`guestbookGroups`) and each was minted by its own refounder — matching
+     * only the current one drops every prior epoch's snapshot. Empty/absent
+     * honors NO snapshot rather than falling back to the owner.
+     *
+     * Per-epoch exactness isn't reachable here: which epoch's stream carried a
+     * rumor is wire-only (`streamPk`) and deliberately not persisted beside it,
+     * and a snapshot rumor doesn't name its own epoch. The residual is that a
+     * refounder of one held epoch is accepted on another's snapshot — all of
+     * them are npubs that legitimately held that key, and a snapshot only
+     * seeds a state any newer firsthand entry supersedes.
+     */
+    snapshotAuthorities?: ReadonlySet<string>;
+
     /** Banned npubs (the Banlist fold) — their entries are dropped entirely. */
     banned?: Set<string>;
   },
@@ -189,7 +233,9 @@ export function coalesceGuestbook(
 
   for (const ev of opened) {
     if (ev.ms > opts.nowMs + GUESTBOOK_MAX_FUTURE_MS) continue;
-    if (ev.sealKind !== KIND_SEAL_ENCRYPTED) continue;
+    // Encrypted-seal (CORD-02 §5), while the seal form is known; a stored
+    // rumor has no envelope and passed this at ingest — see parseEdition.
+    if (ev.sealKind !== undefined && ev.sealKind !== KIND_SEAL_ENCRYPTED) continue;
     if (opts.banned?.has(ev.author)) continue;
 
     if (ev.kind === KIND_JOIN_LEAVE) {
@@ -209,13 +255,13 @@ export function coalesceGuestbook(
 
     if (ev.kind === KIND_KICK) {
       const target = ev.tags.find((t) => t[0] === "p")?.[1];
-      if (!target || !opts.canKick(ev.author, target)) continue;
+      if (!target || !opts.canKick(ev.author, target, citationFromTags(ev.tags), ev.ms)) continue;
       apply({ pubkey: target, state: "kick", ms: ev.ms, rumorId: ev.rumorId, fromSnapshot: false });
       continue;
     }
 
     if (ev.kind === KIND_SNAPSHOT) {
-      if (!opts.snapshotAuthority || ev.author !== opts.snapshotAuthority) continue;
+      if (!opts.snapshotAuthorities?.has(ev.author)) continue;
       let members: unknown;
       try {
         members = JSON.parse(ev.content);

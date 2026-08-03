@@ -10,7 +10,7 @@
  * relays); sealed at-rest key storage arrives with the portal control plane.
  */
 
-import { STOCK_RELAYS, parseInviteLink } from "@armada-bridge/concord-core";
+import { STOCK_RELAYS, inviteDeliveryRelays, parseInviteLink } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
@@ -18,6 +18,7 @@ import postgres from "postgres";
 
 import { BlossomStore } from "./blossom";
 import { ConcordClient, resolveInvite } from "./concord/client";
+import { intakeDirectInviteKeys } from "./concord/keyIntake";
 import { RelayPool } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { loadConfig } from "./config";
@@ -60,7 +61,23 @@ console.log(`bridge: joined material for community ${community.name} (${communit
 
 const pool = new RelayPool(community.relays);
 const primary = localIdentity(primarySk(config.primarySecretKey));
-const client = new ConcordClient(community, pool, primary);
+
+// Private-channel keys addressed to us since the last boot. The join bundle
+// only ever carried what the inviter vended at the time, so a channel we were
+// granted afterwards is readable only once its Direct Invite is opened — and
+// this has to run BEFORE the client folds, or the grant is invisible until the
+// next restart. The stock floor is scanned alongside the community relays
+// because that is where a sender delivers to an npub with no published inbox
+// (which we were, until the 10050 below).
+const floor = new RelayPool(inviteDeliveryRelays([]));
+const intake = await intakeDirectInviteKeys([pool, floor], primary, community).finally(
+  () => void floor.close(),
+);
+if (intake.learned.length > 0) {
+  console.log(`bridge: learned ${intake.learned.length} private-channel key(s) from direct invites`);
+}
+
+const client = new ConcordClient(intake.community, pool, primary);
 await client.syncControl();
 
 const concordChannelId =
@@ -77,6 +94,12 @@ await client
     bot: true,
   })
   .catch((error) => console.warn("bridge: profile publish failed", error));
+// Point our giftwrap inbox at the community relays (NIP-17 kind 10050), the
+// list Armada resolves before sending a Direct Invite. Without it every key
+// handoff goes to the stock interop floor and stays there.
+await client
+  .publishDmRelays(primary, community.relays)
+  .catch((error) => console.warn("bridge: DM relay list publish failed", error));
 
 // ── Storage, Discord, router ────────────────────────────────────────────────
 const sql = postgres(config.databaseUrl, { onnotice: () => {} });

@@ -10,15 +10,19 @@ import {
   buildRegistryEdition,
   buildRoleEdition,
   foldControlState,
+  banShouldRotate,
+  banShouldRotateMany,
   hasForeignLiveLinks,
   isCommunityPublic,
+  citationSatisfied,
   isDissolved,
   openControlWraps,
   sealDissolved,
   sealEdition,
 } from "./control";
-import { bytesToHex, communityIdOf, controlGroupKey, grantLocator, hex32, random32, type GroupKey } from "./derive";
-import { rewrapSeal, sealRumor, wrapSeal, type Rumor } from "./stream";
+import { bytesToHex, communityIdOf, controlGroupKey, dissolvedGroupKey, grantLocator, hex32, random32, type GroupKey } from "./derive";
+import { isTagDecimal } from "./edition";
+import { buildRumor, openWrap, rewrapSeal, sealRumor, wrapSeal, type Rumor } from "./stream";
 import { KIND_SEAL_ENCRYPTED, KIND_SEAL_PLAINTEXT } from "./kinds";
 import { adminRole, badgeOf, hasPermission, isAdmin, moderatorRole, Permissions, type Role } from "./roles";
 import {
@@ -33,6 +37,16 @@ import { attachGitRepository, detachGitRepository, parseGitRepositoryAddress } f
 
 function signer(sk = generateSecretKey()) {
   return { sk, pubkey: getPublicKey(sk), signEvent: async (t: EventTemplate) => finalizeEvent(t, sk) };
+}
+
+/**
+ * The `vac` an actor must attach, read back off the wrap that granted them
+ * their role (CORD-04 §5). Roles and Grants are authority actions too, so a
+ * non-owner minting either has to cite — the same as any other edition.
+ */
+function citeGrant(grantWrap: NostrEvent, control: GroupKey, version = 1n) {
+  const [parsed] = openControlWraps([grantWrap], [control]);
+  return { entityId: parsed.entityId, version, editionHash: parsed.selfHash };
 }
 
 async function makeCommunity() {
@@ -293,25 +307,27 @@ describe("control plane fold (CORD-04)", () => {
     const adm = adminRole(bytesToHex(random32()));
     const mrole = moderatorRole(bytesToHex(random32()));
     const peerAdm = adminRole(bytesToHex(random32()));
+    const admGrant = await sealEdition(
+      buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }),
+      control,
+      owner,
+    );
+    const cite = citeGrant(admGrant, control);
     const wraps: NostrEvent[] = [
       // Owner roots the Admin.
       await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
-      await sealEdition(
-        buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }),
-        control,
-        owner,
-      ),
+      admGrant,
       // The admin (position 1) mints Moderator (position 2) and grants it — honored.
-      await sealEdition(buildRoleEdition(mrole, { actorPubkey: admin.pubkey, version: 1n }), control, admin),
+      await sealEdition(buildRoleEdition(mrole, { actorPubkey: admin.pubkey, version: 1n, authority: cite }), control, admin),
       await sealEdition(
-        buildGrantEdition(communityId, { member: mod.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: admin.pubkey, version: 1n }),
+        buildGrantEdition(communityId, { member: mod.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: admin.pubkey, version: 1n, authority: cite }),
         control,
         admin,
       ),
       // The admin mints a PEER Admin (position 1) — dropped (equal cannot act on equal).
-      await sealEdition(buildRoleEdition(peerAdm, { actorPubkey: admin.pubkey, version: 1n }), control, admin),
+      await sealEdition(buildRoleEdition(peerAdm, { actorPubkey: admin.pubkey, version: 1n, authority: cite }), control, admin),
       await sealEdition(
-        buildGrantEdition(communityId, { member: wannabe.pubkey, roleIds: [peerAdm.roleId] }, { actorPubkey: admin.pubkey, version: 1n }),
+        buildGrantEdition(communityId, { member: wannabe.pubkey, roleIds: [peerAdm.roleId] }, { actorPubkey: admin.pubkey, version: 1n, authority: cite }),
         control,
         admin,
       ),
@@ -323,6 +339,115 @@ describe("control plane fold (CORD-04)", () => {
     expect(hasPermission(folded.roster, mod.pubkey, Permissions.BAN)).toBe(true);
     expect(hasPermission(folded.roster, mod.pubkey, Permissions.MANAGE_ROLES)).toBe(false);
     expect(badgeOf(folded.roster, wannabe.pubkey)).toBeUndefined();
+  });
+
+  it("honors an edition citing a grant version we have SYNCED PAST (CORD-04 §5)", async () => {
+    // "until it has synced AT LEAST that Grant" — a later head satisfies the
+    // floor. Requiring the exact version instead would break on rotation:
+    // compaction re-wraps only each entity's HEAD, so a superseded grant
+    // version does not cross into the new epoch, and every edition still citing
+    // one would fall out of the fold. That is a community losing its name, or
+    // its admins, for having rotated.
+    const { owner, communityId, control } = await makeCommunity();
+    const admin = signer();
+    const alice = signer();
+
+    const adm = adminRole(bytesToHex(random32()));
+    const mrole = moderatorRole(bytesToHex(random32()));
+    const grantV1 = await sealEdition(
+      buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }),
+      control,
+      owner,
+    );
+    const [g1] = openControlWraps([grantV1], [control]);
+    // The admin acts while their grant is at v1, and cites v1.
+    const citeV1 = { entityId: g1.entityId, version: 1n, editionHash: g1.selfHash };
+    // The owner then re-issues the admin's grant at v2, superseding v1.
+    const grantV2 = await sealEdition(
+      buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 2n, prevHash: g1.selfHash }),
+      control,
+      owner,
+    );
+
+    // Fold WITHOUT v1 present, exactly as a post-compaction epoch would look.
+    const folded = foldControlState(
+      openControlWraps(
+        [
+          await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
+          grantV2,
+          await sealEdition(buildRoleEdition(mrole, { actorPubkey: admin.pubkey, version: 1n, authority: citeV1 }), control, admin),
+          await sealEdition(
+            buildGrantEdition(communityId, { member: alice.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: admin.pubkey, version: 1n, authority: citeV1 }),
+            control,
+            admin,
+          ),
+        ],
+        [control],
+      ),
+      communityId,
+      owner.pubkey,
+    );
+
+    expect(
+      folded.roster.roles.some((r) => r.roleId === mrole.roleId),
+      "a role citing a superseded grant version still folds",
+    ).toBe(true);
+    expect(badgeOf(folded.roster, alice.pubkey), "and so does the grant it made").toBe("moderator");
+  });
+
+  it("drops an UNCITED role or grant from a non-owner (CORD-04 §5)", async () => {
+    // Roles and Grants are authority actions like any other, so the delegation
+    // chain itself carries the sync floor. Without it a client whose roster is
+    // one sweep stale honors a promotion issued by an admin already stripped of
+    // MANAGE_ROLES — the fold would ask only "does this author resolve as
+    // authorized RIGHT NOW", which is precisely the stale-roster question.
+    const { owner, communityId, control } = await makeCommunity();
+    const admin = signer();
+    const alice = signer();
+    const bob = signer();
+
+    const adm = adminRole(bytesToHex(random32()));
+    const mrole = moderatorRole(bytesToHex(random32()));
+    const uncitedRole = moderatorRole(bytesToHex(random32()));
+    const admGrant = await sealEdition(
+      buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }),
+      control,
+      owner,
+    );
+    const cite = citeGrant(admGrant, control);
+
+    const folded = foldControlState(
+      openControlWraps(
+        [
+          await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
+          admGrant,
+          // CITED — honored.
+          await sealEdition(buildRoleEdition(mrole, { actorPubkey: admin.pubkey, version: 1n, authority: cite }), control, admin),
+          await sealEdition(
+            buildGrantEdition(communityId, { member: alice.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: admin.pubkey, version: 1n, authority: cite }),
+            control,
+            admin,
+          ),
+          // UNCITED, same author, same authority — dropped on the citation alone.
+          await sealEdition(buildRoleEdition(uncitedRole, { actorPubkey: admin.pubkey, version: 1n }), control, admin),
+          await sealEdition(
+            buildGrantEdition(communityId, { member: bob.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: admin.pubkey, version: 1n }),
+            control,
+            admin,
+          ),
+        ],
+        [control],
+      ),
+      communityId,
+      owner.pubkey,
+    );
+
+    expect(badgeOf(folded.roster, alice.pubkey), "the cited grant lands").toBe("moderator");
+    expect(badgeOf(folded.roster, bob.pubkey), "the uncited grant is dropped").toBeUndefined();
+    expect(
+      folded.roster.roles.some((r) => r.roleId === uncitedRole.roleId),
+      "and the uncited role never reaches the roster",
+    ).toBe(false);
   });
 
   it("a moderator (no MANAGE_ROLES) cannot grant roles", async () => {
@@ -390,9 +515,12 @@ describe("control plane fold (CORD-04)", () => {
       await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
       await sealEdition(buildRoleEdition(ltRole, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
       await sealEdition(buildRoleEdition(lowRole, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
-      // The lieutenant's own authority settles BEFORE the victims' entities.
-      await sealEdition(buildGrantEdition(communityId, { member: lt.pubkey, roleIds: [ltRole.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
     ];
+    // The lieutenant's own authority settles BEFORE the victims' entities, and
+    // is what their editions cite.
+    const ltGrant = await sealEdition(buildGrantEdition(communityId, { member: lt.pubkey, roleIds: [ltRole.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
+    const ltCite = citeGrant(ltGrant, control);
+    wraps.push(ltGrant);
     const g1 = await sealEdition(buildGrantEdition(communityId, { member: admin1.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
     const g2 = await sealEdition(buildGrantEdition(communityId, { member: admin2.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
     const [g1v1] = openControlWraps([g1], [control]);
@@ -402,19 +530,19 @@ describe("control plane fold (CORD-04)", () => {
       g2,
       // Strip admin1 — dropped (a revoke acts on a rank the lieutenant doesn't outrank).
       await sealEdition(
-        buildGrantEdition(communityId, { member: admin1.pubkey, roleIds: [] }, { actorPubkey: lt.pubkey, version: 2n, prevHash: g1v1.selfHash }),
+        buildGrantEdition(communityId, { member: admin1.pubkey, roleIds: [] }, { actorPubkey: lt.pubkey, version: 2n, prevHash: g1v1.selfHash, authority: ltCite }),
         control,
         lt,
       ),
       // Demote admin2 to the Helper role — dropped (outranking the role handed OUT is not enough).
       await sealEdition(
-        buildGrantEdition(communityId, { member: admin2.pubkey, roleIds: [lowRole.roleId] }, { actorPubkey: lt.pubkey, version: 2n, prevHash: g2v1.selfHash }),
+        buildGrantEdition(communityId, { member: admin2.pubkey, roleIds: [lowRole.roleId] }, { actorPubkey: lt.pubkey, version: 2n, prevHash: g2v1.selfHash, authority: ltCite }),
         control,
         lt,
       ),
       // A fresh grant BELOW the lieutenant's rank — honored.
       await sealEdition(
-        buildGrantEdition(communityId, { member: newbie.pubkey, roleIds: [lowRole.roleId] }, { actorPubkey: lt.pubkey, version: 1n }),
+        buildGrantEdition(communityId, { member: newbie.pubkey, roleIds: [lowRole.roleId] }, { actorPubkey: lt.pubkey, version: 1n, authority: ltCite }),
         control,
         lt,
       ),
@@ -435,17 +563,19 @@ describe("control plane fold (CORD-04)", () => {
     const ltRole: Role = { roleId: bytesToHex(random32()), name: "Lieutenant", position: 2, permissions: Permissions.MANAGE_ROLES, scope: { kind: "server" }, color: 0 };
     const mrole = moderatorRole(bytesToHex(random32())); // minted by the ADMIN (position 2)
 
-    const modV1 = await sealEdition(buildRoleEdition(mrole, { actorPubkey: admin.pubkey, version: 1n }), control, admin);
+    const admGrant = await sealEdition(buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
+    const ltGrant = await sealEdition(buildGrantEdition(communityId, { member: lt.pubkey, roleIds: [ltRole.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
+    const modV1 = await sealEdition(buildRoleEdition(mrole, { actorPubkey: admin.pubkey, version: 1n, authority: citeGrant(admGrant, control) }), control, admin);
     const [modV1Parsed] = openControlWraps([modV1], [control]);
     const wraps: NostrEvent[] = [
       await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
       await sealEdition(buildRoleEdition(ltRole, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
-      await sealEdition(buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
-      await sealEdition(buildGrantEdition(communityId, { member: lt.pubkey, roleIds: [ltRole.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
+      admGrant,
+      ltGrant,
       modV1,
       // The lieutenant (position 2) shoves the peer Moderator role to position 5 — dropped.
       await sealEdition(
-        buildRoleEdition({ ...mrole, position: 5, permissions: 0n }, { actorPubkey: lt.pubkey, version: 2n, prevHash: modV1Parsed.selfHash }),
+        buildRoleEdition({ ...mrole, position: 5, permissions: 0n }, { actorPubkey: lt.pubkey, version: 2n, prevHash: modV1Parsed.selfHash, authority: citeGrant(ltGrant, control) }),
         control,
         lt,
       ),
@@ -470,14 +600,15 @@ describe("control plane fold (CORD-04)", () => {
       owner,
     );
     const [modGrantV1] = openControlWraps([modGrant], [control]);
+    const admGrant = await sealEdition(buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
     const wraps: NostrEvent[] = [
       await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
       await sealEdition(buildRoleEdition(mrole, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
-      await sealEdition(buildGrantEdition(communityId, { member: admin.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
+      admGrant,
       modGrant,
       // The admin (position 1) strips the moderator (rank 2) — honored.
       await sealEdition(
-        buildGrantEdition(communityId, { member: mod.pubkey, roleIds: [] }, { actorPubkey: admin.pubkey, version: 2n, prevHash: modGrantV1.selfHash }),
+        buildGrantEdition(communityId, { member: mod.pubkey, roleIds: [] }, { actorPubkey: admin.pubkey, version: 2n, prevHash: modGrantV1.selfHash, authority: citeGrant(admGrant, control) }),
         control,
         admin,
       ),
@@ -509,13 +640,13 @@ describe("control plane fold (CORD-04)", () => {
       const ltRoleW = await sealEdition(buildRoleEdition(ltRole, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
       const delegGrant = await sealEdition(buildGrantEdition(communityId, { member: deleg.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
       const ltGrant = await sealEdition(buildGrantEdition(communityId, { member: lt.pubkey, roleIds: [ltRole.roleId] }, { actorPubkey: owner.pubkey, version: 1n }), control, owner);
-      const mroleW = await sealEdition(buildRoleEdition(mrole, { actorPubkey: deleg.pubkey, version: 1n }), control, deleg);
-      const targetGrant = await sealEdition(buildGrantEdition(communityId, { member: target.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: deleg.pubkey, version: 1n }), control, deleg);
+      const mroleW = await sealEdition(buildRoleEdition(mrole, { actorPubkey: deleg.pubkey, version: 1n, authority: citeGrant(delegGrant, control) }), control, deleg);
+      const targetGrant = await sealEdition(buildGrantEdition(communityId, { member: target.pubkey, roleIds: [mrole.roleId] }, { actorPubkey: deleg.pubkey, version: 1n, authority: citeGrant(delegGrant, control) }), control, deleg);
       const [tgV1] = openControlWraps([targetGrant], [control]);
       // The lieutenant (rank 2) tries to strip the target (rank 2) — equal rank,
       // so it must be dropped: a revoke needs STRICT outrank (CORD-04 §5).
       const revoke = await sealEdition(
-        buildGrantEdition(communityId, { member: target.pubkey, roleIds: [] }, { actorPubkey: lt.pubkey, version: 2n, prevHash: tgV1.selfHash }),
+        buildGrantEdition(communityId, { member: target.pubkey, roleIds: [] }, { actorPubkey: lt.pubkey, version: 2n, prevHash: tgV1.selfHash, authority: citeGrant(ltGrant, control) }),
         control,
         lt,
       );
@@ -565,7 +696,7 @@ describe("control plane fold (CORD-04)", () => {
       const [modGrantV1] = openControlWraps([modGrant], [control]);
       // The admin (position 1) revokes the moderator (rank 2) — always legitimate.
       const revoke = await sealEdition(
-        buildGrantEdition(communityId, { member: mod.pubkey, roleIds: [] }, { actorPubkey: admin.pubkey, version: 2n, prevHash: modGrantV1.selfHash }),
+        buildGrantEdition(communityId, { member: mod.pubkey, roleIds: [] }, { actorPubkey: admin.pubkey, version: 2n, prevHash: modGrantV1.selfHash, authority: citeGrant(adminGrant, control) }),
         control,
         admin,
       );
@@ -941,6 +1072,98 @@ describe("control plane fold (CORD-04)", () => {
     expect(hasForeignLiveLinks(folded, otherAdmin, owner.pubkey)).toBe(false);
   });
 
+  it("banShouldRotate: a foreign live link blocks a rotation, but never a forced one", async () => {
+    // An ordinary ban must not strand another admin's invite link on a dead
+    // epoch. A ban answering control-plane abuse must, because the rotation is
+    // the only thing that takes the flooder's root away — a banlist silences
+    // them but leaves them minting junk.
+    const { owner, communityId, control } = await makeCommunity();
+    const wraps = [
+      await sealEdition(
+        buildRegistryEdition(communityId, owner.pubkey, [bytesToHex(random32())], { actorPubkey: owner.pubkey, version: 1n }),
+        control,
+        owner,
+      ),
+    ];
+    const folded = foldControlState(openControlWraps(wraps, [control]), communityId, owner.pubkey);
+    const otherAdmin = bytesToHex(random32());
+    const bystander = bytesToHex(random32());
+
+    expect(banShouldRotate(folded, owner.pubkey, bystander), "my own link is refreshed by the rotation").toBe(true);
+    expect(banShouldRotate(folded, otherAdmin, bystander), "someone else's link would be stranded").toBe(false);
+    expect(
+      banShouldRotate(folded, otherAdmin, bystander, true),
+      "a forced rotation accepts that cost",
+    ).toBe(true);
+    expect(banShouldRotate(undefined, otherAdmin, bystander, true), "no fold, nothing to rotate from").toBe(false);
+  });
+
+  it("banShouldRotateMany: judged once for the group, excluding every target's own links", async () => {
+    // Two admins each hold a live link. Banning ONE of them still leaves the
+    // other's link to strand, so no rotation; banning BOTH removes every
+    // foreign registry from the view and the single group rotation may run.
+    const { owner, communityId, control } = await makeCommunity();
+    const adminA = signer();
+    const adminB = signer();
+    const adm = adminRole(bytesToHex(random32()));
+    const authorityWraps = [
+      await sealEdition(buildRoleEdition(adm, { actorPubkey: owner.pubkey, version: 1n }), control, owner),
+      await sealEdition(
+        buildGrantEdition(communityId, { member: adminA.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }),
+        control,
+        owner,
+      ),
+      await sealEdition(
+        buildGrantEdition(communityId, { member: adminB.pubkey, roleIds: [adm.roleId] }, { actorPubkey: owner.pubkey, version: 1n }),
+        control,
+        owner,
+      ),
+    ];
+    // Non-owner registry editions must cite their own grant (vac).
+    const heads = foldControlState(openControlWraps(authorityWraps, [control]), communityId, owner.pubkey).heads;
+    const cite = (adminPubkey: string) => {
+      const eid = grantLocator(communityId, hex32(adminPubkey));
+      const head = heads.get(bytesToHex(eid))!;
+      return { entityId: eid, version: head.version, editionHash: head.hash };
+    };
+    const wraps = [
+      ...authorityWraps,
+      await sealEdition(
+        buildRegistryEdition(communityId, adminA.pubkey, [bytesToHex(random32())], {
+          actorPubkey: adminA.pubkey,
+          version: 1n,
+          authority: cite(adminA.pubkey),
+        }),
+        control,
+        adminA,
+      ),
+      await sealEdition(
+        buildRegistryEdition(communityId, adminB.pubkey, [bytesToHex(random32())], {
+          actorPubkey: adminB.pubkey,
+          version: 1n,
+          authority: cite(adminB.pubkey),
+        }),
+        control,
+        adminB,
+      ),
+    ];
+    const folded = foldControlState(openControlWraps(wraps, [control]), communityId, owner.pubkey);
+    expect(folded.registriesByCreator.size, "both admins' registries must actually fold").toBe(2);
+
+    expect(hasForeignLiveLinks(folded, owner.pubkey, [adminA.pubkey])).toBe(true);
+    expect(hasForeignLiveLinks(folded, owner.pubkey, [adminA.pubkey, adminB.pubkey])).toBe(false);
+
+    expect(banShouldRotateMany(folded, owner.pubkey, [adminA.pubkey]), "B's link would strand").toBe(false);
+    expect(banShouldRotateMany(folded, owner.pubkey, [adminA.pubkey, adminB.pubkey]), "no foreign links survive the group ban").toBe(true);
+    expect(banShouldRotateMany(folded, owner.pubkey, [adminA.pubkey], true), "force overrides").toBe(true);
+    expect(banShouldRotateMany(undefined, owner.pubkey, [adminA.pubkey], true), "no fold, nothing to rotate from").toBe(false);
+
+    // The single-target form is the [target] delegate — identical verdicts.
+    expect(banShouldRotate(folded, owner.pubkey, adminA.pubkey)).toBe(
+      banShouldRotateMany(folded, owner.pubkey, [adminA.pubkey]),
+    );
+  });
+
   it("a compaction re-wrap folds for a fresh joiner despite the dangling prev", async () => {
     const { owner, communityId, root, control } = await makeCommunity();
 
@@ -952,7 +1175,7 @@ describe("control plane fold (CORD-04)", () => {
 
     // Refounding: re-wrap ONLY the head into epoch 1 (plaintext seal survives).
     const control1 = controlGroupKey(root, communityId, 1); // (test shortcut: same root, new epoch address)
-    const rewrapped = rewrapSeal(p2.opened.seal, control1);
+    const rewrapped = rewrapSeal(p2.opened.seal!, control1);
 
     const joinerView = openControlWraps([rewrapped], [control1]);
     const folded = foldControlState(joinerView, communityId, owner.pubkey);
@@ -1024,7 +1247,7 @@ describe("control plane fold (CORD-04)", () => {
 
     // e2 Refounding: compaction re-wraps the head (v3) under the new epoch.
     const control2 = controlGroupKey(root, communityId, 2);
-    const rewrapped = rewrapSeal(p3.opened.seal, control2);
+    const rewrapped = rewrapSeal(p3.opened.seal!, control2);
 
     // The rejoiner's readable view: e0 fragment + e2 snapshot; e1 is dark.
     const view = [...openControlWraps([w1], [control]), ...openControlWraps([rewrapped], [control2])];
@@ -1042,7 +1265,7 @@ describe("control plane fold (CORD-04)", () => {
     // A hostile keyholder re-wraps the OLD banning edition into the current
     // epoch to poison the subset. Version anchoring defeats it: a re-wrap
     // can't raise the version inside the signed seal, so v1 loses to v3.
-    const poison = rewrapSeal(p1.opened.seal, control2);
+    const poison = rewrapSeal(p1.opened.seal!, control2);
     const poisonedView = [...view, ...openControlWraps([poison], [control2])];
     const poisonedSnap = new Set([bytesToHex(p3.rumorId), bytesToHex(p1.rumorId)]);
     const resistant = foldControlState(poisonedView, communityId, owner.pubkey, undefined, poisonedSnap);
@@ -1066,7 +1289,7 @@ describe("control plane fold (CORD-04)", () => {
     const b3 = buildBanlistEdition(communityId, [], { actorPubkey: owner.pubkey, version: 3n, prevHash: p2.selfHash });
     const p3 = openControlWraps([await sealEdition(b3, control1, owner)], [control1])[0];
     const control2 = controlGroupKey(root, communityId, 2);
-    const rewrapped = rewrapSeal(p3.opened.seal, control2);
+    const rewrapped = rewrapSeal(p3.opened.seal!, control2);
 
     // Fold 1: only the old fragment is readable; no current-epoch editions yet.
     const first = foldControlState(
@@ -1096,7 +1319,7 @@ describe("control plane fold (CORD-04)", () => {
     const m2 = buildMetadataEdition(communityId, { name: "Two", relays: [] }, { actorPubkey: owner.pubkey, version: 2n, prevHash: p1.selfHash });
     const w2 = await sealEdition(m2, control, owner);
     const control1 = controlGroupKey(root, communityId, 1);
-    const poison = rewrapSeal(p1.opened.seal, control1);
+    const poison = rewrapSeal(p1.opened.seal!, control1);
 
     // View: the store's full e0 chain + the poison; only the poison is
     // current-epoch-attributed.
@@ -1117,14 +1340,14 @@ describe("control plane fold (CORD-04)", () => {
     const m2 = buildMetadataEdition(communityId, { name: "Two", relays: [] }, { actorPubkey: owner.pubkey, version: 2n, prevHash: p1.selfHash });
     const p2 = openControlWraps([await sealEdition(m2, control, owner)], [control])[0];
     const control1 = controlGroupKey(root, communityId, 1);
-    const rewrapV2 = rewrapSeal(p2.opened.seal, control1);
+    const rewrapV2 = rewrapSeal(p2.opened.seal!, control1);
     const snapView = openControlWraps([rewrapV2], [control1]);
     const tracked = foldControlState(snapView, communityId, owner.pubkey, undefined, new Set([bytesToHex(p2.rumorId)]));
     expect(tracked.metadata?.name).toBe("Two");
 
     // The relay then serves only a re-wrap of the OLD v1: nothing at/above the
     // floor remains — the entity holds (no downgrade) and flags incomplete.
-    const rewrapV1 = rewrapSeal(p1.opened.seal, control1);
+    const rewrapV1 = rewrapSeal(p1.opened.seal!, control1);
     const starved = foldControlState(
       openControlWraps([rewrapV1], [control1]),
       communityId,
@@ -1132,7 +1355,10 @@ describe("control plane fold (CORD-04)", () => {
       tracked.heads,
       new Set([bytesToHex(p1.rumorId)]),
     );
-    expect(starved.metadata?.name).not.toBe("Two"); // v2 wasn't served; v1 is below the floor
+    // v2 wasn't served and v1 is below the floor, so the entity is SUSPENDED —
+    // not downgraded to "One". Asserting only `not.toBe("Two")` would have
+    // passed on the downgrade, which is the whole failure mode.
+    expect(starved.metadata).toBeUndefined();
     expect(starved.incomplete).toContain(bytesToHex(communityId));
   });
 
@@ -1286,6 +1512,84 @@ describe("control plane fold (CORD-04)", () => {
   });
 });
 
+describe("tag numbers are spec-shaped decimals (CORD-01 §5)", () => {
+  // "its decimal form with no leading zeros". BigInt()/Number() accept several
+  // shapes that aren't, and a stricter peer drops what we'd honor — a
+  // divergence neither side can see, since a declined parse is never logged.
+  it("accepts a plain decimal and a bare zero", () => {
+    expect(isTagDecimal("4")).toBe(true);
+    expect(isTagDecimal("0")).toBe(true);
+    expect(isTagDecimal("1099511627776")).toBe(true);
+  });
+
+  it("refuses leading zeros, signs, and every non-decimal shape", () => {
+    for (const bad of ["04", "007", "00", "+4", "-4", "0x4", "1e2", " 4", "4 ", "", "4.0", "٤"]) {
+      expect(isTagDecimal(bad), `${JSON.stringify(bad)} is not decimal form`).toBe(false);
+    }
+    expect(isTagDecimal(undefined)).toBe(false);
+  });
+});
+
+describe("citationSatisfied (CORD-04 §5 sync floor)", () => {
+  // Mirrors Vector's `authority_citation_satisfied` case for case. The two
+  // clients diverging here means one honors a moderation action the other
+  // silently ignores, invisibly to both.
+  const owner = "0".repeat(64);
+  const mod = "1".repeat(64);
+  const cid = new Uint8Array(32).fill(7);
+  const eid = grantLocator(cid, hex32(mod));
+  const hash = new Uint8Array(32).fill(0xaa);
+
+  const foldWith = (heads: Array<[string, { version: bigint; hash: Uint8Array }]>) =>
+    ({ ownerHex: owner, heads: new Map(heads) }) as unknown as Parameters<typeof citationSatisfied>[0];
+
+  const cite = (version: bigint, h = hash, entity = eid) => ({ entityId: entity, version, editionHash: h });
+
+  it("the owner cites nothing and is always satisfied", () => {
+    expect(citationSatisfied(foldWith([]), cid, owner, undefined)).toBe(true);
+  });
+
+  it("a non-owner citing nothing is refused", () => {
+    expect(citationSatisfied(foldWith([[bytesToHex(eid), { version: 5n, hash }]]), cid, mod, undefined)).toBe(false);
+  });
+
+  it("passes when synced PAST the cited version", () => {
+    // Whether they are STILL authorized is the caller's roster check, which
+    // already reflects the later head.
+    const f = foldWith([[bytesToHex(eid), { version: 9n, hash: new Uint8Array(32).fill(0xbb) }]]);
+    expect(citationSatisfied(f, cid, mod, cite(3n))).toBe(true);
+  });
+
+  it("at the exact cited version, the hash must be the one that won our fold", () => {
+    const f = foldWith([[bytesToHex(eid), { version: 3n, hash }]]);
+    expect(citationSatisfied(f, cid, mod, cite(3n))).toBe(true);
+    expect(
+      citationSatisfied(f, cid, mod, cite(3n, new Uint8Array(32).fill(0xee))),
+      "a non-canonical fork of their own Grant",
+    ).toBe(false);
+  });
+
+  it("PARKS when our head is behind the cited version", () => {
+    // Fail closed: we cannot confirm the authority yet. Self-heals on sync.
+    const f = foldWith([[bytesToHex(eid), { version: 2n, hash }]]);
+    expect(citationSatisfied(f, cid, mod, cite(3n))).toBe(false);
+  });
+
+  it("refuses a citation naming someone ELSE's Grant", () => {
+    // Completeness can't be borrowed from a foreign edition we happen to hold.
+    const foreign = grantLocator(cid, hex32("2".repeat(64)));
+    const f = foldWith([
+      [bytesToHex(eid), { version: 5n, hash }],
+      [bytesToHex(foreign), { version: 5n, hash }],
+    ]);
+    expect(citationSatisfied(f, cid, mod, cite(5n, hash, foreign))).toBe(false);
+  });
+
+  it("refuses when the actor's Grant is absent entirely", () => {
+    expect(citationSatisfied(foldWith([]), cid, mod, cite(1n))).toBe(false);
+  });
+});
+
 describe("dissolution (CORD-02 §9)", () => {
   it("only the owner's tombstone counts", async () => {
     const { owner, communityId } = await makeCommunity();
@@ -1296,5 +1600,54 @@ describe("dissolution (CORD-02 §9)", () => {
 
     expect(isDissolved([fake], communityId, owner.pubkey)).toBe(false);
     expect(isDissolved([fake, real], communityId, owner.pubkey)).toBe(true);
+  });
+
+  it("a tombstone cannot be replayed onto another community of the same owner", async () => {
+    // The dissolved plane's keypair derives from the community_id with NO
+    // secret input, and the id is public (it ships in every invite). So anyone
+    // holding two public ids can read one community's dissolved plane and sign
+    // at another's — the only thing they lack is an owner-signed vsk-10 rumor.
+    //
+    // With the frozen §9 all-zero `eid` that rumor names nothing, so an owner's
+    // genuine tombstone for X is a working weapon against every OTHER community
+    // the same owner runs: lift the plaintext seal, re-wrap it at Y's dissolved
+    // address, and Y is dead. No membership, no keys, and no un-dissolve.
+    // Committing the community_id inside the signed payload is what stops it.
+    const owner = signer();
+    const x = communityIdOf(hex32(owner.pubkey), random32());
+    const y = communityIdOf(hex32(owner.pubkey), random32());
+    expect(bytesToHex(x)).not.toBe(bytesToHex(y));
+
+    const tombstoneX = await sealDissolved(x, owner.pubkey, owner);
+    expect(isDissolved([tombstoneX], x, owner.pubkey), "it really does kill X").toBe(true);
+
+    // Lift X's seal and re-wrap it at Y's dissolved address — derivable by
+    // anyone from Y's public id, and rewrapSeal is already in the codebase
+    // because compaction needs it.
+    const openedX = openWrap(tombstoneX, dissolvedGroupKey(x));
+    const replayed = rewrapSeal(openedX.seal, dissolvedGroupKey(y));
+
+    expect(
+      isDissolved([replayed], y, owner.pubkey),
+      "a seal minted for X must never kill Y",
+    ).toBe(false);
+  });
+
+  it("refuses an all-zero eid rather than grandfathering it", async () => {
+    // Accepting the frozen shape IS the vulnerability, so it is refused rather
+    // than kept for compatibility. The failure mode of refusing is a community
+    // that reads alive and can simply be re-dissolved; the failure mode of
+    // accepting is one that dies permanently with no recovery.
+    const { owner, communityId } = await makeCommunity();
+    const group = dissolvedGroupKey(communityId);
+    const legacy = buildRumor({
+      kind: 3308,
+      content: "",
+      tags: [["vsk", "10"], ["eid", "0".repeat(64)]],
+      pubkey: owner.pubkey,
+      ms: null,
+    });
+    const seal = await sealRumor(legacy, KIND_SEAL_PLAINTEXT, group, owner);
+    expect(isDissolved([wrapSeal(seal, group)], communityId, owner.pubkey)).toBe(false);
   });
 });

@@ -5,6 +5,7 @@ import { describe, expect, it } from "bun:test";
 import {
   baseRekeyGroupKey,
   bytesToHex,
+  channelRekeyGroupKey,
   epochKeyCommitment,
   random32,
   recipientLocator,
@@ -14,13 +15,18 @@ import { KIND_SEAL_ENCRYPTED } from "./kinds";
 import {
   base64ToBytes,
   buildRekeyRumors,
+  channelRekeyAddressWindow,
+  highestRotatedEpoch,
   bytesToBase64,
   checkContinuity,
   decodeWrappedKey,
   encodeWrappedKey,
   findBlob,
   groupRotations,
+  REKEY_BLOBS_PER_EVENT,
+  type ParsedRekey,
   lowerKeyWins,
+  mintOrReuseRotationKey,
   myLocator,
   parseRekey,
   rekeyScopeId,
@@ -67,6 +73,68 @@ describe("rekey events (CORD-06 §1–2)", () => {
     expect(parsed.newEpoch).toBe(1n);
     expect(parsed.prevCommit).toBe(prevCommit);
     expect(parsed.blobs.length).toBe(1);
+  });
+
+  it("carries the rotator's authority citation across every chunk, and correlates it onto the set", async () => {
+    // CORD-06 §Authority: a rotation cites the Grant it acts under, so a client
+    // whose roster is one sweep stale never honors a just-demoted admin's
+    // Refounding — and that one turns the WHOLE community's keys. The citation
+    // rides every chunk (like the continuity fields), so a receiver holding only
+    // some chunks can still judge the authority.
+    const rotator = signer();
+    const priorRoot = random32();
+    const cid = random32();
+    const address = baseRekeyGroupKey(priorRoot, cid, 1);
+    const prevCommit = bytesToHex(epochKeyCommitment(0n, priorRoot));
+    const vac = { entityId: random32(), version: 4n, editionHash: random32() };
+
+    // Enough blobs to force more than one chunk.
+    const blobs: RekeyBlob[] = Array.from({ length: REKEY_BLOBS_PER_EVENT + 1 }, () => ({
+      locator: bytesToHex(random32()),
+      wrapped: "AAAA",
+    }));
+    const rumors = buildRekeyRumors(
+      rotator.pubkey,
+      { scope: { kind: "root" }, newEpoch: 1n, prevEpoch: 0n, prevCommit },
+      blobs,
+      Date.now(),
+      vac,
+    );
+    expect(rumors.length, "the fixture must actually span chunks").toBeGreaterThan(1);
+
+    const parsed: ParsedRekey[] = [];
+    for (const r of rumors) {
+      const wrap = wrapSeal(await sealRumor(r, KIND_SEAL_ENCRYPTED, address, rotator), address);
+      parsed.push(parseRekey(openWrap(wrap, address)));
+    }
+    for (const p of parsed) {
+      expect(bytesToHex(p.authority!.entityId), "every chunk carries it").toBe(bytesToHex(vac.entityId));
+      expect(p.authority!.version).toBe(4n);
+    }
+
+    const [set] = groupRotations(parsed);
+    expect(set.complete).toBe(true);
+    expect(bytesToHex(set.authority!.editionHash), "and it reaches the adoption gate").toBe(
+      bytesToHex(vac.editionHash),
+    );
+  });
+
+  it("leaves the citation absent when the owner rotates", async () => {
+    // The owner is proven by the community_id itself — there is no Grant to cite.
+    const rotator = signer();
+    const priorRoot = random32();
+    const cid = random32();
+    const address = baseRekeyGroupKey(priorRoot, cid, 1);
+    const prevCommit = bytesToHex(epochKeyCommitment(0n, priorRoot));
+    const rumors = buildRekeyRumors(
+      rotator.pubkey,
+      { scope: { kind: "root" }, newEpoch: 1n, prevEpoch: 0n, prevCommit },
+      [{ locator: bytesToHex(random32()), wrapped: "AAAA" }],
+      Date.now(),
+      undefined,
+    );
+    const wrap = wrapSeal(await sealRumor(rumors[0], KIND_SEAL_ENCRYPTED, address, rotator), address);
+    expect(parseRekey(openWrap(wrap, address)).authority).toBeUndefined();
   });
 
   it("chunks at 120 blobs and completes only with every chunk", () => {
@@ -233,3 +301,67 @@ describe("exclusion vs. history (join-onto-a-past-Refounding, liveness-only bug)
   });
 });
 
+
+describe("rotation key reservation (retry safety)", () => {
+  const CID = "c1".repeat(32);
+  const COMMIT = "ab".repeat(32);
+
+  it("hands a retry the SAME key it minted for the first attempt", async () => {
+    // groupRotations keys a set by (rotator, scope, newEpoch, prevCommit) —
+    // every one of which a retry reproduces. A retry that re-minted would
+    // merge into the first attempt's set chunk-for-chunk, and members would
+    // adopt whichever key rode the chunk carrying their locator: the community
+    // splits in half at one epoch, both halves continuity-valid.
+    const first = await mintOrReuseRotationKey(CID, { kind: "root" }, 3n, COMMIT);
+    const retry = await mintOrReuseRotationKey(CID, { kind: "root" }, 3n, COMMIT);
+    expect(bytesToHex(retry)).toBe(bytesToHex(first));
+  });
+
+  it("mints a distinct key per epoch, scope and base", async () => {
+    const chan = new Uint8Array(32).fill(0x5a);
+    const base = await mintOrReuseRotationKey(CID, { kind: "root" }, 7n, COMMIT);
+    const nextEpoch = await mintOrReuseRotationKey(CID, { kind: "root" }, 8n, COMMIT);
+    const channel = await mintOrReuseRotationKey(CID, { kind: "channel", channelId: chan }, 7n, COMMIT);
+    const forked = await mintOrReuseRotationKey(CID, { kind: "root" }, 7n, "cd".repeat(32));
+    const hexes = [base, nextEpoch, channel, forked].map(bytesToHex);
+    expect(new Set(hexes).size, "a reservation is only shared by genuine retries").toBe(4);
+  });
+});
+
+describe("channel epoch floor from the wire (CORD-03 §2 / CORD-06 §2)", () => {
+  it("derives rotation addresses from the ROOT alone — no channel key needed", () => {
+    // This is the whole reason the floor is discoverable. A member who never
+    // held a single generation of a channel still holds the community root,
+    // and CORD-06 §2 keys the rekey address on (root, channel_id, epoch).
+    const root = random32();
+    const channelId = random32();
+    const window = channelRekeyAddressWindow([{ key: root }], channelId, 4);
+    expect(window.size).toBe(4);
+    expect([...window.values()]).toEqual([1n, 2n, 3n, 4n]);
+    for (const [pk, epoch] of window) {
+      expect(pk).toBe(channelRekeyGroupKey(root, channelId, epoch).pk);
+    }
+  });
+
+  it("spans every held root, since a Refounding seals under the PRIOR one", () => {
+    const a = random32();
+    const b = random32();
+    const channelId = random32();
+    expect(channelRekeyAddressWindow([{ key: a }, { key: b }], channelId, 3).size).toBe(6);
+  });
+
+  it("reports the highest epoch any observed rotation accounts for", () => {
+    const root = random32();
+    const channelId = random32();
+    const window = channelRekeyAddressWindow([{ key: root }], channelId, 8);
+    const at = (e: bigint) => channelRekeyGroupKey(root, channelId, e).pk;
+    expect(highestRotatedEpoch(window, [at(1n), at(5n), at(3n)])).toBe(5n);
+  });
+
+  it("is 0 for a channel that never rotated, so the first privatisation is epoch 1", () => {
+    const window = channelRekeyAddressWindow([{ key: random32() }], random32(), 8);
+    expect(highestRotatedEpoch(window, [])).toBe(0n);
+    // An unrelated author proves nothing about this channel.
+    expect(highestRotatedEpoch(window, ["ff".repeat(32)])).toBe(0n);
+  });
+});

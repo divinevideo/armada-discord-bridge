@@ -10,6 +10,7 @@
  * dangling `prev` ({@link bootstrapHead}).
  */
 
+import type { Rumor } from "./stream";
 import { sha256 } from "@noble/hashes/sha2.js";
 
 /**

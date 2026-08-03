@@ -10,6 +10,7 @@
 
 import {
   KIND_BOT_MANIFEST,
+  KIND_DM_RELAYS,
   KIND_INVITE_BUNDLE,
   KIND_MESSAGE,
   KIND_SEAL_ENCRYPTED,
@@ -194,6 +195,26 @@ export class ConcordClient {
    * default, or a puppet so bridged Discord users appear in the member list
    * before they are looked up by a message.
    */
+  /**
+   * Publish the NIP-17 DM relay list (kind 10050) — where our giftwrap inbox
+   * lives, and so where a Direct Invite carrying a private-channel key gets
+   * delivered (`recipientInboxRelays`). Replaceable; boot republish is the
+   * update mechanism.
+   *
+   * The community relays are the honest answer for a bridge: it is only ever
+   * reachable about one community, and it already holds standing connections
+   * to exactly those relays.
+   */
+  async publishDmRelays(author: LocalIdentity, relays: string[]): Promise<void> {
+    const event = await author.signer.signEvent({
+      kind: KIND_DM_RELAYS,
+      content: "",
+      tags: relays.map((url) => ["relay", url]),
+      created_at: Math.floor(Date.now() / 1000),
+    });
+    await this.pool.publish(event);
+  }
+
   async publishJoin(ms = Date.now(), author: LocalIdentity = this.primary): Promise<NostrEvent> {
     const group = currentGuestbookGroup(this.community);
     const rumor = buildJoinRumor(author.pk, ms);

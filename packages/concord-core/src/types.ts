@@ -210,12 +210,41 @@ export interface PrivateChannelKey {
   epoch: bigint;
   /** Join-time preview name; the ChannelMetadata fold is the authority. */
   name: string;
+  /**
+   * Superseded keys for this channel, retained so HISTORY stays readable
+   * across rotations. A rotation re-keys the channel forward; without the
+   * priors, every message sealed under an earlier epoch becomes undecryptable
+   * to a member who is still fully entitled — the conversation would appear
+   * to start over on every revoke. Read-only: never used to write.
+   *
+   * `retiredAt` is the epoch-seconds the superseding rotation published: the
+   * hard read cutoff for the retired key. Anything sealed under it with a
+   * later `created_at` is refused — a retired epoch is history, never a live
+   * channel an ejected keyholder can keep writing into. Absent for keys
+   * retired before this client recorded cutoffs (those decode uncapped).
+   */
+  priors?: Array<{ key: Uint8Array; epoch: bigint; retiredAt?: number }>;
 }
 
 /** A held root-key epoch (the current one plus retained priors for history). */
 export interface HeldRoot {
   epoch: bigint;
   key: Uint8Array;
+  /**
+   * Epoch-seconds the rotation that superseded this root published — the hard
+   * read cutoff for everything derived from it (see the priors doc above).
+   * Absent on the current root, and on roots retired before cutoffs existed.
+   */
+  retiredAt?: number;
+  /**
+   * The npub whose Refounding minted this epoch (x-only hex) — the snapshot
+   * authority for ITS Guestbook (CORD-02 §5: a snapshot "is honored only from
+   * the npub whose Refounding minted that epoch"). Recorded so historical
+   * epochs' snapshots stay verifiable after the rotator's rank (or the
+   * `refounder` field, which only names the CURRENT epoch's) has moved on.
+   * Absent at genesis (the owner) and on epochs adopted before this existed.
+   */
+  refounder?: string;
 }
 
 /**
@@ -262,10 +291,18 @@ export interface ChannelV2 {
   idHex: string;
   name: string;
   isPrivate: boolean;
+  /** Sidebar grouping (channelCategory.ts); undefined renders ungrouped. */
+  category?: string;
+  /** Sidebar position (channelOrder.ts); undefined sorts last, by name. */
+  position?: number;
   /** The current epoch's call coordinates — every Channel is callable (CORD-07 §1). */
   voice: VoiceKeys;
-  /** Stream keys across every held epoch, newest first (reads span rekeys). */
-  streams: Array<{ epoch: bigint; group: GroupKey }>;
+  /**
+   * Stream keys across every held epoch, newest first (reads span rekeys).
+   * A retired epoch carries its rotation's publish time as `retiredAt` — the
+   * decode path refuses anything sealed under it with a later `created_at`.
+   */
+  streams: Array<{ epoch: bigint; group: GroupKey; retiredAt?: number }>;
   /** The current write coordinate. */
   current: { epoch: bigint; group: GroupKey };
 }

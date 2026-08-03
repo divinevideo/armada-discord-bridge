@@ -45,6 +45,28 @@ export const KIND_EDIT = 3302;
 export const KIND_ZAP = 9735;
 /** On-chain Bitcoin zap attribution (NIP-? §8333 shape, sealed as a rumor). */
 export const KIND_ONCHAIN_ZAP = 8333;
+/**
+ * Poll (CORD.md "Polls"): the NIP-88 kind-1068 poll, sealed as a Chat Plane
+ * rumor. Renders as a visible timeline message and is the `e`-target of votes.
+ */
+export const KIND_POLL = 1068;
+/**
+ * Poll vote (CORD.md "Polls"): the NIP-88 kind-1018 vote, an `e`-referencing
+ * side event sealed like a reaction. Tallied per poll (latest per pubkey wins),
+ * never shown as its own timeline row.
+ */
+export const KIND_POLL_VOTE = 1018;
+/**
+ * Calendar events (CORD.md "Calendar Events"): NIP-52 date-based (31922) and
+ * time-based (31923) events, sealed as Chat Plane rumors. Not timeline messages
+ * — surfaced in the events bar. Addressable identity is (author, `d`) within the
+ * channel; RSVPs reference an event by its rumor id via an `e` tag (there is no
+ * `a`-coordinate for an unsigned rumor).
+ */
+export const KIND_CALENDAR_DATE = 31922;
+export const KIND_CALENDAR_TIME = 31923;
+/** Calendar RSVP (NIP-52 kind 31925), an `e`-referencing side event like a vote. */
+export const KIND_CALENDAR_RSVP = 31925;
 /** WebXDC peer signal. */
 export const KIND_WEBXDC = 3310;
 /** Typing indicator — ephemeral rumor (rides a 21059 wrap). */
@@ -84,8 +106,6 @@ export const KIND_REKEY = 3303;
 
 /** Public invite bundle: addressable, signed by the per-link keypair, empty `d`. */
 export const KIND_INVITE_BUNDLE = 33301;
-/** Bot command manifest (Armada draft NIP): replaceable, bot-key-signed, no `d`. */
-export const KIND_BOT_MANIFEST = 10304;
 /** A member's self-encrypted Community List (replaceable, one per user). */
 export const KIND_COMMUNITY_LIST = 13302;
 /** A creator's self-encrypted Invite List (replaceable, one per user). */
@@ -106,3 +126,53 @@ export const VSK_DISSOLVED = "10";
 /** Invite-bundle marker values for its `vsk` tag: live vs revocation tombstone. */
 export const VSK_INVITE_LIVE = "6";
 export const VSK_INVITE_REVOKED = "9";
+
+// ── Plane rules (CORD-02 §5) ─────────────────────────────────────────────────
+
+/**
+ * The stream planes whose stored rumors are read back BY KIND.
+ *
+ * Chat is not one of them: it is read back by `#channel` tag, bound to the
+ * stream key that decrypted it by `checkChannelBinding`, and its kinds overlap
+ * nothing here.
+ */
+export type Plane = "control" | "guestbook" | "rekey";
+
+/**
+ * What each plane may carry: its rumor kinds, and the seal form CORD-02 §5
+ * fixes for it.
+ *
+ * This is the WHOLE mapping, and it is total — which is why neither fact needs
+ * to be stored beside a rumor. The seal form is a function of the kind (3308 is
+ * plaintext because a control edition must survive a compaction re-wrap;
+ * everything else is encrypted), and the kind sets are disjoint, so the plane a
+ * stored rumor belongs to is a property of the rumor itself.
+ *
+ * Enforced ONCE, at ingest ({@link writeOpened}), against the plane whose keys
+ * actually opened the wrap. That is what makes the kind sufficient afterwards:
+ * without it, a holder of any one plane's stream key could wrap a rumor of
+ * another plane's kind and have it read back as that plane's — the read is a
+ * kind query, and a kind is just data the wrapper chose.
+ */
+export const PLANE_RULES: Record<Plane, { kinds: number[]; sealKind: number }> = {
+  control: { kinds: [KIND_CONTROL], sealKind: KIND_SEAL_PLAINTEXT },
+  guestbook: { kinds: [KIND_JOIN_LEAVE, KIND_KICK, KIND_SNAPSHOT], sealKind: KIND_SEAL_ENCRYPTED },
+  rekey: { kinds: [KIND_REKEY], sealKind: KIND_SEAL_ENCRYPTED },
+};
+
+/**
+ * Every kind claimed by a non-chat plane — the set the CHAT ingress refuses.
+ *
+ * The mirror of {@link PLANE_RULES}' use in `writeOpened`, and the other half
+ * of the same boundary. A community's planes share one tenant, and a plane is
+ * read back by kind, so the two ingresses have to fence each other: a plane
+ * write refuses a `channel` tag (which would put it in a timeline), and a chat
+ * write refuses these kinds (which would put it in a plane). Without this a
+ * holder of any ONE channel's stream key could wrap a kind-3308 rumor carrying
+ * a valid channel binding and have `queryPlane` serve it as a control edition —
+ * and nothing downstream would catch it, since a stored rumor has no seal for
+ * `parseEdition` to check the form of.
+ */
+export const PLANE_KINDS: ReadonlySet<number> = new Set(
+  Object.values(PLANE_RULES).flatMap((rule) => rule.kinds),
+);

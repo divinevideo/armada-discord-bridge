@@ -30,6 +30,20 @@ const TAG_CITATION = "vac";
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
+/**
+ * CORD-01 §5: a tag number rides as "its decimal form with no leading zeros".
+ * So `"4"` and `"0"` are the shape; `"04"`, `"+4"`, `"0x4"`, `"1e2"` and `" 4 "`
+ * are not. `BigInt()`/`Number()` accept several of those, and a peer that
+ * doesn't would drop the event we honored — a divergence neither side can see,
+ * because a declined parse is never logged.
+ */
+const DECIMAL = /^(0|[1-9][0-9]*)$/;
+
+/** True if `s` is a spec-shaped tag number (see {@link DECIMAL}). */
+export function isTagDecimal(s: string | undefined): s is string {
+  return s !== undefined && DECIMAL.test(s);
+}
+
 /** The pinned authority an actor claims for an action (CORD-04 §5). */
 export interface AuthorityCitation {
   entityId: Uint8Array;
@@ -44,7 +58,7 @@ export function citationToTag(c: AuthorityCitation): string[] {
 export function citationFromTags(tags: string[][]): AuthorityCitation | undefined {
   const t = tags.find((t) => t.length >= 4 && t[0] === TAG_CITATION);
   if (!t) return undefined;
-  if (!HEX64.test(t[1]) || !HEX64.test(t[3]) || !/^\d+$/.test(t[2])) return undefined;
+  if (!HEX64.test(t[1]) || !HEX64.test(t[3]) || !isTagDecimal(t[2])) return undefined;
   return { entityId: hexToBytes(t[1]), version: BigInt(t[2]), editionHash: hexToBytes(t[3]) };
 }
 
@@ -118,7 +132,15 @@ export function parseEdition(opened: OpenedEvent): ParsedEdition {
   // Control seals MUST be plaintext (CORD-02 §5) — an encrypted-seal edition
   // could never survive a compaction re-wrap, so honoring it would mint state
   // that silently vanishes for every fresh joiner at the next Refounding.
-  if (opened.sealKind !== KIND_SEAL_PLAINTEXT) throw new EditionError("bad-field", "seal-kind");
+  //
+  // Checked whenever the seal form is KNOWN, which is any event still holding
+  // its wrap — including the freshly-swept ones that reach a fold in memory
+  // without being read back from the store. A STORED rumor has no envelope at
+  // all, and needs none: `writeOpened` applied this same rule before it could
+  // be stored.
+  if (opened.sealKind !== undefined && opened.sealKind !== KIND_SEAL_PLAINTEXT) {
+    throw new EditionError("bad-field", "seal-kind");
+  }
 
   for (const name of [TAG_SUBKIND, TAG_ENTITY, TAG_EVERSION, TAG_EPREV, TAG_CITATION]) {
     if (opened.tags.filter((t) => t[0] === name).length > 1) {
@@ -132,7 +154,7 @@ export function parseEdition(opened: OpenedEvent): ParsedEdition {
   const entityId = decodeHash(get(TAG_ENTITY), "eid");
   const evStr = get(TAG_EVERSION);
   if (evStr === undefined) throw new EditionError("missing-field", "ev");
-  if (!/^\d+$/.test(evStr)) throw new EditionError("bad-field", "ev");
+  if (!isTagDecimal(evStr)) throw new EditionError("bad-field", "ev");
   const version = BigInt(evStr);
   const epStr = get(TAG_EPREV);
   const prevHash = epStr !== undefined ? decodeHash(epStr, "ep") : undefined;

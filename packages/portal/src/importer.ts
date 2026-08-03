@@ -26,6 +26,7 @@ import {
   adminRole,
   buildBundleEvent,
   buildChannelEdition,
+  buildDirectInviteRumor,
   buildGrantEdition,
   buildInviteUrl,
   buildJoinRumor,
@@ -43,17 +44,37 @@ import {
   grantToJSON,
   guestbookGroups,
   hex32,
+  inviteDeliveryRelays,
   mintCommunity,
   mintLinkSigner,
   mintToken,
   parseInviteLink,
   random32,
+  recipientInboxRelays,
   registerStreamKeys,
+  sealDirectInvite,
   sealEdition,
   sealGuestbook,
+  withChannelCategory,
+  withChannelPosition,
+  wrapDirectInvite,
   wrapSeal,
 } from "@armada-bridge/concord-core";
-import type { AuthorityCitation, CommunityV2, InviteBundle, Rumor } from "@armada-bridge/concord-core";
+import type {
+  AuthorityCitation,
+  ChannelMetadata,
+  CommunityV2,
+  InviteBundle,
+  Rumor,
+} from "@armada-bridge/concord-core";
+
+/**
+ * Namespace for the Discord facts Concord has no field for (channel topic, the
+ * originating Discord channel type). Ours, not `armada.*`: CORD-02 §6 makes an
+ * unknown custom member something every editor round-trips, so squatting on
+ * another project's namespace would collide the day they define it.
+ */
+export const DISCORD_IMPORT_METADATA_KEY = "discord.import";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
@@ -323,6 +344,16 @@ export class Importer {
     const { community } = mintCommunity(plan.communityName, ownerPk, plan.relays);
     for (const channel of plan.channels) {
       channel.channelIdHex = channel.selected ? bytesToHex(random32()) : undefined;
+      // A Private Channel is born with an independent key and the Role that
+      // gates it (CORD-03 §1, CORD-04 §2). Both are minted here so a resumed
+      // import republishes the SAME pair instead of forking the channel into
+      // two generations, and the key is sealed at rest like every other
+      // secret in this row.
+      if (channel.selected && channel.private) {
+        channel.accessRoleIdHex = bytesToHex(random32());
+        // Hex, not the raw Buffer: this rides the plan's jsonb column.
+        channel.keySealed = seal(this.env.sealKeyHex, bytesToHex(random32())).toString("hex");
+      }
     }
     for (const role of plan.roles) role.roleIdHex = bytesToHex(random32());
     const token = mintToken();
@@ -582,8 +613,13 @@ export class Importer {
           relays: community.relays,
           ...(cp.iconPointer ? { icon: cp.iconPointer } : {}),
           ...(cp.bannerPointer ? { banner: cp.bannerPointer } : {}),
-          // Forward-compatible pointer to the guild emoji pack (30030).
-          ...(plan.emojis.length > 0 ? { custom: { emojiPack: `30030:${op.pk}:discord-import` } } : {}),
+          // Pointer to the guild emoji pack (30030). Nothing in Armada reads
+          // it yet — packs are per-user there (kind 10030 lists), not a
+          // community field — so this is a forward-compatible breadcrumb under
+          // a namespace we own, not a feature.
+          ...(plan.emojis.length > 0
+            ? { custom: { [DISCORD_IMPORT_METADATA_KEY]: { emojiPack: `30030:${op.pk}:discord-import` } } }
+            : {}),
         };
         await pool.publish(
           await sealEdition(buildMetadataEdition(community.id, metadata, opV1), control, op.signer),
@@ -592,16 +628,69 @@ export class Importer {
         await save();
       }
 
+      // Channel-access Roles sit below every imported Role. They are peers of
+      // each other (CORD-04 §3 lets Roles share a position; display order
+      // tiebreaks on role_id), and the op key holds the stock Admin at
+      // position 1, so it outranks them and may mint them.
+      const accessRolePosition = plan.roles.length + 2;
+
       let position = 0;
       for (const channel of plan.channels) {
         if (!channel.selected) continue;
         const thisPosition = position++;
         if (channel.publishedAt) continue;
-        const custom: Record<string, unknown> = { position: thisPosition };
-        if (channel.topic) custom.topic = channel.topic;
-        if (channel.category) custom.category = channel.category;
-        if (channel.kind) custom.kind = channel.kind;
-        const metadata = { name: channel.name, private: false, custom };
+        // The arrangement rides Armada's namespaced custom members, NOT bare
+        // `category`/`position` keys — `channelCategory`/`channelOrder` read
+        // `armada.category` and `armada.order` and nothing else, so an import
+        // that invents its own spelling lands as a flat alphabetical list with
+        // the sidebar arrangement computed and then discarded.
+        // The access Role publishes BEFORE the channel edition, the ordering
+        // Armada's own createChannel takes: a Role scoped to a channel that
+        // never appeared is inert (it confers no key and grants nothing),
+        // while a private channel whose Role mint then failed is a room with
+        // no access list at all.
+        if (channel.private && !channel.accessRolePublishedAt) {
+          await pool.publish(
+            await sealEdition(
+              buildRoleEdition(
+                {
+                  roleId: channel.accessRoleIdHex!,
+                  name: channel.name,
+                  position: accessRolePosition,
+                  permissions: 0n,
+                  scope: { kind: "channel", channelId: channel.channelIdHex! },
+                  color: 0,
+                },
+                opV1,
+              ),
+              control,
+              op.signer,
+            ),
+          );
+          channel.accessRolePublishedAt = Date.now();
+          await save();
+        }
+        let metadata: ChannelMetadata = { name: channel.name, private: Boolean(channel.private) };
+        metadata = withChannelPosition(metadata, thisPosition);
+        metadata = withChannelCategory(metadata, channel.category);
+        // Discord facts Concord has no field for. Kept under a namespace this
+        // repo owns rather than `armada.*` (which is Armada's to define) so a
+        // client round-trips them per CORD-02 §6 instead of dropping them:
+        // `topic` has no Concord equivalent, and `type` records what the room
+        // was on Discord — every Concord channel is callable (CORD-07 §1), so
+        // a voice room is a naming convention here, not a kind.
+        if (channel.topic || channel.kind) {
+          metadata = {
+            ...metadata,
+            custom: {
+              ...metadata.custom,
+              [DISCORD_IMPORT_METADATA_KEY]: {
+                ...(channel.topic ? { topic: channel.topic } : {}),
+                ...(channel.kind ? { type: channel.kind } : {}),
+              },
+            },
+          };
+        }
         await pool.publish(
           await sealEdition(buildChannelEdition(hex32(channel.channelIdHex!), metadata, opV1), control, op.signer),
         );
@@ -716,6 +805,50 @@ export class Importer {
       }
       if (!cp.invitePublishedAt) {
         cp.invitePublishedAt = Date.now();
+        await save();
+      }
+
+      // 5. The private-channel keys, handed to the OWNER as a Direct Invite
+      // (CORD-05 §6). They cannot ride the public bundle above — that bundle
+      // is what every joiner reads, so a key in it gates nothing — and the
+      // owner never receives one otherwise: they join their own community
+      // through that same public link.
+      //
+      // Only the owner. Everyone else's access is a grant of the channel's
+      // Role, made from Armada once real npubs exist (see PlannedChannel.private).
+      const privateChannels = plan.channels.filter((c) => c.selected && c.private && c.keySealed);
+      if (privateChannels.length > 0 && !cp.ownerChannelKeysSentAt) {
+        const keyBundle: InviteBundle = {
+          ...bundle,
+          channels: privateChannels.map((c) => ({
+            id: c.channelIdHex!,
+            key: unseal(this.env.sealKeyHex, Buffer.from(c.keySealed!, "hex")),
+            epoch: 0,
+            name: c.name,
+          })),
+          label: "Imported from Discord — private channel keys",
+        };
+        const rumor = buildDirectInviteRumor(keyBundle, op.pk);
+        const directSeal = await sealDirectInvite(rumor, community.owner, op.signer);
+        const wrap = wrapDirectInvite(directSeal, community.owner);
+        // The owner's giftwrap inbox, not the community relays: that is where
+        // their client scans (their 10050 DM relays, else NIP-65 reads). A
+        // FAILED lookup is not "no list" — delivering to the stock floor would
+        // report success while the invite sat somewhere they never read.
+        const inbox = await recipientInboxRelays(pool, community.owner);
+        const deliveryPool = this.poolFactory(inviteDeliveryRelays(inbox ?? []));
+        try {
+          await deliveryPool.publish(wrap);
+          cp.ownerChannelKeysSentAt = Date.now();
+        } catch (error) {
+          // Non-fatal: the community is fully published and the channels are
+          // gated. What is missing is the owner's copy of the keys, which is
+          // recoverable by re-running the import (this step is idempotent —
+          // the keys are checkpointed, not re-minted).
+          cp.ownerChannelKeysError = String(error);
+        } finally {
+          await deliveryPool.close().catch(() => {});
+        }
         await save();
       }
     } finally {
