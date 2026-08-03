@@ -88,7 +88,9 @@ app.get("/api/auth/discord", async (c) => {
   if (c.req.query("mode") === "popup" && !popupOrigin) {
     console.warn(`portal: popup auth from non-allow-listed origin ${JSON.stringify(requested ?? null)}, falling back to redirect flow`);
   }
-  await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state, popupOrigin });
+  const nonce = c.req.query("nonce");
+  const claimNonce = popupOrigin && nonce && /^[0-9a-f]{16,64}$/i.test(nonce) ? nonce.toLowerCase() : undefined;
+  await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state, popupOrigin, claimNonce });
   return c.redirect(oauthUrl(env.discordClientId, redirectUri, state));
 });
 
@@ -120,6 +122,7 @@ app.get("/api/auth/discord/callback", async (c) => {
     })),
     accessToken: token,
     popupOrigin: stored.popupOrigin,
+    claimNonce: stored.claimNonce,
   };
   await sessions.updateBySid(found.sid, data);
   // Re-issue the cookie: the redirect flow's SPA needs it, and the one from
@@ -142,6 +145,22 @@ app.get("/api/auth/discord/callback", async (c) => {
     );
   }
   return c.redirect("/");
+});
+
+/**
+ * Poll-side of the popup flow. The opener cannot count on the callback's
+ * postMessage (Discord's COOP severs `window.opener` during the login
+ * navigation), so it polls here with the nonce it minted. Pending until the
+ * callback lands; the first successful claim spends the nonce.
+ */
+app.post("/api/auth/claim", async (c) => {
+  const { nonce } = (await c.req.json().catch(() => ({}))) as { nonce?: string };
+  if (!nonce || !/^[0-9a-f]{16,64}$/i.test(nonce)) return c.json({ error: "nonce required" }, 400);
+  const found = await sessions.findByClaimNonce(nonce.toLowerCase());
+  if (!found || !found.data.user.id) return c.json({ pending: true });
+  const { claimNonce: _spent, ...rest } = found.data;
+  await sessions.updateBySid(found.sid, rest as SessionData);
+  return c.json({ token: found.sid });
 });
 
 app.post("/api/auth/dev", async (c) => {

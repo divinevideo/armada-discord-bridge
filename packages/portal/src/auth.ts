@@ -32,6 +32,15 @@ export interface SessionData {
    * both ends, so it can never name a site the operator didn't approve.
    */
   popupOrigin?: string;
+  /**
+   * Client-generated random nonce for the popup flow. Discord's pages carry
+   * `Cross-Origin-Opener-Policy: same-origin-allow-popups`, which severs the
+   * popup's `window.opener` the moment it navigates there — so the callback's
+   * postMessage handoff cannot be relied on. The opener instead polls
+   * `/api/auth/claim` with this nonce; the first claim after the callback
+   * completes returns the session token and spends the nonce.
+   */
+  claimNonce?: string;
   /** OAuth bearer, kept for claim-time member lookups (guilds.members.read). */
   accessToken?: string;
 }
@@ -104,6 +113,15 @@ export class Sessions {
       WHERE data->>'oauthState' = ${state} AND expires_at > now()`;
     if (!row) return undefined;
     return { sid: row.sid as string, data: row.data as SessionData, expires: new Date(row.expires_at as string) };
+  }
+
+  /** The completed-or-pending OAuth run named by a claim nonce. */
+  async findByClaimNonce(nonce: string): Promise<{ sid: string; data: SessionData } | undefined> {
+    const [row] = await this.sql`
+      SELECT sid, data FROM portal_sessions
+      WHERE data->>'claimNonce' = ${nonce} AND expires_at > now()`;
+    if (!row) return undefined;
+    return { sid: row.sid as string, data: row.data as SessionData };
   }
 
   /** Update a session found by {@link findByOauthState} (no cookie in hand). */
