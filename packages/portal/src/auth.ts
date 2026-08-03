@@ -25,6 +25,13 @@ export interface SessionData {
   guilds: SessionGuild[];
   oauthState?: string;
   dev?: boolean;
+  /**
+   * Set when the OAuth run was started from a popup opened by an allow-listed
+   * origin; the callback hands the session token back to that exact origin via
+   * postMessage instead of redirecting. Validated against `allowedOrigins` at
+   * both ends, so it can never name a site the operator didn't approve.
+   */
+  popupOrigin?: string;
   /** OAuth bearer, kept for claim-time member lookups (guilds.members.read). */
   accessToken?: string;
 }
@@ -32,7 +39,8 @@ export interface SessionData {
 export class Sessions {
   constructor(private readonly sql: postgres.Sql) {}
 
-  async create(c: Context, data: SessionData): Promise<void> {
+  /** Creates the session, sets the cookie, and returns the raw session id. */
+  async create(c: Context, data: SessionData): Promise<string> {
     const sid = randomBytes(24).toString("hex");
     const expires = new Date(Date.now() + SESSION_TTL_MS);
     await this.sql`
@@ -44,10 +52,33 @@ export class Sessions {
       path: "/",
       expires,
     });
+    return sid;
+  }
+
+  /**
+   * The session id for this request: the cookie, or an `Authorization: Bearer`
+   * token.
+   *
+   * The bearer path exists for clients on another origin (Armada running the
+   * import wizard in-app), where the `SameSite=Lax` cookie is never sent and
+   * relaxing it to `None` would put the session at the mercy of third-party
+   * cookie blocking. A token is only ever handed to an origin the operator
+   * allow-listed, and unlike a cookie it is not attached automatically, so a
+   * hostile page cannot spend it just by making the browser issue a request.
+   */
+  /** The raw session id, for handing to an allow-listed origin as a token. */
+  token(c: Context): string | undefined {
+    return this.sid(c);
+  }
+
+  private sid(c: Context): string | undefined {
+    const header = c.req.header("Authorization") ?? "";
+    const bearer = /^Bearer\s+([0-9a-f]{48})$/i.exec(header.trim());
+    return bearer ? bearer[1].toLowerCase() : getCookie(c, COOKIE);
   }
 
   async get(c: Context): Promise<SessionData | undefined> {
-    const sid = getCookie(c, COOKIE);
+    const sid = this.sid(c);
     if (!sid) return undefined;
     const [row] = await this.sql`
       SELECT data FROM portal_sessions
@@ -56,14 +87,14 @@ export class Sessions {
   }
 
   async update(c: Context, data: SessionData): Promise<void> {
-    const sid = getCookie(c, COOKIE);
+    const sid = this.sid(c);
     if (!sid) return;
     await this.sql`
       UPDATE portal_sessions SET data = ${this.sql.json(data as never)} WHERE sid = ${sid}`;
   }
 
   async destroy(c: Context): Promise<void> {
-    const sid = getCookie(c, COOKIE);
+    const sid = this.sid(c);
     if (!sid) return;
     await this.sql`DELETE FROM portal_sessions WHERE sid = ${sid}`;
     setCookie(c, COOKIE, "", { path: "/", expires: new Date(0) });

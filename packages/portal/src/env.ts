@@ -16,6 +16,16 @@ export interface PortalEnv {
   inviteBaseUrl: string;
   /** Default relay set for imported communities; empty falls back to stock. */
   importRelays: string[];
+  /**
+   * Origins allowed to drive the API cross-origin (the Armada client running
+   * the import wizard in-app). Empty = same-origin only, i.e. the portal's own
+   * SPA and nothing else.
+   *
+   * Credentials are NOT sent cross-origin; those callers authenticate with a
+   * bearer token instead of the session cookie, so a permissive entry here
+   * cannot be used to ride a visitor's existing portal session.
+   */
+  allowedOrigins: string[];
 }
 
 function required(name: string): string {
@@ -42,6 +52,10 @@ export function loadPortalEnv(): PortalEnv {
     importRelays: (process.env.IMPORT_DEFAULT_RELAYS ?? "")
       .split(",")
       .map((r) => r.trim())
+      .filter(Boolean),
+    allowedOrigins: (process.env.PORTAL_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim().replace(/\/+$/, ""))
       .filter(Boolean),
   };
 }

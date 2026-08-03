@@ -57,6 +57,7 @@ const env: PortalEnv = {
   devLogin: false,
   inviteBaseUrl: "https://armada.example",
   importRelays: [],
+  allowedOrigins: [],
 };
 
 /** Just enough of postgres.Sql for the importer's queries. */

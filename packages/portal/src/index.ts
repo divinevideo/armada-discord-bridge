@@ -39,12 +39,45 @@ const importer = new Importer(sql, env, manager);
 const app = new Hono();
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;
 
+/**
+ * CORS for allow-listed origins (the Armada client driving the import wizard
+ * in-app).
+ *
+ * `Access-Control-Allow-Credentials` is deliberately absent: cookies must never
+ * ride a cross-origin request. Those callers carry an `Authorization: Bearer`
+ * token instead, which the browser does not attach on its own, so an allow-list
+ * entry grants the ability to *ask* with a token the user's client was given —
+ * never the ability to spend a session cookie a visitor already holds.
+ */
+app.use("/api/*", async (c, next) => {
+  const origin = c.req.header("Origin");
+  const allowed = Boolean(origin && env.allowedOrigins.includes(origin));
+  if (origin && allowed) {
+    c.header("Access-Control-Allow-Origin", origin);
+    c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    c.header("Access-Control-Max-Age", "600");
+  }
+  // Cached responses must not leak one origin's ACAO header to another.
+  c.header("Vary", "Origin");
+  if (c.req.method === "OPTIONS") return c.body(null, allowed ? 204 : 403);
+  return next();
+});
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 app.get("/api/auth/discord", async (c) => {
   if (!env.discordClientId) return c.json({ error: "DISCORD_CLIENT_ID not configured" }, 501);
   const state = randomBytes(16).toString("hex");
-  await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state });
+  // Popup mode: an allow-listed origin opened this window and is waiting for
+  // the token. An origin that isn't allow-listed silently falls back to the
+  // normal redirect flow rather than being told it was rejected.
+  const requested = c.req.query("origin");
+  const popupOrigin =
+    c.req.query("mode") === "popup" && requested && env.allowedOrigins.includes(requested)
+      ? requested
+      : undefined;
+  await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state, popupOrigin });
   return c.redirect(oauthUrl(env.discordClientId, redirectUri, state));
 });
 
@@ -69,19 +102,39 @@ app.get("/api/auth/discord/callback", async (c) => {
       canManage: canManage(g),
     })),
     accessToken: token,
+    popupOrigin: stored.popupOrigin,
   };
   await sessions.update(c, data);
+
+  // Popup mode: hand the token to the opener and close, instead of redirecting
+  // this window to the portal SPA the user never asked for.
+  if (stored.popupOrigin) {
+    const sid = sessions.token(c);
+    if (!sid) return c.text("session lost", 400);
+    return c.html(
+      `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
+<body style="font:14px system-ui;padding:2rem;text-align:center">Discord connected. You can close this window.
+<script>(function(){
+  try { window.opener && window.opener.postMessage(
+    { type: "armada-bridge-session", token: ${JSON.stringify(sid)} },
+    ${JSON.stringify(stored.popupOrigin)}); } catch (e) {}
+  window.close();
+})();</script>`,
+    );
+  }
   return c.redirect("/");
 });
 
 app.post("/api/auth/dev", async (c) => {
   if (!env.devLogin) return c.json({ error: "dev login disabled" }, 403);
-  await sessions.create(c, {
+  // Returns the token too, so a cross-origin client (Armada's wizard in dev)
+  // can authenticate without the cookie.
+  const sid = await sessions.create(c, {
     user: { id: "0", username: "dev" },
     guilds: [{ id: "0", name: "Dev Guild", canManage: true }],
     dev: true,
   });
-  return c.json({ ok: true });
+  return c.json({ ok: true, token: sid });
 });
 
 app.post("/api/auth/logout", async (c) => {
