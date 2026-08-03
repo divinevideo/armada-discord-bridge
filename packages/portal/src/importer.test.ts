@@ -189,6 +189,11 @@ describe("importer pipeline", () => {
     const routed: Array<{ channelId: string; id: string; timestampMs?: number }> = [];
     const manager = {
       activateImported: async (row: BridgeRow) => void activated.push(row),
+      // The wiring step provisions the identity, admits the bridge to any
+      // private channel, then starts it — so the stub hands back a row with a
+      // primary_pk, the way the real manager does.
+      provisionImported: async (row: BridgeRow) => ({ ...row, primary_pk: `pk-${row.bridge_id}` }),
+      startImported: async (row: BridgeRow) => void activated.push(row),
       resyncFor: async () => {},
       channelKnown: () => true,
       routerFor: (discordChannelId: string) => ({

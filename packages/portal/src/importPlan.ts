@@ -269,19 +269,16 @@ function planChannels(snapshot: GuildSnapshot, skipped: SkippedItem[]): PlannedC
       continue;
     }
     const priv = isPrivate(channel, snapshot.guild.id, categories);
-    if (priv) {
-      // Imported, but not mirrored: a live bridge reads a private channel only
-      // if the bridge's own npub holds the key, and the bridge learns keys
-      // exactly once — from the invite bundle it joined with. Until it follows
-      // CORD-06 rekey deliveries, wiring one would produce a bridge that
-      // silently mirrors nothing.
-      skipped.push({
-        kind: "channel",
-        name: label(channel),
-        reason: "private channel: imported gated, but not live-bridged to Discord yet",
-      });
-    }
-    const bridgeable = channel.type === TEXT && !priv;
+    // A private channel CAN be mirrored, but never by default: doing so vends
+    // its key to the bridge's custodial npub and copies a deliberately gated
+    // room into Discord in plaintext. That is a choice the owner makes per
+    // channel, on the review screen, not one an import makes for them.
+    //
+    // (The bridge takes delivery of the key at boot as a Direct Invite — see
+    // keyIntake.ts — which the wiring step sends before starting it. What is
+    // still unhandled is CORD-06 rotation: after a revoke-driven rekey the
+    // bridge holds a superseded key and goes quiet until it is re-granted.)
+    const bridgeable = channel.type === TEXT;
     out.push({
       discordId: channel.id,
       discordType: channel.type,
@@ -291,7 +288,7 @@ function planChannels(snapshot: GuildSnapshot, skipped: SkippedItem[]): PlannedC
       kind: voice ? "voice" : undefined,
       private: priv || undefined,
       bridgeable,
-      bridge: bridgeable,
+      bridge: bridgeable && !priv,
       selected: true,
       history: false, // flipped on below when the member gate allows
     });
@@ -378,7 +375,9 @@ export function buildImportPlan(snapshot: GuildSnapshot): ImportPlan {
   const memberCount = snapshot.guild.approximate_member_count;
   const historyAllowed = memberCount !== undefined && memberCount <= HISTORY_MEMBER_CAP;
   if (historyAllowed) {
-    for (const channel of channels) if (channel.bridgeable) channel.history = true;
+    // Follows the bridge default, so a private channel doesn't arrive with
+    // history pre-ticked under an unticked bridge it depends on.
+    for (const channel of channels) if (channel.bridgeable && channel.bridge) channel.history = true;
   } else {
     skipped.push({
       kind: "feature",

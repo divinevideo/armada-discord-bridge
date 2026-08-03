@@ -487,7 +487,7 @@ export class Importer {
   private async run(importId: string): Promise<void> {
     const { community, opSk, plan } = await this.load(importId);
     await this.publishEditions(importId, community, opSk, plan);
-    await this.wireBridges(importId, community, plan);
+    await this.wireBridges(importId, community, opSk, plan);
     await this.importHistory(importId, plan);
     await this.sql`
       UPDATE imports SET status = 'done', status_detail = NULL, updated_at = now()
@@ -1212,7 +1212,90 @@ export class Importer {
   }
 
   /** Create + activate a bridges row per selected text channel, no consent gate (D4). */
-  private async wireBridges(importId: string, community: CommunityV2, plan: ImportPlan): Promise<void> {
+  /**
+   * Let a bridge into a private channel the owner ticked for mirroring.
+   *
+   * Two steps, in this order:
+   *
+   * 1. Grant the bridge's npub the channel-scoped access Role. This is the
+   *    access list Armada shows and revokes from — without it the bridge would
+   *    hold a key nobody can see it holding, and a revoke would have nothing to
+   *    remove. The op key mints it under the Admin role the owner granted it.
+   * 2. Hand it the key as a Direct Invite (CORD-05 §6), giftwrapped to that
+   *    npub and published where the bridge scans at boot: the community relays
+   *    plus the stock floor. Nothing is persisted for it — the wrap is a
+   *    durable relay event, so a restart re-reads the same key.
+   *
+   * Rotation is still not covered: a CORD-06 rekey after a revoke mints an
+   * epoch the bridge does not follow, so it goes quiet on that channel until
+   * re-granted. That is the known bound on this feature, not a failure here.
+   */
+  private async admitBridgeToPrivateChannel(
+    community: CommunityV2,
+    opSk: Uint8Array,
+    plan: ImportPlan,
+    channel: PlannedChannel,
+    bridgePk: string,
+  ): Promise<void> {
+    const op = localIdentity(opSk);
+    const control = currentControlGroup(community);
+    registerStreamKeys(controlGroups(community), community.relays);
+    const pool = this.poolFactory(community.relays);
+    try {
+      const opV1 = {
+        actorPubkey: op.pk,
+        version: 1n,
+        authority: {
+          entityId: grantLocator(community.id, hex32(op.pk)),
+          version: 1n,
+          editionHash: hex32(plan.checkpoints.grantHashHex!),
+        },
+      };
+      await pool.publish(
+        await sealEdition(
+          buildGrantEdition(
+            community.id,
+            { member: bridgePk, roleIds: [channel.accessRoleIdHex!] },
+            opV1,
+          ),
+          control,
+          op.signer,
+        ),
+      );
+
+      const keyBundle: InviteBundle = {
+        community_id: community.idHex,
+        owner: community.owner,
+        owner_salt: bytesToHex(community.ownerSalt),
+        community_root: bytesToHex(community.root),
+        root_epoch: 0,
+        channels: [
+          {
+            id: channel.channelIdHex!,
+            key: unseal(this.env.sealKeyHex, Buffer.from(channel.keySealed!, "hex")),
+            epoch: 0,
+            name: channel.name,
+          },
+        ],
+        relays: community.relays,
+        name: plan.communityName,
+        creator_npub: community.owner,
+        label: `Bridge access — ${channel.name}`,
+      };
+      const rumor = buildDirectInviteRumor(keyBundle, op.pk);
+      const directSeal = await sealDirectInvite(rumor, bridgePk, op.signer);
+      await pool.publish(wrapDirectInvite(directSeal, bridgePk));
+    } finally {
+      await pool.close?.();
+    }
+  }
+
+  private async wireBridges(
+    importId: string,
+    community: CommunityV2,
+    opSk: Uint8Array,
+    plan: ImportPlan,
+  ): Promise<void> {
     await this.sql`
       UPDATE imports SET status = 'wiring', updated_at = now() WHERE import_id = ${importId}`;
     const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
@@ -1228,13 +1311,21 @@ export class Importer {
                 ${community.idHex}, ${plan.communityName},
                 ${row.discord_guild_id}, ${channel.discordId}, ${channel.channelIdHex!})
         RETURNING *`;
+
+      // Mint the identity first, so a private channel's key can reach it
+      // before it boots — key intake happens once, at start.
+      const provisioned = await this.manager.provisionImported(bridge);
+      if (channel.private && channel.keySealed && provisioned.primary_pk) {
+        await this.admitBridgeToPrivateChannel(community, opSk, plan, channel, provisioned.primary_pk);
+      }
+
       // resolveInvite inside start() races relay propagation of the fresh
       // bundle; a couple of spaced retries absorb that.
       let lastError: unknown;
       for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 3000));
         try {
-          await this.manager.activateImported(bridge);
+          await this.manager.startImported(provisioned);
           lastError = undefined;
           break;
         } catch (error) {

@@ -235,7 +235,15 @@ export class BridgeManager {
    * portal custodially owns the imported community, so the Armada-side
    * consent the confirm gate exists for is implicit (plan D4).
    */
-  async activateImported(row: BridgeRow): Promise<void> {
+  /**
+   * Mint the bridge's identity and mark it active, WITHOUT starting it.
+   *
+   * Split out from {@link activateImported} because a private channel's key has
+   * to reach this npub before the bridge boots: `start()` takes key delivery
+   * exactly once, at boot (see keyIntake.ts). A bridge started first simply
+   * cannot see the channel, and would sit there mirroring nothing.
+   */
+  async provisionImported(row: BridgeRow): Promise<BridgeRow> {
     if (!row.community_id || !row.discord_guild_id) {
       throw new Error("bridge must be linked (community + guild) before activation");
     }
@@ -252,7 +260,16 @@ export class BridgeManager {
       WHERE bridge_id = ${row.bridge_id}`;
 
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${row.bridge_id}`;
-    await this.start(fresh);
+    return fresh;
+  }
+
+  /** Start an already-provisioned bridge. Safe to retry: `start` is idempotent. */
+  async startImported(row: BridgeRow): Promise<void> {
+    await this.start(row);
+  }
+
+  async activateImported(row: BridgeRow): Promise<void> {
+    await this.start(await this.provisionImported(row));
   }
 
   private async start(row: BridgeRow): Promise<void> {

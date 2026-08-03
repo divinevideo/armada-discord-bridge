@@ -71,7 +71,7 @@ describe("channel planning", () => {
     ]);
   });
 
-  it("plans a private channel (own overwrite) gated, and does not bridge it", () => {
+  it("plans a private channel (own overwrite) gated, mirrorable but off by default", () => {
     const plan = buildImportPlan(
       snapshot([
         channel({
@@ -82,8 +82,12 @@ describe("channel planning", () => {
         }),
       ]),
     );
-    expect(plan.channels.map((c) => [c.name, c.private, c.bridgeable])).toEqual([["mods-only", true, false]]);
-    expect(plan.skipped.find((s) => s.name === "#mods-only")?.reason).toContain("not live-bridged");
+    // Offered, never assumed: mirroring a gated room copies it into Discord in
+    // plaintext, so the owner has to tick it themselves. History follows the
+    // bridge flag, so it must not arrive pre-ticked either.
+    expect(plan.channels.map((c) => [c.name, c.private, c.bridgeable, c.bridge, c.history])).toEqual([
+      ["mods-only", true, true, false, false],
+    ]);
   });
 
   it("inherits privacy from the category unless the channel re-allows", () => {
