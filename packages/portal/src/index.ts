@@ -128,6 +128,9 @@ app.get("/api/auth/discord/callback", async (c) => {
   // Re-issue the cookie: the redirect flow's SPA needs it, and the one from
   // auth-start may be gone or belong to a newer abandoned run.
   sessions.adopt(c, found.sid, found.expires);
+  console.log(
+    `portal: oauth callback completed (popup=${Boolean(stored.popupOrigin)}, nonce=${stored.claimNonce ? `${stored.claimNonce.slice(0, 8)}…` : "none"})`,
+  );
 
   // Popup mode: hand the token to the opener and close, instead of redirecting
   // this window to the portal SPA the user never asked for.
@@ -157,9 +160,13 @@ app.post("/api/auth/claim", async (c) => {
   const { nonce } = (await c.req.json().catch(() => ({}))) as { nonce?: string };
   if (!nonce || !/^[0-9a-f]{16,64}$/i.test(nonce)) return c.json({ error: "nonce required" }, 400);
   const found = await sessions.findByClaimNonce(nonce.toLowerCase());
-  if (!found || !found.data.user.id) return c.json({ pending: true });
+  if (!found || !found.data.user.id) {
+    console.log(`portal: claim ${nonce.slice(0, 8)}…: pending (${found ? "awaiting callback" : "no session"})`);
+    return c.json({ pending: true });
+  }
   const { claimNonce: _spent, ...rest } = found.data;
   await sessions.updateBySid(found.sid, rest as SessionData);
+  console.log(`portal: claim ${nonce.slice(0, 8)}…: token released`);
   return c.json({ token: found.sid });
 });
 

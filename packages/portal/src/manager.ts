@@ -52,6 +52,7 @@ export interface BridgeRow {
   concord_channel_id: string | null;
   confirm_code: string | null;
   options: Record<string, unknown> | null;
+  announced_at: string | null;
 }
 
 interface Running {
@@ -494,8 +495,18 @@ export class BridgeManager {
   /**
    * One-time welcome in both directions when a bridge goes live: tells
    * everyone the channel is mirrored and teaches /claim. Fire-and-forget.
+   *
+   * One-time means once per bridge EVER, not once per process: attachRouting
+   * runs again on every restart's resume, so the sent-ness is claimed on the
+   * row first. A crash between the claim and the sends drops the welcome,
+   * which is the better failure than greeting the channel on every deploy.
    */
   private async announceBridge(rb: Running): Promise<void> {
+    const [claimed] = await this.sql`
+      UPDATE bridges SET announced_at = now()
+      WHERE bridge_id = ${rb.id} AND announced_at IS NULL
+      RETURNING bridge_id`;
+    if (!claimed) return;
     await rb.client
       .sendChat(rb.channel, {
         content:
