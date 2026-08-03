@@ -6,20 +6,41 @@ import { Claims } from "./Claims";
 import { ImportWizard } from "./ImportWizard";
 import { Wizard } from "./Wizard";
 
+/**
+ * Where a deep link's intent is parked while the visitor signs in. Discord's
+ * OAuth callback always redirects to `/`, so reading the path straight into
+ * state only works for someone who already has a session; anyone arriving cold
+ * would land on the dashboard having forgotten why they came.
+ */
+const PENDING_VIEW_KEY = "portal:pending-view";
+
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [view, setView] = useState<"dashboard" | "wizard" | "import" | "claims">("dashboard");
   const [wizardFrom, setWizardFrom] = useState<BridgeSummary | undefined>();
   const [claimCommunityId, setClaimCommunityId] = useState<string | null>(null);
 
-  // A /claim bot link lands here: /claim/<communityId>.
+  // Deep links: /import (Armada's "Import from Discord" buttons) and
+  // /claim/<communityId> (the bot's claim link). Park the intent, then clean the
+  // URL so a refresh mid-wizard doesn't restart it.
   useEffect(() => {
-    const match = /^\/claim\/([0-9a-f]{64})$/.exec(window.location.pathname);
-    if (match) {
-      setClaimCommunityId(match[1]);
-      window.history.replaceState(null, "", "/");
-    }
+    const path = window.location.pathname;
+    const claim = /^\/claim\/([0-9a-f]{64})$/.exec(path);
+    if (claim) sessionStorage.setItem(PENDING_VIEW_KEY, `claim:${claim[1]}`);
+    else if (path === "/import") sessionStorage.setItem(PENDING_VIEW_KEY, "import");
+    else return;
+    window.history.replaceState(null, "", "/");
   }, []);
+
+  // Consume it once there's a session to act on.
+  useEffect(() => {
+    if (!me?.user) return;
+    const pending = sessionStorage.getItem(PENDING_VIEW_KEY);
+    if (!pending) return;
+    sessionStorage.removeItem(PENDING_VIEW_KEY);
+    if (pending === "import") setView("import");
+    else if (pending.startsWith("claim:")) setClaimCommunityId(pending.slice("claim:".length));
+  }, [me]);
 
   const refresh = useCallback(() => {
     void api<Me>("/api/me").then(setMe).catch(() => setMe({ user: null, devLogin: false, discordConfigured: false }));
