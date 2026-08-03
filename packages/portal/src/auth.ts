@@ -86,6 +86,46 @@ export class Sessions {
     return row?.data as SessionData | undefined;
   }
 
+  /**
+   * The session that started the OAuth run named by `state`, for the callback.
+   *
+   * The callback deliberately does NOT identify the session by cookie: the
+   * popup flow's cookie routinely fails to survive the round trip through
+   * Discord (privacy modes that scope a popup's cookies to its opener, logins
+   * that continue in a different window or the Discord app, a second click on
+   * Connect overwriting the first popup's cookie), and the 128-bit
+   * single-shot `oauthState` is the CSRF binding anyway. `sessions.update`
+   * replaces the data without `oauthState`, so a state can never be spent
+   * twice.
+   */
+  async findByOauthState(state: string): Promise<{ sid: string; data: SessionData; expires: Date } | undefined> {
+    const [row] = await this.sql`
+      SELECT sid, data, expires_at FROM portal_sessions
+      WHERE data->>'oauthState' = ${state} AND expires_at > now()`;
+    if (!row) return undefined;
+    return { sid: row.sid as string, data: row.data as SessionData, expires: new Date(row.expires_at as string) };
+  }
+
+  /** Update a session found by {@link findByOauthState} (no cookie in hand). */
+  async updateBySid(sid: string, data: SessionData): Promise<void> {
+    await this.sql`
+      UPDATE portal_sessions SET data = ${this.sql.json(data as never)} WHERE sid = ${sid}`;
+  }
+
+  /**
+   * (Re)issue the cookie for an existing session. The callback uses this so
+   * the redirect flow stays signed in even when the auth-start cookie was
+   * lost or overwritten between the two legs.
+   */
+  adopt(c: Context, sid: string, expires: Date): void {
+    setCookie(c, COOKIE, sid, {
+      httpOnly: true,
+      sameSite: "Lax",
+      path: "/",
+      expires,
+    });
+  }
+
   async update(c: Context, data: SessionData): Promise<void> {
     const sid = this.sid(c);
     if (!sid) return;

@@ -85,16 +85,25 @@ app.get("/api/auth/discord", async (c) => {
     c.req.query("mode") === "popup" && requested && env.allowedOrigins.includes(requested)
       ? requested
       : undefined;
+  if (c.req.query("mode") === "popup" && !popupOrigin) {
+    console.warn(`portal: popup auth from non-allow-listed origin ${JSON.stringify(requested ?? null)}, falling back to redirect flow`);
+  }
   await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state, popupOrigin });
   return c.redirect(oauthUrl(env.discordClientId, redirectUri, state));
 });
 
 app.get("/api/auth/discord/callback", async (c) => {
-  const stored = await sessions.get(c);
   const state = c.req.query("state");
   const code = c.req.query("code");
-  if (!stored || !code || !state || state !== stored.oauthState) return c.text("bad oauth state", 400);
-  const token = await exchangeCode(env.discordClientId, env.discordClientSecret, redirectUri, code);
+  // The session is found by the state, not the cookie — see findByOauthState
+  // for why the cookie cannot be trusted to survive the trip through Discord.
+  const found = state && code ? await sessions.findByOauthState(state) : undefined;
+  if (!found) {
+    console.warn(`portal: oauth callback with no matching session (code=${Boolean(code)}, state=${Boolean(state)})`);
+    return c.text("bad oauth state", 400);
+  }
+  const stored = found.data;
+  const token = await exchangeCode(env.discordClientId, env.discordClientSecret, redirectUri, code as string);
   const me = await fetchMe(token);
   const guilds = await fetchMyGuilds(token);
   const data: SessionData = {
@@ -112,13 +121,15 @@ app.get("/api/auth/discord/callback", async (c) => {
     accessToken: token,
     popupOrigin: stored.popupOrigin,
   };
-  await sessions.update(c, data);
+  await sessions.updateBySid(found.sid, data);
+  // Re-issue the cookie: the redirect flow's SPA needs it, and the one from
+  // auth-start may be gone or belong to a newer abandoned run.
+  sessions.adopt(c, found.sid, found.expires);
 
   // Popup mode: hand the token to the opener and close, instead of redirecting
   // this window to the portal SPA the user never asked for.
   if (stored.popupOrigin) {
-    const sid = sessions.token(c);
-    if (!sid) return c.text("session lost", 400);
+    const sid = found.sid;
     return c.html(
       `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
 <body style="font:14px system-ui;padding:2rem;text-align:center">Discord connected. You can close this window.
