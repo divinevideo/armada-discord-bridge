@@ -33,7 +33,15 @@ await migrate(env.databaseUrl);
 const sql = postgres(env.databaseUrl, { onnotice: () => {} });
 const sessions = new Sessions(sql);
 const manager = new BridgeManager(sql, env);
-await manager.init();
+/**
+ * Deliberately NOT awaited. `init()` resumes every active bridge serially, and
+ * each resume folds that community over its relays — so a single unreachable
+ * relay used to leave the process alive with the Discord gateway connected but
+ * the HTTP port never bound, because the default export is only evaluated once
+ * the module's top-level awaits settle. The API must come up regardless;
+ * bridges go live as they finish folding.
+ */
+void manager.init().catch((error) => console.error("portal: bridge resume failed:", error));
 const importer = new Importer(sql, env, manager);
 
 const app = new Hono();
