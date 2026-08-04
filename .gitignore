@@ -4,5 +4,3 @@ dist/
 .env
 .env.*
 *.log
-scripts/liveness/state.json
-scripts/seed/out/
