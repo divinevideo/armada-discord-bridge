@@ -62,6 +62,44 @@ Keep `PORTAL_SEAL_KEY` stable across restarts or existing bridges cannot be
 unsealed. In production, `vite build packages/portal/web` once and the API
 serves `web/dist` itself on :8787.
 
+## Deploy (production)
+
+The portal runs on `discord-bridge.lan` (a Proxmox LXC) as the systemd unit
+`bridge-portal.service`, which is `bun run packages/portal/src/index.ts` in
+`/opt/armada-discord-bridge`, reading secrets from
+`/opt/armada-discord-bridge/.env.portal`. `cloudflared` fronts it and serves
+`https://bridge.armada.buzz` to `127.0.0.1:8787`. SSH is root-only; the `mk`
+login is not authorized on the box.
+
+The server has no `node`/`npm` and cannot fetch the nostr `origin`, so deploys
+run from a workstation checkout: build the SPA locally, ship the commit as a git
+bundle and the built `dist` as a tarball, then restart the unit.
+
+```sh
+# workstation, from a clean `main`
+./node_modules/.bin/vite build packages/portal/web
+git bundle create /tmp/armada-main.bundle main
+tar czf /tmp/portal-dist.tgz -C packages/portal/web dist
+scp /tmp/armada-main.bundle /tmp/portal-dist.tgz root@discord-bridge.lan:/tmp/
+
+# server
+ssh root@discord-bridge.lan '
+  cd /opt/armada-discord-bridge
+  git -c safe.directory=$PWD pull --ff-only /tmp/armada-main.bundle main
+  rm -rf packages/portal/web/dist
+  tar xzf /tmp/portal-dist.tgz -C packages/portal/web
+  systemctl restart bridge-portal.service
+'
+```
+
+`web/dist` is gitignored, so it ships separately from the bundle.
+`git -c safe.directory` is required because the repo reads as `UNKNOWN` owner
+inside the container. When `package.json` changes, run `bun install`
+(`/root/.bun/bin/bun`) on the server before the restart; it rarely does. Keep
+`PORTAL_SEAL_KEY` in the server's `.env.portal` stable or existing bridges
+cannot be unsealed. To roll back, `git -c safe.directory=$PWD reset --hard
+<prev-commit>` and restart the unit.
+
 The gap between plans and code is tracked in [`NEXT-STEPS.md`](./NEXT-STEPS.md).
 
 The design lives in two documents:

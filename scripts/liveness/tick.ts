@@ -37,7 +37,7 @@ import { personasFor } from "../seed/personas";
 import { deriveSock } from "../seed/sock";
 import type { CommunitySeed, Persona } from "../seed/types";
 import { LIVENESS, type CommunityLiveness } from "./config";
-import { generate } from "./llm";
+import { generate, judgeMeme, judgeMedia, judgeLink } from "./llm";
 import { fetchHot, type RedditPost } from "./reddit";
 import { loadState, saveState, type LivenessState } from "./state";
 
@@ -54,6 +54,8 @@ const INVITES: Record<string, CommunitySeed> = {
 const DEFAULT_RELAYS = ["wss://relay.ditto.pub", "wss://relay.dreamith.to"];
 const BASE_P = 0.24;
 const CONTEXT_HOURS = 72;
+/** Max image vision-checks per repost tick, bounding latency/cost. */
+const REPOST_VET_LIMIT = 5;
 const EMOJI = ["😂", "💯", "🔥", "❤️", "👀", "😭", "👍", "🙌", "💀", "🤝"];
 
 const normChan = (s: string): string => s.trim().toLowerCase();
@@ -168,8 +170,49 @@ async function actReddit(ctx: Ctx): Promise<boolean> {
   const flavored = source.flavor === "image" ? unseen.filter((p) => p.kind === "image") : unseen;
   const candidates = (flavored.length > 0 ? flavored : unseen).sort((a, b) => b.score - a.score).slice(0, 10);
   if (candidates.length === 0) return false;
-  const post = pick(candidates);
   const persona = choosePersona(ctx);
+  if (ctx.cfg.repostOnly) {
+    // Repost source content, vetted, in hot order. Every candidate is judged
+    // before it can post, so nothing goes out unseen. "meme" sources post the
+    // image bare; "curate" sources post links and content images with the
+    // source post's own title. Meme lanes are image-only. Reddit self-posts
+    // (no shareUrl) are skipped.
+    const mode = source.mode ?? "curate";
+    const subject = source.subject ?? ctx.cfg.topic ?? ctx.cfg.key;
+    const avoid = ctx.cfg.avoid;
+    let vetted = 0;
+    for (const item of candidates) {
+      if (!item.shareUrl) continue;
+      if (mode === "meme" && item.kind !== "image") continue;
+      if (vetted >= REPOST_VET_LIMIT) break;
+      vetted++;
+      ctx.state.seenReddit.push(`${item.sub}/${item.id}`); // don't re-vet a reject
+      let ok = false;
+      try {
+        ok =
+          mode === "meme"
+            ? await judgeMeme(item.shareUrl, subject, avoid)
+            : item.kind === "image"
+              ? await judgeMedia(item.shareUrl, subject, avoid)
+              : await judgeLink(item.title, subject, avoid);
+      } catch (e) {
+        console.warn(`  vet failed: ${e instanceof Error ? e.message : e}`);
+      }
+      if (!ok) {
+        console.log(`  skip (vet) ${item.shareUrl}`);
+        continue;
+      }
+      // Memes post bare unless the source opts into keeping its title for
+      // context; everything else carries the source title.
+      const content =
+        mode === "meme" && !source.caption ? item.shareUrl : `${trunc(item.title, 200)}\n${item.shareUrl}`;
+      await publish(ctx, channel, persona, KIND_MESSAGE, content, []);
+      noteSent(ctx, channel, persona, item.title);
+      return true;
+    }
+    return false;
+  }
+  const post = pick(candidates);
   const inChannel = ctx.recent.filter((c) => c.channelIdHex === channel.idHex);
   // Reddit is the idea source, never the destination: memes and external
   // links are shared directly, discussions become topics raised in the
@@ -308,7 +351,9 @@ async function actOnce(cfg: CommunityLiveness, master: string, state: LivenessSt
     const forced = { reddit: actReddit, reply: actReply, chatter: actChatter, reaction: actReaction }[
       process.env.LIVENESS_ACTION?.trim() ?? ""
     ];
-    const order = forced
+    const order = cfg.repostOnly
+      ? [actReddit]
+      : forced
       ? [forced, actChatter]
       : roll < 0.3
         ? [actReddit, actChatter]

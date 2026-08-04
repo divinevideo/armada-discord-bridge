@@ -10,7 +10,7 @@ export const seed: CommunitySeed = {
   key: "the-basement",
   name: "The Basement",
   invite:
-    "http://localhost:8080/invite/naddr1qvzqqqyzz5pzp7y02j4d9qx7w5c7ftnqrz3t6tjhgm6az4s8k74q6clum8zny88fqqqqff9n5f#BAADAwQBKAH8G9EXxkBdC9QOZlGnlQ",
+    "https://armada.buzz/invite/naddr1qvzqqqyzz5pzqhmnfls4tnw8g73y8vf67upfsc30g2n3cx07uqdy0em94mqktn4wqqqqptzxe8#BAADAwQBtoU_BRS3XZS_lZDUQQDMIw",
   startedAt: "2026-07-19T20:00:00Z",
   messages: [
     { from: "theo-m", channel: "introductions", at: 0, text: "hey all, theo. i make music in a closet studio, guitar, ableton, too many pedals. here to nerd out and share stuff" },

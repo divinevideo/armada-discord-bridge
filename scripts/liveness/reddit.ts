@@ -68,8 +68,12 @@ export async function fetchHot(sub: string, limit = 25): Promise<RedditPost[]> {
     const id = /<id>t3_([a-z0-9]+)<\/id>/.exec(entry)?.[1];
     const rawTitle = /<title>([\s\S]*?)<\/title>/.exec(entry)?.[1];
     const permalink = /<link href="([^"]+)"/.exec(entry)?.[1];
-    // The escaped content HTML carries `<a href="...">[link]</a>` → the real URL.
-    const target = /href="([^"]+)"&gt;\[link\]/.exec(entry)?.[1];
+    // The content HTML is entity-escaped: decode one level so the
+    // `<a href="...">[link]</a>` anchor is readable, then read its target.
+    // (Feeds now escape the attribute quotes as &quot;, so matching the raw
+    // entry never found this.) The URL gets a second decode via unescapeXml
+    // below, for any &amp; in query strings.
+    const target = /href="([^"]+)">\s*\[link\]/.exec(unescapeXml(entry))?.[1];
     if (!id || !rawTitle || !permalink) continue;
     const title = unescapeXml(rawTitle).trim();
     if (!title || title.length > 300) continue;
