@@ -24,7 +24,7 @@ import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyInt
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
-import { DiscordAdapter, parseBotCommand } from "@armada-bridge/bridge/src/discord/adapter";
+import { DiscordAdapter, isMissingPermissions, parseBotCommand } from "@armada-bridge/bridge/src/discord/adapter";
 import { Kind0ProfileResolver } from "@armada-bridge/bridge/src/profiles";
 import { PuppetCache } from "@armada-bridge/bridge/src/puppets";
 import { BridgeRouter } from "@armada-bridge/bridge/src/router";
@@ -53,6 +53,7 @@ export interface BridgeRow {
   confirm_code: string | null;
   options: Record<string, unknown> | null;
   announced_at: string | null;
+  perm_alerted_at: string | null;
 }
 
 interface Running {
@@ -408,7 +409,8 @@ export class BridgeManager {
       const ids = await rb.router
         .onConcordChat(chat, rb.link)
         .catch((error) => {
-          console.warn(`bridge ${rb.id}: backfill mirror failed for ${chat.rumorId}:`, error);
+          if (isMissingPermissions(error)) void this.alertMissingWebhookPermission(rb);
+          else console.warn(`bridge ${rb.id}: backfill mirror failed for ${chat.rumorId}:`, error);
           return [];
         });
       mirrored += ids.length > 0 ? 1 : 0;
@@ -464,7 +466,47 @@ export class BridgeManager {
         .catch(() => {});
       return;
     }
-    if (rb.router) await rb.router.onConcordChat(chat, rb.link);
+    if (!rb.router) return;
+    try {
+      await rb.router.onConcordChat(chat, rb.link);
+    } catch (error) {
+      if (isMissingPermissions(error)) return void this.alertMissingWebhookPermission(rb);
+      throw error;
+    }
+  }
+
+  /**
+   * One-time alert that the bot can't mirror into its Discord channel because
+   * it's missing Manage Webhooks. Claimed on the row first (survives restarts,
+   * fires once), then announced where people will see it: the Concord channel
+   * — which always works — and, best effort, the Discord channel itself (a
+   * plain bot message needs only Send Messages, so it usually lands even when
+   * webhooks don't). The bridge stays active; mirroring resumes on its own
+   * once the permission is granted.
+   */
+  private async alertMissingWebhookPermission(rb: Running): Promise<void> {
+    const detail = "the bot is missing Manage Webhooks in the linked Discord channel; Armada messages can't mirror there until it's granted";
+    const [claimed] = await this.sql`
+      UPDATE bridges SET perm_alerted_at = now(), status_detail = ${detail}
+      WHERE bridge_id = ${rb.id} AND perm_alerted_at IS NULL
+      RETURNING bridge_id`;
+    if (!claimed) return;
+    console.warn(`bridge ${rb.id}: ${detail}`);
+    await rb.client
+      .sendChat(rb.channel, {
+        content:
+          "Heads up: the Discord bridge bot is missing the \"Manage Webhooks\" permission in the " +
+          "linked channel, so messages from here aren't being mirrored to Discord. A Discord admin " +
+          "can grant the bot Manage Webhooks on that channel to restore it.",
+        author: rb.primary,
+      })
+      .catch(() => {});
+    await this.adapter
+      ?.notice(
+        rb.link.discordChannelId,
+        "I can't mirror Armada messages into this channel until I'm granted the \"Manage Webhooks\" permission here.",
+      )
+      .catch(() => {});
   }
 
   private attachRouting(

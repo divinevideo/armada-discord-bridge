@@ -126,6 +126,18 @@ async function botGet<T>(botToken: string, path: string): Promise<T | undefined>
   return (await res.json()) as T;
 }
 
+/**
+ * Whether the bot can manage webhooks in a channel — the permission the live
+ * bridge needs to mirror Armada messages into Discord as personas. A 403 is
+ * the bot lacking it; anything else (200, or a 404 for a channel that has
+ * since gone) is not flagged here, so the import preview only warns on a
+ * genuine permission gap.
+ */
+export async function botCanManageWebhooks(botToken: string, channelId: string): Promise<boolean> {
+  const res = await discordFetch(`/channels/${channelId}/webhooks`, { Authorization: `Bot ${botToken}` });
+  return res.status !== 403;
+}
+
 export interface GuildChannel {
   id: string;
   name: string;

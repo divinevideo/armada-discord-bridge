@@ -246,6 +246,17 @@ export class DiscordAdapter implements WebhookSender {
     await webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } });
   }
 
+  /**
+   * Post a plain bot message (not a webhook) into a channel. Used for the
+   * missing-permission notice: it needs only Send Messages, so it can still
+   * land in the very channel where Manage Webhooks — and thus persona
+   * mirroring — is what's missing.
+   */
+  async notice(channelId: string, content: string): Promise<void> {
+    const channel = await this.textChannel(channelId);
+    await channel.send({ content, allowedMentions: { parse: [] } });
+  }
+
   /** Display name of a guild text channel (dashboard labels). */
   async channelName(channelId: string): Promise<string> {
     return (await this.textChannel(channelId)).name;
@@ -322,4 +333,14 @@ export function sanitizeUsername(name: string): string {
 function isUsernameRejection(error: unknown): boolean {
   const e = error as { code?: number; rawError?: unknown };
   return e?.code === 50035 && JSON.stringify(e.rawError ?? "").includes("USERNAME_INVALID");
+}
+
+/**
+ * Discord's "Missing Permissions" (50013): the bot lacks a permission the
+ * operation needed — for the bridge, almost always Manage Webhooks on the
+ * mirrored channel. Surfaced so the manager can tell the owner instead of
+ * silently retrying a send that will never land.
+ */
+export function isMissingPermissions(error: unknown): boolean {
+  return (error as { code?: number })?.code === 50013;
 }

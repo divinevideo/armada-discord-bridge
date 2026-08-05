@@ -80,6 +80,13 @@ export interface PlannedChannel {
   accessRolePublishedAt?: number;
   /** Only GuildText channels can be live-bridged (webhook mirroring). */
   bridgeable: boolean;
+  /**
+   * Pre-flight: the bot lacks Manage Webhooks in this channel, so a live
+   * bridge could not mirror Armada messages into it. Set on the review screen
+   * (Importer.preview) so the owner can fix Discord perms before wiring, not
+   * discover the gap once the channel silently stops mirroring.
+   */
+  botMissingWebhook?: boolean;
   /** User toggle: create a live bridge for this channel. */
   bridge: boolean;
   /** User toggle: include this channel in the import at all. */

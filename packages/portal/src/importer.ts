@@ -91,7 +91,7 @@ import { generateSecretKey, verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type postgres from "postgres";
 
-import { fetchMyGuildMember } from "./discordRest";
+import { botCanManageWebhooks, fetchMyGuildMember } from "./discordRest";
 import { botChannelMessagesBefore, botGuildSnapshot, botInstallUrl } from "./discordRest";
 import type { RestMessage } from "./discordRest";
 import type { PortalEnv } from "./env";
@@ -275,6 +275,15 @@ export class Importer {
       return { present: false, installUrl: botInstallUrl(this.env.discordClientId, guildId) };
     }
     const plan = buildImportPlan(snapshot);
+    // Pre-flight the bot's Manage Webhooks in every live-bridgeable channel,
+    // so the review screen can warn before wiring. Sequential (not a burst)
+    // to stay gentle on the rate limiter; the helper waits out any 429.
+    for (const channel of plan.channels) {
+      if (!channel.bridgeable) continue;
+      if (!(await botCanManageWebhooks(this.env.discordBotToken, channel.discordId))) {
+        channel.botMissingWebhook = true;
+      }
+    }
     const [row] = await this.sql<ImportRow[]>`
       INSERT INTO imports (owner_discord_id, discord_guild_id, discord_guild_name, plan)
       VALUES (${ownerDiscordId}, ${guildId}, ${snapshot.guild.name}, ${this.sql.json(plan as never)})

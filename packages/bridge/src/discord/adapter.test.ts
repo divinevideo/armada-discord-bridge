@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { sanitizeUsername } from "./adapter";
+import { isMissingPermissions, sanitizeUsername } from "./adapter";
 
 describe("sanitizeUsername", () => {
   it("neutralizes forbidden substrings beyond lookalike normalization", () => {
@@ -20,5 +20,16 @@ describe("sanitizeUsername", () => {
 
   it("leaves ordinary names alone", () => {
     expect(sanitizeUsername("mireille")).toBe("mireille");
+  });
+});
+
+describe("isMissingPermissions", () => {
+  it("matches Discord's 50013 and nothing else", () => {
+    expect(isMissingPermissions({ code: 50013 })).toBe(true);
+    expect(isMissingPermissions({ code: 50013, status: 403, rawError: { message: "Missing Permissions" } })).toBe(true);
+    expect(isMissingPermissions({ code: 50035 })).toBe(false);
+    expect(isMissingPermissions(new Error("boom"))).toBe(false);
+    expect(isMissingPermissions(undefined)).toBe(false);
+    expect(isMissingPermissions(null)).toBe(false);
   });
 });
