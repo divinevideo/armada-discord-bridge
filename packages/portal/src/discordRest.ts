@@ -74,8 +74,40 @@ export async function exchangeCode(
   return json.access_token;
 }
 
+/** Longest single 429 wait we honor; Discord's global bans can claim hours. */
+const MAX_RATELIMIT_WAIT_MS = 60_000;
+/** Total 429 waiting per request before giving up and surfacing the 429. */
+const RATELIMIT_BUDGET_MS = 5 * 60_000;
+
+/**
+ * fetch that waits out Discord 429s instead of failing: sleeps for the
+ * `retry_after` the API reports (JSON body, falling back to the Retry-After
+ * header) and retries, until the per-request budget runs out. History
+ * backfill pages one route hundreds of times, so rate limits here are
+ * routine, and imports used to die on the first one.
+ */
+async function discordFetch(path: string, headers: Record<string, string>): Promise<Response> {
+  let waitedMs = 0;
+  for (;;) {
+    const res = await fetch(`${API}${path}`, { headers });
+    if (res.status !== 429) return res;
+    let retryAfterMs = Number(res.headers.get("Retry-After")) * 1000;
+    try {
+      const body = (await res.clone().json()) as { retry_after?: number };
+      if (typeof body.retry_after === "number") retryAfterMs = body.retry_after * 1000;
+    } catch {
+      // non-JSON 429 (Cloudflare); the header value stands
+    }
+    if (!Number.isFinite(retryAfterMs) || retryAfterMs <= 0) retryAfterMs = 5_000;
+    retryAfterMs = Math.min(retryAfterMs, MAX_RATELIMIT_WAIT_MS);
+    if (waitedMs + retryAfterMs > RATELIMIT_BUDGET_MS) return res;
+    waitedMs += retryAfterMs;
+    await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+  }
+}
+
 async function userGet<T>(accessToken: string, path: string): Promise<T> {
-  const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const res = await discordFetch(path, { Authorization: `Bearer ${accessToken}` });
   if (!res.ok) throw new Error(`discord ${path} failed: ${res.status}`);
   return (await res.json()) as T;
 }
@@ -88,7 +120,7 @@ export const fetchMyGuildMember = (token: string, guildId: string) =>
   userGet<{ roles: string[]; nick?: string | null }>(token, `/users/@me/guilds/${guildId}/member`);
 
 async function botGet<T>(botToken: string, path: string): Promise<T | undefined> {
-  const res = await fetch(`${API}${path}`, { headers: { Authorization: `Bot ${botToken}` } });
+  const res = await discordFetch(path, { Authorization: `Bot ${botToken}` });
   if (res.status === 403 || res.status === 404) return undefined;
   if (!res.ok) throw new Error(`discord bot ${path} failed: ${res.status}`);
   return (await res.json()) as T;
