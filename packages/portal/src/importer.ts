@@ -317,6 +317,26 @@ export class Importer {
     const ownerPk = parseAdminPubkey(body.ownerNpub ?? "");
     if (!ownerPk) throw new Error("connect your Armada account (npub) first");
 
+    // One live community per guild. Minting a second one here would wire a
+    // parallel bridge onto the same Discord channels, and the manager routes
+    // each channel to whichever bridge attached LAST (manager.ts byDiscordChannel
+    // is last-writer-wins), so the newcomer silently steals the channel from the
+    // members who already joined the first community — the duplicate-community
+    // stranding the Lynch import hit. Recover a failed import with retry() /
+    // rerunHistory(), which reuse the existing community, not a brand-new one.
+    const [live] = await this.sql<{ status: string }[]>`
+      SELECT status FROM bridges
+      WHERE discord_guild_id = ${row.discord_guild_id}
+        AND status IN ('active', 'pending_confirm')
+        AND community_id IS DISTINCT FROM ${row.community_id}
+      LIMIT 1`;
+    if (live) {
+      throw new Error(
+        "this Discord server is already bridged to an Armada community; " +
+          "retry or re-run history on the existing import instead of importing it again",
+      );
+    }
+
     const plan = row.plan;
     for (const toggle of body.channels ?? []) {
       const channel = plan.channels.find((c) => c.discordId === toggle.discordId);

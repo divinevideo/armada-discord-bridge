@@ -71,6 +71,16 @@ function fakeSql(store: { imports: Map<string, Record<string, unknown>>; bridges
     if (text.startsWith("SELECT 1 FROM messages")) {
       return []; // nothing pre-imported in tests
     }
+    if (text.startsWith("SELECT status FROM bridges")) {
+      const guildId = next();
+      const communityId = next();
+      return store.bridges.filter(
+        (b) =>
+          b.discord_guild_id === guildId &&
+          (b.status === "active" || b.status === "pending_confirm") &&
+          b.community_id !== communityId,
+      );
+    }
     if (text.startsWith("SELECT * FROM imports")) {
       const row = store.imports.get(next() as string);
       if (!row) return [];
@@ -178,6 +188,40 @@ describe("parseAdminPubkey", () => {
     expect(parseAdminPubkey(pk.toUpperCase())).toBe(pk);
     expect(parseAdminPubkey("nsec1notanpub")).toBeUndefined();
     expect(parseAdminPubkey("hello")).toBeUndefined();
+  });
+});
+
+describe("import dedupe guard", () => {
+  it("refuses to prepare a second community for an already-bridged guild", async () => {
+    const store = {
+      imports: new Map<string, Record<string, unknown>>(),
+      // A prior import already went live for guild "100".
+      bridges: [
+        { bridge_id: "b-existing", discord_guild_id: "100", community_id: "prior-community", status: "active" },
+      ] as Array<Record<string, unknown>>,
+    };
+    const importer = new Importer(fakeSql(store), env, {} as never, () => wirePool([]));
+    store.imports.set("imp2", {
+      import_id: "imp2",
+      owner_discord_id: "user1",
+      discord_guild_id: "100",
+      discord_guild_name: "Test Fleet",
+      status: "previewed",
+      status_detail: null,
+      plan: buildImportPlan(snapshot),
+      owner_sk_sealed: null,
+      community_sealed: null,
+      community_id: null,
+      invite_url_sealed: null,
+      link_signer_sk_sealed: null,
+    });
+    const userPk = getPublicKey(generateSecretKey());
+    await expect(
+      importer.prepare("imp2", "user1", { ownerNpub: nip19.npubEncode(userPk) }),
+    ).rejects.toThrow(/already bridged/);
+    // Nothing minted: the import stays previewed, no key material written.
+    expect(store.imports.get("imp2")!.status).toBe("previewed");
+    expect(store.imports.get("imp2")!.community_id).toBeNull();
   });
 });
 
