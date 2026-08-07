@@ -8,6 +8,7 @@ import {
   bytesToHex,
   channelGroupKey,
   communityIdOf,
+  controlSignerGroupKey,
   hex32,
   random32,
   voiceGroupKey,
@@ -21,9 +22,11 @@ import { capRelays, type ChannelV2, type CommunityV2, type VoiceKeys } from "./t
 
 /**
  * Mint a brand-new community: a random `owner_salt` commits the owner into the
- * self-certifying `community_id`, and an independent random `community_root`
- * is the access key (deliberately NOT derived from the id, so access can
- * rotate while identity stays fixed).
+ * self-certifying `community_id`, an independent random `community_root` is
+ * the access key (deliberately NOT derived from the id, so access can rotate
+ * while identity stays fixed), and a random `control_root` — held by the
+ * owner alone until staff are promoted — write-gates the Control Plane
+ * (CORD-02 §2), every member reading it by the derived `control_pk`.
  *
  * Genesis publishes exactly two owner-signed editions — the metadata and one
  * public `#general` Channel — which the caller builds; this mints the secrets
@@ -37,6 +40,8 @@ export function mintCommunity(name: string, ownerPubkeyHex: string, relays: stri
   const owner = ownerPubkeyHex.toLowerCase();
   const id = communityIdOf(hex32(owner), ownerSalt);
   const root = random32();
+  const controlRoot = random32();
+  const controlPk = controlSignerGroupKey(controlRoot, id, 0n).pk;
   const generalChannelId = random32();
   return {
     community: {
@@ -46,7 +51,9 @@ export function mintCommunity(name: string, ownerPubkeyHex: string, relays: stri
       ownerSalt,
       root,
       rootEpoch: 0n,
-      heldRoots: [{ epoch: 0n, key: root }],
+      controlPk,
+      controlRoot,
+      heldRoots: [{ epoch: 0n, key: root, controlPk }],
       privateChannels: [],
       relays: capRelays(relays),
       name,
@@ -76,7 +83,11 @@ export function channelsView(community: CommunityV2, folded: FoldedControl | und
 
   // Every Channel is callable: its call coordinates derive from the same
   // (secret, epoch) that addresses its CURRENT Chat Plane (CORD-07 §1), so the
-  // room name and media root roll with the Channel's key on a rekey.
+  // room name and media root roll with the Channel's key on a rekey. Each
+  // channel's `voice` property is a LAZY memoized getter over this: the room
+  // keypair costs a secp256k1 point multiplication, and nothing reads voice
+  // keys until a call is joined or resolved for that channel — deriving them
+  // eagerly here priced every channelsView at a point-mul per channel.
   const voiceKeys = (secret: Uint8Array, id: Uint8Array, epoch: bigint): VoiceKeys => ({
     room: voiceGroupKey(secret, id, epoch),
     mediaKey: voiceMediaKey(secret, id, epoch),
@@ -110,6 +121,7 @@ export function channelsView(community: CommunityV2, folded: FoldedControl | und
       : [];
 
     if (!def.isPrivate) {
+      let voiceMemo: VoiceKeys | undefined;
       out.push({
         id,
         idHex: def.channelIdHex,
@@ -117,7 +129,9 @@ export function channelsView(community: CommunityV2, folded: FoldedControl | und
         isPrivate: false,
         category: channelCategory(def.metadata),
         position: channelPosition(def.metadata),
-        voice: voiceKeys(community.root, id, community.rootEpoch),
+        get voice() {
+          return (voiceMemo ??= voiceKeys(community.root, id, community.rootEpoch));
+        },
         // Writes go to the root stream; private-era streams stay readable.
         streams: [...rootStreams, ...channelStreams],
         current: rootStreams[0],
@@ -126,6 +140,7 @@ export function channelsView(community: CommunityV2, folded: FoldedControl | und
     }
 
     if (!held) continue; // no key → cannot read; omit rather than tease
+    let voiceMemo: VoiceKeys | undefined;
     out.push({
       id,
       idHex: def.channelIdHex,
@@ -133,7 +148,9 @@ export function channelsView(community: CommunityV2, folded: FoldedControl | und
       isPrivate: true,
       category: channelCategory(def.metadata),
       position: channelPosition(def.metadata),
-      voice: voiceKeys(held.key, id, held.epoch),
+      get voice() {
+        return (voiceMemo ??= voiceKeys(held.key, id, held.epoch));
+      },
       // Writes go to the current channel key; public-era history stays readable.
       streams: [...channelStreams, ...rootStreams],
       current: channelStreams[0],
@@ -152,12 +169,15 @@ export function channelsView(community: CommunityV2, folded: FoldedControl | und
       group: channelGroupKey(p.key, held.id, p.epoch),
       ...(p.retiredAt !== undefined ? { retiredAt: p.retiredAt } : {}),
     }));
+    let voiceMemo: VoiceKeys | undefined;
     out.push({
       id: held.id,
       idHex,
       name: held.name || idHex.slice(0, 8),
       isPrivate: true,
-      voice: voiceKeys(held.key, held.id, held.epoch),
+      get voice() {
+        return (voiceMemo ??= voiceKeys(held.key, held.id, held.epoch));
+      },
       streams: [stream, ...priorStreams],
       current: stream,
     });

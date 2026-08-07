@@ -33,13 +33,16 @@ import {
   buildMetadataEdition,
   buildRegistryEdition,
   buildRoleEdition,
+  bytesToBase64,
   bytesToHex,
   capRelays,
   communityIdOf,
   controlGroups,
-  currentControlGroup,
+  controlSignerGroupKey,
+  currentControlWriteGroup,
   currentGuestbookGroup,
   editionHash,
+  encodeControlWrap,
   grantLocator,
   grantToJSON,
   guestbookGroups,
@@ -85,7 +88,7 @@ import type { DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
 import { derivePuppet } from "@armada-bridge/bridge/src/puppets";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { encrypt as nip44Encrypt } from "nostr-tools/nip44";
+import { encrypt as nip44Encrypt, getConversationKey } from "nostr-tools/nip44";
 import * as nip19 from "nostr-tools/nip19";
 import { generateSecretKey, verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
@@ -169,6 +172,45 @@ export function parseAdminPubkey(input: string): string | undefined {
 interface CommunitySecrets {
   owner_salt: string;
   community_root: string;
+  /**
+   * The staff write key (CORD-02 §2). The portal's op key is the only staff
+   * member it publishes as, so this is what lets it reach the Control Plane at
+   * all. Absent on rows sealed before the split: those are legacy communities
+   * whose plane is still keyed by `community_root` alone, and they stay that
+   * way until a Refounding mints the pair (CORD-06 §3).
+   */
+  control_root?: string;
+}
+
+/**
+ * Rebuild the runtime community from its sealed secrets. The control pair is
+ * derived, not stored twice: `control_pk` is a pure function of the
+ * `control_root` at this epoch, so there is no way for the two to disagree.
+ * A row without a `control_root` rebuilds as a legacy community — no
+ * `controlPk`, and every control read/write falls back to the member-derivable
+ * address (CORD-02 §5).
+ */
+function communityFromSecrets(
+  secrets: CommunitySecrets,
+  args: { id: Uint8Array; owner: string; relays: string[]; name: string },
+): CommunityV2 {
+  const root = hex32(secrets.community_root);
+  const controlRoot = secrets.control_root ? hex32(secrets.control_root) : undefined;
+  const controlPk = controlRoot ? controlSignerGroupKey(controlRoot, args.id, 0n).pk : undefined;
+  return {
+    id: args.id,
+    idHex: bytesToHex(args.id),
+    owner: args.owner,
+    ownerSalt: hex32(secrets.owner_salt),
+    root,
+    rootEpoch: 0n,
+    ...(controlPk ? { controlPk } : {}),
+    ...(controlRoot ? { controlRoot } : {}),
+    heldRoots: [{ epoch: 0n, key: root, ...(controlPk ? { controlPk } : {}) }],
+    privateChannels: [],
+    relays: args.relays,
+    name: args.name,
+  };
 }
 
 /** Mirror of sealRumor's PLAINTEXT template: what the owner actually signs. */
@@ -430,6 +472,9 @@ export class Importer {
     const secrets: CommunitySecrets = {
       owner_salt: bytesToHex(community.ownerSalt),
       community_root: bytesToHex(community.root),
+      // Minted by mintCommunity alongside the root. Without this the op key
+      // could never publish an edition after the first reload (CORD-02 §2).
+      control_root: community.controlRoot ? bytesToHex(community.controlRoot) : undefined,
     };
     const inviteUrl = buildInviteUrl(this.env.inviteBaseUrl, link.pk, token, community.relays);
     await this.sql`
@@ -535,21 +580,13 @@ export class Importer {
     }
     const opSk = Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, row.owner_sk_sealed), "hex"));
     const secrets = JSON.parse(unseal(this.env.sealKeyHex, row.community_sealed)) as CommunitySecrets;
-    const ownerSalt = hex32(secrets.owner_salt);
-    const root = hex32(secrets.community_root);
-    const id = communityIdOf(hex32(cp.ownerPkHex), ownerSalt);
-    const community: CommunityV2 = {
+    const id = communityIdOf(hex32(cp.ownerPkHex), hex32(secrets.owner_salt));
+    const community = communityFromSecrets(secrets, {
       id,
-      idHex: bytesToHex(id),
       owner: cp.ownerPkHex,
-      ownerSalt,
-      root,
-      rootEpoch: 0n,
-      heldRoots: [{ epoch: 0n, key: root }],
-      privateChannels: [],
       relays: plan.relays,
       name: plan.communityName,
-    };
+    });
     if (community.idHex !== cp.communityIdHex) {
       throw new Error("sealed community secrets do not reproduce the checkpointed community id");
     }
@@ -567,7 +604,7 @@ export class Importer {
       UPDATE imports SET status = 'publishing', updated_at = now() WHERE import_id = ${importId}`;
     const cp = plan.checkpoints;
     const op = localIdentity(opSk);
-    const control = currentControlGroup(community);
+    const control = currentControlWriteGroup(community);
     const guestbook = currentGuestbookGroup(community);
     registerStreamKeys([...controlGroups(community), ...guestbookGroups(community)], community.relays);
     const pool = this.poolFactory(community.relays);
@@ -611,6 +648,39 @@ export class Importer {
       if (!cp.ownerJoinPublishedAt) {
         await pool.publish(wrapSeal(ownerSeal("owner-join"), guestbook));
         cp.ownerJoinPublishedAt = Date.now();
+        await save();
+      }
+
+      // 1b. Hand the OWNER the staff write key (CORD-04 §3). The portal minted
+      // the `control_root` server-side and the owner joins through the public
+      // invite, which carries `control_pk` but never the secret — so without
+      // this they could read the Control Plane and never write to it, not even
+      // to revoke the op grant this whole chain exists to make revocable.
+      //
+      // The vehicle is the spec's own: a Grant edition for the owner carrying
+      // `control_wrap`, the secret NIP-44'd under the op↔owner pairwise key
+      // (one ECDH either side computes, so a bunker account opens it). The
+      // role set is EMPTY on purpose — the owner's authority is position 0,
+      // rooted in the community_id, and never came from a grant; op holds
+      // Admin at position 1 and so could not hand out a role at its own rank
+      // anyway. This edition delivers a key and claims nothing.
+      if (!cp.ownerControlKeyPublishedAt && community.controlRoot) {
+        const controlWrap = nip44Encrypt(
+          bytesToBase64(encodeControlWrap(community.rootEpoch, community.controlRoot)),
+          getConversationKey(opSk, community.owner),
+        );
+        await pool.publish(
+          await sealEdition(
+            buildGrantEdition(
+              community.id,
+              { member: community.owner, roleIds: [], controlWrap },
+              opV1,
+            ),
+            control,
+            op.signer,
+          ),
+        );
+        cp.ownerControlKeyPublishedAt = Date.now();
         await save();
       }
 
@@ -814,6 +884,9 @@ export class Importer {
         owner_salt: bytesToHex(community.ownerSalt),
         community_root: bytesToHex(community.root),
         root_epoch: 0,
+        // Read access to the Control Plane, never write (CORD-02 §7). Absent
+        // on a legacy community, which folds Control at the legacy address.
+        control_pk: community.controlPk,
         channels: [],
         relays: community.relays,
         name: plan.communityName,
@@ -1138,19 +1211,13 @@ export class Importer {
           Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, importRow.owner_sk_sealed), "hex")),
         );
         const secrets = JSON.parse(unseal(this.env.sealKeyHex, importRow.community_sealed)) as CommunitySecrets;
-        const community: CommunityV2 = {
+        const community = communityFromSecrets(secrets, {
           id: hex32(importRow.community_id!),
-          idHex: importRow.community_id!,
           owner: importRow.plan.checkpoints.ownerPkHex!,
-          ownerSalt: hex32(secrets.owner_salt),
-          root: hex32(secrets.community_root),
-          rootEpoch: 0n,
-          heldRoots: [{ epoch: 0n, key: hex32(secrets.community_root) }],
-          privateChannels: [],
           relays: importRow.plan.relays,
           name: importRow.plan.communityName,
-        };
-        const control = currentControlGroup(community);
+        });
+        const control = currentControlWriteGroup(community);
         registerStreamKeys([...controlGroups(community), ...guestbookGroups(community)], community.relays);
         const pool = this.poolFactory(community.relays);
         try {
@@ -1267,7 +1334,7 @@ export class Importer {
     bridgePk: string,
   ): Promise<void> {
     const op = localIdentity(opSk);
-    const control = currentControlGroup(community);
+    const control = currentControlWriteGroup(community);
     registerStreamKeys(controlGroups(community), community.relays);
     const pool = this.poolFactory(community.relays);
     try {
@@ -1298,6 +1365,7 @@ export class Importer {
         owner_salt: bytesToHex(community.ownerSalt),
         community_root: bytesToHex(community.root),
         root_epoch: 0,
+        control_pk: community.controlPk,
         channels: [
           {
             id: channel.channelIdHex!,

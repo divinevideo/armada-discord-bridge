@@ -14,7 +14,8 @@
 
 
 
-import { KIND_CALENDAR_DATE, KIND_CALENDAR_RSVP, KIND_CALENDAR_TIME, KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_ONCHAIN_ZAP, KIND_POLL, KIND_POLL_VOTE, KIND_REACTION, KIND_SEAL_ENCRYPTED, KIND_ZAP } from "./kinds";
+import { KIND_CALENDAR_DATE, KIND_CALENDAR_RSVP, KIND_CALENDAR_TIME, KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_ONCHAIN_ZAP, KIND_POLL, KIND_POLL_VOTE, KIND_REACTION, KIND_SEAL_ENCRYPTED, KIND_TIMER_NOTICE, KIND_ZAP } from "./kinds";
+import { dmTimerSeconds, isExpired } from "./vendor/nip17";
 import { reactionContentKey } from "./vendor/reactions";
 import type { RsvpVote } from "./vendor/calendar";
 import type { PollVote } from "./vendor/polls";
@@ -223,6 +224,14 @@ export interface ChatModeration {
    * never carries one.
    */
   canDelete: (deleter: string, author: string, action?: { citation?: AuthorityCitation; ms: number }) => boolean;
+  /**
+   * Whether `author` may be believed about a disappearing-messages timer
+   * change (CORD-08 §4): holds MANAGE_METADATA in the fold. A kind-1740 notice
+   * is informational — the metadata fold is the authority — but display is
+   * gated like an authority claim, or anyone could spell the tag. Optional so
+   * bare lib folds (tests) keep notices; the app path always supplies it.
+   */
+  canSetTimer?: (author: string) => boolean;
 }
 
 /** A tallied reaction: reactors (pubkey→rumorId) plus the NIP-30 custom-emoji URL (if any). */
@@ -244,6 +253,12 @@ export interface FoldedTimeline {
   calendarEvents: OpenedChat[];
   /** event rumor id → its raw RSVPs (tallied per event by the transport). */
   rsvps: Map<string, RsvpVote[]>;
+  /**
+   * Authorized disappearing-messages timer notices (kind 1740, CORD-08 §4),
+   * sorted by ms ascending. Not messages — the transport interleaves them as
+   * centered notice rows, like the DM timer entries.
+   */
+  timerNotices: OpenedChat[];
 }
 
 /**
@@ -319,10 +334,27 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
   // member, so without this anyone could replay someone else's and inflate
   // tallies (CORD.md §4).
   const zapCandidates: Array<{ target: string; hash: string; ms: number; entry: ZapEntry }> = [];
+  const timerNotices: OpenedChat[] = [];
+  // One clock per fold: a rumor expiring mid-loop must not split the batch.
+  const nowSecs = Math.floor(Date.now() / 1000);
 
   for (const ev of opened) {
     if (moderation?.banned.has(ev.author)) continue;
+    // Expired rumors are refused at ingest and swept from the store
+    // (CORD-08 §3), but rows stored before their deadline passed — and
+    // freshly-decrypted events folded in ahead of the store round-trip —
+    // reach here, so the read side applies the same rule.
+    if (isExpired(ev.tags, nowSecs)) continue;
 
+    if (ev.kind === KIND_TIMER_NOTICE) {
+      // A notice with no readable timer value is malformed, not "off"; an
+      // author the roster doesn't trust with MANAGE_METADATA is dropped
+      // (CORD-08 §4) — anyone can spell the tag, only staff are believed.
+      if (dmTimerSeconds(ev) === undefined) continue;
+      if (moderation?.canSetTimer && !moderation.canSetTimer(ev.author)) continue;
+      timerNotices.push(ev);
+      continue;
+    }
     if (ev.kind === KIND_DELETE) {
       // NIP-09 shape: possibly several `e` targets.
       for (const t of ev.tags) {
@@ -534,5 +566,6 @@ export function foldTimeline(opened: OpenedChat[], moderation?: ChatModeration):
     pollVotes,
     calendarEvents: [...calendarById.values()],
     rsvps,
+    timerNotices: timerNotices.sort((a, b) => (a.ms !== b.ms ? a.ms - b.ms : a.rumorId < b.rumorId ? -1 : 1)),
   };
 }

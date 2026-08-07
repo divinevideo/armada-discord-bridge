@@ -11,7 +11,7 @@ import {
   buildInviteUrl,
   bytesToHex,
   channelGroupKey,
-  currentControlGroup,
+  currentControlWriteGroup,
   sealEdition,
   guestbookGroups,
   mintCommunity,
@@ -200,7 +200,12 @@ describe("ConcordClient", () => {
     const ownerSk = generateSecretKey();
     const { community } = makeCommunity2(ownerSk);
     const pool = new FakePool();
-    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    // The bridge is a plain member: it holds the Control Plane's ADDRESS and
+    // the community_root-derived read key, never the staff `control_root`
+    // (CORD-02 §2). Dropping the secret here is what makes this a real test of
+    // the split — a member reading a plane only staff can write.
+    const memberView = { ...community, controlRoot: undefined };
+    const client = new ConcordClient(memberView, pool, localIdentity(generateSecretKey()));
 
     let folds = 0;
     client.subscribeControl(() => folds++);
@@ -211,7 +216,7 @@ describe("ConcordClient", () => {
       actorPubkey: owner.pk,
       version: 1n,
     });
-    const wrap = await sealEdition(edition, currentControlGroup(community), owner.signer);
+    const wrap = await sealEdition(edition, currentControlWriteGroup(community), owner.signer);
     pool.emit(wrap);
 
     expect(folds).toBe(1);

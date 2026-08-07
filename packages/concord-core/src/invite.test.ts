@@ -119,6 +119,28 @@ describe("invite bundle (CORD-05 §1–2)", () => {
     expect(() => parseBundleEvent(event, link.pk, token, 1_000_001)).toThrow(/expired/);
   });
 
+  it("carries the description preview, truncated to the byte cap on a code-point boundary", () => {
+    const { bundle } = makeBundle();
+    const token = mintToken();
+    const link = mintLinkSigner();
+    // 3-byte code points, 200 of them = 600 bytes: the 500-byte cap falls
+    // mid-code-point (500 / 3), so truncation must back off to a boundary.
+    const withDescription = { ...bundle, description: "€".repeat(200) };
+    const event = buildBundleEvent(withDescription, token, link.sk);
+    const parsed = parseBundleEvent(event, link.pk, token, Date.now());
+    expect(parsed.description).toBe("€".repeat(166));
+  });
+
+  it("drops a non-string description rather than refusing the bundle", () => {
+    const { bundle } = makeBundle();
+    const token = mintToken();
+    const link = mintLinkSigner();
+    const hostile = { ...bundle, description: 42 as unknown as string };
+    const event = buildBundleEvent(hostile, token, link.sk);
+    const parsed = parseBundleEvent(event, link.pk, token, Date.now());
+    expect(parsed.description).toBeUndefined();
+  });
+
   it("bounds a hostile bundle's channel count", () => {
     const { bundle } = makeBundle();
     const token = mintToken();
