@@ -1,10 +1,15 @@
 /**
  * Concord V2 Control Plane — CORD-02 §5/§6/§9, CORD-04.
  *
- * The Control Plane is one Private Stream per Community (keyed by the
- * community_root at `control_pk`) carrying versioned, real-npub-signed
- * editions inside PLAINTEXT seals (kind 20014 — the one plane whose seals stay
- * plaintext so a compaction can re-wrap signed editions across epochs).
+ * The Control Plane is one Private Stream per Community carrying versioned,
+ * real-npub-signed editions inside PLAINTEXT seals (kind 20014 — the one plane
+ * whose seals stay plaintext so a compaction can re-wrap signed editions
+ * across epochs). Its stream key is SPLIT (CORD-01 Write-Restricted Streams):
+ * the address-and-signer keypair derives from the staff-held `control_root`,
+ * while the wraps' content is encrypted under the community_root-derived read
+ * key every member holds — a spam gate, never authority. Epochs minted before
+ * the split keyed the whole plane by the `concord/control` derivation alone,
+ * retained here for reading them (CORD-02 §5).
  *
  * `foldControlState` replays the whole plane into current state in one pass:
  * the owner-rooted roster first (delegation fixpoint — the owner's rank comes
@@ -18,11 +23,13 @@ import {
   banlistLocator,
   bytesToHex,
   controlGroupKey,
+  controlSignerGroupKey,
   dissolvedGroupKey,
   grantLocator,
   hex32,
   inviteLinksLocator,
   type GroupKey,
+  type StreamKeyView,
 } from "./derive";
 import {
   buildEditionRumor,
@@ -39,6 +46,7 @@ import {
   VSK_GRANT,
   VSK_INVITE_REGISTRY,
   VSK_METADATA,
+  VSK_PINS,
   VSK_ROLE,
 } from "./kinds";
 import {
@@ -59,6 +67,7 @@ import {
   type Role,
 } from "./roles";
 import { buildRumor, openWrap, sealRumor, wrapSeal, type OpenedEvent, type StreamSigner, type Rumor } from "./stream";
+import { readFolded } from "./vendor/foldedCache";
 import {
   utf8Len,
   DESCRIPTION_MAX_BYTES,
@@ -74,14 +83,73 @@ import { bootstrapHead, fold, type Edition } from "./version";
 
 // ── Addressing ───────────────────────────────────────────────────────────────
 
-/** Every control-plane stream key across the community's held root epochs, newest first. */
-export function controlGroups(community: CommunityV2): GroupKey[] {
-  return community.heldRoots.map((r) => controlGroupKey(r.key, community.id, r.epoch));
+/**
+ * One held root epoch's Control Plane read view (CORD-02 §5).
+ *
+ * A SPLIT epoch (the root carries a held `control_pk`) subscribes and verifies
+ * by that address while decrypting under the community_root-derived read key;
+ * its `sk` is present only when this member holds the epoch's `control_root`
+ * and it actually derives to the held address (staff). A LEGACY epoch is the
+ * `concord/control` derivation whole — address, signer and encryption in one
+ * key every member holds.
+ */
+function controlStreamOf(community: CommunityV2, rootKey: Uint8Array, epoch: bigint, controlPk?: string): StreamKeyView {
+  const read = controlGroupKey(rootKey, community.id, epoch);
+  if (!controlPk) return read;
+  const signerSk =
+    community.controlRoot !== undefined && epoch === community.rootEpoch
+      ? controlSignerGroupKey(community.controlRoot, community.id, epoch)
+      : undefined;
+  return {
+    pk: controlPk,
+    get convKey() {
+      return read.convKey;
+    },
+    // The reader's half of the write gate: the wrap signature proves a
+    // control_root holder published it, so openWrap verifies it (CORD-01
+    // Write-Restricted Streams; CORD-02 §5).
+    restricted: true,
+    // A held secret that does not derive to the held address is corrupt state,
+    // not a signer: leave `sk` absent (fail closed to read-only) rather than
+    // mint wraps at an address nobody subscribes to.
+    ...(signerSk && signerSk.pk === controlPk ? { sk: signerSk.sk } : {}),
+  };
 }
 
-/** The CURRENT control-plane stream key (where new editions publish). */
-export function currentControlGroup(community: CommunityV2): GroupKey {
-  return controlGroupKey(community.root, community.id, community.rootEpoch);
+/** Every control-plane stream view across the community's held root epochs, newest first. */
+export function controlGroups(community: CommunityV2): StreamKeyView[] {
+  return community.heldRoots.map((r) => controlStreamOf(community, r.key, r.epoch, r.controlPk));
+}
+
+/** The CURRENT control-plane stream view (address + read key; `sk` when writable). */
+export function currentControlGroup(community: CommunityV2): StreamKeyView {
+  return controlStreamOf(community, community.root, community.rootEpoch, community.controlPk);
+}
+
+/** Whether this member can PUBLISH to the current Control Plane (CORD-02 §2). */
+export function canWriteControl(community: CommunityV2): boolean {
+  return currentControlGroup(community).sk !== undefined;
+}
+
+/**
+ * The CURRENT control-plane WRITE key: address, signing secret and read
+ * conv_key. Throws when the epoch is split and this member does not hold its
+ * `control_root` — publishing there would mint a wrap that fails the plane's
+ * signature check at every reader and relay (CORD-02 §2).
+ */
+export function currentControlWriteGroup(community: CommunityV2): GroupKey {
+  const stream = currentControlGroup(community);
+  const sk = stream.sk;
+  if (sk === undefined) {
+    throw new Error("Only community staff hold this community's write key; ask a moderator to re-send it.");
+  }
+  return {
+    sk,
+    pk: stream.pk,
+    get convKey() {
+      return stream.convKey;
+    },
+  };
 }
 
 // ── Sealing / opening ────────────────────────────────────────────────────────
@@ -102,7 +170,7 @@ export async function sealEdition(rumor: Rumor, control: GroupKey, signer: Strea
 const parsedEditionMemo = new Map<string, ParsedEdition | null>();
 
 /** Open every control wrap that decodes under one of `groups` into editions. */
-export function openControlWraps(wraps: NostrEvent[], groups: GroupKey[]): ParsedEdition[] {
+export function openControlWraps(wraps: NostrEvent[], groups: StreamKeyView[]): ParsedEdition[] {
   const byPk = new Map(groups.map((g) => [g.pk, g]));
   const out: ParsedEdition[] = [];
   for (const wrap of wraps) {
@@ -254,6 +322,13 @@ export interface FoldedControl {
   liveInviteLinks: Set<string>;
   /** creatorHex → that creator's own registry list (for maintaining one's registry). */
   registriesByCreator: Map<string, string[]>;
+  /**
+   * Pin Lists (vsk 11) by their `pins_locator` eid → the head's RAW content.
+   * Content is never decoded here: the sealed form needs a Channel key the
+   * fold has no business holding, and a cap-violating or unreadable list reads
+   * as EMPTY rather than affecting the fold at all (CORD-04 §7).
+   */
+  pinLists: Map<string, { content: string; author: string }>;
   /** Per-entity head version + hash, for chaining the next edition (key = eid hex). */
   heads: Map<string, EntityHead>;
   /**
@@ -280,6 +355,48 @@ export interface FoldedControl {
    * gate as `banned`, so a forged banlist can't backdate-suppress a member.
    */
   bannedAt: Map<string, number>;
+}
+
+/**
+ * Whether a snapshot decoded off disk still has the shape this build reads.
+ *
+ * `readFolded` rehydrates JSON behind an unchecked `as T`, so a snapshot written
+ * by an older build arrives TYPED as current and is then dereferenced as
+ * current. That is not hypothetical: {@link FoldedChannel.metadata} was added
+ * after this cache already existed, and the readers came later still —
+ * `channelsView` reads `def.metadata.custom` unguarded, so an older snapshot
+ * threw during the boot render, and a moderator's next reorder would have built
+ * its edition from a metadata object that isn't there.
+ *
+ * Checked at the boundary rather than patched at each reader, because the fold
+ * is a pure cache: rejecting it costs one re-fold from editions already on
+ * disk, and the next {@link writeFolded} replaces the entry under the same key,
+ * so there is nothing to migrate and nothing left behind. Extend this when the
+ * persisted shape gains a field readers assume is there.
+ */
+export function isCurrentFoldedControl(value: unknown): value is FoldedControl {
+  const fold = value as FoldedControl | undefined;
+  if (!fold || !(fold.channels instanceof Map) || !(fold.heads instanceof Map)) return false;
+  // Every Map the fold carries has to be checked, not a representative sample:
+  // a snapshot from a build that predates a field passes every check that
+  // field is missing from, and then throws on first read. `pinLists` arrived
+  // after `channels` and `heads`, and a snapshot without it must be a MISS
+  // rather than an empty list — an empty pin list reads as "nothing pinned",
+  // which would let a write replace entries it never saw (CORD-04 §7).
+  if (!(fold.pinLists instanceof Map)) return false;
+  for (const def of fold.channels.values()) {
+    if (!def || typeof def.metadata !== "object" || def.metadata === null) return false;
+  }
+  return true;
+}
+
+/**
+ * A community's cached control fold, or undefined on a miss OR a snapshot this
+ * build can't read. Every reader of the persisted fold goes through here.
+ */
+export async function readControlFold(idHex: string): Promise<FoldedControl | undefined> {
+  const folded = await readFolded<FoldedControl>(controlFoldKey(idHex));
+  return isCurrentFoldedControl(folded) ? folded : undefined;
 }
 
 function pushEdition(m: Map<string, ParsedEdition[]>, key: string, p: ParsedEdition) {
@@ -1075,6 +1192,19 @@ function foldOnce(
     for (const pk of list) liveInviteLinks.add(pk.toLowerCase());
   }
 
+  // 7. Pin Lists (vsk 11), each gated by PIN_MESSAGES (CORD-04 §7). Only the
+  // authority question is settled here; the content is carried verbatim, since
+  // a violating list reads as empty rather than as a refused edition.
+  const pinLists = new Map<string, { content: string; author: string }>();
+  for (const [eid, candidates] of candidatesOf(VSK_PINS)) {
+    const head = pickHead(candidates, heads, headEditions, (p) => {
+      if (!isAuthorized(roster, p.author, ownerHex, Permissions.PIN_MESSAGES)) return false;
+      return citationOk(p);
+    });
+    if (!head) continue;
+    pinLists.set(eid, { content: head.content, author: head.author });
+  }
+
   // Data-availability roll-up: gap-held entities, plus floored entities with
   // ZERO served editions this fold. A floored entity whose editions were
   // served but authority-rejected is NOT flagged — that's a deliberate drop
@@ -1087,7 +1217,7 @@ function foldOnce(
     if (!servedEids.has(eid) && !gapHeld.has(eid)) incomplete.push(eid);
   }
 
-  const result: FoldedControl = { roster, ownerHex, metadata, channels, banned, bannedAt, liveInviteLinks, registriesByCreator, heads, headEditions, incomplete };
+  const result: FoldedControl = { roster, ownerHex, metadata, channels, banned, bannedAt, liveInviteLinks, registriesByCreator, pinLists, heads, headEditions, incomplete };
   return result;
 }
 

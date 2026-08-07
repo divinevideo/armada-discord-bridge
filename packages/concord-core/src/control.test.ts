@@ -10,6 +10,9 @@ import {
   buildRegistryEdition,
   buildRoleEdition,
   foldControlState,
+  isCurrentFoldedControl,
+  type FoldedChannel,
+  type FoldedControl,
   banShouldRotate,
   banShouldRotateMany,
   hasForeignLiveLinks,
@@ -20,8 +23,10 @@ import {
   sealDissolved,
   sealEdition,
 } from "./control";
-import { bytesToHex, communityIdOf, controlGroupKey, dissolvedGroupKey, grantLocator, hex32, random32, type GroupKey } from "./derive";
-import { isTagDecimal } from "./edition";
+import { bytesToHex, communityIdOf, controlGroupKey, dissolvedGroupKey, grantLocator, hex32, pinsLocator, random32, type GroupKey } from "./derive";
+import { channelCategory } from "./channelCategory";
+import { buildEditionRumor, isTagDecimal } from "./edition";
+import { VSK_PINS } from "./kinds";
 import { buildRumor, openWrap, rewrapSeal, sealRumor, wrapSeal, type Rumor } from "./stream";
 import { KIND_SEAL_ENCRYPTED, KIND_SEAL_PLAINTEXT } from "./kinds";
 import { adminRole, badgeOf, hasPermission, isAdmin, moderatorRole, Permissions, type Role } from "./roles";
@@ -1072,6 +1077,53 @@ describe("control plane fold (CORD-04)", () => {
     expect(hasForeignLiveLinks(folded, otherAdmin, owner.pubkey)).toBe(false);
   });
 
+  it("pin lists (vsk 11) fold only from a PIN_MESSAGES holder, content carried verbatim", async () => {
+    const { owner, communityId, control } = await makeCommunity();
+    const stranger = signer();
+    const chan = random32();
+    const eid = pinsLocator(communityId, chan);
+    const eidHex = bytesToHex(eid);
+    const content = JSON.stringify({ entries: [] });
+
+    // A roleless stranger's pin list is refused outright.
+    const strangerWraps = [
+      await sealEdition(
+        buildEditionRumor({ vsk: VSK_PINS, entityId: eid, content, actorPubkey: stranger.pubkey, version: 1n }),
+        control,
+        stranger,
+      ),
+    ];
+    const refused = foldControlState(openControlWraps(strangerWraps, [control]), communityId, owner.pubkey);
+    expect(refused.pinLists.has(eidHex)).toBe(false);
+
+    // The owner's folds, and the content rides through untouched.
+    const ownerWraps = [
+      await sealEdition(
+        buildEditionRumor({ vsk: VSK_PINS, entityId: eid, content, actorPubkey: owner.pubkey, version: 1n }),
+        control,
+        owner,
+      ),
+    ];
+    const folded = foldControlState(openControlWraps(ownerWraps, [control]), communityId, owner.pubkey);
+    expect(folded.pinLists.get(eidHex)).toEqual({ content, author: owner.pubkey });
+
+    // A cap-violating list still FOLDS (CORD-04 §7) — emptiness is a read-side
+    // verdict, never a refused edition, or two fold models would disagree.
+    const bloated = JSON.stringify({ entries: [], pad: "z".repeat(40_000) });
+    const bloatedWraps = [
+      await sealEdition(
+        buildEditionRumor({ vsk: VSK_PINS, entityId: eid, content: bloated, actorPubkey: owner.pubkey, version: 1n }),
+        control,
+        owner,
+      ),
+    ];
+    const withBloat = foldControlState(openControlWraps(bloatedWraps, [control]), communityId, owner.pubkey);
+    expect(withBloat.pinLists.get(eidHex)?.content, "folded, not refused").toBe(bloated);
+    // Upstream also asserts `readPinList` reads it back EMPTY. That read-side
+    // helper (pins.ts) is not vendored here — the bridge folds Pin Lists but
+    // never renders them — so the fold assertion above is the whole check.
+  });
+
   it("banShouldRotate: a foreign live link blocks a rotation, but never a forced one", async () => {
     // An ordinary ban must not strand another admin's invite link on a dead
     // epoch. A ban answering control-plane abuse must, because the rotation is
@@ -1649,5 +1701,74 @@ describe("dissolution (CORD-02 §9)", () => {
     });
     const seal = await sealRumor(legacy, KIND_SEAL_PLAINTEXT, group, owner);
     expect(isDissolved([wrapSeal(seal, group)], communityId, owner.pubkey)).toBe(false);
+  });
+});
+
+describe("isCurrentFoldedControl", () => {
+  /**
+   * The fold is persisted whole and rehydrated behind an unchecked `as T`, so a
+   * snapshot from a build that predates a field arrives typed as though it has
+   * one. `FoldedChannel.metadata` is exactly that field, and its readers
+   * dereference it — hence the boundary check rather than a guard per reader.
+   */
+  it("rejects a snapshot whose channels predate `metadata`", async () => {
+    const { owner, communityId, control } = await makeCommunity();
+    const channelId = random32();
+    const wrap = await sealEdition(
+      buildChannelEdition(channelId, normalizeChannelMetadata({ name: "general", private: false }), {
+        actorPubkey: owner.pubkey,
+        version: 1n,
+      }),
+      control,
+      owner,
+    );
+    const folded = foldControlState(openControlWraps([wrap], [control]), communityId, owner.pubkey);
+    expect(isCurrentFoldedControl(folded)).toBe(true);
+
+    const idHex = bytesToHex(channelId);
+    const { metadata: _dropped, ...older } = folded.channels.get(idHex)!;
+    folded.channels.set(idHex, older as FoldedChannel);
+    expect(isCurrentFoldedControl(folded)).toBe(false);
+
+    // What accepting it would have cost: the readers dereference `metadata`.
+    expect(() => channelCategory(folded.channels.get(idHex)!.metadata)).toThrow(TypeError);
+  });
+
+  /**
+   * The same failure, one field later. This one reached production: a snapshot
+   * written before Pins passed every check (`channels` and `heads` were both
+   * Maps), and `usePins2`'s first read of `pinLists.get()` threw inside a
+   * render, taking down the whole React tree for anyone with a cached fold.
+   */
+  it("rejects a snapshot that predates `pinLists`", async () => {
+    const { owner, communityId, control } = await makeCommunity();
+    const channelId = random32();
+    const wrap = await sealEdition(
+      buildChannelEdition(channelId, normalizeChannelMetadata({ name: "general", private: false }), {
+        actorPubkey: owner.pubkey,
+        version: 1n,
+      }),
+      control,
+      owner,
+    );
+    const folded = foldControlState(openControlWraps([wrap], [control]), communityId, owner.pubkey);
+    expect(isCurrentFoldedControl(folded)).toBe(true);
+
+    const { pinLists: _dropped, ...older } = folded;
+    expect(isCurrentFoldedControl(older as FoldedControl)).toBe(false);
+
+    // What accepting it would have cost: a TypeError inside a render memo.
+    expect(() => (older as FoldedControl).pinLists.get("aa".repeat(32))).toThrow(TypeError);
+  });
+
+  it("rejects a miss, and anything that isn't a fold", () => {
+    expect(isCurrentFoldedControl(undefined)).toBe(false);
+    expect(isCurrentFoldedControl(null)).toBe(false);
+    expect(isCurrentFoldedControl({})).toBe(false);
+    // `channels` survives JSON only because the codec revives it as a Map; a
+    // plain object here means the snapshot was written by something else.
+    expect(isCurrentFoldedControl({ channels: {}, heads: new Map() })).toBe(false);
+    // Every Map is load-bearing: missing any one of them is a stale shape.
+    expect(isCurrentFoldedControl({ channels: new Map(), heads: new Map() }), "no pinLists").toBe(false);
   });
 });

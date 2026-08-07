@@ -17,22 +17,32 @@ import {
   buildBanlistEdition,
   buildChannelEdition,
   buildMetadataEdition,
+  canWriteControl,
   controlGroups,
   currentControlGroup,
+  currentControlWriteGroup,
   foldControlState,
   openControlWraps,
   sealEdition,
 } from "./control";
-import { baseRekeyGroupKey, bytesToHex, epochKeyCommitment, hex32, random32 } from "./derive";
+import {
+  baseRekeyGroupKey,
+  bytesToHex,
+  controlGroupKey,
+  controlSignerGroupKey,
+  epochKeyCommitment,
+  hex32,
+  random32,
+} from "./derive";
 import { buildInviteUrl, buildBundleEvent, buildRefreshedBundleEvents, mintLinkSigner, mintToken, parseBundleEvent, parseInviteLink, type InviteBundle } from "./invite";
-import { KIND_MESSAGE, KIND_SEAL_ENCRYPTED } from "./kinds";
+import { KIND_MESSAGE, KIND_SEAL_ENCRYPTED, KIND_SEAL_PLAINTEXT } from "./kinds";
 import {
   base64ToBytes,
   buildRekeyRumors,
   bytesToBase64,
   checkContinuity,
-  decodeWrappedKey,
-  encodeWrappedKey,
+  decodeWrappedBaseKey,
+  encodeWrappedBaseKey,
   findBlob,
   groupRotations,
   myLocator,
@@ -66,7 +76,13 @@ describe("Concord V2 end to end", () => {
     const { community: ownerCommunity, generalChannelId } = mintCommunity("Test Fleet", owner.pubkey, [
       "wss://relay.example",
     ]);
-    const control0 = currentControlGroup(ownerCommunity);
+    // The owner minted the control_root, so they are staff and can publish
+    // here; the plane's address is the control_root-derived signer's, not the
+    // community_root's (CORD-02 §5).
+    expect(ownerCommunity.controlPk).toBeDefined();
+    expect(canWriteControl(ownerCommunity)).toBe(true);
+    const control0 = currentControlWriteGroup(ownerCommunity);
+    expect(control0.pk).toBe(ownerCommunity.controlPk!);
     wire.push(
       await sealEdition(
         buildMetadataEdition(ownerCommunity.id, { name: "Test Fleet", relays: ownerCommunity.relays }, { actorPubkey: owner.pubkey, version: 1n }),
@@ -89,6 +105,8 @@ describe("Concord V2 end to end", () => {
       owner_salt: bytesToHex(ownerCommunity.ownerSalt),
       community_root: bytesToHex(ownerCommunity.root),
       root_epoch: 0,
+      // Read access to the Control Plane, never write (CORD-02 §7).
+      control_pk: ownerCommunity.controlPk,
       channels: [],
       relays: ownerCommunity.relays,
       name: "Test Fleet",
@@ -107,6 +125,7 @@ describe("Concord V2 end to end", () => {
       owner_salt: fetched.owner_salt,
       community_root: fetched.community_root,
       root_epoch: fetched.root_epoch,
+      control_pk: fetched.control_pk,
       channels: [],
       relays: fetched.relays,
       name: fetched.name,
@@ -114,6 +133,42 @@ describe("Concord V2 end to end", () => {
     const aliceCommunity = rehydrateCommunity({ community_id: jm.community_id, seed: jm, current: jm, added_at: 1 })!;
     expect(aliceCommunity.idHex).toBe(ownerCommunity.idHex);
     expect(bytesToHex(aliceCommunity.root)).toBe(bytesToHex(ownerCommunity.root));
+
+    // The invite handed Alice the plane's ADDRESS but not its secret: she can
+    // subscribe, verify and read, and cannot publish (CORD-02 §2).
+    expect(aliceCommunity.controlPk).toBe(ownerCommunity.controlPk!);
+    expect(aliceCommunity.controlRoot).toBeUndefined();
+    expect(canWriteControl(aliceCommunity)).toBe(false);
+    expect(() => currentControlWriteGroup(aliceCommunity)).toThrow();
+
+    // Nor can she forge one. Signing with the community_root-derived key she
+    // does hold lands at the LEGACY address, which nobody subscribes to on a
+    // split epoch; re-pointing that wrap at the real address leaves a
+    // signature only a control_root holder could have made, so the reader's
+    // write gate drops it (CORD-01 Write-Restricted Streams).
+    const forgedSeal = await sealRumor(
+      buildMetadataEdition(
+        aliceCommunity.id,
+        { name: "Pwned", relays: aliceCommunity.relays },
+        { actorPubkey: alice.pubkey, version: 2n },
+      ),
+      KIND_SEAL_PLAINTEXT,
+      currentControlGroup(aliceCommunity),
+      alice,
+    );
+    const legacyKey = controlGroupKey(aliceCommunity.root, aliceCommunity.id, 0n);
+    const atLegacyAddress = wrapSeal(forgedSeal, legacyKey);
+    expect(atLegacyAddress.pubkey).not.toBe(aliceCommunity.controlPk!);
+    // Round-tripped through JSON, the way a wrap actually arrives: a spread
+    // would carry nostr-tools' `Symbol(verified)` cache over from the event we
+    // just built locally and short-circuit the very check under test.
+    const repointed = JSON.parse(
+      JSON.stringify({ ...atLegacyAddress, pubkey: aliceCommunity.controlPk! }),
+    ) as NostrEvent;
+    expect(() => openWrap(repointed, currentControlGroup(aliceCommunity))).toThrow(
+      /write-restricted wrap signature invalid/,
+    );
+    expect(openControlWraps([atLegacyAddress, repointed], controlGroups(aliceCommunity))).toEqual([]);
 
     // ── 4. Alice folds the control plane and finds #general.
     const aliceFold = foldControlState(
@@ -158,13 +213,22 @@ describe("Concord V2 end to end", () => {
 
     const newEpoch = 1n;
     const newRoot = random32();
+    // Every compliant base rotation mints the split alongside the new root
+    // (CORD-06 §3): the pair rides the same blobs.
+    const newControlRoot = random32();
+    const newControlPk = controlSignerGroupKey(newControlRoot, ownerCommunity.id, newEpoch).pk;
     const prevCommit = bytesToHex(epochKeyCommitment(0n, ownerCommunity.root));
     const rekeyAddress = baseRekeyGroupKey(ownerCommunity.root, ownerCommunity.id, newEpoch);
-    const plain = bytesToBase64(encodeWrappedKey(new Uint8Array(32), newEpoch, newRoot));
+    // A member's blob is 104 bytes (root + control_pk); a staff recipient's is
+    // 136, appending the secret itself (CORD-06 §1). Only the owner is staff.
+    const memberPlain = bytesToBase64(encodeWrappedBaseKey(newEpoch, newRoot, hex32(newControlPk)));
+    const staffPlain = bytesToBase64(
+      encodeWrappedBaseKey(newEpoch, newRoot, hex32(newControlPk), newControlRoot),
+    );
     const survivors = [owner.pubkey, alice.pubkey];
     const blobs: RekeyBlob[] = survivors.map((pk) => ({
       locator: myLocator(owner.pubkey, pk, "0".repeat(64), newEpoch),
-      wrapped: owner.nip44encrypt(pk, plain),
+      wrapped: owner.nip44encrypt(pk, pk === owner.pubkey ? staffPlain : memberPlain),
     }));
     for (const rumor of buildRekeyRumors(
       owner.pubkey,
@@ -185,10 +249,19 @@ describe("Concord V2 end to end", () => {
       ...ownerCommunity,
       root: newRoot,
       rootEpoch: newEpoch,
-      heldRoots: [{ epoch: newEpoch, key: newRoot }, ...ownerCommunity.heldRoots],
+      controlPk: newControlPk,
+      controlRoot: newControlRoot,
+      heldRoots: [
+        { epoch: newEpoch, key: newRoot, controlPk: newControlPk },
+        ...ownerCommunity.heldRoots,
+      ],
       refounder: owner.pubkey,
     };
-    const control1 = currentControlGroup(rotatedOwner);
+    // The compaction republishes at the NEW epoch's split address, signed by
+    // the fresh control_root — never mirrored to the legacy one, which would
+    // re-open the member-writable surface the split closes (CORD-06 §3).
+    const control1 = currentControlWriteGroup(rotatedOwner);
+    expect(control1.pk).toBe(newControlPk);
     for (const head of ownerFold.headEditions.values()) {
       wire.push(rewrapSeal(head.opened.seal, control1));
     }
@@ -203,12 +276,27 @@ describe("Concord V2 end to end", () => {
 
     const aliceBlob = findBlob(rotation, myLocator(owner.pubkey, alice.pubkey, rotation.scopeIdHex, newEpoch));
     expect(aliceBlob).toBeDefined();
-    const aliceNewRoot = decodeWrappedKey(
+    const aliceWrapped = decodeWrappedBaseKey(
       base64ToBytes(alice.nip44decrypt(owner.pubkey, aliceBlob!.wrapped)),
-      new Uint8Array(32),
+      aliceCommunity.id,
       newEpoch,
     );
+    const aliceNewRoot = aliceWrapped.newRoot;
     expect(bytesToHex(aliceNewRoot)).toBe(bytesToHex(newRoot));
+    // A member's blob carries the new address forward, never the secret.
+    expect(aliceWrapped.controlPk).toBe(newControlPk);
+    expect(aliceWrapped.controlRoot).toBeUndefined();
+
+    // The owner's own blob is the staff form, and its secret derives to the
+    // address every member was handed.
+    const ownerBlob = findBlob(rotation, myLocator(owner.pubkey, owner.pubkey, rotation.scopeIdHex, newEpoch));
+    const ownerWrapped = decodeWrappedBaseKey(
+      base64ToBytes(owner.nip44decrypt(owner.pubkey, ownerBlob!.wrapped)),
+      ownerCommunity.id,
+      newEpoch,
+    );
+    expect(ownerWrapped.controlRoot && bytesToHex(ownerWrapped.controlRoot)).toBe(bytesToHex(newControlRoot));
+    expect(ownerWrapped.controlPk).toBe(newControlPk);
 
     // Mallory finds no blob across the COMPLETE rotation → removed.
     const malloryBlob = findBlob(rotation, myLocator(owner.pubkey, mallory.pubkey, rotation.scopeIdHex, newEpoch));
@@ -221,7 +309,17 @@ describe("Concord V2 end to end", () => {
         community_id: aliceCommunity.idHex,
         seed: jm,
         current: toJoinMaterial(
-          { ...aliceCommunity, root: aliceNewRoot, rootEpoch: newEpoch, heldRoots: [{ epoch: newEpoch, key: aliceNewRoot }, ...aliceCommunity.heldRoots], refounder: owner.pubkey },
+          {
+            ...aliceCommunity,
+            root: aliceNewRoot,
+            rootEpoch: newEpoch,
+            controlPk: aliceWrapped.controlPk,
+            heldRoots: [
+              { epoch: newEpoch, key: aliceNewRoot, controlPk: aliceWrapped.controlPk },
+              ...aliceCommunity.heldRoots,
+            ],
+            refounder: owner.pubkey,
+          },
           { relays: jm.relays },
         ),
         added_at: 1,
@@ -229,6 +327,9 @@ describe("Concord V2 end to end", () => {
     )!;
     expect(rotatedAlice.rootEpoch).toBe(1n);
     expect(rotatedAlice.refounder).toBe(owner.pubkey);
+    // She followed the rotation onto the new plane, still read-only.
+    expect(rotatedAlice.controlPk).toBe(newControlPk);
+    expect(canWriteControl(rotatedAlice)).toBe(false);
     const aliceFold1 = foldControlState(
       openControlWraps(wire, controlGroups(rotatedAlice)),
       rotatedAlice.id,
@@ -303,6 +404,7 @@ describe("Concord V2 end to end", () => {
       owner_salt: bytesToHex(c.ownerSalt),
       community_root: bytesToHex(c.root),
       root_epoch: Number(c.rootEpoch),
+      control_pk: c.controlPk,
       channels: [],
       relays: c.relays,
       name: "Test Fleet",
@@ -315,11 +417,22 @@ describe("Concord V2 end to end", () => {
 
     // ── 2. The owner Refounds to epoch 1 (ban/convert): newEpoch = rootEpoch+1,
     // a fresh root. The link is NOT revoked — it stays live and shareable.
+    // The rotation mints a new root and, with it, a fresh control_root
+    // (CORD-06 §3). `root` and the head of `heldRoots` are the same key — they
+    // were two separate random32() calls before, which no assertion here
+    // caught but is not a shape a real rotation ever produces.
+    const e1Root = random32();
+    const e1ControlRoot = random32();
     const rotatedOwner: CommunityV2 = {
       ...e0,
-      root: random32(),
+      root: e1Root,
       rootEpoch: 1n,
-      heldRoots: [{ epoch: 1n, key: random32() }, ...e0.heldRoots],
+      controlPk: controlSignerGroupKey(e1ControlRoot, e0.id, 1n).pk,
+      controlRoot: e1ControlRoot,
+      heldRoots: [
+        { epoch: 1n, key: e1Root, controlPk: controlSignerGroupKey(e1ControlRoot, e0.id, 1n).pk },
+        ...e0.heldRoots,
+      ],
       refounder: owner.pubkey,
     };
 

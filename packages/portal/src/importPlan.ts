@@ -160,6 +160,13 @@ export interface ImportCheckpoints {
   ownerGrantPublishedAt?: number;
   ownerRegistryPublishedAt?: number;
   ownerJoinPublishedAt?: number;
+  /**
+   * The Grant edition that hands the owner the staff write key (CORD-04 §3).
+   * The portal mints the `control_root` server-side, so without this delivery
+   * the owner holds `control_pk` (read) but could never publish a Control
+   * edition from Armada — not even to revoke the op grant.
+   */
+  ownerControlKeyPublishedAt?: number;
   /** Encrypted-blob pointers (CORD-02 §6) for the rehosted icon/banner. */
   iconPointer?: { url: string; key: string; nonce: string; hash: string };
   bannerPointer?: { url: string; key: string; nonce: string; hash: string };

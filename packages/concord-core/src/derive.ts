@@ -23,6 +23,7 @@ import { getConversationKey } from "nostr-tools/nip44";
 
 const LABEL_CHANNEL = "concord/channel";
 const LABEL_CONTROL = "concord/control";
+const LABEL_CONTROL_SIGNER = "concord/control-signer";
 const LABEL_REKEY_PSEUDONYM = "concord/rekey-pseudonym";
 const LABEL_BASE_REKEY_PSEUDONYM = "concord/base-rekey-pseudonym";
 const LABEL_RECIPIENT_PSEUDONYM = "concord/recipient-pseudonym";
@@ -34,6 +35,7 @@ const LABEL_DISSOLVED = "concord/dissolved";
 const LABEL_GRANT = "concord/grant";
 const LABEL_BANLIST = "concord/banlist";
 const LABEL_INVITE_LINKS = "concord/invite-links";
+const LABEL_PINS = "concord/pins";
 const LABEL_INVITE_KEY = "concord/invite-key";
 
 /** The community_id commitment prefix (A.4) — plain SHA-256, NOT the hkdf shape. */
@@ -135,23 +137,78 @@ export interface GroupKey {
   sk: Uint8Array;
   /** x-only pubkey hex — the Stream address. */
   pk: string;
-  /** NIP-44 conversation key (self-ECDH of sk with its own pk). */
-  convKey: Uint8Array;
-}
-
-function groupKey(label: string, secret: Uint8Array, id: Uint8Array, epoch?: bigint): GroupKey {
-  const sk = hkdfToSecretKey(secret, buildInfo(label, id, epoch));
-  const pk = bytesToHex(schnorr.getPublicKey(sk));
-  const convKey = getConversationKey(sk, pk);
-  return { sk, pk, convKey };
+  /**
+   * NIP-44 conversation key (self-ECDH of sk with its own pk).
+   *
+   * Derived LAZILY on first read: the ECDH is an arbitrary-point multiplication
+   * (~1–2ms on a phone, the expensive half of a derivation), and many keys are
+   * only ever used for their address — subscription filters, stream-auth
+   * registration, voice room names — which never touch it.
+   */
+  readonly convKey: Uint8Array;
 }
 
 /**
- * `groupKey` memo. A single derivation costs one HKDF plus TWO secp256k1
- * point multiplications (~ms each on a phone), and the app re-derives every
- * community's full key set on short polls (stream-auth registration each 20s,
- * subscription and wire rebuilds each 60s/2min) — uncached, that alone was
- * seconds of main-thread crypto per poll for multi-community users.
+ * A stream as a READER holds it: the address to subscribe/verify by and the
+ * conversation key that opens the wraps — with the signing secret only when
+ * it is actually held.
+ *
+ * Every plane except the split Control Plane is a full {@link GroupKey}
+ * (holding the secret IS holding the plane). A Write-Restricted Stream
+ * (CORD-01) splits the two: every member holds the Control Plane's address
+ * (`control_pk`, delivered rather than derived) and its community_root-derived
+ * read key, but only staff hold the `control_root` the signing `sk` derives
+ * from — so the read view's `sk` is optional, and everything that only READS
+ * (openWrap, subscription filters, NIP-42 registration) takes this shape.
+ */
+export interface StreamKeyView {
+  /** x-only pubkey hex — the Stream address. */
+  pk: string;
+  /** NIP-44 conversation key that opens the wraps. */
+  readonly convKey: Uint8Array;
+  /** The wrap-signing secret, when held (absent for a write-restricted read view). */
+  sk?: Uint8Array;
+  /**
+   * Write-restricted (CORD-01): the address is a narrower writer-set's signer,
+   * so a wrap's signature actually proves something (a `control_root` holder
+   * published it) and the reader MUST verify it — where an ordinary stream's
+   * wrap signature is made with a key every reader holds and proves nothing.
+   */
+  restricted?: boolean;
+}
+
+/**
+ * The persistable form of one derivation — what `groupKeyPersist.ts` writes
+ * into ArmadaDB's KV so a warm boot re-derives nothing.
+ *
+ * `h` is sha256 of the in-memory memo key, so the persisted blob never spells
+ * the community secret a derivation started FROM. The derived `sk` is stored
+ * (hex) — the same device-trust level as the decrypted plane data and raw
+ * channel keys the event store already persists. `ck` appears only once the
+ * lazy conversation key has actually been computed.
+ *
+ * Entries are trusted as our own prior output: `pk`/`ck` are not re-proved
+ * against `sk` on import (that point-mul is exactly the cost being cached),
+ * only shape-checked.
+ */
+export interface GroupKeyMemoEntry {
+  /** sha256 hex of the memo key (label|secret|id|epoch). */
+  h: string;
+  /** Derived secp256k1 secret key, hex. */
+  sk: string;
+  /** x-only pubkey hex — the Stream address. */
+  pk: string;
+  /** NIP-44 conversation key hex; absent until first `convKey` read. */
+  ck?: string;
+}
+
+/**
+ * `groupKey` memo. A single derivation costs one HKDF plus a secp256k1
+ * base-point multiplication up front (and a lazy ECDH on first `convKey`
+ * read, ~ms each on a phone), and the app re-derives every community's full
+ * key set on short polls (stream-auth registration each 20s, subscription and
+ * wire rebuilds each 60s/2min) — uncached, that alone was seconds of
+ * main-thread crypto per poll for multi-community users.
  *
  * Caching is sound because the derivation is a pure function of
  * (label, secret, id, epoch) — CORD-02 Appendix A is frozen — and every
@@ -159,19 +216,109 @@ function groupKey(label: string, secret: Uint8Array, id: Uint8Array, epoch?: big
  * FIFO-bounded: entries are tiny (~200B) and the working set is
  * O(communities × channels × held epochs), far under the cap.
  */
-const groupKeyMemo = new Map<string, GroupKey>();
+const groupKeyMemo = new Map<string, { key: GroupKey; entry: GroupKeyMemoEntry }>();
 const GROUP_KEY_MEMO_MAX = 8192;
+
+/** Persisted entries not yet claimed by a derivation this session, keyed by `h`. */
+const hydratedEntries = new Map<string, GroupKeyMemoEntry>();
+
+/** Notified synchronously whenever the persistable state gains information. */
+let memoDirtyListener: (() => void) | undefined;
+
+function memoDirty(): void {
+  memoDirtyListener?.();
+}
+
+function hashMemoKey(memoKey: string): string {
+  return bytesToHex(sha256(ASCII.encode(memoKey)));
+}
+
+/** The GroupKey view over a memo entry; reading `convKey` lazily fills `entry.ck`. */
+function entryGroupKey(entry: GroupKeyMemoEntry): GroupKey {
+  const sk = hexToBytes(entry.sk);
+  const pk = entry.pk;
+  let convKey = entry.ck !== undefined ? hexToBytes(entry.ck) : undefined;
+  return {
+    sk,
+    pk,
+    get convKey(): Uint8Array {
+      if (convKey === undefined) {
+        convKey = getConversationKey(sk, pk);
+        entry.ck = bytesToHex(convKey);
+        memoDirty();
+      }
+      return convKey;
+    },
+  };
+}
 
 function groupKeyCached(label: string, secret: Uint8Array, id: Uint8Array, epoch?: bigint): GroupKey {
   const memoKey = `${label}|${bytesToHex(secret)}|${bytesToHex(id)}|${epoch ?? ""}`;
   const hit = groupKeyMemo.get(memoKey);
-  if (hit) return hit;
-  const key = groupKey(label, secret, id, epoch);
+  if (hit) return hit.key;
+
+  const h = hashMemoKey(memoKey);
+  let entry = hydratedEntries.get(h);
+  if (entry !== undefined) {
+    hydratedEntries.delete(h);
+  } else {
+    const sk = hkdfToSecretKey(secret, buildInfo(label, id, epoch));
+    entry = { h, sk: bytesToHex(sk), pk: bytesToHex(schnorr.getPublicKey(sk)) };
+    memoDirty();
+  }
+
+  const slot = { key: entryGroupKey(entry), entry };
   if (groupKeyMemo.size >= GROUP_KEY_MEMO_MAX) {
     groupKeyMemo.delete(groupKeyMemo.keys().next().value as string);
   }
-  groupKeyMemo.set(memoKey, key);
-  return key;
+  groupKeyMemo.set(memoKey, slot);
+  return slot.key;
+}
+
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/**
+ * Install persisted entries, shape-checked; malformed rows are skipped rather
+ * than trusted. Each is claimed (and dropped from this staging map) by the
+ * first derivation that asks for it.
+ */
+export function importGroupKeyMemo(entries: unknown[]): void {
+  for (const raw of entries) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const { h, sk, pk, ck } = raw as Partial<GroupKeyMemoEntry>;
+    if (typeof h !== "string" || !HEX64.test(h)) continue;
+    if (typeof sk !== "string" || !HEX64.test(sk)) continue;
+    if (typeof pk !== "string" || !HEX64.test(pk)) continue;
+    if (ck !== undefined && (typeof ck !== "string" || !HEX64.test(ck))) continue;
+    hydratedEntries.set(h, { h, sk, pk, ...(ck !== undefined ? { ck } : {}) });
+  }
+}
+
+/**
+ * Everything worth persisting: this session's memo PLUS the hydrated entries
+ * nothing claimed yet — a community not opened this session keeps its cache
+ * rather than losing it to the next write. Deduped by `h` (the live memo's
+ * copy wins, it may have gained a `ck`), oldest first so a `limit` drops the
+ * stalest hydrated leftovers.
+ */
+export function exportGroupKeyMemo(limit: number): GroupKeyMemoEntry[] {
+  const byHash = new Map<string, GroupKeyMemoEntry>();
+  for (const entry of hydratedEntries.values()) byHash.set(entry.h, entry);
+  for (const { entry } of groupKeyMemo.values()) byHash.set(entry.h, entry);
+  const entries = [...byHash.values()];
+  return entries.length > limit ? entries.slice(entries.length - limit) : entries;
+}
+
+/** Register THE dirty listener (last registration wins — one persist layer exists). */
+export function onGroupKeyMemoDirty(listener: () => void): void {
+  memoDirtyListener = listener;
+}
+
+/** Test seam: forget every cached and hydrated derivation. */
+export function _resetGroupKeyMemoForTests(): void {
+  groupKeyMemo.clear();
+  hydratedEntries.clear();
+  memoDirtyListener = undefined;
 }
 
 // ── Plane keys (CORD-02 §5, CORD-03 §1, CORD-06 §2) ─────────────────────────
@@ -187,11 +334,32 @@ export function channelGroupKey(secret: Uint8Array, channelId: Uint8Array, epoch
   return groupKeyCached(LABEL_CHANNEL, secret, channelId, toEpoch(epoch));
 }
 
-/** The Control Plane's group key (community_root-keyed). */
+/**
+ * The Control Plane's community_root-keyed group key (CORD-02 §5).
+ *
+ * Post-split this is the plane's READ key: its `convKey` encrypts the wraps
+ * for every member. On a LEGACY (pre-split) epoch the same derivation was the
+ * whole plane — its `pk` the address and wrap signer too — and that use is
+ * retained for reading such epochs; the two schemes never collide (different
+ * labels, different addresses).
+ */
 export function controlGroupKey(communityRoot: Uint8Array, communityId: Uint8Array, epoch: number | bigint): GroupKey {
   assert32("communityRoot", communityRoot);
   assert32("communityId", communityId);
   return groupKeyCached(LABEL_CONTROL, communityRoot, communityId, toEpoch(epoch));
+}
+
+/**
+ * The Control Plane's control_root-keyed SIGNER keypair (CORD-02 §2/§5): its
+ * `pk` is the plane's address and its staff-only `sk` signs the wraps. Every
+ * member holds the derived `control_pk` (delivered, never derived — only the
+ * owner and staff hold the `control_root` input); the wraps' content is
+ * encrypted under {@link controlGroupKey}'s conv_key, not this one's.
+ */
+export function controlSignerGroupKey(controlRoot: Uint8Array, communityId: Uint8Array, epoch: number | bigint): GroupKey {
+  assert32("controlRoot", controlRoot);
+  assert32("communityId", communityId);
+  return groupKeyCached(LABEL_CONTROL_SIGNER, controlRoot, communityId, toEpoch(epoch));
 }
 
 /** The Guestbook Plane's group key (community_root-keyed). */
@@ -276,6 +444,13 @@ export function grantLocator(communityId: Uint8Array, memberXonly: Uint8Array): 
   assert32("communityId", communityId);
   assert32("memberXonly", memberXonly);
   return hkdf32(communityId, buildInfo(LABEL_GRANT, memberXonly));
+}
+
+/** A Channel's Pin List coordinate (CORD-04 §7). */
+export function pinsLocator(communityId: Uint8Array, channelId: Uint8Array): Uint8Array {
+  assert32("communityId", communityId);
+  assert32("channelId", channelId);
+  return hkdf32(communityId, buildInfo(LABEL_PINS, channelId));
 }
 
 /** The community-wide Banlist coordinate. */

@@ -16,6 +16,7 @@
 # The client-only edges are rewritten mechanically:
 #   @/concord-v2/lib/X  -> ./X            (path alias)
 #   @/lib/gitActivity   -> ./vendor/...   (already vendored)
+#   @/lib/nip17/protocol-> ./vendor/nip17 (the 3 expiry/timer fns chat.ts uses)
 #   NostrRumor          -> Rumor          (core defines its own in stream.ts)
 #   perfCount(...)      -> dropped        (client instrumentation)
 #
@@ -40,6 +41,11 @@ FILES=(
 # Upstream's own tests come along: they are the only check that a copy is
 # faithful rather than merely type-correct.
 #
+# One hand-edit survives each sync: control.test.ts's Pin List case ends with a
+# `readPinList` assertion, and pins.ts is deliberately not vendored (it needs
+# nip44keys.ts and two more deps, and the bridge folds Pin Lists but never
+# renders them). Drop that one line and its `./pins` import after syncing.
+#
 # Excluded, and kept as this repo's own: `protocol.test.ts` (bridge-specific),
 # `chat.test.ts` and `directInvite.test.ts` (they need client test infra —
 # @nostrify/indexeddb, a bolt11 mock, vitest's importOriginal mocking — and
@@ -58,6 +64,7 @@ for f in "${FILES[@]}"; do
   sed -E \
     -e 's#"@/concord-v2/lib/([A-Za-z0-9_]+)"#"./\1"#g' \
     -e 's#"@/lib/(gitActivity|platform|zaps|calendar|polls|foldedCache)"#"./vendor/\1"#g' \
+    -e 's#"@/lib/nip17/protocol"#"./vendor/nip17"#g' \
     -e 's#"@/hooks/useDmRelayList"#"./vendor/dmRelays"#g' \
     -e 's#"@/hooks/useReactions"#"./vendor/reactions"#g' \
     -e 's#"vitest"#"bun:test"#g' \

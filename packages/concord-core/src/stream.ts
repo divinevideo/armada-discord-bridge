@@ -21,7 +21,7 @@ import { decrypt as nip44Decrypt, encrypt as nip44Encrypt } from "nostr-tools/ni
 import { finalizeEvent, generateSecretKey, getEventHash, getPublicKey, verifyEvent } from "nostr-tools/pure";
 import type { EventTemplate, NostrEvent, UnsignedEvent } from "nostr-tools/pure";
 
-import type { GroupKey } from "./derive";
+import type { GroupKey, StreamKeyView } from "./derive";
 import {
   KIND_SEAL_ENCRYPTED,
   KIND_SEAL_PLAINTEXT,
@@ -40,6 +40,7 @@ export class StreamError extends Error {
       | "decrypt"
       | "parse"
       | "bad-wrap-kind"
+      | "bad-wrap-signature"
       | "bad-seal-kind"
       | "bad-seal-signature"
       | "author-mismatch"
@@ -123,7 +124,7 @@ export interface StreamSigner {
 export async function sealRumor(
   rumor: Rumor,
   sealKind: typeof KIND_SEAL_ENCRYPTED | typeof KIND_SEAL_PLAINTEXT,
-  stream: GroupKey,
+  stream: StreamKeyView,
   signer: StreamSigner,
 ): Promise<NostrEvent> {
   const rumorJson = JSON.stringify(rumor);
@@ -213,10 +214,12 @@ export function resolveMs(createdAtSecs: number, tags: string[][]): number {
 /**
  * Open and fully verify one stream wrap under its plane's group key:
  *
-  *   1. the wrap's author must be the stream address (else it isn't ours);
- *      the wrap's OWN signature is never checked — it is made by a throwaway
- *      ephemeral key and proves nothing, which is why this takes a rumor and
- *      not a signed event;
+ *   1. the wrap's author must be the stream address (else it isn't ours). On an
+ *      ordinary stream the wrap's OWN signature is not checked — it is made
+ *      with a key every reader holds, so it proves nothing, which is why this
+ *      takes a rumor and not a signed event. On a WRITE-RESTRICTED stream
+ *      (`stream.restricted`, CORD-01) the signer set is narrower than the
+ *      readership, so the signature is the write gate and MUST be verified;
  *   2. decrypt the wrap → the seal; verify the seal's Schnorr signature
  *      (authorship proof) and that its kind declares a known seal form;
  *   3. recover the rumor (decrypting again for 20013); verify the rumor's id
@@ -224,12 +227,23 @@ export function resolveMs(createdAtSecs: number, tags: string[][]): number {
  *      claimed one) and that the rumor's pubkey equals the seal's signer (or a
  *      keyholder could re-seal another member's rumor under their own name).
  */
-export function openWrap(wrap: Rumor, stream: GroupKey): OpenedEvent {
+export function openWrap(wrap: Rumor, stream: StreamKeyView): OpenedEvent {
   if (wrap.kind !== KIND_WRAP && wrap.kind !== KIND_WRAP_EPHEMERAL) {
     throw new StreamError("bad-wrap-kind", `not a stream wrap: kind ${wrap.kind}`);
   }
   if (wrap.pubkey !== stream.pk) {
     throw new StreamError("author-mismatch", "wrap author is not this stream's address");
+  }
+  // A WRITE-RESTRICTED stream's wrap signature is the write gate (CORD-01):
+  // the signer set is narrower than the readership, so unlike an ordinary
+  // stream wrap (signed with a key every reader holds — never checked), it
+  // proves a `control_root` holder published this, and a reader MUST check it
+  // rather than lean on the relays having done so.
+  if (stream.restricted) {
+    const signed = wrap as Rumor & { sig?: string };
+    if (typeof signed.sig !== "string" || !verifyEvent(signed as NostrEvent)) {
+      throw new StreamError("bad-wrap-signature", "write-restricted wrap signature invalid");
+    }
   }
 
   let seal: NostrEvent;

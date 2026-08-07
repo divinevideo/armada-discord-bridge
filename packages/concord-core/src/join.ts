@@ -18,6 +18,13 @@ export function bundleToEntry(bundle: InviteBundle, opts?: { inviteRef?: string 
     owner_salt: bundle.owner_salt,
     community_root: bundle.community_root,
     root_epoch: bundle.root_epoch,
+    // The split epoch's Control Plane address (CORD-02 §7): subscribe, verify
+    // and read, never write. Dropped when malformed rather than carried
+    // through — a bad address is a plane nobody can read, and absent means
+    // "legacy", which at least folds at the member-derivable address.
+    ...(typeof bundle.control_pk === "string" && /^[0-9a-f]{64}$/i.test(bundle.control_pk)
+      ? { control_pk: bundle.control_pk.toLowerCase() }
+      : {}),
     channels: Array.isArray(bundle.channels)
       ? bundle.channels.map((ch) => ({ id: ch.id, key: ch.key, epoch: ch.epoch, name: ch.name }))
       : [],

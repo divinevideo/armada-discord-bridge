@@ -11,6 +11,13 @@ import { describe, expect, it } from "bun:test";
 import {
   ADMIN_ALL,
   Permissions,
+  base64ToBytes,
+  bytesToHex,
+  canWriteControl,
+  controlSignerGroupKey,
+  decodeControlWrap,
+  grantLocator,
+  hex32,
   channelCategory,
   channelRoles,
   isEntitled,
@@ -28,6 +35,7 @@ import { resolveInvite } from "@armada-bridge/bridge/src/concord/client";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
 import * as nip19 from "nostr-tools/nip19";
+import { decrypt as nip44Decrypt, getConversationKey } from "nostr-tools/nip44";
 import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 
@@ -417,6 +425,31 @@ describe("importer pipeline", () => {
     // proves the vac citations resolve.
     const opPk = row().plan.checkpoints.opPkHex!;
     expect(effectivePermissions(fold.roster, opPk)).toBe(ADMIN_ALL);
+
+    // The Control Plane is SPLIT (CORD-02 §2): its address is the
+    // control_root-derived signer's, the invite hands joiners that address,
+    // and a joiner holding only `community_root` can read but not write.
+    expect(community.controlPk).toBe(bundle.control_pk!);
+    expect(canWriteControl(community)).toBe(false);
+
+    // The owner must still be able to ADMINISTER from Armada — including
+    // revoking the op grant — so the op delivers them the staff write key
+    // inside a Grant (CORD-04 §3). Replay exactly what Armada's staff-key
+    // watcher does: find my folded Grant head, decrypt its `control_wrap`
+    // under the granter↔me pairwise key, and adopt only if the secret derives
+    // to the `control_pk` I already hold at this epoch.
+    const ownerGrantEid = bytesToHex(grantLocator(community.id, hex32(userPk)));
+    const ownerHead = fold.headEditions.get(ownerGrantEid);
+    expect(ownerHead?.author).toBe(opPk);
+    const ownerGrant = fold.roster.grants.find((g) => g.member === userPk);
+    expect(ownerGrant?.controlWrap).toBeDefined();
+    const decoded = decodeControlWrap(
+      base64ToBytes(nip44Decrypt(ownerGrant!.controlWrap!, getConversationKey(userSk, ownerHead!.author))),
+    );
+    expect(decoded.epoch).toBe(community.rootEpoch);
+    expect(controlSignerGroupKey(decoded.controlRoot, community.id, decoded.epoch).pk).toBe(community.controlPk!);
+    // Having adopted it, the owner can publish.
+    expect(canWriteControl({ ...community, controlRoot: decoded.controlRoot })).toBe(true);
 
     // The public invite registry is live under the OWNER's name.
     expect(isCommunityPublic(fold)).toBe(true);
