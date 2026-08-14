@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 
 import { api } from "./api";
 import type { BridgeSummary, Me } from "./api";
-import { Claims } from "./Claims";
 import { ImportWizard } from "./ImportWizard";
 import { Wizard } from "./Wizard";
 
@@ -16,19 +15,14 @@ const PENDING_VIEW_KEY = "portal:pending-view";
 
 export function App() {
   const [me, setMe] = useState<Me | null>(null);
-  const [view, setView] = useState<"dashboard" | "wizard" | "import" | "claims">("dashboard");
+  const [view, setView] = useState<"dashboard" | "wizard" | "import">("dashboard");
   const [wizardFrom, setWizardFrom] = useState<BridgeSummary | undefined>();
-  const [claimCommunityId, setClaimCommunityId] = useState<string | null>(null);
 
-  // Deep links: /import (Armada's "Import from Discord" buttons) and
-  // /claim/<communityId> (the bot's claim link). Park the intent, then clean the
-  // URL so a refresh mid-wizard doesn't restart it.
+  // Deep link: /import, from Armada's "Import from Discord" buttons. Park the
+  // intent, then clean the URL so a refresh mid-wizard doesn't restart it.
   useEffect(() => {
-    const path = window.location.pathname;
-    const claim = /^\/claim\/([0-9a-f]{64})$/.exec(path);
-    if (claim) sessionStorage.setItem(PENDING_VIEW_KEY, `claim:${claim[1]}`);
-    else if (path === "/import") sessionStorage.setItem(PENDING_VIEW_KEY, "import");
-    else return;
+    if (window.location.pathname !== "/import") return;
+    sessionStorage.setItem(PENDING_VIEW_KEY, "import");
     window.history.replaceState(null, "", "/");
   }, []);
 
@@ -38,8 +32,10 @@ export function App() {
     const pending = sessionStorage.getItem(PENDING_VIEW_KEY);
     if (!pending) return;
     sessionStorage.removeItem(PENDING_VIEW_KEY);
+    // A retired `claim:<id>` parked by an older build lands here too. It is
+    // already out of sessionStorage by now, and matches nothing, so it clears
+    // itself rather than needing a migration.
     if (pending === "import") setView("import");
-    else if (pending.startsWith("claim:")) setClaimCommunityId(pending.slice("claim:".length));
   }, [me]);
 
   const refresh = useCallback(() => {
@@ -69,7 +65,7 @@ export function App() {
 
       {!me && <p className="muted">Loading…</p>}
       {me && !me.user && <SignIn devLogin={me.devLogin} discordConfigured={me.discordConfigured} onSignedIn={refresh} />}
-      {me?.user && view === "dashboard" && !claimCommunityId && (
+      {me?.user && view === "dashboard" && (
         <Dashboard
           onNew={(from) => { setWizardFrom(from); setView("wizard"); }}
           onImport={() => setView("import")}
@@ -89,9 +85,6 @@ export function App() {
           onDone={() => setView("dashboard")}
           onCancel={() => setView("dashboard")}
         />
-      )}
-      {me?.user && claimCommunityId && (
-        <Claims communityId={claimCommunityId} onDone={() => setClaimCommunityId(null)} />
       )}
       <Footer />
     </>

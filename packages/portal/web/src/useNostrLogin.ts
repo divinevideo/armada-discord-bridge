@@ -18,9 +18,9 @@ declare global {
 const LOGIN_STORE = "portal:nostr-login";
 
 /**
- * Armada-style key login, shared by the import wizard and the claims page:
- * nsec paste or NIP-07 extension, local signing only, persisted in
- * localStorage so the login survives reloads.
+ * Armada-style key login, used by the import wizard: nsec paste or NIP-07
+ * extension, local signing only, persisted in localStorage so the login
+ * survives reloads.
  */
 export function useNostrLogin(defaultRelays: string[]) {
   const [pk, setPk] = useState("");
