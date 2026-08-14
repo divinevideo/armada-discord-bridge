@@ -35,7 +35,7 @@ import type postgres from "postgres";
 
 import type { PortalEnv } from "./env";
 import { filterPublicRelays } from "./relayGuard";
-import { claimCodeDigest, seal, unseal } from "./seal";
+import { seal, unseal } from "./seal";
 
 export interface BridgeRow {
   bridge_id: string;
@@ -81,10 +81,6 @@ export const BRIDGE_COMMANDS = [
       { name: "action", type: "choice", description: "What to do", required: true, choices: ["confirm"] },
       { name: "code", type: "string", description: "The 8-character confirm code", required: true },
     ],
-  },
-  {
-    name: "claim",
-    description: "Link your Discord identity to your own npub (run it on the Discord side).",
   },
   {
     name: "help",
@@ -559,7 +555,7 @@ export class BridgeManager {
 
   /**
    * One-time welcome in both directions when a bridge goes live: tells
-   * everyone the channel is mirrored and teaches /claim. Fire-and-forget.
+   * everyone the channel is mirrored. Fire-and-forget.
    *
    * One-time means once per bridge EVER, not once per process: attachRouting
    * runs again on every restart's resume, so the sent-ness is claimed on the
@@ -574,18 +570,13 @@ export class BridgeManager {
     if (!claimed) return;
     await rb.client
       .sendChat(rb.channel, {
-        content:
-          "This channel is now mirrored with Discord. Members can run /claim there " +
-          "to connect their Discord account to their Armada account.",
+        content: "This channel is now mirrored with Discord.",
         author: rb.primary,
       })
       .catch(() => {});
     await this.adapter!.send(rb.link, {
       username: "Armada Bridge",
-      content:
-        "This channel is now mirrored with an Armada community. " +
-        "Run /claim to connect your Discord account to your Armada account " +
-        "(your history, roles, and puppet key), or /help for commands.",
+      content: "This channel is now mirrored with an Armada community. /help lists what this bot answers.",
     }).catch(() => {});
   }
 
@@ -655,9 +646,8 @@ export class BridgeManager {
 
   /**
    * Any `/command` posted in a bridged channel gets handled or answered
-   * (never silently swallowed): /claim is the one real command today; /help
-   * and unknown commands get the same help text. Unbridged channels stay
-   * silent.
+   * (never silently swallowed): /help and unknown commands get the same help
+   * text. Unbridged channels stay silent.
    */
   private handleBotCommand(message: import("discord.js").Message): boolean {
     const command = parseBotCommand(message.content);
@@ -679,34 +669,18 @@ export class BridgeManager {
       await message.reply(this.helpText());
       return;
     }
-    if (command !== "claim") {
-      await message.reply(`Unknown command /${command}. ${this.helpText()}`);
+    // /claim is answered by name rather than falling through to "unknown".
+    // The bot advertised it in this very channel when the bridge went live,
+    // and that welcome cannot be unsent, so people will keep running it for
+    // as long as the scrollback lasts. "Unknown command" would read as a bug.
+    if (command === "claim") {
+      await message.reply("/claim has been retired; there is nothing to run in its place.");
       return;
     }
-    const [existing] = await this.sql<{ npub: string }[]>`
-      SELECT npub FROM claims
-      WHERE community_id = ${rb.link.communityId} AND discord_user_id = ${message.author.id}`;
-    if (existing) {
-      await message.reply(`You've already claimed ${existing.npub.slice(0, 12)}… in this community.`);
-      return;
-    }
-    // A one-time code bound to the INVOKING user, and enforced against the
-    // portal session's Discord identity at claim time -- which is what makes
-    // this public channel reply safe: a bystander who copies the code cannot
-    // spend it without being signed in as the account that asked. Stored as a
-    // digest, so the code lives in this message and nowhere else.
-    const code = randomBytes(4).toString("hex");
-    await this.sql`
-      INSERT INTO claim_codes (code, community_id, discord_guild_id, discord_user_id)
-      VALUES (${claimCodeDigest(this.env.sealKeyHex, code)},
-              ${rb.link.communityId}, ${rb.link.discordGuildId}, ${message.author.id})
-      ON CONFLICT (code) DO NOTHING`;
-    await message.reply(
-      `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and enter code ${code} (expires in 30 minutes).`,
-    );
+    await message.reply(`Unknown command /${command}. ${this.helpText()}`);
   }
 
   private helpText(): string {
-    return "Commands: /claim connects your Discord account to your Armada account (your history, roles, and puppet key).";
+    return "Commands: /bridge confirm <code> approves a pending bridge link (Armada side).";
   }
 }

@@ -60,7 +60,8 @@ export interface SessionData {
    */
   claimNonce?: string;
   /**
-   * OAuth bearer, kept for claim-time member lookups (guilds.members.read).
+   * OAuth bearer, kept so `guildAuthority` can re-read the manageable-guild
+   * list from Discord rather than trusting the snapshot taken at login.
    * Sealed on the way into the row; callers only ever see the plaintext.
    */
   accessToken?: string;
@@ -143,8 +144,9 @@ export class Sessions {
 
   /**
    * Inverse of {@link toStored}. An unreadable bearer (key rotated out from
-   * under the row) is dropped rather than fatal: it degrades a claim to "no
-   * roles granted", exactly as an expired OAuth scope already does.
+   * under the row) is dropped rather than fatal: the session survives, and
+   * `guildAuthority` denies once the captured guild list goes stale, which is
+   * a re-login rather than a lost session.
    */
   private fromStored(stored: SessionData | undefined): SessionData | undefined {
     if (!stored?.accessToken) return stored;

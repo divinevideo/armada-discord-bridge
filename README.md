@@ -32,10 +32,6 @@ never bridged without its community's consent.
 - **Server import**: mint a whole Armada community from a Discord server —
   channels, roles, and grants, with genesis signed by the owner's own key in
   their browser — then backfill history.
-- **`/claim`**: a Discord user connects their Armada account to their bridged
-  identity, receiving their imported roles and, if they ask for it, the puppet
-  key itself.
-
 Not yet: severance detection (ban, refounding, dissolution) is partial, and
 Discord-side commands are parsed from message text rather than registered as
 slash commands.
@@ -127,9 +123,8 @@ spendable.
 - **Sealed:** per-bridge key material (invite, primary nsec, puppet master
   secret), an imported community's owner key, and the Discord OAuth bearer
   inside a session.
-- **Digested:** session ids (SHA-256) and `/claim` codes (keyed HMAC). Both
-  are bearer credentials that exist in full only in the browser, or in the
-  Discord reply that carried them.
+- **Digested:** session ids (SHA-256), a bearer credential that exists in full
+  only in the browser holding it.
 - **Never stored:** the Discord bot token, which comes from the environment,
   and webhook credentials, which are created at runtime and cached in memory.
 

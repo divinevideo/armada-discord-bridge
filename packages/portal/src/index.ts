@@ -24,11 +24,11 @@ import {
 } from "./discordRest";
 import type { OAuthGuild } from "./discordRest";
 import { loadPortalEnv } from "./env";
-import { Importer, claimChallenge } from "./importer";
-import type { ClaimBody, ConfirmBody, PrepareBody } from "./importer";
+import { Importer } from "./importer";
+import type { ConfirmBody, PrepareBody } from "./importer";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
-import { claimCodeDigest, seal, unseal } from "./seal";
+import { seal, unseal } from "./seal";
 import { securityHeaders } from "./security";
 
 const env = loadPortalEnv();
@@ -178,7 +178,7 @@ app.get("/api/auth/discord/callback", async (c) => {
    * `code`, then makes a victim's browser follow the callback URL. The lookup
    * succeeds, `adopt` below plants a cookie, and the victim is now operating
    * inside the ATTACKER's Discord account — pasting their invite link, running
-   * an import, linking a claim.
+   * an import, linking a bridge.
    *
    * The redirect flow is exactly the case where the cookie DOES survive:
    * /api/auth/discord set it moments earlier and `SameSite=Lax` sends it on
@@ -422,67 +422,6 @@ app.post("/api/communities/:communityId/rerun-history", async (c) => {
   } catch (error) {
     return c.json({ error: String(error) }, 400);
   }
-});
-
-// ── Claims ──────────────────────────────────────────────────────────────────
-
-/** The community a /claim link points at: name, plus the caller's status. */
-app.get("/api/claims/:communityId", async (c) => {
-  const session = await requireSession(c, sessions);
-  if (!session) return c.json({ error: "unauthorized" }, 401);
-  const [row] = await sql`
-    SELECT b.community_id, MAX(b.community_name) AS community_name,
-           count(m.discord_message_id) AS message_count,
-           EXISTS(SELECT 1 FROM claims cl
-                  WHERE cl.community_id = b.community_id AND cl.discord_user_id = ${session.user.id}) AS claimed
-    FROM bridges b
-    LEFT JOIN messages m ON m.community_id = b.community_id AND m.origin = 'discord' AND m.author_ref = ${session.user.id}
-    WHERE b.community_id = ${c.req.param("communityId")}
-    GROUP BY b.community_id`;
-  if (!row) return c.json({ error: "no such community" }, 404);
-  return c.json({
-    communityId: row.community_id,
-    communityName: row.community_name,
-    messageCount: String(row.message_count),
-    claimed: row.claimed,
-  });
-});
-
-app.post("/api/claims", async (c) => {
-  const session = await requireSession(c, sessions);
-  if (!session) return c.json({ error: "unauthorized" }, 401);
-  const body = (await c.req.json()) as ClaimBody & { communityId?: string };
-  if (!body.communityId) return c.json({ error: "communityId required" }, 400);
-  try {
-    return c.json(await importer.claim(body.communityId, session, body));
-  } catch (error) {
-    return c.json({ error: String(error) }, 400);
-  }
-});
-
-/**
- * Resolve a claim code into the challenge the claimant signs. Scoped to the
- * caller's own Discord account, like the claim it precedes: the challenge
- * names the Discord user it is for, and codes are public in-channel.
- *
- * POST, and the code rides in the body. It used to be a query parameter,
- * which put a live single-use credential into access logs, proxy logs and
- * `Referer` — the code is short-lived and account-bound, so this was never
- * severe, but a credential in a URL is avoidable by construction.
- */
-app.post("/api/claims/:communityId/challenge", async (c) => {
-  const session = await requireSession(c, sessions);
-  if (!session) return c.json({ error: "unauthorized" }, 401);
-  const { code: raw } = (await c.req.json().catch(() => ({}))) as { code?: string };
-  const code = (raw ?? "").trim().toLowerCase();
-  const [row] = await sql<{ discord_user_id: string }[]>`
-    SELECT discord_user_id FROM claim_codes
-    WHERE code = ${claimCodeDigest(env.sealKeyHex, code)}
-      AND community_id = ${c.req.param("communityId")}
-      AND discord_user_id = ${session.user.id}
-      AND consumed_at IS NULL AND expires_at > now()`;
-  if (!row) return c.json({ error: "that code is wrong, used, expired, or not yours; run /claim again" }, 400);
-  return c.json({ challenge: claimChallenge(c.req.param("communityId"), row.discord_user_id) });
 });
 
 // ── Bridges ──────────────────────────────────────────────────────────────────

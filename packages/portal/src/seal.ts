@@ -2,14 +2,13 @@
  * At-rest sealing for per-bridge secrets: AES-256-GCM under the portal KMS
  * key (PORTAL_SEAL_KEY). Layout: 12-byte IV || 16-byte tag || ciphertext.
  *
- * {@link digest} covers the other half of the problem: secrets the database
- * has to look up BY VALUE (one-time codes) can't be sealed, since the same
- * input must land on the same row every time. Those are stored as a keyed
- * HMAC instead — same key, same property that a database-only leak yields
- * nothing usable, but deterministic so an equality lookup still works.
+ * This module used to carry a keyed-HMAC `digest` alongside, for secrets the
+ * database had to look up BY VALUE — /claim codes were the only such secret,
+ * and they went with the claim feature. Anything needing that shape again
+ * wants a length-prefixed, domain-separated label; see git history.
  */
 
-import { createCipheriv, createDecipheriv, createHmac, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
 export function seal(keyHex: string, plaintext: string): Buffer {
   const key = keyFrom(keyHex);
@@ -26,27 +25,6 @@ export function unseal(keyHex: string, sealed: Uint8Array): string {
   const decipher = createDecipheriv("aes-256-gcm", key, buf.subarray(0, 12));
   decipher.setAuthTag(buf.subarray(12, 28));
   return Buffer.concat([decipher.update(buf.subarray(28)), decipher.final()]).toString("utf8");
-}
-
-/**
- * Keyed, deterministic digest of a lookup secret. `label` domain-separates
- * the uses, so a digest minted for one kind of secret can never be replayed
- * as another. The label is length-prefixed rather than merely delimited, so
- * no pair of (label, value) can smear across the boundary into another.
- */
-export function digest(keyHex: string, label: string, value: string): string {
-  return createHmac("sha256", keyFrom(keyHex))
-    .update(`${label.length}:${label}:${value}`, "utf8")
-    .digest("hex");
-}
-
-/**
- * The stored form of a /claim code. The code is a real credential — whoever
- * presents it claims that Discord user's puppet identity and roles — so the
- * table holds only this.
- */
-export function claimCodeDigest(keyHex: string, code: string): string {
-  return digest(keyHex, "claim-code", code.trim().toLowerCase());
 }
 
 function keyFrom(hex: string): Buffer {

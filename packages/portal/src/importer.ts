@@ -85,7 +85,6 @@ import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import type { LocalIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { discordEmojiUrl } from "@armada-bridge/bridge/src/router";
 import type { DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
-import { derivePuppet } from "@armada-bridge/bridge/src/puppets";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { encrypt as nip44Encrypt, getConversationKey } from "nostr-tools/nip44";
@@ -94,7 +93,7 @@ import { generateSecretKey, verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type postgres from "postgres";
 
-import { botCanManageWebhooks, fetchMyGuildMember } from "./discordRest";
+import { botCanManageWebhooks } from "./discordRest";
 import { botChannelMessagesBefore, botGuildSnapshot, botInstallUrl } from "./discordRest";
 import type { RestMessage } from "./discordRest";
 import type { PortalEnv } from "./env";
@@ -102,7 +101,7 @@ import { HISTORY_MESSAGE_CAP, buildImportPlan } from "./importPlan";
 import type { ImportPlan, OwnerSignTemplate, PlannedChannel, SignedSeal } from "./importPlan";
 import type { BridgeManager, BridgeRow } from "./manager";
 import { assertPublicRelays } from "./relayGuard";
-import { claimCodeDigest, seal, unseal } from "./seal";
+import { seal, unseal } from "./seal";
 
 export interface ImportRow {
   import_id: string;
@@ -126,30 +125,6 @@ export interface PrepareBody {
   relays?: string[];
   /** Per-channel toggles keyed by Discord channel id. */
   channels?: Array<{ discordId: string; selected?: boolean; bridge?: boolean; history?: boolean }>;
-}
-
-export interface ClaimTarget {
-  communityId: string;
-  communityName: string;
-  guildId: string;
-  messageCount: number;
-}
-
-export interface ClaimBody {
-  npub?: string;
-  /** kind 30078 signed by the npub, content exactly the challenge string. */
-  signedProof?: SignedSeal;
-  /** Which levels to run. */
-  levels?: { link?: boolean; roles?: boolean; key?: boolean };
-  /** The one-time code the bot handed to the invoking Discord user. */
-  code?: string;
-}
-
-const KIND_CLAIM_PROOF = 30078;
-
-/** The exact content the claimant signs; versioned, community-scoped. */
-export function claimChallenge(communityId: string, discordUserId: string): string {
-  return `armada-bridge claim v1\ncommunity ${communityId}\ndiscord ${discordUserId}`;
 }
 
 export interface ConfirmBody {
@@ -1118,211 +1093,6 @@ export class Importer {
     await this.sql`
       UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
       WHERE import_id = ${importId}`;
-  }
-
-  // ── Claims ────────────────────────────────────────────────────────────────
-
-  /**
-   * Communities where this Discord user has bridged/imported messages and
-   * whose puppet master secret exists (i.e. the puppet is derivable).
-   */
-  async claimTargets(discordUserId: string): Promise<ClaimTarget[]> {
-    return this.sql<ClaimTarget[]>`
-      SELECT DISTINCT s.community_id AS "communityId",
-             MAX(b.community_name) AS "communityName",
-             s.discord_guild_id AS "guildId",
-             count(m.discord_message_id) AS "messageCount"
-      FROM guild_community_secrets s
-      JOIN bridges b ON b.community_id = s.community_id AND b.discord_guild_id = s.discord_guild_id
-      LEFT JOIN messages m ON m.community_id = s.community_id AND m.origin = 'discord' AND m.author_ref = ${discordUserId}
-      GROUP BY s.community_id, s.discord_guild_id
-      ORDER BY MAX(b.created_at) DESC`;
-  }
-
-  /**
-   * Execute a claim: Level 1 (puppet profile link + dual attestations),
-   * Level 2 (imported Discord roles granted to the claimant), Level 3
-   * (puppet key revealed once, marked shared-custody). Both identities are
-   * proven, not asserted: the npub by the signed challenge, the Discord
-   * account by the session, with the one-time code tying the two together.
-   */
-  async claim(
-    communityId: string,
-    session: { user: { id: string }; accessToken?: string },
-    body: ClaimBody,
-  ): Promise<{ linkPublished: boolean; rolesGranted: string[]; puppetNsec?: string }> {
-    const npub = parseAdminPubkey(body.npub ?? "");
-    if (!npub) throw new Error("log in with your Armada account first");
-
-    // Who is claiming: the session's Discord identity, and nothing else. The
-    // one-time code proves the claim was invited from inside the community,
-    // but it CANNOT name the claimant -- the bot answers /claim with a public
-    // channel reply, so anyone reading the channel sees somebody else's code,
-    // and a code that named its bearer would hand them that person's roles,
-    // profile link, and puppet key. The identity is bound here; the code is
-    // matched against it, and a mismatch consumes nothing.
-    const discordUserId = session.user.id;
-    const code = (body.code ?? "").trim().toLowerCase();
-    if (!/^[0-9a-f]{8}$/.test(code)) throw new Error("enter the code the bot gave you");
-    const [claimCode] = await this.sql<{ discord_user_id: string }[]>`
-      UPDATE claim_codes SET consumed_at = now()
-      WHERE code = ${claimCodeDigest(this.env.sealKeyHex, code)} AND community_id = ${communityId}
-        AND discord_user_id = ${discordUserId}
-        AND consumed_at IS NULL AND expires_at > now()
-      RETURNING discord_user_id`;
-    if (!claimCode) {
-      const [issued] = await this.sql<{ discord_user_id: string }[]>`
-        SELECT discord_user_id FROM claim_codes
-        WHERE code = ${claimCodeDigest(this.env.sealKeyHex, code)} AND community_id = ${communityId}
-          AND consumed_at IS NULL AND expires_at > now()`;
-      throw new Error(
-        issued
-          ? "that code was issued to a different Discord account; run /claim yourself"
-          : "that code is wrong, used, or expired; run /claim again",
-      );
-    }
-
-    const proof = body.signedProof;
-    if (
-      !proof ||
-      proof.kind !== KIND_CLAIM_PROOF ||
-      proof.pubkey !== npub ||
-      proof.content !== claimChallenge(communityId, discordUserId) ||
-      !verifyEvent(proof as NostrEvent)
-    ) {
-      throw new Error("invalid ownership proof");
-    }
-
-    const levels = { link: body.levels?.link !== false, roles: body.levels?.roles !== false, key: body.levels?.key === true };
-
-    const [bridge] = await this.sql<BridgeRow[]>`
-      SELECT b.*, s.master_secret_sealed AS shared_secret_sealed FROM bridges b
-      JOIN guild_community_secrets s ON s.community_id = b.community_id AND s.discord_guild_id = b.discord_guild_id
-      WHERE b.community_id = ${communityId} AND b.invite_url_sealed IS NOT NULL
-      LIMIT 1`;
-    if (!bridge?.invite_url_sealed || !bridge.master_secret_sealed || !bridge.discord_guild_id) {
-      throw new Error("no claimable community found");
-    }
-
-    const [importRow] = await this.sql<ImportRow[]>`
-      SELECT * FROM imports WHERE community_id = ${communityId} AND discord_guild_id = ${bridge.discord_guild_id}
-      AND status = 'done' ORDER BY created_at DESC LIMIT 1`;
-
-    const puppet = derivePuppet(
-      unseal(this.env.sealKeyHex, bridge.master_secret_sealed),
-      discordUserId,
-    );
-
-    // Level 2: current Discord roles -> imported Armada roles (op-signed
-    // grant). Optional: a stale OAuth scope, a plain (non-imported) bridge,
-    // or a member with no mapped roles all degrade to "no roles granted"
-    // rather than failing the claim.
-    let rolesGranted: string[] = [];
-    if (levels.roles && importRow?.owner_sk_sealed && importRow.community_sealed && session.accessToken) {
-      try {
-        const member = await fetchMyGuildMember(session.accessToken, bridge.discord_guild_id);
-        rolesGranted = importRow.plan.roles
-          .filter((r) => member.roles.includes(r.discordId))
-          .map((r) => r.roleIdHex!);
-        if (rolesGranted.length > 0) {
-        const op = localIdentity(
-          Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, importRow.owner_sk_sealed), "hex")),
-        );
-        const secrets = JSON.parse(unseal(this.env.sealKeyHex, importRow.community_sealed)) as CommunitySecrets;
-        const community = communityFromSecrets(secrets, {
-          id: hex32(importRow.community_id!),
-          owner: importRow.plan.checkpoints.ownerPkHex!,
-          relays: importRow.plan.relays,
-          name: importRow.plan.communityName,
-        });
-        const control = currentControlWriteGroup(community);
-        registerStreamKeys([...controlGroups(community), ...guestbookGroups(community)], community.relays);
-        const pool = this.poolFactory(community.relays);
-        try {
-          const vac: AuthorityCitation = {
-            entityId: grantLocator(community.id, hex32(op.pk)),
-            version: 1n,
-            editionHash: hex32(importRow.plan.checkpoints.grantHashHex!),
-          };
-          await pool.publish(
-            await sealEdition(
-              buildGrantEdition(community.id, { member: npub, roleIds: rolesGranted },
-                { actorPubkey: op.pk, version: 1n, authority: vac }),
-              control,
-              op.signer,
-            ),
-          );
-        } finally {
-          await pool.close();
-        }
-        }
-      } catch (error) {
-        console.warn(`claim: role grant failed for ${discordUserId}:`, error);
-      }
-    }
-
-    // Level 1: link the puppet's profile to the claimant, dual-signed.
-    // Needs the community relays: an imported community carries them, and a
-    // plain bridge's sealed invite supplies them.
-    let linkPublished = false;
-    if (levels.link) {
-      let relays = importRow?.plan.relays ?? [];
-      if (relays.length === 0 && bridge.invite_url_sealed) {
-        try {
-          const parsed = parseInviteLink(unseal(this.env.sealKeyHex, bridge.invite_url_sealed));
-          relays = parsed?.bootstrapRelays ?? [];
-        } catch {
-          relays = [];
-        }
-      }
-      if (relays.length > 0) {
-        const puppetIdentity = localIdentity(puppet.sk);
-        const pool = this.poolFactory(relays);
-        try {
-          const now = Math.floor(Date.now() / 1000);
-          const challenge = claimChallenge(communityId, discordUserId);
-          await pool.publish(
-            await puppetIdentity.signer.signEvent({
-              kind: 0,
-              content: JSON.stringify({ claimed_by: npub }),
-              tags: [["p", npub]],
-              created_at: now,
-            }),
-          );
-          await pool.publish(
-            await puppetIdentity.signer.signEvent({
-              kind: KIND_CLAIM_PROOF,
-              content: challenge,
-              tags: [["p", npub]],
-              created_at: now,
-            }),
-          );
-          linkPublished = true;
-        } finally {
-          await pool.close();
-        }
-      }
-    }
-
-    const [row] = await this.sql<{ claim_id: string }[]>`
-      INSERT INTO claims (community_id, discord_guild_id, discord_user_id, npub, linked, roles_granted, key_revealed)
-      VALUES (${communityId}, ${bridge.discord_guild_id}, ${discordUserId}, ${npub},
-              ${linkPublished}, ${rolesGranted}, ${levels.key})
-      ON CONFLICT (tenant_id, community_id, discord_user_id)
-      DO UPDATE SET npub = EXCLUDED.npub,
-        linked = claims.linked OR EXCLUDED.linked,
-        roles_granted = EXCLUDED.roles_granted,
-        key_revealed = claims.key_revealed OR EXCLUDED.key_revealed
-      RETURNING claim_id`;
-
-    const result: { linkPublished: boolean; rolesGranted: string[]; puppetNsec?: string } = {
-      linkPublished,
-      rolesGranted,
-    };
-    if (levels.key) {
-      result.puppetNsec = nip19.nsecEncode(puppet.sk);
-    }
-    return result;
   }
 
   /** Create + activate a bridges row per selected text channel, no consent gate (D4). */

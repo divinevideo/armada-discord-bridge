@@ -65,8 +65,7 @@ export interface PlannedChannel {
    *
    * The key lands with the OWNER alone. Discord's per-channel allow list names
    * Discord roles held by Discord accounts, and an import has no npub for any
-   * of them — members arrive later through the invite, and claim their npub
-   * later still. Vending the key to anyone else at import time would mean
+   * of them — members arrive later, through the invite. Vending the key to anyone else at import time would mean
    * vending it to everyone who joins, which is a public channel with extra
    * steps. The owner distributes it from Armada, which is where the grant and
    * the rekey-on-revoke live.

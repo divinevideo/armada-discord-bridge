@@ -104,7 +104,7 @@ export class DiscordAdapter implements WebhookSender {
     });
     this.client.on("messageCreate", (message) => {
       // Guild-scoped bot commands the host intercepts BEFORE any router
-      // (claims, etc.); returning true consumes the message.
+      // (/help, /bridge); returning true consumes the message.
       if (this.handlers.onBotCommand?.(message)) return;
       void this.handlers.onMessage(toInbound(message)).catch((error) => {
         console.error("bridge: onMessage failed", error);

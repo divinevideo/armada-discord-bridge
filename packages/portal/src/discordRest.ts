@@ -36,7 +36,10 @@ export function oauthUrl(clientId: string, redirectUri: string, state: string): 
     client_id: clientId,
     redirect_uri: redirectUri,
     response_type: "code",
-    scope: "identify guilds guilds.members.read",
+    // `guilds.members.read` is deliberately absent: the only thing that ever
+    // needed a member's roles was the claim feature, and asking for a scope
+    // nothing spends is a consent screen users are right to distrust.
+    scope: "identify guilds",
     state,
   });
   return `${API}/oauth2/authorize?${q}`;
@@ -114,10 +117,6 @@ async function userGet<T>(accessToken: string, path: string): Promise<T> {
 
 export const fetchMe = (token: string) => userGet<DiscordUser>(token, "/users/@me");
 export const fetchMyGuilds = (token: string) => userGet<OAuthGuild[]>(token, "/users/@me/guilds");
-
-/** The user's own member object in one guild (roles + nick); needs guilds.members.read. */
-export const fetchMyGuildMember = (token: string, guildId: string) =>
-  userGet<{ roles: string[]; nick?: string | null }>(token, `/users/@me/guilds/${guildId}/member`);
 
 async function botGet<T>(botToken: string, path: string): Promise<T | undefined> {
   const res = await discordFetch(path, { Authorization: `Bot ${botToken}` });
