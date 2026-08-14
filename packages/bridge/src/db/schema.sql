@@ -1,7 +1,7 @@
--- Bridge schema v1 (armada-discord-bridge-PLAN.md, section 2).
+-- Bridge schema v1.
 -- Multi-tenant from day one: every table carries tenant_id so the hosted
--- portal (armada-bridge-portal-PLAN.md) needs no migration. The single-tenant
--- deployment uses tenant_id = 'default'.
+-- portal needs no migration. The single-tenant deployment uses
+-- tenant_id = 'default'.
 
 -- Join material (community_root, channel keys, epochs) deliberately does NOT
 -- live here: the env-provisioned bridge takes it from env, and the portal
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS cursors (
   PRIMARY KEY (tenant_id, community_id, stream_pk, relay_url)
 );
 
--- Exactly-one-worker-per-community lease (portal plan, section 1).
+-- Exactly-one-worker-per-community lease, for a multi-worker data plane.
 CREATE TABLE IF NOT EXISTS leases (
   tenant_id    text NOT NULL DEFAULT 'default',
   community_id text NOT NULL,

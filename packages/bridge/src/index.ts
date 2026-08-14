@@ -1,6 +1,5 @@
 /**
- * Bridge service entry point: env-provisioned single-link MVP
- * (armada-discord-bridge-PLAN.md section 7).
+ * Bridge service entry point: env-provisioned single-link MVP.
  *
  * Required env beyond config.ts: BRIDGE_INVITE_URL, DISCORD_TOKEN,
  * DISCORD_GUILD_ID, DISCORD_CHANNEL_ID; optional CONCORD_CHANNEL_ID

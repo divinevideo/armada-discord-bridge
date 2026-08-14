@@ -1,4 +1,4 @@
--- Server import (armada-server-import-PLAN.md): one row per import run. The
+-- Server import: one row per import run. The
 -- plan jsonb is both the preview shown to the user and the pipeline's
 -- checkpoint ledger, so a crashed import resumes instead of duplicating.
 -- Secrets (community owner key, invite URL, link signer) are sealed with the

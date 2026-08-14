@@ -1,4 +1,4 @@
--- History backfill (armada-history-claims-PLAN.md): the import pipeline gains
+-- History backfill: the import pipeline gains
 -- a 'history' phase after wiring; claims link a Discord user to their Armada
 -- key (levels: profile link, role grants, key handover).
 

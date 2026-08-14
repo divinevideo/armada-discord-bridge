@@ -1,4 +1,4 @@
--- Portal control plane (armada-bridge-portal-PLAN.md): accounts arrive via
+-- Portal control plane: accounts arrive via
 -- Discord OAuth (no separate users table; the session carries the identity),
 -- bridges own their sealed per-bridge secrets.
 

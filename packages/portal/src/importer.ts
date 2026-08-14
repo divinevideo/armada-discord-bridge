@@ -1,5 +1,5 @@
 /**
- * Server importer (armada-server-import-PLAN.md): snapshot a Discord guild,
+ * Server importer: snapshot a Discord guild,
  * preview the mapping, then mint a brand-new Armada community and publish its
  * control-plane editions — metadata, channels, roles, a public invite — and
  * wire live bridges for the selected text channels.
@@ -958,7 +958,7 @@ export class Importer {
     }
   }
 
-  // ── History backfill (armada-history-claims-PLAN.md §2) ───────────────────
+  // ── History backfill ──────────────────────────────────────────────────────
 
   /**
    * Backfill the newest HISTORY_MESSAGE_CAP messages of every bridged
@@ -1119,7 +1119,7 @@ export class Importer {
       WHERE import_id = ${importId}`;
   }
 
-  // ── Claims (armada-history-claims-PLAN.md §3) ─────────────────────────────
+  // ── Claims ────────────────────────────────────────────────────────────────
 
   /**
    * Communities where this Discord user has bridged/imported messages and

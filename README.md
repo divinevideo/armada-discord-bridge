@@ -138,16 +138,16 @@ environment as the process, so anything that executes code there gets both.
 It bounds database exposure specifically. Rotating the key invalidates sealed
 material — every bridge included — so treat it as permanent.
 
-## Where the work is tracked
+## Diagnostics
 
-- [`NEXT-STEPS.md`](./NEXT-STEPS.md) — what is unbuilt or partial, in rough
-  priority order.
-- [`ARMADA-ASKS.md`](./ARMADA-ASKS.md) — friction the bridge cannot fix alone,
-  written for the Armada client side.
+`scripts/probe-channel.ts` resolves a bridge's community from its sealed
+invite, folds the control plane, and reads the bridged channel from each relay
+separately — which is how a per-relay delivery gap becomes visible at all,
+since the pool view merges them.
 
-The design documents that drove the original build (`*-PLAN.md`) were retired
-once the code outgrew them; source comments still cite them, and `git log --
-'*-PLAN.md'` brings them back.
+```sh
+PORTAL_SEAL_KEY=… DATABASE_URL=… bun run scripts/probe-channel.ts <bridge-id-prefix>
+```
 
 ## References
 

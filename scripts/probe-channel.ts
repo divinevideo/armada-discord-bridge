@@ -1,20 +1,28 @@
 /**
- * Diagnostic probe: resolve a bridge's community fresh, list channels, and
- * live-decrypt the bridged channel's stream for a few seconds.
+ * Diagnostic probe: resolve a bridge's community fresh from its sealed
+ * invite, fold the control plane, list the channels it can see, then read the
+ * bridged channel's stream from each relay SEPARATELY.
  *
- *   PORTAL_SEAL_KEY=... DATABASE_URL=... bun run probe-channel.ts <bridge-id-prefix>
+ * That last part is the point. The pool merges relays, so a relay that has
+ * stopped delivering — or was never authenticated — looks identical to one
+ * that is keeping up. Querying them one at a time is what makes a per-relay
+ * delivery gap visible.
+ *
+ *   PORTAL_SEAL_KEY=... DATABASE_URL=... \
+ *     bun run scripts/probe-channel.ts <bridge-id-prefix>
  */
 
 import postgres from "postgres";
 import { generateSecretKey } from "nostr-tools/pure";
 
-import { ConcordClient, resolveInvite } from "./packages/bridge/src/concord/client";
-import { RelayPool } from "./packages/bridge/src/concord/pool";
-import { localIdentity } from "./packages/bridge/src/concord/signer";
-import { unseal } from "./packages/portal/src/seal";
+import { ConcordClient, resolveInvite } from "../packages/bridge/src/concord/client";
+import { RelayPool } from "../packages/bridge/src/concord/pool";
+import { localIdentity } from "../packages/bridge/src/concord/signer";
+import { unseal } from "../packages/portal/src/seal";
 import { KIND_WRAP, STOCK_RELAYS, parseInviteLink } from "@armada-bridge/concord-core";
 
-const prefix = process.argv[2] ?? "c869";
+const prefix = process.argv[2];
+if (!prefix) throw new Error("usage: bun run scripts/probe-channel.ts <bridge-id-prefix>");
 const sealKey = process.env.PORTAL_SEAL_KEY;
 if (!sealKey) throw new Error("PORTAL_SEAL_KEY not set");
 const sql = postgres(process.env.DATABASE_URL ?? "postgres://bridge:bridge@localhost:5432/bridge", {
@@ -50,7 +58,7 @@ if (!channel) {
   console.log(`channel "${channel.name}" stream pks: ${authors.map((a) => a.slice(0, 8)).join(",")}`);
   // Query each relay separately: a per-relay delivery gap is invisible in
   // the merged pool view.
-  const { openChatBatch } = await import("./packages/concord-core/src/chat");
+  const { openChatBatch } = await import("../packages/concord-core/src/chat");
   for (const url of community.relays) {
     const solo = new RelayPool([url]);
     try {

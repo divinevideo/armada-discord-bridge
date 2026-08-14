@@ -1,5 +1,5 @@
 /**
- * Server-import planning (armada-server-import-PLAN.md): normalize a Discord
+ * Server-import planning: normalize a Discord
  * guild snapshot into an ImportPlan — the channels, roles, and metadata the
  * importer will mint on Armada, plus an honest report of what is skipped.
  * Pure mapping, no I/O; the plan is stored as the imports row's jsonb and
@@ -192,7 +192,7 @@ export interface ImportCheckpoints {
   emojiPackPublishedAt?: number;
 }
 
-/** History import gates (armada-history-claims-PLAN.md §2.2). */
+/** History import gates. */
 export const HISTORY_MEMBER_CAP = 100;
 export const HISTORY_MESSAGE_CAP = 10_000;
 

@@ -1,6 +1,6 @@
 /**
  * Puppet identities: one deterministic Nostr keypair per Discord user
- * (armada-discord-bridge-PLAN.md, following Mostr's derivation pattern).
+ * (following Mostr's derivation pattern).
  *
  * Nothing per-user is stored; keys are recomputed from the bridge's master
  * secret and the Discord user id, and LRU-cached. A Concord moderator can ban

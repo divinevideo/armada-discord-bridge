@@ -18,7 +18,7 @@ interface ClaimResult {
 }
 
 /**
- * Claim your old account (armada-history-claims-PLAN.md §3). You arrive from
+ * Claim your old account. You arrive from
  * a /claim bot link with a one-time code; the code proves you're the Discord
  * account that asked, your Nostr login proves which Armada account you are.
  */

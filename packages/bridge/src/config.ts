@@ -1,8 +1,8 @@
 /**
  * Bridge configuration, read once from the environment at startup.
  *
- * Secrets policy (see armada-discord-bridge-PLAN.md §2): the puppet master
- * secret and primary nsec are scoped per bridge. In the single-tenant
+ * Secrets policy: the puppet master secret and primary nsec are scoped per
+ * bridge. In the single-tenant
  * deployment they arrive via env; the multi-tenant portal stores them sealed
  * in Postgres and injects them per worker.
  */

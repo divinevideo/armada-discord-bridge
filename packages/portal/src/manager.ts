@@ -235,7 +235,7 @@ export class BridgeManager {
    * Activate a bridge minted by the server importer: same secret minting as
    * `activate`, but straight to `active` with no in-channel confirm — the
    * portal custodially owns the imported community, so the Armada-side
-   * consent the confirm gate exists for is implicit (plan D4).
+   * consent the confirm gate exists for is implicit.
    */
   /**
    * Mint the bridge's identity and mark it active, WITHOUT starting it.
