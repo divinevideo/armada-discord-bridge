@@ -35,6 +35,12 @@ export interface SessionGuild {
 export interface SessionData {
   user: { id: string; username: string; avatarUrl?: string };
   guilds: SessionGuild[];
+  /**
+   * When `guilds` was last read from Discord (epoch ms). Authority to act on
+   * a guild expires with it: see `guildAuthority` in index.ts, which re-reads
+   * rather than trusting a snapshot indefinitely.
+   */
+  guildsFetchedAt?: number;
   oauthState?: string;
   dev?: boolean;
   /**
@@ -64,7 +70,18 @@ export class Sessions {
   constructor(
     private readonly sql: postgres.Sql,
     private readonly sealKeyHex: string,
+    /**
+     * Mark the cookie `Secure`, so it never rides a plaintext request. Driven
+     * by the deployment's own base URL rather than the request's scheme: the
+     * portal sits behind a TLS proxy and sees plain HTTP on loopback, so
+     * inferring it per-request would disable it exactly where it matters.
+     */
+    private readonly secureCookie = false,
   ) {}
+
+  private cookieOptions(expires: Date) {
+    return { httpOnly: true, sameSite: "Lax", path: "/", secure: this.secureCookie, expires } as const;
+  }
 
   /** Creates the session, sets the cookie, and returns the raw session id. */
   async create(c: Context, data: SessionData): Promise<string> {
@@ -73,12 +90,7 @@ export class Sessions {
     await this.sql`
       INSERT INTO portal_sessions (sid, data, expires_at)
       VALUES (${hashSid(sid)}, ${this.sql.json(this.toStored(data) as never)}, ${expires})`;
-    setCookie(c, COOKIE, sid, {
-      httpOnly: true,
-      sameSite: "Lax",
-      path: "/",
-      expires,
-    });
+    setCookie(c, COOKIE, sid, this.cookieOptions(expires));
     return sid;
   }
 
@@ -218,12 +230,7 @@ export class Sessions {
    * lost or overwritten between the two legs.
    */
   adopt(c: Context, sid: string, expires: Date): void {
-    setCookie(c, COOKIE, sid, {
-      httpOnly: true,
-      sameSite: "Lax",
-      path: "/",
-      expires,
-    });
+    setCookie(c, COOKIE, sid, this.cookieOptions(expires));
   }
 
   async update(c: Context, data: SessionData): Promise<void> {

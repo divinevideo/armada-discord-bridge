@@ -7,11 +7,12 @@
 import { randomBytes } from "node:crypto";
 import { migrate } from "@armada-bridge/bridge/src/db/migrate";
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { serveStatic } from "hono/bun";
 import postgres from "postgres";
 
 import { Sessions, requireSession } from "./auth";
-import type { SessionData } from "./auth";
+import type { SessionData, SessionGuild } from "./auth";
 import {
   botGuildTextChannels,
   botInstallUrl,
@@ -21,6 +22,7 @@ import {
   fetchMyGuilds,
   oauthUrl,
 } from "./discordRest";
+import type { OAuthGuild } from "./discordRest";
 import { loadPortalEnv } from "./env";
 import { Importer, claimChallenge } from "./importer";
 import type { ClaimBody, ConfirmBody, PrepareBody } from "./importer";
@@ -31,7 +33,7 @@ import { claimCodeDigest, seal, unseal } from "./seal";
 const env = loadPortalEnv();
 await migrate(env.databaseUrl);
 const sql = postgres(env.databaseUrl, { onnotice: () => {} });
-const sessions = new Sessions(sql, env.sealKeyHex);
+const sessions = new Sessions(sql, env.sealKeyHex, env.baseUrl.startsWith("https:"));
 const manager = new BridgeManager(sql, env);
 /**
  * Deliberately NOT awaited. `init()` resumes every active bridge serially, and
@@ -68,9 +70,63 @@ app.use("/api/*", async (c, next) => {
   }
   // Cached responses must not leak one origin's ACAO header to another.
   c.header("Vary", "Origin");
+  // Every API response is session-scoped; none of it belongs in a shared cache.
+  c.header("Cache-Control", "no-store");
   if (c.req.method === "OPTIONS") return c.body(null, allowed ? 204 : 403);
   return next();
 });
+
+/**
+ * How long a captured guild list may keep authorising mutations before it has
+ * to be re-read from Discord.
+ */
+const GUILD_AUTHORITY_TTL_MS = 5 * 60_000;
+
+/** Popup handoff nonce: client-generated, so hold it to 128 bits or better. */
+const CLAIM_NONCE_RE = /^[0-9a-f]{32,64}$/i;
+
+const toSessionGuilds = (guilds: OAuthGuild[]): SessionGuild[] =>
+  guilds.map((g) => ({
+    id: g.id,
+    name: g.name,
+    icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : undefined,
+    canManage: canManage(g),
+  }));
+
+type GuildAuthority = { ok: true; guild: SessionGuild } | { ok: false; status: 401 | 403; error: string };
+
+/**
+ * Whether this session may act on a guild — verified, not merely remembered.
+ *
+ * The guild list is captured at OAuth time, so on its own it would keep
+ * authorising someone for the session's whole 7-day life after they were
+ * demoted or removed from the server. Past {@link GUILD_AUTHORITY_TTL_MS} the
+ * list is re-read from Discord with the session's own bearer and written back,
+ * so the window is minutes rather than days.
+ *
+ * Failing to verify denies rather than falls back: a session whose bearer is
+ * gone (expired, revoked, or stripped by the migration that sealed them)
+ * cannot prove anything, and re-login is one click. Dev-login sessions have no
+ * bearer by design and keep their fixture guilds.
+ */
+async function guildAuthority(c: Context, session: SessionData, guildId: string): Promise<GuildAuthority> {
+  let guilds = session.guilds;
+  if (!session.dev && Date.now() - (session.guildsFetchedAt ?? 0) > GUILD_AUTHORITY_TTL_MS) {
+    if (!session.accessToken) {
+      return { ok: false, status: 401, error: "reconnect Discord so your server permissions can be checked" };
+    }
+    try {
+      guilds = toSessionGuilds(await fetchMyGuilds(session.accessToken));
+      await sessions.update(c, { ...session, guilds, guildsFetchedAt: Date.now() });
+    } catch (error) {
+      console.warn(`portal: guild authority refresh failed for ${session.user.id}:`, error);
+      return { ok: false, status: 401, error: "could not check your Discord permissions; sign in again" };
+    }
+  }
+  const guild = guilds.find((g) => g.id === guildId);
+  if (!guild?.canManage) return { ok: false, status: 403, error: "you do not hold Manage Server in that guild" };
+  return { ok: true, guild };
+}
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -89,7 +145,9 @@ app.get("/api/auth/discord", async (c) => {
     console.warn(`portal: popup auth from non-allow-listed origin ${JSON.stringify(requested ?? null)}, falling back to redirect flow`);
   }
   const nonce = c.req.query("nonce");
-  const claimNonce = popupOrigin && nonce && /^[0-9a-f]{16,64}$/i.test(nonce) ? nonce.toLowerCase() : undefined;
+  // 128 bits minimum: whoever knows the nonce collects the session token, and
+  // the poll that spends it is necessarily unauthenticated.
+  const claimNonce = popupOrigin && nonce && CLAIM_NONCE_RE.test(nonce) ? nonce.toLowerCase() : undefined;
   await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state, popupOrigin, claimNonce });
   return c.redirect(oauthUrl(env.discordClientId, redirectUri, state));
 });
@@ -114,12 +172,8 @@ app.get("/api/auth/discord/callback", async (c) => {
       username: me.global_name || me.username,
       avatarUrl: me.avatar ? `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png` : undefined,
     },
-    guilds: guilds.map((g) => ({
-      id: g.id,
-      name: g.name,
-      icon: g.icon ? `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.png` : undefined,
-      canManage: canManage(g),
-    })),
+    guilds: toSessionGuilds(guilds),
+    guildsFetchedAt: Date.now(),
     accessToken: token,
     popupOrigin: stored.popupOrigin,
     claimNonce: stored.claimNonce,
@@ -137,8 +191,10 @@ app.get("/api/auth/discord/callback", async (c) => {
   );
 
   // Popup mode: hand the token to the opener and close, instead of redirecting
-  // this window to the portal SPA the user never asked for.
+  // this window to the portal SPA the user never asked for. The page carries a
+  // session token in its body, so it must not be stored anywhere.
   if (stored.popupOrigin) {
+    c.header("Cache-Control", "no-store");
     return c.html(
       `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
 <body style="font:14px system-ui;padding:2rem;text-align:center">Discord connected. You can close this window.
@@ -161,7 +217,7 @@ app.get("/api/auth/discord/callback", async (c) => {
  */
 app.post("/api/auth/claim", async (c) => {
   const { nonce } = (await c.req.json().catch(() => ({}))) as { nonce?: string };
-  if (!nonce || !/^[0-9a-f]{16,64}$/i.test(nonce)) return c.json({ error: "nonce required" }, 400);
+  if (!nonce || !CLAIM_NONCE_RE.test(nonce)) return c.json({ error: "nonce required" }, 400);
   const found = await sessions.findByClaimNonce(nonce.toLowerCase());
   if (!found || !found.data.user.id) {
     console.log(`portal: claim ${nonce.slice(0, 8)}…: pending (${found ? "awaiting callback" : "no session"})`);
@@ -213,6 +269,11 @@ app.get("/api/me", async (c) => {
 app.get("/api/guilds/:id/channels", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
+  // This answers with the BOT's view of the guild, private channels included,
+  // so it needs the same authority as acting on the guild — guild ids are not
+  // secret, and any logged-in stranger could otherwise enumerate a server.
+  const authority = await guildAuthority(c, session, c.req.param("id"));
+  if (!authority.ok) return c.json({ error: authority.error }, authority.status);
   if (!env.discordBotToken) return c.json({ error: "bot token not configured" }, 501);
   const channels = await botGuildTextChannels(env.discordBotToken, c.req.param("id"));
   if (!channels) return c.json({ present: false, installUrl: botInstallUrl(env.discordClientId, c.req.param("id")) });
@@ -226,8 +287,8 @@ app.post("/api/imports", async (c) => {
   if (!session) return c.json({ error: "unauthorized" }, 401);
   const { guildId } = (await c.req.json()) as { guildId?: string };
   if (!guildId) return c.json({ error: "guildId required" }, 400);
-  const guild = session.guilds.find((g) => g.id === guildId);
-  if (!guild?.canManage) return c.json({ error: "you do not hold Manage Server in that guild" }, 403);
+  const authority = await guildAuthority(c, session, guildId);
+  if (!authority.ok) return c.json({ error: authority.error }, authority.status);
   try {
     return c.json(await importer.preview(session.user.id, guildId));
   } catch (error) {
@@ -353,7 +414,11 @@ app.post("/api/claims", async (c) => {
   }
 });
 
-/** Resolve a claim code into the challenge the claimant signs. */
+/**
+ * Resolve a claim code into the challenge the claimant signs. Scoped to the
+ * caller's own Discord account, like the claim it precedes: the challenge
+ * names the Discord user it is for, and codes are public in-channel.
+ */
 app.get("/api/claims/:communityId/challenge", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
@@ -362,8 +427,9 @@ app.get("/api/claims/:communityId/challenge", async (c) => {
     SELECT discord_user_id FROM claim_codes
     WHERE code = ${claimCodeDigest(env.sealKeyHex, code)}
       AND community_id = ${c.req.param("communityId")}
+      AND discord_user_id = ${session.user.id}
       AND consumed_at IS NULL AND expires_at > now()`;
-  if (!row) return c.json({ error: "that code is wrong, used, or expired; run /claim again" }, 400);
+  if (!row) return c.json({ error: "that code is wrong, used, expired, or not yours; run /claim again" }, 400);
   return c.json({ challenge: claimChallenge(c.req.param("communityId"), row.discord_user_id) });
 });
 
@@ -421,8 +487,8 @@ app.post("/api/bridges/:id/link", async (c) => {
   if (body.consent !== true) {
     return c.json({ error: "the encryption disclosure must be explicitly accepted" }, 400);
   }
-  const guild = session.guilds.find((g) => g.id === body.guildId);
-  if (!guild?.canManage) return c.json({ error: "you do not hold Manage Server in that guild" }, 403);
+  const authority = await guildAuthority(c, session, body.guildId);
+  if (!authority.ok) return c.json({ error: authority.error }, authority.status);
 
   await sql`
     UPDATE bridges SET discord_guild_id = ${body.guildId}, discord_channel_id = ${body.channelId},
@@ -481,7 +547,9 @@ app.post("/api/bridges/:id/unlink", async (c) => {
 app.get("/api/bridges/:id/events", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
-  const bridgeId = c.req.param("id");
+  const owned = await ownedBridge(c, session.user.id);
+  if (!owned) return c.json({ error: "not found" }, 404);
+  const bridgeId = owned.bridge_id;
   return c.body(
     new ReadableStream({
       async start(controller) {
@@ -508,6 +576,16 @@ app.get("/api/bridges/:id/events", async (c) => {
 // ── Static SPA (production build) ───────────────────────────────────────────
 app.use("/*", serveStatic({ root: "./packages/portal/web/dist" }));
 app.get("*", serveStatic({ path: "./packages/portal/web/dist/index.html" }));
+
+/**
+ * Expired sessions were excluded from every lookup but never deleted, and
+ * anyone can create a pre-auth row by hitting /api/auth/discord — so the table
+ * only grew. Sweep at boot, then hourly.
+ */
+const sweepSessions = () =>
+  void sessions.sweep().catch((error) => console.warn("portal: session sweep failed:", error));
+sweepSessions();
+setInterval(sweepSessions, 60 * 60_000);
 
 console.log(`portal: listening on ${env.baseUrl}`);
 export default { port: env.port, fetch: app.fetch };

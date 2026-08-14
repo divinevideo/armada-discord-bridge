@@ -1141,8 +1141,9 @@ export class Importer {
   /**
    * Execute a claim: Level 1 (puppet profile link + dual attestations),
    * Level 2 (imported Discord roles granted to the claimant), Level 3
-   * (puppet key revealed once, marked shared-custody). The npub is verified
-   * against the signed challenge; the Discord side is the caller's session.
+   * (puppet key revealed once, marked shared-custody). Both identities are
+   * proven, not asserted: the npub by the signed challenge, the Discord
+   * account by the session, with the one-time code tying the two together.
    */
   async claim(
     communityId: string,
@@ -1152,17 +1153,33 @@ export class Importer {
     const npub = parseAdminPubkey(body.npub ?? "");
     if (!npub) throw new Error("log in with your Armada account first");
 
-    // The one-time code from /claim binds the claim to the Discord account
-    // that INVOKED the command, not whoever holds the session or the link.
+    // Who is claiming: the session's Discord identity, and nothing else. The
+    // one-time code proves the claim was invited from inside the community,
+    // but it CANNOT name the claimant -- the bot answers /claim with a public
+    // channel reply, so anyone reading the channel sees somebody else's code,
+    // and a code that named its bearer would hand them that person's roles,
+    // profile link, and puppet key. The identity is bound here; the code is
+    // matched against it, and a mismatch consumes nothing.
+    const discordUserId = session.user.id;
     const code = (body.code ?? "").trim().toLowerCase();
     if (!/^[0-9a-f]{8}$/.test(code)) throw new Error("enter the code the bot gave you");
     const [claimCode] = await this.sql<{ discord_user_id: string }[]>`
       UPDATE claim_codes SET consumed_at = now()
       WHERE code = ${claimCodeDigest(this.env.sealKeyHex, code)} AND community_id = ${communityId}
+        AND discord_user_id = ${discordUserId}
         AND consumed_at IS NULL AND expires_at > now()
       RETURNING discord_user_id`;
-    if (!claimCode) throw new Error("that code is wrong, used, or expired; run /claim again");
-    const discordUserId = claimCode.discord_user_id;
+    if (!claimCode) {
+      const [issued] = await this.sql<{ discord_user_id: string }[]>`
+        SELECT discord_user_id FROM claim_codes
+        WHERE code = ${claimCodeDigest(this.env.sealKeyHex, code)} AND community_id = ${communityId}
+          AND consumed_at IS NULL AND expires_at > now()`;
+      throw new Error(
+        issued
+          ? "that code was issued to a different Discord account; run /claim yourself"
+          : "that code is wrong, used, or expired; run /claim again",
+      );
+    }
 
     const proof = body.signedProof;
     if (

@@ -667,10 +667,11 @@ export class BridgeManager {
       await message.reply(`You've already claimed ${existing.npub.slice(0, 12)}… in this community.`);
       return;
     }
-    // A one-time code bound to the INVOKING user: only the Discord account
-    // that asked can claim the npub, even if the link is forwarded. Whoever
-    // holds it holds that identity's puppet key, so only its digest is
-    // stored — the code itself exists in this reply and nowhere else.
+    // A one-time code bound to the INVOKING user, and enforced against the
+    // portal session's Discord identity at claim time -- which is what makes
+    // this public channel reply safe: a bystander who copies the code cannot
+    // spend it without being signed in as the account that asked. Stored as a
+    // digest, so the code lives in this message and nowhere else.
     const code = randomBytes(4).toString("hex");
     await this.sql`
       INSERT INTO claim_codes (code, community_id, discord_guild_id, discord_user_id)
