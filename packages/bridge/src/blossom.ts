@@ -10,6 +10,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 
 import type { LocalIdentity } from "./concord/signer";
+import { safeFetch } from "./net";
 import type { BlobPort } from "./router";
 
 const KIND_BLOSSOM_AUTH = 24242;
@@ -17,14 +18,20 @@ const KIND_BLOSSOM_AUTH = 24242;
 export class BlossomStore implements BlobPort {
   constructor(private readonly server: string) {}
 
+  /**
+   * Fetch a blob named by someone else.
+   *
+   * Every caller of this passes a URL the bridge did not choose — an `imeta`
+   * tag on an inbound rumor, or a media URL off a Discord embed, which is an
+   * OpenGraph value from whatever page was linked. It therefore goes through
+   * {@link safeFetch}: http(s) only (Bun's `fetch` will happily resolve
+   * `file:///proc/self/environ` otherwise, and this process holds the seal
+   * key), public hosts only, redirects re-checked, and the cap enforced by a
+   * running counter instead of a `content-length` the remote server chose.
+   */
   async download(url: string, maxBytes: number): Promise<{ data: Uint8Array; mime: string }> {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`download ${url}: HTTP ${res.status}`);
-    const declared = Number(res.headers.get("content-length") ?? 0);
-    if (declared > maxBytes) throw new Error(`download ${url}: ${declared} bytes exceeds cap`);
-    const data = new Uint8Array(await res.arrayBuffer());
-    if (data.length > maxBytes) throw new Error(`download ${url}: body exceeds cap`);
-    return { data, mime: res.headers.get("content-type")?.split(";")[0] || "application/octet-stream" };
+    const { body, mime } = await safeFetch(url, maxBytes);
+    return { data: body, mime };
   }
 
   async upload(

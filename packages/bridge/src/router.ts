@@ -145,6 +145,15 @@ export interface RouterOptions {
 export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 
 /**
+ * Blobs downloaded per inbound rumor. Discord accepts 10 attachments per
+ * message, so anything past this could never be sent anyway — but the tag
+ * count is attacker-chosen and the downloads used to run before the send was
+ * attempted, which made one rumor with a few hundred `imeta` tags into a few
+ * gigabytes of buffering and a few hundred outbound requests.
+ */
+const MAX_IMETA_DOWNLOADS = 10;
+
+/**
  * NIP-25 reaction content -> a Discord-reactable unicode emoji, or undefined
  * for content Discord would reject ("+"/"" mean like, "-" dislike; NIP-30
  * `:shortcode:` custom emoji have no Discord equivalent).
@@ -790,9 +799,14 @@ export class BridgeRouter {
     const urls: string[] = [];
     for (const tag of chat.tags) {
       if (tag[0] !== "imeta") continue;
+      if (files.length >= MAX_IMETA_DOWNLOADS) break;
       const fields = new Map(tag.slice(1).map((f) => [f.split(" ")[0], f.slice(f.indexOf(" ") + 1)]));
       const url = fields.get("url");
       if (!url) continue;
+      // Advisory only: `size` is whatever the sender wrote, and is absent (so
+      // 0) on a tag built to evade this. The real bound is the byte counter in
+      // safeFetch; this just avoids starting a download that admits it is
+      // oversized.
       const size = Number(fields.get("size") ?? 0);
       if (size > MAX_BLOB_BYTES) continue; // stays a link in the content
       try {
