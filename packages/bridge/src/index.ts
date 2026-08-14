@@ -9,7 +9,13 @@
  * relays); sealed at-rest key storage arrives with the portal control plane.
  */
 
-import { STOCK_RELAYS, inviteDeliveryRelays, parseInviteLink } from "@armada-bridge/concord-core";
+import {
+  Permissions,
+  STOCK_RELAYS,
+  inviteDeliveryRelays,
+  isAuthorized,
+  parseInviteLink,
+} from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
@@ -61,23 +67,33 @@ console.log(`bridge: joined material for community ${community.name} (${communit
 const pool = new RelayPool(community.relays);
 const primary = localIdentity(primarySk(config.primarySecretKey));
 
+// Fold the Control Plane FIRST. It reads from the community root the invite
+// already carried, so it needs no private-channel key — which means the
+// roster, and therefore who is entitled to vend a channel key, is knowable
+// before we accept any. The intake below refuses bundles from anyone else.
+const preflight = new ConcordClient(community, pool, primary);
+const folded = await preflight.syncControl();
+
 // Private-channel keys addressed to us since the last boot. The join bundle
 // only ever carried what the inviter vended at the time, so a channel we were
 // granted afterwards is readable only once its Direct Invite is opened — and
-// this has to run BEFORE the client folds, or the grant is invisible until the
-// next restart. The stock floor is scanned alongside the community relays
-// because that is where a sender delivers to an npub with no published inbox
-// (which we were, until the 10050 below).
+// this has to run BEFORE the client that serves `channels()` is built, or the
+// grant is invisible until the next restart. The stock floor is scanned
+// alongside the community relays because that is where a sender delivers to an
+// npub with no published inbox (which we were, until the 10050 below).
 const floor = new RelayPool(inviteDeliveryRelays([]));
-const intake = await intakeDirectInviteKeys([pool, floor], primary, community).finally(
-  () => void floor.close(),
-);
+const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
+  isAuthorizedSender: (pk) =>
+    isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
+}).finally(() => void floor.close());
 if (intake.learned.length > 0) {
   console.log(`bridge: learned ${intake.learned.length} private-channel key(s) from direct invites`);
 }
 
-const client = new ConcordClient(intake.community, pool, primary);
-await client.syncControl();
+// Re-fold only when the intake actually changed the key set; otherwise the
+// preflight client already holds the answer.
+const client = intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
+if (intake.learned.length > 0) await client.syncControl();
 
 const concordChannelId =
   process.env.CONCORD_CHANNEL_ID?.trim() || client.channels()[0]?.idHex;

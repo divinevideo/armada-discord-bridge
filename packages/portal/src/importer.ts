@@ -101,6 +101,7 @@ import type { PortalEnv } from "./env";
 import { HISTORY_MESSAGE_CAP, buildImportPlan } from "./importPlan";
 import type { ImportPlan, OwnerSignTemplate, PlannedChannel, SignedSeal } from "./importPlan";
 import type { BridgeManager, BridgeRow } from "./manager";
+import { assertPublicRelays } from "./relayGuard";
 import { claimCodeDigest, seal, unseal } from "./seal";
 
 export interface ImportRow {
@@ -401,9 +402,9 @@ export class Importer {
     if (!plan.channels.some((c) => c.selected)) throw new Error("select at least one channel");
 
     const requested = (body.relays ?? []).map((r) => r.trim()).filter(Boolean);
-    for (const relay of requested) {
-      if (!/^wss?:\/\//.test(relay)) throw new Error(`not a relay URL: ${relay}`);
-    }
+    // Scheme AND host: the old check was scheme-only, so `ws://127.0.0.1:6379/`
+    // passed and the server opened a socket to it on the caller's behalf.
+    await assertPublicRelays(requested);
     plan.relays = capRelays(
       requested.length ? requested : this.env.importRelays.length ? this.env.importRelays : STOCK_RELAYS,
     );

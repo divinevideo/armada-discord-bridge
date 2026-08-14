@@ -34,6 +34,7 @@ import { generateSecretKey } from "nostr-tools/pure";
 import type postgres from "postgres";
 
 import type { PortalEnv } from "./env";
+import { filterPublicRelays } from "./relayGuard";
 import { claimCodeDigest, seal, unseal } from "./seal";
 
 export interface BridgeRow {
@@ -170,10 +171,18 @@ export class BridgeManager {
   }> {
     const invite = parseInviteLink(inviteUrl);
     if (!invite) throw new Error("not a valid Armada invite URL");
-    const bootstrap = new RelayPool(invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS);
+    // Both lists are attacker-reachable: bootstrapRelays is encoded in the
+    // pasted link, and community.relays rides on the event that link resolves
+    // to. Neither may name a host inside our network.
+    const bootstrap = new RelayPool(
+      await filterPublicRelays(
+        invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS,
+        STOCK_RELAYS,
+      ),
+    );
     try {
       const { community } = await resolveInvite(inviteUrl, bootstrap);
-      const pool = new RelayPool(community.relays);
+      const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS));
       try {
         const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
         await client.syncControl();
@@ -283,23 +292,37 @@ export class BridgeManager {
     const invite = parseInviteLink(inviteUrl);
     if (!invite) throw new Error("stored invite no longer parses");
 
-    const bootstrap = new RelayPool(invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS);
+    const bootstrap = new RelayPool(
+      await filterPublicRelays(
+        invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS,
+        STOCK_RELAYS,
+      ),
+    );
     const { community } = await resolveInvite(inviteUrl, bootstrap).finally(() => void bootstrap.close());
 
-    const pool = new RelayPool(community.relays);
+    const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS));
     const primarySkHex = unseal(this.env.sealKeyHex, row.primary_sk_sealed);
     const primary = localIdentity(Uint8Array.from(Buffer.from(primarySkHex, "hex")));
 
-    // Private-channel keys granted to THIS bridge's npub since it was linked,
-    // delivered as Direct Invites (see keyIntake.ts). Runs before the fold so
-    // a gated channel is present in `client.channels()` on the first pass.
-    const floor = new RelayPool(inviteDeliveryRelays([]));
-    const intake = await intakeDirectInviteKeys([pool, floor], primary, community).finally(
-      () => void floor.close(),
-    );
+    // Fold the Control Plane first: it reads from the community root the
+    // invite carried, so the roster — and with it, who may vend a channel key
+    // — is knowable before we accept any. The intake refuses anyone else.
+    const preflight = new ConcordClient(community, pool, primary);
+    const folded = await preflight.syncControl();
 
-    const client = new ConcordClient(intake.community, pool, primary);
-    await client.syncControl();
+    // Private-channel keys granted to THIS bridge's npub since it was linked,
+    // delivered as Direct Invites (see keyIntake.ts). Runs before the client
+    // that serves `channels()` is built, so a gated channel is present on the
+    // first pass.
+    const floor = new RelayPool(inviteDeliveryRelays([]));
+    const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
+      isAuthorizedSender: (pk) =>
+        isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
+    }).finally(() => void floor.close());
+
+    const client =
+      intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
+    if (intake.learned.length > 0) await client.syncControl();
 
     const channel = row.concord_channel_id ? client.channel(row.concord_channel_id) : undefined;
     if (!channel) {

@@ -51,6 +51,24 @@ export interface KeyIntakeResult {
   learned: string[];
 }
 
+export interface KeyIntakeOptions {
+  /**
+   * Whether `senderPk` may vend channel keys for this community — the owner,
+   * or a roster member holding MANAGE_CHANNELS. REQUIRED, and the reason is
+   * worth stating: a Direct Invite is giftwrapped to our npub, but our npub is
+   * public (we publish it as kind 0, in the guestbook join, and in our kind
+   * 10050), and `community_id`/`owner`/`owner_salt` ride in every invite. So
+   * anyone at all can seal a well-formed bundle to us naming this community.
+   * Without this gate the only check was `community_id`, and since
+   * `unionChannelKeys` resolves a collision by HIGHER EPOCH WINS, a stranger's
+   * bundle claiming `epoch: 9999` for a real channel id would replace that
+   * channel's key — silently redirecting everything the bridge mirrors into a
+   * stream only the attacker can read, and persisting across restarts because
+   * the forged wrap stays on the relays.
+   */
+  isAuthorizedSender: (senderPk: string) => boolean;
+}
+
 /**
  * Scan the identity's giftwrap inbox for Direct Invites to THIS community and
  * merge the private-channel keys they carry.
@@ -64,6 +82,7 @@ export async function intakeDirectInviteKeys(
   pools: readonly RelayLike[],
   identity: LocalIdentity,
   community: CommunityV2,
+  options: KeyIntakeOptions,
 ): Promise<KeyIntakeResult> {
   const filter = {
     kinds: [KIND_WRAP],
@@ -85,6 +104,17 @@ export async function intakeDirectInviteKeys(
   for (const wrap of wraps.values()) {
     const opened = await unwrapDirectInvite(wrap, identity.signer).catch(() => undefined);
     if (!opened) continue;
+    // WHO sealed this, before WHAT it says. `unwrapDirectInvite` authenticates
+    // the sender (the seal opens only under the pairwise ECDH key, and the
+    // rumor's claimed author must equal the seal's), so `sender` is proven —
+    // but proven-who is not authorized-to, and the bundle's contents are
+    // otherwise unsigned key material we are about to adopt.
+    if (!options.isAuthorizedSender(opened.sender)) {
+      console.warn(
+        `bridge: ignoring direct invite from unauthorized sender ${opened.sender.slice(0, 8)}…`,
+      );
+      continue;
+    }
     const bundle = parseDirectInviteRumor(opened.rumor.kind, opened.rumor.content);
     // A bundle for another community is not ours to merge: the keys inside are
     // addressed by channel id alone, and channel ids are random 32-byte values

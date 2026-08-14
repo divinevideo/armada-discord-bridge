@@ -253,10 +253,24 @@ export class Sessions {
   }
 }
 
-/** 401-guarding helper: returns the session or writes the error response. */
+/**
+ * 401-guarding helper: returns an AUTHENTICATED session or writes the error
+ * response.
+ *
+ * The `user.id` test is not redundant. `/api/auth/discord` creates a real row
+ * and sets the cookie *before* the user has been anywhere near Discord, so it
+ * can remember `oauthState` across the round trip — that pre-auth session
+ * carries `user: { id: "", username: "" }`. Anyone can mint one by fetching a
+ * URL. Existence of a session therefore proves only that a request was made;
+ * only a non-empty `user.id` means an OAuth callback completed and Discord
+ * told us who this is. Most routes then scope their SQL by `user.id` and would
+ * merely find nothing under `''`, but not all of them do — the bridge-create
+ * path does real work before any ownership check — so the gate belongs here,
+ * once, rather than in each handler's WHERE clause.
+ */
 export async function requireSession(c: Context, sessions: Sessions): Promise<SessionData | undefined> {
   const session = await sessions.get(c);
-  if (!session) {
+  if (!session || !session.user.id) {
     c.status(401);
     return undefined;
   }

@@ -59,6 +59,16 @@ function community(): CommunityV2 {
   return mintCommunity("Bridge Test", getPublicKey(ownerSk), ["wss://relay.example"]).community;
 }
 
+/**
+ * Sender authorization is exercised on its own below; the merge-semantics
+ * tests hold it open so an epoch/union assertion fails for the reason it
+ * names rather than because a fixture key holds no role.
+ */
+const anySender = { isAuthorizedSender: () => true };
+
+/** Only these pubkeys may vend, as a real roster check would decide. */
+const onlyFrom = (...pks: string[]) => ({ isAuthorizedSender: (pk: string) => pks.includes(pk) });
+
 /** A control fold naming one private channel, as the Control Plane would. */
 function foldWithPrivateChannel(idHex: string, name: string): FoldedControl {
   return {
@@ -87,7 +97,7 @@ describe("direct-invite key intake", () => {
     const fold = foldWithPrivateChannel(channelId, "mods-only");
     expect(channelsView(target, fold)).toEqual([]);
 
-    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, target);
+    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, target, anySender);
     expect(result.learned).toEqual([channelId]);
     expect(result.community.privateChannels.map((c) => bytesToHex(c.key))).toEqual([channelKey]);
     expect(channelsView(result.community, fold).map((c) => c.name)).toEqual(["mods-only"]);
@@ -104,7 +114,7 @@ describe("direct-invite key intake", () => {
       bridge.pk,
     );
 
-    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, target);
+    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, target, anySender);
     expect(result.learned).toEqual([]);
     expect(result.community).toBe(target);
   });
@@ -127,7 +137,7 @@ describe("direct-invite key intake", () => {
       bridge.pk,
     );
 
-    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, held);
+    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, held, anySender);
     expect(result.learned).toEqual([bytesToHex(channelId)]);
     expect(bytesToHex(result.community.privateChannels[0].key)).toBe(newKey);
     expect(result.community.privateChannels[0].epoch).toBe(1n);
@@ -144,7 +154,7 @@ describe("direct-invite key intake", () => {
       stranger.pk,
     );
 
-    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, target);
+    const result = await intakeDirectInviteKeys([new CannedPool([wrap])], bridge, target, anySender);
     expect(result.learned).toEqual([]);
   });
 
@@ -168,7 +178,7 @@ describe("direct-invite key intake", () => {
       ),
     ];
 
-    const result = await intakeDirectInviteKeys([new CannedPool(wraps)], bridge, target);
+    const result = await intakeDirectInviteKeys([new CannedPool(wraps)], bridge, target, anySender);
     const held = result.community.privateChannels;
     expect(held).toHaveLength(1);
     expect(bytesToHex(held[0].key)).toBe(newKey);
@@ -176,5 +186,86 @@ describe("direct-invite key intake", () => {
     // The superseded key survives as a prior: history sealed under epoch 0 has
     // to stay readable, or a rotation looks like the conversation restarting.
     expect(held[0].priors?.map((p) => bytesToHex(p.key))).toEqual([oldKey]);
+  });
+
+  it("takes the key when the sender is entitled to vend it", async () => {
+    const target = community();
+    const bridge = localIdentity(generateSecretKey());
+    const inviterSk = generateSecretKey();
+    const inviterPk = localIdentity(inviterSk).pk;
+    const channelId = bytesToHex(random32());
+
+    const wrap = await directInvite(
+      bundleFor(target, [{ id: channelId, key: bytesToHex(random32()), epoch: 0, name: "mods-only" }]),
+      inviterSk,
+      bridge.pk,
+    );
+
+    const result = await intakeDirectInviteKeys(
+      [new CannedPool([wrap])],
+      bridge,
+      target,
+      onlyFrom(inviterPk),
+    );
+    expect(result.learned).toEqual([channelId]);
+  });
+
+  it("refuses a bundle from a sender with no authority to vend", async () => {
+    const target = community();
+    const bridge = localIdentity(generateSecretKey());
+    const strangerSk = generateSecretKey();
+    const channelId = bytesToHex(random32());
+
+    // Everything an outsider needs is public: community_id, owner and
+    // owner_salt ride in every invite, and the bridge publishes its own npub.
+    // So this bundle is well-formed and genuinely sealed to us — only the
+    // sender's standing separates it from a real grant.
+    const wrap = await directInvite(
+      bundleFor(target, [{ id: channelId, key: bytesToHex(random32()), epoch: 0, name: "mods-only" }]),
+      strangerSk,
+      bridge.pk,
+    );
+
+    const result = await intakeDirectInviteKeys(
+      [new CannedPool([wrap])],
+      bridge,
+      target,
+      onlyFrom(localIdentity(generateSecretKey()).pk),
+    );
+    expect(result.learned).toEqual([]);
+    expect(result.community).toBe(target);
+  });
+
+  it("refuses a stranger's higher-epoch bundle for a channel we already hold", async () => {
+    const target = community();
+    const bridge = localIdentity(generateSecretKey());
+    const channelId = random32();
+    const realKey = random32();
+    const held: CommunityV2 = {
+      ...target,
+      privateChannels: [{ id: channelId, key: realKey, epoch: 0n, name: "mods-only" }],
+    };
+
+    // The takeover shape: unionChannelKeys resolves a collision by HIGHER
+    // EPOCH WINS, so an unauthorized vend at epoch 9999 would otherwise become
+    // the channel's write target and every mirrored message would be sealed
+    // where only the attacker can read it.
+    const wrap = await directInvite(
+      bundleFor(target, [
+        { id: bytesToHex(channelId), key: bytesToHex(random32()), epoch: 9999, name: "mods-only" },
+      ]),
+      generateSecretKey(),
+      bridge.pk,
+    );
+
+    const result = await intakeDirectInviteKeys(
+      [new CannedPool([wrap])],
+      bridge,
+      held,
+      onlyFrom(localIdentity(generateSecretKey()).pk),
+    );
+    expect(result.learned).toEqual([]);
+    expect(bytesToHex(result.community.privateChannels[0].key)).toBe(bytesToHex(realKey));
+    expect(result.community.privateChannels[0].epoch).toBe(0n);
   });
 });
