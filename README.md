@@ -62,6 +62,25 @@ Keep `PORTAL_SEAL_KEY` stable across restarts or existing bridges cannot be
 unsealed. In production, `vite build packages/portal/web` once and the API
 serves `web/dist` itself on :8787.
 
+### What the database does and doesn't hold
+
+Everything sensitive in Postgres is either sealed under `PORTAL_SEAL_KEY`
+(AES-256-GCM) or stored as a one-way digest, so a database-only leak — a
+backup, a replica, a dump, a console someone over-shared — yields nothing
+spendable. Sealed: per-bridge key material (invite, primary nsec, puppet
+master secret), the imported community's owner key, and the Discord OAuth
+bearer inside a session. Digested: session ids (SHA-256) and `/claim` codes
+(keyed HMAC), both of which are bearer credentials that only ever exist in
+full in the browser or the Discord reply that carried them. The Discord bot
+token and webhook credentials are never persisted at all — the bot token
+comes from `DISCORD_TOKEN`, and webhooks are created at runtime and cached in
+memory.
+
+This is defense in depth, not a boundary: the key lives in the same
+environment as the process, so anything that executes code on the host gets
+both. It bounds database exposure specifically. Rotating the key invalidates
+sealed material — bridges included — so treat it as permanent.
+
 ## Deploy (production)
 
 The portal runs on `discord-bridge.lan` (a Proxmox LXC) as the systemd unit

@@ -141,8 +141,8 @@ export async function ensureLink(
   tenantId = "default",
 ): Promise<void> {
   await sql`
-    INSERT INTO communities (tenant_id, community_id, sealed_keys, relays, name)
-    VALUES (${tenantId}, ${community.idHex}, ${Buffer.alloc(0)}, ${community.relays}, ${community.name ?? null})
+    INSERT INTO communities (tenant_id, community_id, relays, name)
+    VALUES (${tenantId}, ${community.idHex}, ${community.relays}, ${community.name ?? null})
     ON CONFLICT (tenant_id, community_id)
     DO UPDATE SET relays = EXCLUDED.relays, name = EXCLUDED.name`;
   await sql`

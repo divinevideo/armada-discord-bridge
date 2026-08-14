@@ -101,7 +101,7 @@ import type { PortalEnv } from "./env";
 import { HISTORY_MESSAGE_CAP, buildImportPlan } from "./importPlan";
 import type { ImportPlan, OwnerSignTemplate, PlannedChannel, SignedSeal } from "./importPlan";
 import type { BridgeManager, BridgeRow } from "./manager";
-import { seal, unseal } from "./seal";
+import { claimCodeDigest, seal, unseal } from "./seal";
 
 export interface ImportRow {
   import_id: string;
@@ -1158,7 +1158,7 @@ export class Importer {
     if (!/^[0-9a-f]{8}$/.test(code)) throw new Error("enter the code the bot gave you");
     const [claimCode] = await this.sql<{ discord_user_id: string }[]>`
       UPDATE claim_codes SET consumed_at = now()
-      WHERE code = ${code} AND community_id = ${communityId}
+      WHERE code = ${claimCodeDigest(this.env.sealKeyHex, code)} AND community_id = ${communityId}
         AND consumed_at IS NULL AND expires_at > now()
       RETURNING discord_user_id`;
     if (!claimCode) throw new Error("that code is wrong, used, or expired; run /claim again");

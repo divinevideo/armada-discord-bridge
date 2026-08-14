@@ -34,7 +34,7 @@ import { generateSecretKey } from "nostr-tools/pure";
 import type postgres from "postgres";
 
 import type { PortalEnv } from "./env";
-import { seal, unseal } from "./seal";
+import { claimCodeDigest, seal, unseal } from "./seal";
 
 export interface BridgeRow {
   bridge_id: string;
@@ -668,11 +668,14 @@ export class BridgeManager {
       return;
     }
     // A one-time code bound to the INVOKING user: only the Discord account
-    // that asked can claim the npub, even if the link is forwarded.
+    // that asked can claim the npub, even if the link is forwarded. Whoever
+    // holds it holds that identity's puppet key, so only its digest is
+    // stored — the code itself exists in this reply and nowhere else.
     const code = randomBytes(4).toString("hex");
     await this.sql`
       INSERT INTO claim_codes (code, community_id, discord_guild_id, discord_user_id)
-      VALUES (${code}, ${rb.link.communityId}, ${rb.link.discordGuildId}, ${message.author.id})
+      VALUES (${claimCodeDigest(this.env.sealKeyHex, code)},
+              ${rb.link.communityId}, ${rb.link.discordGuildId}, ${message.author.id})
       ON CONFLICT (code) DO NOTHING`;
     await message.reply(
       `Claim your bridged history: open ${this.env.baseUrl}/claim/${rb.link.communityId} and enter code ${code} (expires in 30 minutes).`,

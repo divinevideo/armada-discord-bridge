@@ -3,15 +3,27 @@
  * identity and the manageable-guild list captured at OAuth time; guild
  * authority is re-checked against this at mutation time and refreshed on
  * re-login.
+ *
+ * Nothing in the row is usable on its own. The session id is a bearer
+ * credential — the cookie value and the API token are the same string — so
+ * the table stores only its SHA-256, and the Discord OAuth bearer riding
+ * along in `data` is sealed. A database-only compromise (backup, replica,
+ * dump, an over-shared console) therefore yields no session to hijack and no
+ * token to spend against Discord.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Context } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import type postgres from "postgres";
 
+import { seal, unseal } from "./seal";
+
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const COOKIE = "portal_sid";
+
+/** What the `sid` column holds for a given raw token. */
+const hashSid = (raw: string): string => createHash("sha256").update(raw, "utf8").digest("hex");
 
 export interface SessionGuild {
   id: string;
@@ -41,12 +53,18 @@ export interface SessionData {
    * completes returns the session token and spends the nonce.
    */
   claimNonce?: string;
-  /** OAuth bearer, kept for claim-time member lookups (guilds.members.read). */
+  /**
+   * OAuth bearer, kept for claim-time member lookups (guilds.members.read).
+   * Sealed on the way into the row; callers only ever see the plaintext.
+   */
   accessToken?: string;
 }
 
 export class Sessions {
-  constructor(private readonly sql: postgres.Sql) {}
+  constructor(
+    private readonly sql: postgres.Sql,
+    private readonly sealKeyHex: string,
+  ) {}
 
   /** Creates the session, sets the cookie, and returns the raw session id. */
   async create(c: Context, data: SessionData): Promise<string> {
@@ -54,7 +72,7 @@ export class Sessions {
     const expires = new Date(Date.now() + SESSION_TTL_MS);
     await this.sql`
       INSERT INTO portal_sessions (sid, data, expires_at)
-      VALUES (${sid}, ${this.sql.json(data as never)}, ${expires})`;
+      VALUES (${hashSid(sid)}, ${this.sql.json(this.toStored(data) as never)}, ${expires})`;
     setCookie(c, COOKIE, sid, {
       httpOnly: true,
       sameSite: "Lax",
@@ -62,6 +80,68 @@ export class Sessions {
       expires,
     });
     return sid;
+  }
+
+  /**
+   * Replace a session's id, returning the new raw token.
+   *
+   * Two jobs. It is the moment a pre-auth row becomes an authenticated
+   * session, where rotating is the textbook defence against session fixation.
+   * And because the table stores only hashes, rotation is the *only* way to
+   * obtain a usable token for a session found by state or nonce rather than
+   * by cookie — the callback has no other way to learn what to hand back.
+   *
+   * `handoff` additionally seals the new token into the row for the popup
+   * poller to collect (see {@link collectHandoff}), so both legs of that flow
+   * hand out the same token instead of racing to invalidate each other.
+   */
+  async rotate(sidHash: string, data: SessionData, handoff = false): Promise<string> {
+    const sid = randomBytes(24).toString("hex");
+    await this.sql`
+      UPDATE portal_sessions
+      SET sid = ${hashSid(sid)}, data = ${this.sql.json(this.toStored(data) as never)},
+          handoff_sealed = ${handoff ? seal(this.sealKeyHex, sid) : null}
+      WHERE sid = ${sidHash}`;
+    return sid;
+  }
+
+  /**
+   * Take the sealed token stashed by {@link rotate} for the nonce poller, and
+   * spend it: a second collection finds nothing. Uncollected stashes expire
+   * with their session.
+   */
+  async collectHandoff(sidHash: string, data: SessionData): Promise<string | undefined> {
+    // RETURNING reports post-update values, so the stash is read from the
+    // pre-update snapshot the FROM clause supplies.
+    const [row] = await this.sql<{ handoff_sealed: Uint8Array | null }[]>`
+      UPDATE portal_sessions s
+      SET data = ${this.sql.json(this.toStored(data) as never)}, handoff_sealed = NULL
+      FROM portal_sessions prev
+      WHERE s.sid = ${sidHash} AND prev.sid = s.sid
+      RETURNING prev.handoff_sealed`;
+    if (!row?.handoff_sealed) return undefined;
+    return unseal(this.sealKeyHex, row.handoff_sealed);
+  }
+
+  /** Row shape: everything as-is except the OAuth bearer, which is sealed. */
+  private toStored(data: SessionData): SessionData {
+    if (!data.accessToken) return data;
+    return { ...data, accessToken: seal(this.sealKeyHex, data.accessToken).toString("hex") };
+  }
+
+  /**
+   * Inverse of {@link toStored}. An unreadable bearer (key rotated out from
+   * under the row) is dropped rather than fatal: it degrades a claim to "no
+   * roles granted", exactly as an expired OAuth scope already does.
+   */
+  private fromStored(stored: SessionData | undefined): SessionData | undefined {
+    if (!stored?.accessToken) return stored;
+    try {
+      return { ...stored, accessToken: unseal(this.sealKeyHex, Buffer.from(stored.accessToken, "hex")) };
+    } catch {
+      const { accessToken: _unreadable, ...rest } = stored;
+      return rest as SessionData;
+    }
   }
 
   /**
@@ -91,8 +171,8 @@ export class Sessions {
     if (!sid) return undefined;
     const [row] = await this.sql`
       SELECT data FROM portal_sessions
-      WHERE sid = ${sid} AND expires_at > now()`;
-    return row?.data as SessionData | undefined;
+      WHERE sid = ${hashSid(sid)} AND expires_at > now()`;
+    return this.fromStored(row?.data as SessionData | undefined);
   }
 
   /**
@@ -103,31 +183,33 @@ export class Sessions {
    * Discord (privacy modes that scope a popup's cookies to its opener, logins
    * that continue in a different window or the Discord app, a second click on
    * Connect overwriting the first popup's cookie), and the 128-bit
-   * single-shot `oauthState` is the CSRF binding anyway. `sessions.update`
+   * single-shot `oauthState` is the CSRF binding anyway. {@link rotate}
    * replaces the data without `oauthState`, so a state can never be spent
    * twice.
+   *
+   * Returns the *hashed* id, which is all the table has: it identifies the
+   * row for a later write but cannot be handed to a browser. Use
+   * {@link rotate} to mint a token for it.
    */
-  async findByOauthState(state: string): Promise<{ sid: string; data: SessionData; expires: Date } | undefined> {
+  async findByOauthState(state: string): Promise<{ sidHash: string; data: SessionData; expires: Date } | undefined> {
     const [row] = await this.sql`
       SELECT sid, data, expires_at FROM portal_sessions
       WHERE data->>'oauthState' = ${state} AND expires_at > now()`;
     if (!row) return undefined;
-    return { sid: row.sid as string, data: row.data as SessionData, expires: new Date(row.expires_at as string) };
+    return {
+      sidHash: row.sid as string,
+      data: this.fromStored(row.data as SessionData)!,
+      expires: new Date(row.expires_at as string),
+    };
   }
 
   /** The completed-or-pending OAuth run named by a claim nonce. */
-  async findByClaimNonce(nonce: string): Promise<{ sid: string; data: SessionData } | undefined> {
+  async findByClaimNonce(nonce: string): Promise<{ sidHash: string; data: SessionData } | undefined> {
     const [row] = await this.sql`
       SELECT sid, data FROM portal_sessions
       WHERE data->>'claimNonce' = ${nonce} AND expires_at > now()`;
     if (!row) return undefined;
-    return { sid: row.sid as string, data: row.data as SessionData };
-  }
-
-  /** Update a session found by {@link findByOauthState} (no cookie in hand). */
-  async updateBySid(sid: string, data: SessionData): Promise<void> {
-    await this.sql`
-      UPDATE portal_sessions SET data = ${this.sql.json(data as never)} WHERE sid = ${sid}`;
+    return { sidHash: row.sid as string, data: this.fromStored(row.data as SessionData)! };
   }
 
   /**
@@ -148,13 +230,14 @@ export class Sessions {
     const sid = this.sid(c);
     if (!sid) return;
     await this.sql`
-      UPDATE portal_sessions SET data = ${this.sql.json(data as never)} WHERE sid = ${sid}`;
+      UPDATE portal_sessions SET data = ${this.sql.json(this.toStored(data) as never)}
+      WHERE sid = ${hashSid(sid)}`;
   }
 
   async destroy(c: Context): Promise<void> {
     const sid = this.sid(c);
     if (!sid) return;
-    await this.sql`DELETE FROM portal_sessions WHERE sid = ${sid}`;
+    await this.sql`DELETE FROM portal_sessions WHERE sid = ${hashSid(sid)}`;
     setCookie(c, COOKIE, "", { path: "/", expires: new Date(0) });
   }
 

@@ -3,12 +3,12 @@
 -- portal (armada-bridge-portal-PLAN.md) needs no migration. The single-tenant
 -- deployment uses tenant_id = 'default'.
 
+-- Join material (community_root, channel keys, epochs) deliberately does NOT
+-- live here: the env-provisioned bridge takes it from env, and the portal
+-- keeps its own sealed under bridges.*_sealed.
 CREATE TABLE IF NOT EXISTS communities (
   tenant_id      text NOT NULL DEFAULT 'default',
   community_id   text NOT NULL,             -- lowercase hex, self-certifying
-  -- Join material from the invite (community_root, channel keys, epochs),
-  -- sealed with the deployment KMS key before it touches this row.
-  sealed_keys    bytea NOT NULL,
   relays         text[] NOT NULL,
   name           text,
   joined_at      timestamptz NOT NULL DEFAULT now(),
@@ -21,8 +21,8 @@ CREATE TABLE IF NOT EXISTS channel_links (
   tenant_id          text NOT NULL DEFAULT 'default',
   discord_guild_id   text NOT NULL,
   discord_channel_id text NOT NULL,
-  webhook_id         text,
-  webhook_token      text,
+  -- No webhook credentials here on purpose: the adapter creates its webhook
+  -- from the bot token at runtime and caches it in memory.
   community_id       text NOT NULL,
   concord_channel_id text NOT NULL,          -- lowercase hex channel id
   enabled            boolean NOT NULL DEFAULT false,  -- flips on in-channel confirm

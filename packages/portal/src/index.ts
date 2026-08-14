@@ -26,12 +26,12 @@ import { Importer, claimChallenge } from "./importer";
 import type { ClaimBody, ConfirmBody, PrepareBody } from "./importer";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
-import { seal, unseal } from "./seal";
+import { claimCodeDigest, seal, unseal } from "./seal";
 
 const env = loadPortalEnv();
 await migrate(env.databaseUrl);
 const sql = postgres(env.databaseUrl, { onnotice: () => {} });
-const sessions = new Sessions(sql);
+const sessions = new Sessions(sql, env.sealKeyHex);
 const manager = new BridgeManager(sql, env);
 /**
  * Deliberately NOT awaited. `init()` resumes every active bridge serially, and
@@ -124,10 +124,14 @@ app.get("/api/auth/discord/callback", async (c) => {
     popupOrigin: stored.popupOrigin,
     claimNonce: stored.claimNonce,
   };
-  await sessions.updateBySid(found.sid, data);
+  // Rotate: the pre-auth id becomes an authenticated session, and the table
+  // stores only hashes, so this is also where the token to hand back is
+  // minted. When a nonce is in play the same token is sealed into the row for
+  // the poller below, so both legs of the popup flow agree on one session.
+  const sid = await sessions.rotate(found.sidHash, data, Boolean(stored.claimNonce));
   // Re-issue the cookie: the redirect flow's SPA needs it, and the one from
   // auth-start may be gone or belong to a newer abandoned run.
-  sessions.adopt(c, found.sid, found.expires);
+  sessions.adopt(c, sid, found.expires);
   console.log(
     `portal: oauth callback completed (popup=${Boolean(stored.popupOrigin)}, nonce=${stored.claimNonce ? `${stored.claimNonce.slice(0, 8)}…` : "none"})`,
   );
@@ -135,7 +139,6 @@ app.get("/api/auth/discord/callback", async (c) => {
   // Popup mode: hand the token to the opener and close, instead of redirecting
   // this window to the portal SPA the user never asked for.
   if (stored.popupOrigin) {
-    const sid = found.sid;
     return c.html(
       `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
 <body style="font:14px system-ui;padding:2rem;text-align:center">Discord connected. You can close this window.
@@ -165,9 +168,15 @@ app.post("/api/auth/claim", async (c) => {
     return c.json({ pending: true });
   }
   const { claimNonce: _spent, ...rest } = found.data;
-  await sessions.updateBySid(found.sid, rest as SessionData);
+  const token = await sessions.collectHandoff(found.sidHash, rest as SessionData);
+  if (!token) {
+    // The stash is single-use and the nonce is spent with it, so this is a
+    // second poll racing the first, not a failure worth a session for.
+    console.log(`portal: claim ${nonce.slice(0, 8)}…: already collected`);
+    return c.json({ pending: true });
+  }
   console.log(`portal: claim ${nonce.slice(0, 8)}…: token released`);
-  return c.json({ token: found.sid });
+  return c.json({ token });
 });
 
 app.post("/api/auth/dev", async (c) => {
@@ -351,7 +360,8 @@ app.get("/api/claims/:communityId/challenge", async (c) => {
   const code = (c.req.query("code") ?? "").trim().toLowerCase();
   const [row] = await sql<{ discord_user_id: string }[]>`
     SELECT discord_user_id FROM claim_codes
-    WHERE code = ${code} AND community_id = ${c.req.param("communityId")}
+    WHERE code = ${claimCodeDigest(env.sealKeyHex, code)}
+      AND community_id = ${c.req.param("communityId")}
       AND consumed_at IS NULL AND expires_at > now()`;
   if (!row) return c.json({ error: "that code is wrong, used, or expired; run /claim again" }, 400);
   return c.json({ challenge: claimChallenge(c.req.param("communityId"), row.discord_user_id) });
