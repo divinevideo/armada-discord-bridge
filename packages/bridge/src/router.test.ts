@@ -21,7 +21,7 @@ import { ConcordClient, hasProxyTag } from "./concord/client";
 import type { RelayLike } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { PuppetCache } from "./puppets";
-import { BridgeRouter, MemoryMappingStore, applyCustomEmoji, fallbackProfile, resolveGifVariant } from "./router";
+import { BridgeRouter, MemoryMappingStore, applyCustomEmoji, escapeMarkdown, fallbackProfile, reactionEmoji, resolveGifVariant } from "./router";
 import type { ChannelLink, DiscordInboundMessage, RouterOptions } from "./router";
 
 const MASTER = "ab".repeat(32);
@@ -401,7 +401,12 @@ describe("BridgeRouter: deletes", () => {
   });
 
   it("Discord delete of an Armada member's mirror stops at Discord", async () => {
-    const { router, pool, link } = harness();
+    // `channel` was missing from this destructure, so `channel.current.group.pk`
+    // was an unresolved name. It never threw only because `e.kind === 1059`
+    // short-circuits the `&&` on an empty publish log -- the assertion was
+    // comparing 0 to 0 and would have crashed the moment it had anything to
+    // count. tsc had been flagging it the whole time.
+    const { router, pool, channel, link } = harness();
     await router.onConcordChat(concordChat(), link); // mirror as id 9000
     const before = pool.published.filter((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk).length;
     expect(await router.onDiscordDelete({ id: "9000", channelId: "c1", guildId: "g1" }, link)).toBeUndefined();
@@ -812,5 +817,56 @@ describe("custom emoji round-trip", () => {
       link,
     );
     expect(webhooks.sent[0].content).toBe("hello <:pepe:456>");
+  });
+});
+
+describe("reactionEmoji", () => {
+  it("passes real emoji through, including ZWJ sequences and skin tones", () => {
+    expect(reactionEmoji("👍")).toBe("👍");
+    expect(reactionEmoji("👨‍👩‍👧‍👦")).toBe("👨‍👩‍👧‍👦");
+    expect(reactionEmoji("👍🏽")).toBe("👍🏽");
+    expect(reactionEmoji("🏳️‍🌈")).toBe("🏳️‍🌈");
+    expect(reactionEmoji("  🎉  ")).toBe("🎉");
+  });
+
+  it("keeps the NIP-25 sentinels", () => {
+    expect(reactionEmoji("")).toBe("👍");
+    expect(reactionEmoji("+")).toBe("👍");
+    expect(reactionEmoji("-")).toBe("👎");
+  });
+
+  it("refuses an emoji with a payload welded to it", () => {
+    // The old test was "contains a pictograph" while it returned the WHOLE
+    // string, so this put 60KB into a Discord reaction API path.
+    expect(reactionEmoji(`👍${"A".repeat(60_000)}`)).toBeUndefined();
+    expect(reactionEmoji("👍 not an emoji")).toBeUndefined();
+    expect(reactionEmoji("👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍👍")).toBeUndefined();
+  });
+
+  it("still refuses shortcodes and plain text", () => {
+    expect(reactionEmoji(":shrug:")).toBeUndefined();
+    expect(reactionEmoji("nice")).toBeUndefined();
+    expect(reactionEmoji("123")).toBeUndefined();
+  });
+});
+
+describe("escapeMarkdown", () => {
+  it("defuses a link injected through a kind 0 display name", () => {
+    const escaped = escapeMarkdown("[#general](https://phishing.example)");
+    expect(escaped).not.toMatch(/\[[^\\]*\]\(/);
+    expect(escaped).toContain("\\[");
+    expect(escaped).toContain("\\]");
+    expect(escaped).toContain("\\(");
+  });
+
+  it("leaves ordinary names readable", () => {
+    expect(escapeMarkdown("mk fain")).toBe("mk fain");
+    expect(escapeMarkdown("Alice")).toBe("Alice");
+  });
+
+  it("clips a name that would crowd out the embed", () => {
+    const out = escapeMarkdown("x".repeat(500));
+    expect(out.length).toBeLessThan(120);
+    expect(out.endsWith("…")).toBe(true);
   });
 });

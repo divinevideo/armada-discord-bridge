@@ -154,17 +154,57 @@ export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 const MAX_IMETA_DOWNLOADS = 10;
 
 /**
+ * Longest emoji we will hand to Discord's reaction API, in code points. Real
+ * ZWJ sequences top out around ten ("👨‍👩‍👧‍👦" is seven, plus variation
+ * selectors); this leaves headroom without letting a whole message through.
+ */
+const MAX_REACTION_CODEPOINTS = 16;
+
+/**
  * NIP-25 reaction content -> a Discord-reactable unicode emoji, or undefined
  * for content Discord would reject ("+"/"" mean like, "-" dislike; NIP-30
  * `:shortcode:` custom emoji have no Discord equivalent).
+ *
+ * The test used to be "contains a pictograph" while the RETURN was the entire
+ * trimmed content, so a kind 7 whose content was "👍" followed by 60KB of text
+ * put all 60KB into an API path. Containing an emoji is not being one: the
+ * whole string now has to be emoji scaffolding — pictographs, components
+ * (skin tones, regional indicators), ZWJ and variation selectors — and short.
  */
 export function reactionEmoji(content: string): string | undefined {
   const c = content.trim();
   if (c === "" || c === "+") return "👍";
   if (c === "-") return "👎";
   if (/^:.+:$/.test(c)) return undefined;
-  if (/\p{Extended_Pictographic}/u.test(c)) return c;
-  return undefined;
+  // A pictograph must be PRESENT — Emoji_Component alone admits bare digits,
+  // which are keycap parts — and must be all there IS.
+  if (!/\p{Extended_Pictographic}/u.test(c)) return undefined;
+  if ([...c].length > MAX_REACTION_CODEPOINTS) return undefined;
+  // \u200D = ZWJ (joins sequences), \uFE0F = VS16 (emoji presentation); both
+  // are invisible in source, so they are written as escapes.
+  if (!/^(?:\p{Extended_Pictographic}|\p{Emoji_Component}|\u200D|\uFE0F)+$/u.test(c)) return undefined;
+  return c;
+}
+
+/**
+ * Longest display name we will place in an embed. Discord's description cap is
+ * 4096; a name is not what should be allowed to approach it.
+ */
+const MAX_EMBED_NAME_CHARS = 80;
+
+/**
+ * Neutralise Discord markdown in text somebody else wrote, for the one place
+ * bridged text lands in bridge-authored chrome rather than in a puppet's own
+ * message: the reply embed.
+ *
+ * Backslash-escaping is what Discord itself honours. `[`/`]`/`(`/`)` are the
+ * pair that matters (link syntax); the emphasis and spoiler marks are included
+ * so a name cannot restyle the sentence around it, and `\` first so the
+ * escapes we add are not themselves escaped away.
+ */
+export function escapeMarkdown(text: string): string {
+  const clipped = text.length > MAX_EMBED_NAME_CHARS ? `${text.slice(0, MAX_EMBED_NAME_CHARS)}…` : text;
+  return clipped.replace(/[\\`*_~|[\]()>#-]/g, (ch) => `\\${ch}`);
 }
 
 /** Stable, public CDN URL for a Discord custom emoji. */
@@ -731,7 +771,11 @@ export class BridgeRouter {
       const profile = await this.profiles
         .resolve(row.authorRef)
         .catch(() => fallbackProfile(row.authorRef));
-      return { description: `Replying to ${profile.name} ([view message](${url}))` };
+      // The name is a kind 0 field, so its author chooses it, and Discord
+      // renders markdown in an embed description. Unescaped, a display_name of
+      // `[#general](https://phishing.example)` produced an arbitrary link
+      // inside an embed the BRIDGE authored, borrowing its apparent authority.
+      return { description: `Replying to ${escapeMarkdown(profile.name)} ([view message](${url}))` };
     }
     return { description: `Replying to [this message](${url})` };
   }
