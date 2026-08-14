@@ -2,7 +2,7 @@
 #
 # Re-vendor the protocol files from the Armada client.
 #
-# concord-core is a COPY of armada's `src/concord-v2/lib`, not a rewrite: the
+# concord-core is a COPY of armada's `src/concord/lib`, not a rewrite: the
 # bridge folds the same control plane as the client and must agree with it on
 # authority, key custody and history spanning. Hand-merging drifted the copy
 # badly enough that channel categories/ordering, private-channel key priors and
@@ -14,7 +14,7 @@
 # the envelope.
 #
 # The client-only edges are rewritten mechanically:
-#   @/concord-v2/lib/X  -> ./X            (path alias)
+#   @/concord/lib/X  -> ./X            (path alias)
 #   @/lib/gitActivity   -> ./vendor/...   (already vendored)
 #   @/lib/nip17/protocol-> ./vendor/nip17 (the 3 expiry/timer fns chat.ts uses)
 #   NostrRumor          -> Rumor          (core defines its own in stream.ts)
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 ARMADA="${1:-../../../armada}"
-SRC="$ARMADA/src/concord-v2/lib"
+SRC="$ARMADA/src/concord/lib"
 DEST="$(cd "$(dirname "$0")" && pwd)/src"
 
 [ -d "$SRC" ] || { echo "no armada lib at $SRC" >&2; exit 1; }
@@ -62,7 +62,7 @@ FILES+=("${TESTS[@]}")
 for f in "${FILES[@]}"; do
   [ -f "$SRC/$f" ] || { echo "missing upstream: $f" >&2; exit 1; }
   sed -E \
-    -e 's#"@/concord-v2/lib/([A-Za-z0-9_]+)"#"./\1"#g' \
+    -e 's#"@/concord/lib/([A-Za-z0-9_]+)"#"./\1"#g' \
     -e 's#"@/lib/(gitActivity|platform|zaps|calendar|polls|foldedCache)"#"./vendor/\1"#g' \
     -e 's#"@/lib/nip17/protocol"#"./vendor/nip17"#g' \
     -e 's#"@/hooks/useDmRelayList"#"./vendor/dmRelays"#g' \
