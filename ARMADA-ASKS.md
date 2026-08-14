@@ -2,8 +2,8 @@
 
 Friction the bridge cannot solve alone. Each item names the problem as it
 shows up in this repo and the Armada-side change that would fix it.
-Companion to `BRIDGE-IMPROVEMENTS.md`, which covers the reverse: bridge
-work Armada already supports.
+Companion to [`NEXT-STEPS.md`](./NEXT-STEPS.md), which covers the work that
+is ours to do.
 
 ## High value
 

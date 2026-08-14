@@ -138,18 +138,16 @@ environment as the process, so anything that executes code there gets both.
 It bounds database exposure specifically. Rotating the key invalidates sealed
 material — every bridge included — so treat it as permanent.
 
-## Design documents
+## Where the work is tracked
 
-- [`armada-discord-bridge-PLAN.md`](./armada-discord-bridge-PLAN.md) — the
-  bridge service: protocol analysis, architecture, identity mapping, feature
-  mapping, phases, risks.
-- [`armada-bridge-portal-PLAN.md`](./armada-bridge-portal-PLAN.md) — the
-  hosted portal and the multi-tenant architecture behind it.
-- [`armada-server-import-PLAN.md`](./armada-server-import-PLAN.md) — minting a
-  community from an existing Discord server.
-- [`armada-history-claims-PLAN.md`](./armada-history-claims-PLAN.md) — history
-  backfill and the claim levels.
-- [`NEXT-STEPS.md`](./NEXT-STEPS.md) — the gap between the plans and the code.
+- [`NEXT-STEPS.md`](./NEXT-STEPS.md) — what is unbuilt or partial, in rough
+  priority order.
+- [`ARMADA-ASKS.md`](./ARMADA-ASKS.md) — friction the bridge cannot fix alone,
+  written for the Armada client side.
+
+The design documents that drove the original build (`*-PLAN.md`) were retired
+once the code outgrew them; source comments still cite them, and `git log --
+'*-PLAN.md'` brings them back.
 
 ## References
 
