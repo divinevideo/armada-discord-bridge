@@ -90,8 +90,26 @@ The portal runs on `discord-bridge.lan` (a Proxmox LXC) as the systemd unit
 `https://bridge.armada.buzz` to `127.0.0.1:8787` — and the portal binds
 loopback to match, so nothing on the local network can reach the API around
 the proxy. `PORTAL_HOST` overrides that; the compose file sets `0.0.0.0`
-because there the container, not the interface, is the boundary. SSH is root-only; the `mk`
-login is not authorized on the box.
+because there the container, not the interface, is the boundary. SSH is
+key-only and root-only.
+
+The unit runs as the unprivileged `bridge-portal` user with an empty
+capability set, `ProtectSystem=strict`, and `ProtectHome=yes` — so a
+compromise of the portal cannot read the tunnel credentials, the SSH keys, or
+the database dumps under `/root`. Two consequences for anyone editing the
+deployment:
+
+- The service reads Bun from `/usr/local/bin/bun`, a copy — `/root/.bun` is
+  unreachable from a non-root user. Running `bun upgrade` as root does *not*
+  update it; re-copy the binary.
+- `.env.portal` is `root:bridge-portal 0640`. Rewriting it with a tool that
+  replaces the file (`sed -i`, most editors) resets that, and the service then
+  fails to start; re-apply the owner and mode.
+
+`MemoryDenyWriteExecute` is deliberately absent: Bun JITs and dies without W^X.
+
+The box also runs a default-deny `ufw` (only 22 open) and
+`unattended-upgrades` for security updates.
 
 The server has no `node`/`npm` and cannot fetch the nostr `origin`, so deploys
 run from a workstation checkout: build the SPA locally, ship the commit as a git
