@@ -29,6 +29,7 @@ import type { ClaimBody, ConfirmBody, PrepareBody } from "./importer";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
 import { claimCodeDigest, seal, unseal } from "./seal";
+import { securityHeaders } from "./security";
 
 const env = loadPortalEnv();
 await migrate(env.databaseUrl);
@@ -48,6 +49,9 @@ const importer = new Importer(sql, env, manager);
 
 const app = new Hono();
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;
+const overHttps = env.baseUrl.startsWith("https:");
+
+app.use("*", securityHeaders(overHttps));
 
 /**
  * CORS for allow-listed origins (the Armada client driving the import wizard
@@ -195,10 +199,17 @@ app.get("/api/auth/discord/callback", async (c) => {
   // session token in its body, so it must not be stored anywhere.
   if (stored.popupOrigin) {
     c.header("Cache-Control", "no-store");
+    // The only inline script in the codebase, so it gets a policy of its own:
+    // a fresh nonce, and nothing else permitted to run.
+    const nonce = randomBytes(16).toString("base64");
+    c.header(
+      "Content-Security-Policy",
+      `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'`,
+    );
     return c.html(
       `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
 <body style="font:14px system-ui;padding:2rem;text-align:center">Discord connected. You can close this window.
-<script>(function(){
+<script nonce="${nonce}">(function(){
   try { window.opener && window.opener.postMessage(
     { type: "armada-bridge-session", token: ${JSON.stringify(sid)} },
     ${JSON.stringify(stored.popupOrigin)}); } catch (e) {}
