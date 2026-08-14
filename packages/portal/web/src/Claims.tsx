@@ -44,8 +44,11 @@ export function Claims(props: { communityId: string; onDone: () => void }) {
     setBusy(true);
     setError("");
     try {
+      // POSTed, not a query parameter: the code is a live single-use
+      // credential and a URL is the one place it would be logged.
       const { challenge } = await api<{ challenge: string }>(
-        `/api/claims/${props.communityId}/challenge?code=${encodeURIComponent(code.trim())}`,
+        `/api/claims/${props.communityId}/challenge`,
+        { method: "POST", body: JSON.stringify({ code: code.trim() }) },
       );
       const signedProof = await login.signTemplate({
         kind: 30078,

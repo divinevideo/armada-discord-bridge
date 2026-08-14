@@ -12,6 +12,27 @@ export interface NostrProfile {
 /** Aggregators most profiles land on, merged with the community relay set. */
 const PROFILE_RELAYS = ["wss://purplepag.es", "wss://relay.damus.io", "wss://relay.ditto.pub"];
 
+/**
+ * An avatar URL we are willing to put in an `img src`, or undefined.
+ *
+ * `picture` is whatever a relay served: it reaches us unvalidated and is
+ * rendered by the login chip. `javascript:` does not execute from an `img`
+ * in any current browser and the CSP's `img-src` would refuse most of the
+ * rest, so this is defence in depth rather than a live hole — but the check
+ * belongs at the point the value enters the app, not at each render site,
+ * and https-only also stops a mixed-content or `data:` surprise later.
+ */
+function safePictureUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string" || raw === "") return undefined;
+  try {
+    return new URL(raw).protocol === "https:" ? raw : undefined;
+  } catch {
+    // not a URL at all (relative paths included: there is no base to resolve
+    // an avatar against that would mean anything).
+    return undefined;
+  }
+}
+
 export function fetchNostrProfile(pkHex: string, relays: string[], timeoutMs = 4000): Promise<NostrProfile> {
   const urls = [...new Set([...relays, ...PROFILE_RELAYS])];
   return new Promise((resolve) => {
@@ -54,7 +75,7 @@ export function fetchNostrProfile(pkHex: string, relays: string[], timeoutMs = 4
                 const c = JSON.parse(e.content) as { name?: string; display_name?: string; picture?: string };
                 best = {
                   created_at: e.created_at,
-                  profile: { name: c.display_name || c.name, picture: c.picture },
+                  profile: { name: c.display_name || c.name, picture: safePictureUrl(c.picture) },
                 };
               }
             }

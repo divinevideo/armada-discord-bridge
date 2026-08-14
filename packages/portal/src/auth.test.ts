@@ -140,3 +140,30 @@ describe.skipIf(!dbUp)("Sessions", () => {
     expect(await rowFor(sid)).toBeUndefined();
   });
 });
+
+/**
+ * No database: `cookieSidHash` reads one header. It exists so the OAuth
+ * callback can tell "the browser that started this login" from "a browser
+ * handed the callback URL", so what matters is that a bearer cannot stand in
+ * for the cookie — otherwise the binding would be bypassable by a header the
+ * attacker sets themselves.
+ */
+describe("cookieSidHash", () => {
+  const sessions = new Sessions(sql, SEAL_KEY);
+  const app = new Hono();
+  app.get("/x", (c) => c.json({ hash: sessions.cookieSidHash(c) ?? null }));
+  const hashFor = async (headers: Record<string, string>) =>
+    ((await (await app.request("/x", { headers })).json()) as { hash: string | null }).hash;
+
+  it("hashes the cookie the request carries", async () => {
+    const raw = "ab".repeat(24);
+    expect(await hashFor({ Cookie: `portal_sid=${raw}` })).toBe(hashOf(raw));
+  });
+
+  it("is undefined with no cookie, and ignores a bearer", async () => {
+    expect(await hashFor({})).toBeNull();
+    // The bearer is attacker-settable on a cross-site request in a way the
+    // cookie is not, so it must never satisfy the callback's binding.
+    expect(await hashFor({ Authorization: `Bearer ${"cd".repeat(24)}` })).toBeNull();
+  });
+});

@@ -178,6 +178,17 @@ export class Sessions {
     return bearer ? bearer[1].toLowerCase() : getCookie(c, COOKIE);
   }
 
+  /**
+   * The hashed id of the session this request's COOKIE names, ignoring any
+   * bearer. The OAuth callback uses it to check that the browser finishing a
+   * redirect-flow login is the one that started it — see the callback in
+   * index.ts for why that binding cannot simply replace the state lookup.
+   */
+  cookieSidHash(c: Context): string | undefined {
+    const raw = getCookie(c, COOKIE);
+    return raw ? hashSid(raw) : undefined;
+  }
+
   async get(c: Context): Promise<SessionData | undefined> {
     const sid = this.sid(c);
     if (!sid) return undefined;

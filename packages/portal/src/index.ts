@@ -167,6 +167,34 @@ app.get("/api/auth/discord/callback", async (c) => {
     return c.text("bad oauth state", 400);
   }
   const stored = found.data;
+
+  /**
+   * Redirect flow: the browser finishing the login must be the one that
+   * started it.
+   *
+   * Finding the session by `state` alone is what the popup flow needs (its
+   * cookie routinely does not survive the trip through Discord), but on its
+   * own it is a login-CSRF primitive: an attacker starts a run, gets their own
+   * `code`, then makes a victim's browser follow the callback URL. The lookup
+   * succeeds, `adopt` below plants a cookie, and the victim is now operating
+   * inside the ATTACKER's Discord account — pasting their invite link, running
+   * an import, linking a claim.
+   *
+   * The redirect flow is exactly the case where the cookie DOES survive:
+   * /api/auth/discord set it moments earlier and `SameSite=Lax` sends it on
+   * this top-level GET. So require it here, and leave the state-only path to
+   * the popup flow, which hands its token to an allow-listed origin instead of
+   * planting a cookie (see below — `adopt` is skipped there for this reason).
+   *
+   * The cost, accepted knowingly: starting the login twice overwrites the
+   * first run's cookie, so completing the OLDER tab now lands here and is
+   * refused rather than signing in. That is one more click on Connect, and it
+   * is the same trade every double-submit CSRF defence makes.
+   */
+  if (!stored.popupOrigin && sessions.cookieSidHash(c) !== found.sidHash) {
+    console.warn("portal: oauth callback whose cookie does not match the run it completes; refusing");
+    return c.text("bad oauth state", 400);
+  }
   const token = await exchangeCode(env.discordClientId, env.discordClientSecret, redirectUri, code as string);
   const me = await fetchMe(token);
   const guilds = await fetchMyGuilds(token);
@@ -189,7 +217,14 @@ app.get("/api/auth/discord/callback", async (c) => {
   const sid = await sessions.rotate(found.sidHash, data, Boolean(stored.claimNonce));
   // Re-issue the cookie: the redirect flow's SPA needs it, and the one from
   // auth-start may be gone or belong to a newer abandoned run.
-  sessions.adopt(c, sid, found.expires);
+  //
+  // NOT in popup mode. That leg is the one exempted from the cookie binding
+  // above, so planting a cookie here would hand the exemption a way to reach
+  // a victim's browser after all — start a popup run naming an allow-listed
+  // origin, complete it with your own code, then get the victim to load the
+  // callback URL. The popup's caller collects its token by postMessage or the
+  // nonce poll and never reads the cookie, so there is nothing to lose.
+  if (!stored.popupOrigin) sessions.adopt(c, sid, found.expires);
   console.log(
     `portal: oauth callback completed (popup=${Boolean(stored.popupOrigin)}, nonce=${stored.claimNonce ? `${stored.claimNonce.slice(0, 8)}…` : "none"})`,
   );
@@ -429,11 +464,17 @@ app.post("/api/claims", async (c) => {
  * Resolve a claim code into the challenge the claimant signs. Scoped to the
  * caller's own Discord account, like the claim it precedes: the challenge
  * names the Discord user it is for, and codes are public in-channel.
+ *
+ * POST, and the code rides in the body. It used to be a query parameter,
+ * which put a live single-use credential into access logs, proxy logs and
+ * `Referer` — the code is short-lived and account-bound, so this was never
+ * severe, but a credential in a URL is avoidable by construction.
  */
-app.get("/api/claims/:communityId/challenge", async (c) => {
+app.post("/api/claims/:communityId/challenge", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
-  const code = (c.req.query("code") ?? "").trim().toLowerCase();
+  const { code: raw } = (await c.req.json().catch(() => ({}))) as { code?: string };
+  const code = (raw ?? "").trim().toLowerCase();
   const [row] = await sql<{ discord_user_id: string }[]>`
     SELECT discord_user_id FROM claim_codes
     WHERE code = ${claimCodeDigest(env.sealKeyHex, code)}
