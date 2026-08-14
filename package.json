@@ -1,6 +1,7 @@
 {
   "name": "armada-discord-bridge",
   "private": true,
+  "license": "AGPL-3.0-only",
   "workspaces": [
     "packages/*"
   ],

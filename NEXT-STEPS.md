@@ -4,8 +4,8 @@ What is not built yet, in rough priority order. Companion to the two plan
 documents (`armada-discord-bridge-PLAN.md`, `armada-bridge-portal-PLAN.md`);
 this file tracks the gap between those plans and the code on `main`.
 
-Baseline that works today (hosted at bridge.armada.buzz, systemd +
-cloudflared on discord-bridge.lan): two-way text, replies, deletes,
+Baseline that works today (hosted at bridge.armada.buzz): two-way text,
+replies, deletes,
 reactions with removal, edits behind a flag, attachments rehosted through
 Blossom, GIF-picker sends resolved to real gifs (with an ffmpeg transcode
 fallback), per-user attribution both ways (puppet keypairs shared per

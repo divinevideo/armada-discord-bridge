@@ -1,157 +1,161 @@
 # armada-discord-bridge
 
-A standalone service that bridges messages between a Discord channel and an
-Armada (Concord protocol) community channel, in both directions, with per-user
-attribution on both sides. Built to lower the barrier of entry into Armada:
-a Discord community can talk with its Armada counterpart before members migrate.
+Bridges a Discord channel and an [Armada](https://armada.buzz) (Concord
+protocol) community channel in both directions, with per-user attribution on
+both sides. Built to lower the barrier to entry into Armada: a Discord
+community can talk with its Armada counterpart before anyone migrates.
 
-## Status
+Messages from Discord arrive in Armada signed by a puppet key derived
+deterministically per Discord user, so each person keeps one stable identity
+across every channel bridged between the same server and community. Messages
+from Armada arrive in Discord through a webhook wearing the member's kind 0
+name and avatar.
 
-Two-way text MVP wired (plan section 7). What runs today:
+**Bridged messages leave end-to-end encryption.** Anything mirrored into
+Discord is plaintext to Discord. The Armada side gates a link behind an
+in-channel confirmation from someone holding Manage Channels, so a channel is
+never bridged without its community's consent.
 
-- `packages/concord-core`: the headless Concord protocol core (CORD-01..07)
-  extracted from Armada's `src/concord-v2/lib`, its protocol tests passing
-  under `bun test`.
-- `packages/bridge`: env-provisioned single-link bridge. Discord messages
-  arrive as puppet-signed kind 9 rumors (one deterministic keypair per
-  Discord user); Concord messages arrive as webhook posts with the member's
-  kind 0 name and avatar. Loop prevention (proxy tags + puppet identity +
-  mapping rows), banlist enforcement, live control-plane folds, message
-  splitting, Postgres mapping store.
+## What works
 
-Not yet: replies/edits/deletes/reactions, attachment re-hosting,
-rekey/refounding rollover, slash-command provisioning, the portal.
+- **Text both ways**, including long-message splitting, replies, edits,
+  deletes, reactions, and typing indicators.
+- **Attachments**, re-hosted to a Blossom server when one is configured, with
+  a CDN-link fallback.
+- **Loop prevention** on three layers: proxy tags, puppet identity, and
+  mapping rows.
+- **Live control-plane folds** — role and ban changes on the Armada side take
+  effect without a restart, and stream-key rotation re-subscribes.
+- **Catch-up backfill** after downtime, from a per-channel cursor.
+- **The portal** (`packages/portal`): Discord OAuth, a setup wizard, the
+  in-channel confirmation, and a dashboard to pause, resume, and unlink.
+- **Server import**: mint a whole Armada community from a Discord server —
+  channels, roles, and grants, with genesis signed by the owner's own key in
+  their browser — then backfill history.
+- **`/claim`**: a Discord user connects their Armada account to their bridged
+  identity, receiving their imported roles and, if they ask for it, the puppet
+  key itself.
 
-## Run it
+Not yet: severance detection (ban, refounding, dissolution) is partial, and
+Discord-side commands are parsed from message text rather than registered as
+slash commands.
+
+## Layout
+
+| Package | What it is |
+| --- | --- |
+| `packages/concord-core` | Headless Concord protocol core (CORD-01..07), no I/O. Extracted from the Armada client. |
+| `packages/bridge` | The bridge itself: Discord adapter, router, puppets, transforms, Postgres mapping store. |
+| `packages/portal` | Web setup flow and multi-tenant host, running bridges in-process. `web/` is its React SPA. |
+
+The runtime is [Bun](https://bun.sh); Postgres is the only other dependency.
+
+## Local development
 
 ```sh
-# .env: BRIDGE_MASTER_SECRET (openssl rand -hex 32), BRIDGE_PRIMARY_KEY (nsec),
-#       BRIDGE_INVITE_URL, DISCORD_TOKEN, DISCORD_GUILD_ID, DISCORD_CHANNEL_ID
-docker compose up --build
+npm install          # Bun's installer hangs on some resolvers; the runtime is still Bun
+docker compose up -d postgres
 ```
 
-Dev loop: `npm install` (Bun's own installer hangs on some resolvers; the
-runtime is still Bun), then `bun test` and `bun run packages/bridge/src/index.ts`.
-
-## Portal (local dev)
-
-The portal (`packages/portal`) is the web setup flow: Discord OAuth, the
-five-step wizard, in-channel Armada confirmation, and a dashboard. It runs
-bridges in-process, so it replaces the env-provisioned service when used.
+Then the portal, which is the interesting path — it runs bridges in-process
+and replaces the env-provisioned service below:
 
 ```sh
-# 1. Postgres
-docker compose up -d postgres
-
-# 2. API (terminal 1)
+# API (terminal 1)
 DATABASE_URL=postgres://bridge:bridge@localhost:5432/bridge \
 PORTAL_SEAL_KEY=$(openssl rand -hex 32) \
 PORTAL_DEV_LOGIN=1 \
-DISCORD_CLIENT_ID=… DISCORD_CLIENT_SECRET=… DISCORD_TOKEN=… \
 bun run packages/portal/src/index.ts
 
-# 3. SPA with hot reload (terminal 2), proxies /api to :8787
+# SPA with hot reload (terminal 2), proxying /api to :8787
 ./node_modules/.bin/vite packages/portal/web
 # open http://localhost:5173
 ```
 
-Without Discord credentials, `PORTAL_DEV_LOGIN=1` lets you click through the
-UI (dev login button); going live needs a real Discord application: client
-id/secret for OAuth, bot token with the MESSAGE_CONTENT intent enabled.
-Keep `PORTAL_SEAL_KEY` stable across restarts or existing bridges cannot be
-unsealed. In production, `vite build packages/portal/web` once and the API
-serves `web/dist` itself on :8787.
+`PORTAL_DEV_LOGIN=1` gives you a login button that fabricates a session, so
+you can click through the UI without Discord credentials. Going live needs a
+real Discord application: a client id and secret for OAuth, and a bot token
+with the MESSAGE_CONTENT intent enabled.
 
-### What the database does and doesn't hold
+For production, `vite build packages/portal/web` once — the API then serves
+`web/dist` itself. It expects a TLS-terminating proxy in front and binds
+loopback by default.
+
+### Tests
+
+```sh
+bun test                                          # unit + protocol suites
+bunx tsc -b packages/concord-core                 # the repo's typecheck script
+bunx tsc -p packages/portal/tsconfig.json --noEmit  # portal, separately
+```
+
+Suites that need Postgres skip themselves when `DATABASE_URL` is unreachable,
+so a bare `bun test` is still meaningful.
+
+### Configuration
+
+Portal:
+
+| Variable | |
+| --- | --- |
+| `DATABASE_URL` | **Required.** Postgres connection string. |
+| `PORTAL_SEAL_KEY` | **Required.** 64 lowercase hex chars. Seals secrets at rest — see below. |
+| `PORTAL_PORT` | Default `8787`. |
+| `PORTAL_HOST` | Interface to bind. Default `127.0.0.1`; the compose file sets `0.0.0.0`, where the container is the boundary. |
+| `PORTAL_BASE_URL` | Public origin, used for OAuth redirects and to decide whether cookies are `Secure`. |
+| `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | OAuth application credentials. |
+| `DISCORD_TOKEN` | Bot token. Without it, bridges cannot go live. |
+| `PORTAL_DEV_LOGIN` | `1` enables the fake-session login. Never set in production. |
+| `BLOSSOM_SERVER` | Attachment re-hosting target; empty leaves CDN links. |
+| `INVITE_BASE_URL` | Cosmetic base for minted invite URLs. |
+| `IMPORT_DEFAULT_RELAYS` | Comma-separated relays for imported communities. |
+| `PORTAL_ALLOWED_ORIGINS` | Comma-separated origins allowed to drive the API cross-origin with a bearer token. Empty means same-origin only. |
+
+The standalone single-link bridge (`packages/bridge`) is provisioned entirely
+from env instead — `BRIDGE_MASTER_SECRET`, `BRIDGE_PRIMARY_KEY`,
+`BRIDGE_INVITE_URL`, `DISCORD_TOKEN`, `DISCORD_GUILD_ID`,
+`DISCORD_CHANNEL_ID`, `CONCORD_CHANNEL_ID` — and runs with
+`docker compose --profile bridge up`.
+
+## What the database holds
 
 Everything sensitive in Postgres is either sealed under `PORTAL_SEAL_KEY`
 (AES-256-GCM) or stored as a one-way digest, so a database-only leak — a
 backup, a replica, a dump, a console someone over-shared — yields nothing
-spendable. Sealed: per-bridge key material (invite, primary nsec, puppet
-master secret), the imported community's owner key, and the Discord OAuth
-bearer inside a session. Digested: session ids (SHA-256) and `/claim` codes
-(keyed HMAC), both of which are bearer credentials that only ever exist in
-full in the browser or the Discord reply that carried them. The Discord bot
-token and webhook credentials are never persisted at all — the bot token
-comes from `DISCORD_TOKEN`, and webhooks are created at runtime and cached in
-memory.
+spendable.
+
+- **Sealed:** per-bridge key material (invite, primary nsec, puppet master
+  secret), an imported community's owner key, and the Discord OAuth bearer
+  inside a session.
+- **Digested:** session ids (SHA-256) and `/claim` codes (keyed HMAC). Both
+  are bearer credentials that exist in full only in the browser, or in the
+  Discord reply that carried them.
+- **Never stored:** the Discord bot token, which comes from the environment,
+  and webhook credentials, which are created at runtime and cached in memory.
 
 This is defense in depth, not a boundary: the key lives in the same
-environment as the process, so anything that executes code on the host gets
-both. It bounds database exposure specifically. Rotating the key invalidates
-sealed material — bridges included — so treat it as permanent.
+environment as the process, so anything that executes code there gets both.
+It bounds database exposure specifically. Rotating the key invalidates sealed
+material — every bridge included — so treat it as permanent.
 
-## Deploy (production)
+## Design documents
 
-The portal runs on `discord-bridge.lan` (a Proxmox LXC) as the systemd unit
-`bridge-portal.service`, which is `bun run packages/portal/src/index.ts` in
-`/opt/armada-discord-bridge`, reading secrets from
-`/opt/armada-discord-bridge/.env.portal`. `cloudflared` fronts it and serves
-`https://bridge.armada.buzz` to `127.0.0.1:8787` — and the portal binds
-loopback to match, so nothing on the local network can reach the API around
-the proxy. `PORTAL_HOST` overrides that; the compose file sets `0.0.0.0`
-because there the container, not the interface, is the boundary. SSH is
-key-only and root-only.
-
-The unit runs as the unprivileged `bridge-portal` user with an empty
-capability set, `ProtectSystem=strict`, and `ProtectHome=yes` — so a
-compromise of the portal cannot read the tunnel credentials, the SSH keys, or
-the database dumps under `/root`. Two consequences for anyone editing the
-deployment:
-
-- The service reads Bun from `/usr/local/bin/bun`, a copy — `/root/.bun` is
-  unreachable from a non-root user. Running `bun upgrade` as root does *not*
-  update it; re-copy the binary.
-- `.env.portal` is `root:bridge-portal 0640`. Rewriting it with a tool that
-  replaces the file (`sed -i`, most editors) resets that, and the service then
-  fails to start; re-apply the owner and mode.
-
-`MemoryDenyWriteExecute` is deliberately absent: Bun JITs and dies without W^X.
-
-The box also runs a default-deny `ufw` (only 22 open) and
-`unattended-upgrades` for security updates.
-
-The server has no `node`/`npm` and cannot fetch the nostr `origin`, so deploys
-run from a workstation checkout: build the SPA locally, ship the commit as a git
-bundle and the built `dist` as a tarball, then restart the unit.
-
-```sh
-# workstation, from a clean `main`
-./node_modules/.bin/vite build packages/portal/web
-git bundle create /tmp/armada-main.bundle main
-tar czf /tmp/portal-dist.tgz -C packages/portal/web dist
-scp /tmp/armada-main.bundle /tmp/portal-dist.tgz root@discord-bridge.lan:/tmp/
-
-# server
-ssh root@discord-bridge.lan '
-  cd /opt/armada-discord-bridge
-  git -c safe.directory=$PWD pull --ff-only /tmp/armada-main.bundle main
-  rm -rf packages/portal/web/dist
-  tar xzf /tmp/portal-dist.tgz -C packages/portal/web
-  systemctl restart bridge-portal.service
-'
-```
-
-`web/dist` is gitignored, so it ships separately from the bundle.
-`git -c safe.directory` is required because the repo reads as `UNKNOWN` owner
-inside the container. When `package.json` changes, run `bun install`
-(`/root/.bun/bin/bun`) on the server before the restart; it rarely does. Keep
-`PORTAL_SEAL_KEY` in the server's `.env.portal` stable or existing bridges
-cannot be unsealed. To roll back, `git -c safe.directory=$PWD reset --hard
-<prev-commit>` and restart the unit.
-
-The gap between plans and code is tracked in [`NEXT-STEPS.md`](./NEXT-STEPS.md).
-
-The design lives in two documents:
-
-- [`armada-discord-bridge-PLAN.md`](./armada-discord-bridge-PLAN.md): the bridge
-  service itself (protocol analysis, architecture, identity mapping, feature
-  mapping, implementation phases, risks).
-- [`armada-bridge-portal-PLAN.md`](./armada-bridge-portal-PLAN.md): the hosted
-  web portal that lets a Discord admin and an Armada member set up a bridge
-  from a website, plus the multi-tenant architecture behind it.
+- [`armada-discord-bridge-PLAN.md`](./armada-discord-bridge-PLAN.md) — the
+  bridge service: protocol analysis, architecture, identity mapping, feature
+  mapping, phases, risks.
+- [`armada-bridge-portal-PLAN.md`](./armada-bridge-portal-PLAN.md) — the
+  hosted portal and the multi-tenant architecture behind it.
+- [`armada-server-import-PLAN.md`](./armada-server-import-PLAN.md) — minting a
+  community from an existing Discord server.
+- [`armada-history-claims-PLAN.md`](./armada-history-claims-PLAN.md) — history
+  backfill and the claim levels.
+- [`NEXT-STEPS.md`](./NEXT-STEPS.md) — the gap between the plans and the code.
 
 ## References
 
 - Concord protocol specs: https://github.com/concord-protocol/concord
 - Armada client: nostr://soapbox.pub/relay.ngit.dev/armada
+
+## License
+
+[AGPL-3.0](LICENSE)
