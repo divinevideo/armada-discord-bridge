@@ -87,7 +87,10 @@ The portal runs on `discord-bridge.lan` (a Proxmox LXC) as the systemd unit
 `bridge-portal.service`, which is `bun run packages/portal/src/index.ts` in
 `/opt/armada-discord-bridge`, reading secrets from
 `/opt/armada-discord-bridge/.env.portal`. `cloudflared` fronts it and serves
-`https://bridge.armada.buzz` to `127.0.0.1:8787`. SSH is root-only; the `mk`
+`https://bridge.armada.buzz` to `127.0.0.1:8787` — and the portal binds
+loopback to match, so nothing on the local network can reach the API around
+the proxy. `PORTAL_HOST` overrides that; the compose file sets `0.0.0.0`
+because there the container, not the interface, is the boundary. SSH is root-only; the `mk`
 login is not authorized on the box.
 
 The server has no `node`/`npm` and cannot fetch the nostr `origin`, so deploys

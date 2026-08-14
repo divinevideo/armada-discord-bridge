@@ -3,6 +3,14 @@
 export interface PortalEnv {
   databaseUrl: string;
   port: number;
+  /**
+   * Interface to bind. Loopback by default: the production deployment sits
+   * behind a TLS proxy on the same host, and binding every interface quietly
+   * published the whole API to the local network in plaintext, around
+   * whatever the proxy enforces. Container deployments, where the boundary is
+   * the container itself, set PORTAL_HOST=0.0.0.0 explicitly.
+   */
+  host: string;
   baseUrl: string;
   sealKeyHex: string;
   discordClientId: string;
@@ -41,6 +49,7 @@ export function loadPortalEnv(): PortalEnv {
   return {
     databaseUrl: required("DATABASE_URL"),
     port,
+    host: process.env.PORTAL_HOST?.trim() || "127.0.0.1",
     baseUrl: process.env.PORTAL_BASE_URL?.trim() || `http://localhost:${port}`,
     sealKeyHex,
     discordClientId: process.env.DISCORD_CLIENT_ID?.trim() ?? "",

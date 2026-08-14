@@ -598,5 +598,5 @@ const sweepSessions = () =>
 sweepSessions();
 setInterval(sweepSessions, 60 * 60_000);
 
-console.log(`portal: listening on ${env.baseUrl}`);
-export default { port: env.port, fetch: app.fetch };
+console.log(`portal: listening on ${env.baseUrl} (bound to ${env.host}:${env.port})`);
+export default { port: env.port, hostname: env.host, fetch: app.fetch };

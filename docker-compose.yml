@@ -54,6 +54,10 @@ services:
       - "8787:8787"
     environment:
       DATABASE_URL: postgres://bridge:bridge@postgres/bridge
+      # The container is the boundary here, so the published port needs a
+      # bind on every interface. Bare-metal deployments keep the loopback
+      # default and put a proxy in front.
+      PORTAL_HOST: 0.0.0.0
       PORTAL_SEAL_KEY: ${PORTAL_SEAL_KEY:?64 hex chars; seals per-bridge secrets}
       PORTAL_BASE_URL: ${PORTAL_BASE_URL:-http://localhost:8787}
       PORTAL_DEV_LOGIN: ${PORTAL_DEV_LOGIN:-0}
