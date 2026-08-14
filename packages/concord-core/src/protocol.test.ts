@@ -36,6 +36,7 @@ import {
 } from "./derive";
 import { buildInviteUrl, buildBundleEvent, buildRefreshedBundleEvents, mintLinkSigner, mintToken, parseBundleEvent, parseInviteLink, type InviteBundle } from "./invite";
 import { KIND_MESSAGE, KIND_SEAL_ENCRYPTED, KIND_SEAL_PLAINTEXT } from "./kinds";
+import { fold as foldEditions } from "./version";
 import {
   base64ToBytes,
   buildRekeyRumors,
@@ -474,5 +475,50 @@ describe("Concord V2 end to end", () => {
   it("hex32 round-trips through the whole flow (sanity)", () => {
     const b = random32();
     expect(bytesToHex(hex32(bytesToHex(b)))).toBe(bytesToHex(b));
+  });
+});
+
+/**
+ * Kept HERE rather than in a vendored test file: sync-from-armada.sh
+ * overwrites the copied ones, and the bridge folds the same Control Plane as
+ * the client, so this repo wants its own standing check that a forged sibling
+ * cannot freeze an entity. Upstream carries the full conformance cases
+ * (cord04.conformance.test.ts, O-14c/O-14d).
+ */
+describe("edition fold — equal-version forks", () => {
+  const ed = (
+    version: bigint,
+    prev: number | undefined,
+    self: number,
+    tiebreak = 0xa0 + Number(version),
+  ) => ({
+    version,
+    prevHash: prev === undefined ? undefined : new Uint8Array(32).fill(prev),
+    selfHash: new Uint8Array(32).fill(self),
+    createdAt: 100 + Number(version),
+    tiebreakId: new Uint8Array(32).fill(tiebreak),
+  });
+
+  it("a planted sibling at our head version cannot break the chain", () => {
+    // `tiebreakId` is the rumor id, a hash of content the publisher chooses.
+    // Picking the per-version winner by that id BEFORE walking the chain let
+    // one junk edition at a tracking client's own head version fail the anchor
+    // and suspend the entity permanently — without ever facing an authority
+    // gate, which runs later.
+    const floorHash = new Uint8Array(32).fill(2);
+    const real = ed(2n, 1, 2, 0xb0);
+    const junk = ed(2n, 9, 9, 0x01); // lower id, unrelated hashes
+    const next = ed(3n, 2, 3); // links to `real`
+
+    const attacked = foldEditions([junk, real, next], 2n, floorHash);
+    expect(attacked.gap).toBe(false);
+    expect(attacked.head).toBe(2);
+    expect(foldEditions([real, junk, next], 2n, floorHash)).toEqual(attacked);
+  });
+
+  it("still reports a genuine hole rather than skipping it", () => {
+    const holed = foldEditions([ed(1n, undefined, 1), ed(3n, 2, 3)], 0n);
+    expect(holed.head).toBe(0);
+    expect(holed.gap).toBe(true);
   });
 });

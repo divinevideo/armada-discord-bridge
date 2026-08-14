@@ -94,7 +94,8 @@ function cmpBytes(a: Uint8Array, b: Uint8Array): number {
   return a.length - b.length;
 }
 
-function bytesEq(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
+/** Exported for control.ts's floor-hash check; see `headCandidates`. */
+export function bytesEq(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
   if (a === undefined || b === undefined) return a === b;
   return a.length === b.length && cmpBytes(a, b) === 0;
 }
@@ -105,44 +106,65 @@ function bytesEq(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean 
  * that held edition's selfHash.
  */
 export function fold(editions: Edition[], floor: bigint, floorHash?: Uint8Array): FoldResult {
-  // Per-version winner (equal-version fork → lower tiebreakId). Skip below-floor.
-  const byVersion = new Map<bigint, number>();
+  // EVERY sibling per version, tiebreak-ordered — not a single winner.
+  //
+  // Settling the per-version winner here, before the chain is walked, was a
+  // denial of service: `tiebreakId` is the rumor id, a hash of content the
+  // publisher chooses, so anyone able to publish at the control address can
+  // mint a junk edition at a tracking client's own head version whose id
+  // sorts below the real one. That junk then became "the" edition at that
+  // version, its hash did not match the client's recorded floor, the anchor
+  // failed, and every candidate above the floor was dropped — pinning the
+  // entity forever, for every synced client, with content that never had to
+  // pass an authority gate because the gate runs later.
+  //
+  // Carrying the siblings costs nothing and lets the LINK decide which one is
+  // real: a forgery cannot fake `prevHash` continuity to an edition it does
+  // not have, and cannot fake a hash equal to the one we already hold.
+  const byVersion = new Map<bigint, number[]>();
   for (let i = 0; i < editions.length; i++) {
     const e = editions[i];
     if (e.version < floor) continue;
-    const j = byVersion.get(e.version);
-    if (j === undefined || cmpBytes(e.tiebreakId, editions[j].tiebreakId) < 0) {
-      byVersion.set(e.version, i);
-    }
+    const list = byVersion.get(e.version);
+    if (list) list.push(i);
+    else byVersion.set(e.version, [i]);
+  }
+  for (const list of byVersion.values()) {
+    list.sort((x, y) => cmpBytes(editions[x].tiebreakId, editions[y].tiebreakId));
   }
   const versions = [...byVersion.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (versions.length === 0) return { head: null, gap: false };
 
-  const lo = editions[byVersion.get(versions[0])!];
-  let anchored: boolean;
+  // Anchor on a sibling that actually connects to what we hold, preferring the
+  // tiebreak winner among those that do. With one edition per version this is
+  // exactly the old behaviour.
+  const base = byVersion.get(versions[0])!;
+  let anchorIdx: number | undefined;
   if (floor === 0n) {
-    anchored = versions[0] === 1n && lo.prevHash === undefined;
-  } else if (versions[0] === floor) {
-    anchored = floorHash !== undefined && bytesEq(floorHash, lo.selfHash);
-  } else if (versions[0] === floor + 1n) {
-    anchored = floorHash !== undefined && bytesEq(lo.prevHash, floorHash);
-  } else {
-    anchored = false;
+    if (versions[0] === 1n) anchorIdx = base.find((i) => editions[i].prevHash === undefined);
+  } else if (floorHash !== undefined && versions[0] === floor) {
+    anchorIdx = base.find((i) => bytesEq(floorHash, editions[i].selfHash));
+  } else if (floorHash !== undefined && versions[0] === floor + 1n) {
+    anchorIdx = base.find((i) => bytesEq(editions[i].prevHash, floorHash));
   }
-  let gap = !anchored;
+  let gap = anchorIdx === undefined;
 
-  let headIdx = byVersion.get(versions[0])!;
+  // Walk from the anchored edition, choosing at each step the sibling that
+  // links to the one we just accepted rather than the one with the lowest id.
+  let headIdx = anchorIdx ?? base[0];
   for (let k = 0; k + 1 < versions.length; k++) {
-    const loIdx = byVersion.get(versions[k])!;
-    const hiIdx = byVersion.get(versions[k + 1])!;
-    const linked =
-      versions[k + 1] === versions[k] + 1n && bytesEq(editions[hiIdx].prevHash, editions[loIdx].selfHash);
-    if (linked) {
-      headIdx = hiIdx;
-    } else {
+    if (versions[k + 1] !== versions[k] + 1n) {
       gap = true;
       break;
     }
+    const next = byVersion
+      .get(versions[k + 1])!
+      .find((i) => bytesEq(editions[i].prevHash, editions[headIdx].selfHash));
+    if (next === undefined) {
+      gap = true;
+      break;
+    }
+    headIdx = next;
   }
   return { head: headIdx, gap };
 }
