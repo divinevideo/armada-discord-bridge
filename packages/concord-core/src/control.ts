@@ -493,6 +493,33 @@ function headCandidates(
     gapped = floor !== undefined && (result.gap || result.head === null);
     if (gapped) onGap?.();
 
+    // No floor, and the served chain is broken in the middle.
+    //
+    // `fold` anchors on the LOWEST served version and walks up, stopping at the
+    // first discontinuity, so a relay that serves v1 and v3 and withholds v2
+    // seats v1 on a client with nothing to compare against. Withholding is
+    // enough — no forgery — and the relay therefore picks which authorized
+    // edition a fresh client believes: a Banlist before a ban, a Grant before
+    // a revoke.
+    //
+    // Seating the HIGHEST instead is not the fix. It is the wrong answer just
+    // as often in the other direction: a rejoiner whose missing middle lives in
+    // an epoch they could not read (the CORD-06 §3 case below) would drop a ban
+    // that is still in force. Neither end of a chain with a hole in it is
+    // knowable from the chain alone — `snapshot` (epoch attribution) is the
+    // mechanism that actually resolves this, and when it is absent the fold is
+    // guessing whichever way it leans.
+    //
+    // So leave the seated head alone and stop being SILENT about it: report the
+    // hole whenever a higher version was served than the one being seated. With
+    // no floor `gapped` stays false, nothing is suppressed, and bootstrap still
+    // works — but the caller learns the entity is incomplete and can refetch
+    // the middle instead of acting on a state a relay chose for it.
+    if (floor === undefined && result.gap && result.head !== null) {
+      const highest = bootstrapHead(folds, 0n);
+      if (highest !== null && folds[highest].version > folds[result.head].version) onGap?.();
+    }
+
     if (result.head !== null && !gapped) {
       ordered.push(editions[result.head]);
       seenRumors.add(bytesToHex(editions[result.head].rumorId));

@@ -1278,6 +1278,48 @@ describe("control plane fold (CORD-04)", () => {
     expect(onlyDangling.metadata?.name).not.toBe("Hijacked");
   });
 
+  it("reports a withheld middle to a fresh joiner instead of seating an end silently", async () => {
+    // A relay serves both ENDS of a chain and withholds the middle. A client
+    // with no floor has nothing to compare against, so `fold` anchors low and
+    // seats v1 — a Banlist from before the ban. Withholding is all it takes;
+    // nothing is forged, and every edition served is genuinely the owner's.
+    const { owner, communityId, control } = await makeCommunity();
+    const target = signer();
+
+    const b1 = buildBanlistEdition(communityId, [], { actorPubkey: owner.pubkey, version: 1n });
+    const w1 = await sealEdition(b1, control, owner);
+    const p1 = openControlWraps([w1], [control])[0];
+    const b2 = buildBanlistEdition(communityId, [], { actorPubkey: owner.pubkey, version: 2n, prevHash: p1.selfHash });
+    const w2 = await sealEdition(b2, control, owner);
+    const p2 = openControlWraps([w2], [control])[0];
+    const b3 = buildBanlistEdition(communityId, [target.pubkey], {
+      actorPubkey: owner.pubkey,
+      version: 3n,
+      prevHash: p2.selfHash,
+    });
+    const w3 = await sealEdition(b3, control, owner);
+
+    const withheld = foldControlState(openControlWraps([w1, w3], [control]), communityId, owner.pubkey);
+    // Which end is right is NOT decidable from a chain with a hole in it —
+    // seating the highest would drop a ban that is still in force in the
+    // rejoiner case below. The seated head deliberately does not change.
+    expect(withheld.banned.has(target.pubkey)).toBe(false);
+    // What changes is that the caller can now see it is being served a
+    // partial chain, rather than acting on a state the relay picked.
+    expect(withheld.incomplete).toContain(bytesToHex(p1.entityId));
+
+    // The whole chain: the ban lands, and nothing is flagged.
+    const whole = foldControlState(openControlWraps([w1, w2, w3], [control]), communityId, owner.pubkey);
+    expect(whole.banned.has(target.pubkey)).toBe(true);
+    expect(whole.incomplete).not.toContain(bytesToHex(p1.entityId));
+
+    // A lone compacted head still bootstraps clean: no lower version was
+    // served, so there is no hole to report.
+    const compacted = foldControlState(openControlWraps([w3], [control]), communityId, owner.pubkey);
+    expect(compacted.banned.has(target.pubkey)).toBe(true);
+    expect(compacted.incomplete).not.toContain(bytesToHex(p1.entityId));
+  });
+
   it("a rejoiner holding partial old roots folds the compacted snapshot, not the stale fragment (CORD-06 §3)", async () => {
     // The chain's middle lives in an epoch the rejoiner never held: they kept
     // epoch 0 (member then), missed epoch 1 (banned), rejoined at epoch 2. The
