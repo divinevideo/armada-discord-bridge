@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { assertSafeHttpUrl, isPrivateAddress, pinnedTarget, readCapped } from "./net";
+import { assertSafeHttpUrl, isPrivateAddress, pinnedTarget, readCapped, safeProbe } from "./net";
 
 describe("isPrivateAddress", () => {
   it("names the IPv4 ranges we refuse to originate to", () => {
@@ -131,6 +131,27 @@ describe("assertSafeHttpUrl", () => {
 
   it("refuses malformed input rather than passing it to fetch", async () => {
     await expect(assertSafeHttpUrl("not a url")).rejects.toThrow(/malformed/);
+  });
+});
+
+/**
+ * The GIF-variant probe used to call the global `fetch` with `redirect:
+ * "follow"`, which is how a guard with this much care in it still issued
+ * `HEAD http://169.254.169.254/…` on behalf of whoever posted a link. A
+ * refusal must be a value the caller can act on, not an exception.
+ */
+describe("safeProbe", () => {
+  it("answers undefined for hosts the guard refuses, without connecting", async () => {
+    for (const url of [
+      "http://127.0.0.1/x.gif",
+      "http://169.254.169.254/latest/meta-data/x.gif",
+      "http://[::ffff:127.0.0.1]/x.gif",
+      "http://localhost:8787/x.gif",
+      "file:///etc/passwd",
+      "not a url",
+    ]) {
+      expect(await safeProbe(url)).toBeUndefined();
+    }
   });
 });
 

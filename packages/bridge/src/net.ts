@@ -255,6 +255,31 @@ export async function safeFetch(
   maxBytes: number,
   init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal },
 ): Promise<SafeFetchResult> {
+  const res = await guardedFetch(raw, init);
+  if (!res.ok) throw new Error(`download ${raw}: HTTP ${res.status}`);
+
+  const declared = Number(res.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`download ${raw}: ${declared} bytes exceeds cap`);
+  }
+
+  const mime = res.headers.get("content-type")?.split(";")[0] || "application/octet-stream";
+  return { body: await readCapped(res, maxBytes, raw), mime };
+}
+
+/**
+ * Walk an untrusted URL to its final response with the guard applied at every
+ * hop, pinning each connection to the address the verdict was made about.
+ *
+ * Shared by {@link safeFetch} and {@link safeProbe} so there is exactly one
+ * place the guard lives. That is not tidiness: the GIF-variant probe used to
+ * call the global `fetch` with `redirect: "follow"` on an OpenGraph URL from a
+ * linked page, and a second copy of this loop is how that happens again.
+ */
+async function guardedFetch(
+  raw: string,
+  init?: { method?: string; headers?: Record<string, string>; signal?: AbortSignal },
+): Promise<Response> {
   // One budget for the whole operation, not one per hop: three redirects that
   // each get the full timeout is three times the stall a caller asked for.
   const signal = init?.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS);
@@ -281,15 +306,32 @@ export async function safeFetch(
       ({ url: target, address } = await vetHttpUrl(new URL(res.headers.get("location")!, target).toString()));
       continue;
     }
-    if (!res.ok) throw new Error(`download ${raw}: HTTP ${res.status}`);
+    return res;
+  }
+}
 
-    const declared = Number(res.headers.get("content-length") ?? 0);
-    if (Number.isFinite(declared) && declared > maxBytes) {
-      throw new Error(`download ${raw}: ${declared} bytes exceeds cap`);
-    }
-
-    const mime = res.headers.get("content-type")?.split(";")[0] || "application/octet-stream";
-    return { body: await readCapped(res, maxBytes, raw), mime };
+/**
+ * HEAD an untrusted URL under the full guard, for "does this variant exist,
+ * and is it the type I wanted" probes.
+ *
+ * Returns undefined for every kind of no — a non-public host, a rejected
+ * scheme, too many hops, a transport error — because every caller treats those
+ * identically: give up on this candidate and try the next. A probe is not a
+ * download, so there is no body and no byte cap; the point is that the request
+ * is still aimed only at addresses the guard approved. Without it the probe is
+ * a blind SSRF: the URL comes from an OpenGraph tag on a page the message
+ * author chose, and `HEAD http://169.254.169.254/…` from this process is a
+ * reachability oracle for anything on the deployment's internal network.
+ */
+export async function safeProbe(
+  raw: string,
+  timeoutMs = 3_000,
+): Promise<{ ok: boolean; mime: string } | undefined> {
+  try {
+    const res = await guardedFetch(raw, { method: "HEAD", signal: AbortSignal.timeout(timeoutMs) });
+    return { ok: res.ok, mime: res.headers.get("content-type")?.split(";")[0] ?? "" };
+  } catch {
+    return undefined;
   }
 }
 
