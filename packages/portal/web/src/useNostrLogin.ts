@@ -19,8 +19,23 @@ const LOGIN_STORE = "portal:nostr-login";
 
 /**
  * Armada-style key login, used by the import wizard: nsec paste or NIP-07
- * extension, local signing only, persisted in localStorage so the login
- * survives reloads.
+ * extension, local signing only.
+ *
+ * A pasted key lives in memory for as long as the tab does and is never
+ * written to storage. It used to be persisted so the login survived reloads,
+ * which sounds like the ordinary Nostr-client trade until you follow what this
+ * particular key is and how long it is needed: it is the community OWNER's
+ * identity — the position-0 authority that `community_id` commits to, and that
+ * no rotation can revoke — and the wizard signs with it exactly once, in the
+ * burst between `/prepare` and `/confirm`. Nothing after `confirm` signs.
+ *
+ * The persistence did not even buy a resumable wizard: `step`, `importId` and
+ * `plan` are component state, so a reload restarts the import from the top
+ * regardless. What it bought was an owner key sitting on disk indefinitely,
+ * readable by any script on an origin that also serves the Discord session.
+ *
+ * The extension path is unchanged: it stores only which method was used and
+ * re-asks the signer, which is what persistence is supposed to look like.
  */
 export function useNostrLogin(defaultRelays: string[]) {
   const [pk, setPk] = useState("");
@@ -36,12 +51,11 @@ export function useNostrLogin(defaultRelays: string[]) {
     if (!raw) return;
     try {
       const stored = JSON.parse(raw) as { method: "extension" | "nsec"; nsec?: string };
-      if (stored.method === "nsec" && stored.nsec) {
-        const decoded = nip19.decode(stored.nsec);
-        if (decoded.type !== "nsec") throw new Error("bad stored key");
-        setNsec(stored.nsec);
-        setPk(getPublicKey(decoded.data as Uint8Array));
-        setMethod("nsec");
+      if (stored.method === "nsec") {
+        // Written by an earlier build. Not restored — deleted: leaving it
+        // would mean the fix only protects keys pasted from here on, while the
+        // ones already on disk stay there until someone logs out.
+        localStorage.removeItem(LOGIN_STORE);
       } else if (stored.method === "extension" && window.nostr) {
         void window.nostr.getPublicKey()
           .then((k) => {
@@ -104,7 +118,6 @@ export function useNostrLogin(defaultRelays: string[]) {
     }
     setPk(getPublicKey(sk));
     setMethod("nsec");
-    localStorage.setItem(LOGIN_STORE, JSON.stringify({ method: "nsec", nsec: nsec.trim() }));
   }
 
   function disconnect() {
