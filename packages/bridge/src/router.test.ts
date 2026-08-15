@@ -21,6 +21,7 @@ import { ConcordClient, hasProxyTag } from "./concord/client";
 import type { RelayLike } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { PuppetCache } from "./puppets";
+import type { safeProbe } from "./net";
 import { BridgeRouter, MemoryMappingStore, applyCustomEmoji, concordCustomEmojiToDiscord, escapeMarkdown, fallbackProfile, reactionEmoji, resolveGifVariant } from "./router";
 import type { ChannelLink, DiscordInboundMessage, RouterOptions } from "./router";
 
@@ -206,11 +207,9 @@ describe("BridgeRouter: Discord -> Concord", () => {
   });
 
   it("resolveGifVariant probes for a real .gif and falls back to the mp4", async () => {
-    const gifOk = (async () =>
-      new Response(null, { status: 200, headers: { "content-type": "image/gif" } })) as unknown as typeof fetch;
-    const allDead = (async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
-    const htmlTrap = (async () =>
-      new Response(null, { status: 200, headers: { "content-type": "text/html" } })) as unknown as typeof fetch;
+    const gifOk: typeof safeProbe = async () => ({ ok: true, mime: "image/gif" });
+    const allDead: typeof safeProbe = async () => ({ ok: false, mime: "" });
+    const htmlTrap: typeof safeProbe = async () => ({ ok: true, mime: "text/html" });
 
     // Already a gif: no probing.
     expect(await resolveGifVariant("https://p", "https://cdn/x.gif", allDead)).toBe("https://cdn/x.gif");
@@ -224,6 +223,24 @@ describe("BridgeRouter: Discord -> Concord", () => {
     );
     // Nothing viable: keep the mp4.
     expect(await resolveGifVariant("https://p/x", "https://cdn/a.mp4", allDead)).toBe("https://cdn/a.mp4");
+  });
+
+  it("resolveGifVariant probes only through the guard, and takes its refusals", async () => {
+    // The media URL is an OpenGraph value off a page the message author chose,
+    // so this is the SSRF path: the probe must be the guarded one, and a
+    // refusal (undefined) must read as "no", not as an absent content-type.
+    const probed: string[] = [];
+    const refuseAll: typeof safeProbe = async (url) => {
+      probed.push(url);
+      return undefined;
+    };
+    expect(
+      await resolveGifVariant("https://tenor.com/view/x", "http://169.254.169.254/latest/meta-data/x.mp4", refuseAll),
+    ).toBe("http://169.254.169.254/latest/meta-data/x.mp4");
+    expect(probed).toEqual([
+      "http://169.254.169.254/latest/meta-data/x.gif",
+      "https://tenor.com/view/x.gif",
+    ]);
   });
 
   it("skips own webhooks, own application, other bots, and disabled links", async () => {
@@ -294,6 +311,29 @@ describe("BridgeRouter: Concord -> Discord", () => {
     expect(ids.length).toBeGreaterThan(1);
     expect(webhooks.sent.every((m) => m.content.length <= 2000)).toBe(true);
     expect(store.rows).toHaveLength(ids.length);
+  });
+
+  it("caps the fan-out one rumor can become, and says the tail was dropped", async () => {
+    const { router, webhooks, store, link } = harness();
+    // A rumor near what NIP-44 can carry: uncapped this is ~33 sends and 33
+    // mapping rows from a single publish by a single member.
+    const ids = await router.onConcordChat(concordChat({ content: "word ".repeat(13_000) }), link);
+
+    expect(ids).toHaveLength(10);
+    expect(store.rows).toHaveLength(10);
+    expect(webhooks.sent.every((m) => m.content.length <= 2000)).toBe(true);
+    expect(webhooks.sent[9].content).toMatch(/… \d+ more parts not mirrored$/);
+  });
+
+  it("mirrors one rumor at a time, in order", async () => {
+    const { router, webhooks, link } = harness();
+    // Fire-and-forget is how both entry points dispatch; concurrent runs used
+    // to interleave and hold every rumor's attachments at once.
+    const sends = [1, 2, 3, 4, 5].map((n) =>
+      router.onConcordChat(concordChat({ rumorId: String(n).repeat(64), content: `msg ${n}` }), link),
+    );
+    await Promise.all(sends);
+    expect(webhooks.sent.map((m) => m.content)).toEqual(["msg 1", "msg 2", "msg 3", "msg 4", "msg 5"]);
   });
 
   it("never echoes: proxy-tagged, puppet-authored, already-mapped, banned", async () => {

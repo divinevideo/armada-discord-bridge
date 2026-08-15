@@ -19,10 +19,11 @@ import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
 import type { LocalIdentity } from "./concord/signer";
 import { ffmpegAvailable, mp4ToGif } from "./gif";
+import { safeProbe } from "./net";
 
 type LocalIdentitySigner = LocalIdentity["signer"];
 import type { PuppetCache } from "./puppets";
-import { concordToDiscord, discordToConcord, splitForDiscord } from "./transform";
+import { DISCORD_MAX_CHARS, concordToDiscord, discordToConcord, splitForDiscord } from "./transform";
 import type { DiscordMessageContent } from "./transform";
 
 export interface ChannelLink {
@@ -155,6 +156,34 @@ export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
  * successes is no cap at all against URLs chosen to fail.
  */
 const MAX_IMETA_DOWNLOADS = 10;
+
+/**
+ * Total attachment bytes held in memory while assembling ONE inbound rumor.
+ *
+ * The per-file cap and the attempt cap multiply: ten files at MAX_BLOB_BYTES
+ * is 100 MB retained at once, and nothing serialises rumors against each
+ * other, so N concurrent ones are N times that. The process this happens in
+ * also holds PORTAL_SEAL_KEY, so "it eventually OOMs" is not a survivable
+ * outcome. Set above Discord's own per-message ceiling: a rumor that exceeds
+ * this could not have been delivered whole in any case.
+ */
+const MAX_IMETA_TOTAL_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Discord messages one inbound rumor may fan out into.
+ *
+ * Each part is a webhook send AND a mapping row, so the split is the cheapest
+ * amplifier in the bridge. Ten parts is 20,000 characters — far past any real
+ * chat message, and a tenth of the worst case.
+ */
+const MAX_DISCORD_PARTS = 10;
+
+/**
+ * Inbound rumors allowed to queue for one bridged channel before new ones are
+ * dropped. Deep enough that a legitimate burst or a catch-up backfill never
+ * touches it; shallow enough that a flood cannot grow the heap without bound.
+ */
+const MAX_QUEUED_CHATS = 200;
 
 /**
  * Longest emoji we will hand to Discord's reaction API, in code points. Real
@@ -311,7 +340,7 @@ export const fallbackProfile = (pk: string): { name: string; avatarUrl?: string 
 export async function resolveGifVariant(
   pageUrl: string,
   mediaUrl: string,
-  fetchFn: typeof fetch = fetch,
+  probe: typeof safeProbe = safeProbe,
 ): Promise<string> {
   if (/\.gif(\?|$)/i.test(mediaUrl)) return mediaUrl;
   const candidates = [
@@ -319,16 +348,11 @@ export async function resolveGifVariant(
     `${pageUrl.replace(/\/+$/, "")}.gif`,
   ].filter((url) => url !== mediaUrl);
   for (const url of candidates) {
-    try {
-      const res = await fetchFn(url, {
-        method: "HEAD",
-        redirect: "follow",
-        signal: AbortSignal.timeout(3_000),
-      });
-      if (res.ok && (res.headers.get("content-type") ?? "").startsWith("image/")) return url;
-    } catch {
-      // dead candidate; try the next
-    }
+    // Guarded, not a bare fetch: `mediaUrl` is an OpenGraph value read off
+    // whatever page the message linked, so the author picks the host this
+    // probe is aimed at. A dead or refused candidate is undefined either way.
+    const res = await probe(url);
+    if (res?.ok && res.mime.startsWith("image/")) return url;
   }
   return mediaUrl;
 }
@@ -336,13 +360,13 @@ export async function resolveGifVariant(
 /** When the message is only a GIF-picker page link, upgrade its embed media to a true .gif. */
 export async function upgradeGifEmbed(
   msg: DiscordInboundMessage,
-  fetchFn: typeof fetch = fetch,
+  probe: typeof safeProbe = safeProbe,
 ): Promise<DiscordInboundMessage> {
   const bare = msg.content.trim();
   if (!/^https?:\/\/\S+$/.test(bare)) return msg;
   const embed = msg.embeds?.find((e) => e.url === bare && e.mediaUrl);
   if (!embed?.mediaUrl) return msg;
-  const mediaUrl = await resolveGifVariant(bare, embed.mediaUrl, fetchFn);
+  const mediaUrl = await resolveGifVariant(bare, embed.mediaUrl, probe);
   return { ...msg, embeds: [{ url: embed.url, mediaUrl }] };
 }
 
@@ -480,7 +504,46 @@ export class BridgeRouter {
   }
 
   /** Concord -> Discord. Returns created Discord message ids (may split). */
+  /**
+   * Mirror an inbound rumor, one at a time per bridged channel.
+   *
+   * Both entry points dispatch these fire-and-forget (`void
+   * router.onConcordChat(...)`), so before this they ran fully concurrently
+   * and a burst held every rumor's attachments at once — the per-rumor byte
+   * budget bounds one rumor, not N of them. Serialising also gives the mirror
+   * the ordering a channel is expected to have, which concurrent dispatch
+   * never guaranteed.
+   *
+   * Awaiting callers (backfill) keep working: the returned promise settles
+   * when this rumor's turn finishes.
+   */
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
+    if (this.queued >= MAX_QUEUED_CHATS) {
+      // Shedding load beats unbounded growth: past this the sender is flooding
+      // and the relay copy is still the record. Loud, because it is data loss.
+      console.warn(
+        `bridge: dropping inbound rumor ${chat.rumorId.slice(0, 8)}… — ${this.queued} already queued for ${link.discordChannelId}`,
+      );
+      return [];
+    }
+    this.queued++;
+    const run = this.chatQueue.then(() => this.dispatchConcordChat(chat, link));
+    // The chain must survive a failed rumor, or one throw stops the channel.
+    this.chatQueue = run.then(
+      () => {},
+      () => {},
+    );
+    try {
+      return await run;
+    } finally {
+      this.queued--;
+    }
+  }
+
+  private chatQueue: Promise<void> = Promise.resolve();
+  private queued = 0;
+
+  private async dispatchConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (!link.enabled) return [];
     // Layer 1 + 2: bridge-originated or already-bridged rumors never bounce.
     // The primary's own posts (confirm requests, announcements) stay
@@ -521,9 +584,23 @@ export class BridgeRouter {
 
     const profile = await this.profiles.resolve(chat.author).catch(() => fallbackProfile(chat.author));
     const media = await this.filesFromImeta(chat);
-    const parts = splitForDiscord(
+    const all = splitForDiscord(
       applyCustomEmoji(concordToDiscord(stripAttachedUrls(chat.content, media?.urls)), chat.tags),
     );
+    // Cap the fan-out. Inbound length is bounded only by what NIP-44 can carry
+    // (~64 KB), and CONCORD_MAX_CHARS is enforced on the way OUT, so without
+    // this one publish by one member becomes ~33 webhook sends and 33 mapping
+    // rows in the mirrored channel — a flood amplifier available to anyone who
+    // can post in the Concord channel.
+    const parts = all.slice(0, MAX_DISCORD_PARTS);
+    const dropped = all.length - parts.length;
+    if (dropped > 0) {
+      // Say so in-channel rather than silently losing the tail; replace the
+      // end of the last part instead of appending, which would overrun 2000.
+      const notice = `\n… ${dropped} more part${dropped === 1 ? "" : "s"} not mirrored`;
+      const kept = parts[parts.length - 1].slice(0, Math.max(0, DISCORD_MAX_CHARS - notice.length));
+      parts[parts.length - 1] = `${kept}${notice}`;
+    }
     const reply = await this.replyEmbed(chat, link);
     const files = media?.files;
 
@@ -878,9 +955,18 @@ export class BridgeRouter {
     // answers leaves the count untouched, so a rumor carrying a few thousand
     // dead imeta tags still made a few thousand sequential outbound requests.
     let attempted = 0;
+    // Bytes actually held. MAX_BLOB_BYTES bounds ONE file; ten of them bounded
+    // nothing that matters, because every download is retained in `files`
+    // until the whole rumor is sent — 100 MB resident per rumor, and rumors
+    // are dispatched concurrently (index.ts). This is the bound that keeps the
+    // process alive, and it sits above what Discord accepts in one message, so
+    // it costs no traffic that would have been delivered anyway.
+    let held = 0;
     for (const tag of chat.tags) {
       if (tag[0] !== "imeta") continue;
       if (attempted >= MAX_IMETA_DOWNLOADS) break;
+      const remaining = MAX_IMETA_TOTAL_BYTES - held;
+      if (remaining <= 0) break;
       const fields = new Map(tag.slice(1).map((f) => [f.split(" ")[0], f.slice(f.indexOf(" ") + 1)]));
       const url = fields.get("url");
       if (!url) continue;
@@ -888,13 +974,15 @@ export class BridgeRouter {
       // 0) on a tag built to evade this. The real bound is the byte counter in
       // safeFetch; this just avoids starting a download that admits it is
       // oversized.
+      const cap = Math.min(MAX_BLOB_BYTES, remaining);
       const size = Number(fields.get("size") ?? 0);
-      if (size > MAX_BLOB_BYTES) continue; // stays a link in the content
+      if (size > cap) continue; // stays a link in the content
       attempted++;
       try {
-        const { data, mime } = await blobs.download(url, MAX_BLOB_BYTES);
+        const { data, mime } = await blobs.download(url, cap);
         const name = new URL(url).pathname.split("/").pop() || `file.${(mime.split("/")[1] ?? "bin").split("+")[0]}`;
         files.push({ name, data });
+        held += data.length;
         urls.push(url);
       } catch (error) {
         console.warn(`bridge: imeta download failed for ${url}`, error);
