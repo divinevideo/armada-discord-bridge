@@ -277,6 +277,12 @@ export class Importer {
       beforeId?: string,
     ) => Promise<RestMessage[] | undefined> = (channelId, beforeId) =>
       botChannelMessagesBefore(this.env.discordBotToken, channelId, beforeId),
+    /**
+     * Test seam: vet relay hosts without a resolver. The guard refuses a name
+     * it cannot resolve, which is right in production and would otherwise make
+     * every fixture relay a DNS lookup.
+     */
+    private readonly vetRelays: (relays: readonly string[]) => Promise<void> = assertPublicRelays,
   ) {}
 
   /** Snapshot the guild and store a previewed plan. */
@@ -379,7 +385,7 @@ export class Importer {
     const requested = (body.relays ?? []).map((r) => r.trim()).filter(Boolean);
     // Scheme AND host: the old check was scheme-only, so `ws://127.0.0.1:6379/`
     // passed and the server opened a socket to it on the caller's behalf.
-    await assertPublicRelays(requested);
+    await this.vetRelays(requested);
     plan.relays = capRelays(
       requested.length ? requested : this.env.importRelays.length ? this.env.importRelays : STOCK_RELAYS,
     );

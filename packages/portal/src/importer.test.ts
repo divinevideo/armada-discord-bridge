@@ -280,7 +280,16 @@ describe("importer pipeline", () => {
       pageIndex.set(channelId, i + 1);
       return pages[Math.min(i, pages.length - 1)];
     };
-    const importer = new Importer(fakeSql(store), env, manager as never, () => wirePool(wire), historyFetch);
+    // The relay guard resolves every host and refuses what it cannot resolve,
+    // so a fixture relay would otherwise be a DNS lookup in a unit test.
+    const importer = new Importer(
+      fakeSql(store),
+      env,
+      manager as never,
+      () => wirePool(wire),
+      historyFetch,
+      async () => {},
+    );
 
     const plan = buildImportPlan(snapshot);
     store.imports.set("imp1", {
