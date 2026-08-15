@@ -46,17 +46,30 @@ export function loadPortalEnv(): PortalEnv {
   const sealKeyHex = required("PORTAL_SEAL_KEY");
   if (!/^[0-9a-f]{64}$/.test(sealKeyHex)) throw new Error("PORTAL_SEAL_KEY must be 64 lowercase hex chars");
   const port = Number(process.env.PORTAL_PORT ?? 8787);
+  const baseUrl = process.env.PORTAL_BASE_URL?.trim() || `http://localhost:${port}`;
+  const devLogin = process.env.PORTAL_DEV_LOGIN === "1";
+  // Refuse to boot rather than serve the backdoor. `/api/auth/dev` hands any
+  // unauthenticated caller a session whose fixture guild carries canManage and
+  // which is permanently exempt from the fresh-Discord permission re-check —
+  // and every dev session shares one owner id, so they own each other's
+  // bridges. "Never set in production" was a line in the README with nothing
+  // enforcing it, and the compose file passes the variable straight through.
+  if (devLogin && (process.env.NODE_ENV === "production" || baseUrl.startsWith("https:"))) {
+    throw new Error(
+      "PORTAL_DEV_LOGIN=1 refused: it grants any anonymous caller a session, and this looks like a production deployment",
+    );
+  }
   return {
     databaseUrl: required("DATABASE_URL"),
     port,
     host: process.env.PORTAL_HOST?.trim() || "127.0.0.1",
-    baseUrl: process.env.PORTAL_BASE_URL?.trim() || `http://localhost:${port}`,
+    baseUrl,
     sealKeyHex,
     discordClientId: process.env.DISCORD_CLIENT_ID?.trim() ?? "",
     discordClientSecret: process.env.DISCORD_CLIENT_SECRET?.trim() ?? "",
     discordBotToken: process.env.DISCORD_TOKEN?.trim() ?? "",
     blossomServer: process.env.BLOSSOM_SERVER?.trim() ?? "",
-    devLogin: process.env.PORTAL_DEV_LOGIN === "1",
+    devLogin,
     inviteBaseUrl: process.env.INVITE_BASE_URL?.trim() || "https://armada.buzz",
     importRelays: (process.env.IMPORT_DEFAULT_RELAYS ?? "")
       .split(",")

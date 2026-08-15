@@ -101,7 +101,7 @@ Portal:
 | `PORTAL_BASE_URL` | Public origin, used for OAuth redirects and to decide whether cookies are `Secure`. |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | OAuth application credentials. |
 | `DISCORD_TOKEN` | Bot token. Without it, bridges cannot go live. |
-| `PORTAL_DEV_LOGIN` | `1` enables the fake-session login. Never set in production. |
+| `PORTAL_DEV_LOGIN` | `1` enables the fake-session login, which hands any anonymous caller a session. The portal refuses to boot with it set when `PORTAL_BASE_URL` is `https:` or `NODE_ENV=production`. |
 | `BLOSSOM_SERVER` | Attachment re-hosting target; empty leaves CDN links. |
 | `INVITE_BASE_URL` | Cosmetic base for minted invite URLs. |
 | `IMPORT_DEFAULT_RELAYS` | Comma-separated relays for imported communities. |
