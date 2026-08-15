@@ -21,7 +21,7 @@ import { ConcordClient, hasProxyTag } from "./concord/client";
 import type { RelayLike } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { PuppetCache } from "./puppets";
-import { BridgeRouter, MemoryMappingStore, applyCustomEmoji, escapeMarkdown, fallbackProfile, reactionEmoji, resolveGifVariant } from "./router";
+import { BridgeRouter, MemoryMappingStore, applyCustomEmoji, concordCustomEmojiToDiscord, escapeMarkdown, fallbackProfile, reactionEmoji, resolveGifVariant } from "./router";
 import type { ChannelLink, DiscordInboundMessage, RouterOptions } from "./router";
 
 const MASTER = "ab".repeat(32);
@@ -805,6 +805,27 @@ describe("custom emoji round-trip", () => {
     expect(
       applyCustomEmoji("hm :blob:", [["emoji", "blob", "https://example.com/blob.png"]]),
     ).toBe("hm :blob:");
+  });
+
+  it("refuses an emoji tag whose URL only mentions the CDN", () => {
+    // The old test was a substring match anywhere in the string.
+    const smuggled = "https://evil.example/?x=cdn.discordapp.com/emojis/1.png";
+    expect(applyCustomEmoji("hm :blob:", [["emoji", "blob", smuggled]])).toBe("hm :blob:");
+    expect(concordCustomEmojiToDiscord([["emoji", "blob", smuggled]])).toBeUndefined();
+    expect(
+      concordCustomEmojiToDiscord([["emoji", "blob", "http://cdn.discordapp.com.evil.test/emojis/1.png"]]),
+    ).toBeUndefined();
+  });
+
+  // The bound that the unicode path got in 0def35b and the fallback beside it
+  // did not: this string ends up in a Discord API path.
+  it("refuses an emoji name Discord would never have issued", () => {
+    const cdn = "https://cdn.discordapp.com/emojis/1.png";
+    expect(concordCustomEmojiToDiscord([["emoji", "A".repeat(60_000), cdn]])).toBeUndefined();
+    expect(concordCustomEmojiToDiscord([["emoji", "not a name", cdn]])).toBeUndefined();
+    expect(concordCustomEmojiToDiscord([["emoji", "x", cdn]])).toBeUndefined();
+    expect(concordCustomEmojiToDiscord([["emoji", "pepe", cdn]])).toBe("pepe:1");
+    expect(applyCustomEmoji(":x:", [["emoji", "A".repeat(60_000), cdn]])).toBe(":x:");
   });
 
   it("mirrors an Armada message with a Discord-CDN emoji tag as native markup", async () => {

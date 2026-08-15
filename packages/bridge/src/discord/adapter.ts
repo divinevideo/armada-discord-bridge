@@ -303,9 +303,16 @@ export class DiscordAdapter implements WebhookSender {
     await message.react(emoji);
   }
 
-  /** WebhookSender: remove the bot's own reaction (custom emoji resolve by id). */
+  /**
+   * WebhookSender: remove the bot's own reaction (custom emoji resolve by id).
+   *
+   * The name half is bounded even though it is discarded: this value is read
+   * back out of the mapping row, and rows written before the sender validated
+   * emoji names can hold anything. `.+` against a 60KB string is a quadratic
+   * backtrack for a capture we do not use.
+   */
   async unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
-    const custom = /^.+:(\d+)$/.exec(emoji);
+    const custom = /^\w{2,32}:(\d{1,25})$/.exec(emoji);
     if (custom) emoji = custom[1];
     const channel = await this.textChannel(link.discordChannelId);
     const message = await channel.messages.fetch(discordMessageId);

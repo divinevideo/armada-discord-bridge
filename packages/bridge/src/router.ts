@@ -145,11 +145,14 @@ export interface RouterOptions {
 export const MAX_BLOB_BYTES = 10 * 1024 * 1024;
 
 /**
- * Blobs downloaded per inbound rumor. Discord accepts 10 attachments per
+ * Download ATTEMPTS per inbound rumor. Discord accepts 10 attachments per
  * message, so anything past this could never be sent anyway — but the tag
  * count is attacker-chosen and the downloads used to run before the send was
  * attempted, which made one rumor with a few hundred `imeta` tags into a few
  * gigabytes of buffering and a few hundred outbound requests.
+ *
+ * Counting attempts rather than successes is the whole point: a cap on
+ * successes is no cap at all against URLs chosen to fail.
  */
 const MAX_IMETA_DOWNLOADS = 10;
 
@@ -213,6 +216,35 @@ export function discordEmojiUrl(id: string, animated: boolean): string {
 }
 
 /**
+ * Discord's own rule for a custom-emoji name. Both directions validate against
+ * it, because on the way back to Discord the shortcode goes into an API PATH:
+ * a kind 7 whose emoji tag named itself with 60KB of text put all 60KB into
+ * `PUT /channels/…/reactions/{emoji}/@me`. This is the same bound the unicode
+ * path already had — the `??` fallback beside it simply never got one.
+ */
+const EMOJI_NAME_RE = /^\w{2,32}$/;
+
+/**
+ * The emoji id in a Discord CDN URL, or undefined if the URL is not one.
+ *
+ * Parsed rather than substring-matched: the old test looked for
+ * `cdn.discordapp.com/emojis/<digits>.` ANYWHERE in the string, so
+ * `https://evil.example/?x=cdn.discordapp.com/emojis/1.` passed and a foreign
+ * host got to name the emoji Discord would be asked about.
+ */
+function discordEmoji(raw: string): { id: string; animated: boolean } | undefined {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== "https:" || url.hostname !== "cdn.discordapp.com") return undefined;
+  const match = /^\/emojis\/(\d{1,25})\.(\w+)$/.exec(url.pathname);
+  return match ? { id: match[1], animated: match[2] === "gif" } : undefined;
+}
+
+/**
  * Custom emoji in raw Discord content (`<:name:id>` / `<a:name:id>`) ->
  * NIP-30 `["emoji", shortcode, url]` tags, one per distinct shortcode. The
  * transform flattens the markup to `:name:`; these tags let Armada render
@@ -240,10 +272,10 @@ export function applyCustomEmoji(content: string, tags: string[][]): string {
   let out = content;
   for (const tag of tags) {
     if (tag[0] !== "emoji" || !tag[1] || !tag[2]) continue;
-    const match = /cdn\.discordapp\.com\/emojis\/(\d+)\.(\w+)/.exec(tag[2]);
-    if (!match) continue;
-    const animated = match[2] === "gif" ? "a" : "";
-    out = out.split(`:${tag[1]}:`).join(`<${animated}:${tag[1]}:${match[1]}>`);
+    if (!EMOJI_NAME_RE.test(tag[1])) continue;
+    const emoji = discordEmoji(tag[2]);
+    if (!emoji) continue;
+    out = out.split(`:${tag[1]}:`).join(`<${emoji.animated ? "a" : ""}:${tag[1]}:${emoji.id}>`);
   }
   return out;
 }
@@ -256,8 +288,8 @@ export function applyCustomEmoji(content: string, tags: string[][]): string {
 export function concordCustomEmojiToDiscord(tags: string[][]): string | undefined {
   const tag = tags.find((t) => t[0] === "emoji" && t[1] && t[2]);
   if (!tag) return undefined;
-  const match = /cdn\.discordapp\.com\/emojis\/(\d+)\./.exec(tag[2]);
-  return match ? `${tag[1]}:${match[1]}` : undefined;
+  const emoji = discordEmoji(tag[2]);
+  return emoji && EMOJI_NAME_RE.test(tag[1]) ? `${tag[1]}:${emoji.id}` : undefined;
 }
 
 export interface ProfileResolver {
@@ -841,9 +873,14 @@ export class BridgeRouter {
     if (!blobs) return undefined;
     const files: Array<{ name: string; data: Uint8Array }> = [];
     const urls: string[] = [];
+    // ATTEMPTS, not successes. Bounding `files.length` bounded only the happy
+    // path: every download that 404s, refuses the connection or simply never
+    // answers leaves the count untouched, so a rumor carrying a few thousand
+    // dead imeta tags still made a few thousand sequential outbound requests.
+    let attempted = 0;
     for (const tag of chat.tags) {
       if (tag[0] !== "imeta") continue;
-      if (files.length >= MAX_IMETA_DOWNLOADS) break;
+      if (attempted >= MAX_IMETA_DOWNLOADS) break;
       const fields = new Map(tag.slice(1).map((f) => [f.split(" ")[0], f.slice(f.indexOf(" ") + 1)]));
       const url = fields.get("url");
       if (!url) continue;
@@ -853,6 +890,7 @@ export class BridgeRouter {
       // oversized.
       const size = Number(fields.get("size") ?? 0);
       if (size > MAX_BLOB_BYTES) continue; // stays a link in the content
+      attempted++;
       try {
         const { data, mime } = await blobs.download(url, MAX_BLOB_BYTES);
         const name = new URL(url).pathname.split("/").pop() || `file.${(mime.split("/")[1] ?? "bin").split("+")[0]}`;
