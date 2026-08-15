@@ -451,6 +451,23 @@ app.post("/api/auth/logout", async (c) => {
   return c.json({ ok: true });
 });
 
+/**
+ * Sign out everywhere: drops every session for this Discord account.
+ *
+ * The popup handoff releases a session token to whoever polls the nonce, and
+ * plants no cookie in the browser that ran the login — so a token collected by
+ * someone else names a session its owner cannot reach with /logout, which only
+ * ever destroys the one presenting the request. Without this there is no way
+ * to take such a session back before it expires on its own a week later.
+ */
+app.post("/api/auth/revoke-all", async (c) => {
+  const session = await requireSession(c, sessions);
+  if (!session) return c.json({ error: "unauthorized" }, 401);
+  const revoked = await sessions.revokeAllForUser(c, session.user.id);
+  console.log(`portal: revoked ${revoked} session(s) for one account`);
+  return c.json({ ok: true, revoked });
+});
+
 app.get("/api/me", async (c) => {
   const session = await sessions.get(c);
   const discordConfigured = Boolean(env.discordClientId && env.discordClientSecret);

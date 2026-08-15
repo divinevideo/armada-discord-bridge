@@ -59,6 +59,16 @@ export function App() {
             <button className="ghost" onClick={() => void api("/api/auth/logout", { method: "POST" }).then(refresh)}>
               Sign out
             </button>
+            <button
+              className="ghost"
+              title="Ends every session for this account, on every device — including this one."
+              onClick={() => {
+                if (!confirm("Sign out of every session for this account, on all devices?")) return;
+                void api<{ revoked: number }>("/api/auth/revoke-all", { method: "POST" }).then(refresh);
+              }}
+            >
+              Sign out everywhere
+            </button>
           </div>
         </header>
       )}

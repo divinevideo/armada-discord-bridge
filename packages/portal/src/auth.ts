@@ -289,6 +289,32 @@ export class Sessions {
     setCookie(c, COOKIE, "", { path: "/", expires: new Date(0) });
   }
 
+  /**
+   * Drop every session belonging to a Discord user, the caller's included.
+   *
+   * {@link destroy} can only reach the session presenting the request, which
+   * leaves one case with no remedy at all: the popup handoff hands its token
+   * to whoever polls the nonce, and deliberately plants no cookie in the
+   * browser that ran the login (see the callback in index.ts). A token
+   * collected by someone else therefore names a session its owner holds no
+   * reference to and cannot name — it would simply run its seven days out.
+   * This is the recovery path for that, and for the ordinary "signed in on a
+   * machine I no longer have" case.
+   *
+   * Deliberately unsparing: it takes the calling session too, so the answer to
+   * "did I get them all" is yes without the caller having to reason about
+   * which token they are holding. Re-login is one click.
+   *
+   * `user.id` is not indexed — this is a rare, deliberate action, and indexing
+   * it would put a write on the hot path of a table anyone can grow.
+   */
+  async revokeAllForUser(c: Context, discordUserId: string): Promise<number> {
+    const rows = await this.sql`
+      DELETE FROM portal_sessions WHERE data->'user'->>'id' = ${discordUserId} RETURNING sid`;
+    setCookie(c, COOKIE, "", { path: "/", expires: new Date(0) });
+    return rows.length;
+  }
+
   async sweep(): Promise<void> {
     await this.sql`DELETE FROM portal_sessions WHERE expires_at <= now()`;
   }

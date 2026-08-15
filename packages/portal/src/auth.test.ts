@@ -50,6 +50,7 @@ function harness(sessions: Sessions) {
     await sessions.destroy(c);
     return c.json({ ok: true });
   });
+  app.get("/revoke-all", async (c) => c.json({ revoked: await sessions.revokeAllForUser(c, USER) }));
   const me = async (headers: Record<string, string>) =>
     ((await (await app.request("/me", { headers })).json()) as { session: SessionData | null }).session;
   return {
@@ -57,6 +58,12 @@ function harness(sessions: Sessions) {
     me: (sid: string) => me({ Authorization: `Bearer ${sid}` }),
     meByCookie: (sid: string) => me({ Cookie: `portal_sid=${sid}` }),
     logout: (sid: string) => app.request("/logout", { headers: { Authorization: `Bearer ${sid}` } }),
+    revokeAll: async (sid: string): Promise<number> =>
+      (
+        (await (
+          await app.request("/revoke-all", { headers: { Authorization: `Bearer ${sid}` } })
+        ).json()) as { revoked: number }
+      ).revoked,
   };
 }
 
@@ -168,6 +175,21 @@ describe.skipIf(!dbUp)("Sessions", () => {
     await h.logout(sid);
     expect(await h.me(sid)).toBeNull();
     expect(await rowFor(sid)).toBeUndefined();
+  });
+
+  // Last: it takes every session this suite made, by design.
+  it("revoke-all reaches a session the caller holds no reference to", async () => {
+    const mine = await h.create();
+    // The popup-handoff shape: a token released to a poller, with no cookie in
+    // the browser that ran the login. /logout cannot name it; this must.
+    const elsewhere = await h.create();
+    expect(await h.me(elsewhere)).not.toBeNull();
+
+    const revoked = await h.revokeAll(mine);
+    expect(revoked).toBeGreaterThanOrEqual(2);
+    expect(await h.me(elsewhere)).toBeNull();
+    // Unsparing: the calling session goes too, so "did I get them all" is yes.
+    expect(await h.me(mine)).toBeNull();
   });
 });
 
