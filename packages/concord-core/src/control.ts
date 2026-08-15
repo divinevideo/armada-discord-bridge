@@ -50,6 +50,7 @@ import {
   VSK_ROLE,
 } from "./kinds";
 import {
+  canActOnMember,
   canActOnPosition,
   emptyRoles,
   grantFromJSON,
@@ -534,20 +535,44 @@ function headCandidates(
   return ordered;
 }
 
-/** Pick the first candidate passing `gate`; record it as the entity's head. */
+/**
+ * Pick the first candidate passing `gate`; record it as the entity's head.
+ *
+ * `rankOf` breaks an equal-version tie by authority, and every gated entity
+ * passes it. Without it the tie fell to the candidate order, whose last term is
+ * the rumor id — a hash of content the publisher chooses, so it can be ground.
+ * That let any holder of the relevant bit fork the owner's edition at the same
+ * version and mine an id that sorted first: a community's name or a channel's
+ * definition overwritten indefinitely, by someone who could not have replaced
+ * that edition on authority. `authorizeDelegation` already orders roles and
+ * grants this way; this is the same rule for the entities it does not cover.
+ *
+ * Only the tie is affected. Version ordering, the refuse-to-downgrade floor and
+ * the gap rules are settled in `headCandidates` before anything gets here.
+ */
 function pickHead(
   candidates: ParsedEdition[],
   heads: Map<string, EntityHead>,
   headEditions: Map<string, ParsedEdition>,
   gate: (p: ParsedEdition) => boolean,
+  rankOf: (author: string) => number,
 ): ParsedEdition | undefined {
+  let head: ParsedEdition | undefined;
   for (const p of candidates) {
     if (!gate(p)) continue;
-    heads.set(bytesToHex(p.entityId), { version: p.version, hash: p.selfHash });
-    headEditions.set(bytesToHex(p.entityId), p);
-    return p;
+    if (head === undefined) {
+      head = p;
+      continue;
+    }
+    // Candidates arrive version-descending, so once the version drops below the
+    // first passing one there is nothing left that could outrank it.
+    if (p.version !== head.version) break;
+    if (rankOf(p.author) < rankOf(head.author)) head = p;
   }
-  return undefined;
+  if (head === undefined) return undefined;
+  heads.set(bytesToHex(head.entityId), { version: head.version, hash: head.selfHash });
+  headEditions.set(bytesToHex(head.entityId), head);
+  return head;
 }
 
 /** Order role/grant candidates oldest version first (the admissibility walk). */
@@ -1052,6 +1077,10 @@ function foldOnce(
   const citationOk = (p: ParsedEdition): boolean =>
     citationSatisfied({ heads, ownerHex }, communityId, p.author, p.authority);
 
+  /** Authority order for equal-version tiebreaks: owner first, then position. */
+  const rankOf = (author: string): number =>
+    author === ownerHex ? -1 : (highestPosition(roster, author) ?? Number.MAX_SAFE_INTEGER);
+
   // 3. Metadata (vsk 0): must be the community's own entity + an authorized actor.
   let metadata: CommunityMetadata | undefined;
   {
@@ -1069,7 +1098,7 @@ function foldOnce(
       } catch {
         return false;
       }
-    });
+    }, rankOf);
     if (head) {
       const parsed = JSON.parse(head.content) as CommunityMetadata;
       metadata = {
@@ -1094,7 +1123,7 @@ function foldOnce(
         return false;
       }
     };
-    const head = pickHead(candidates, heads, headEditions, channelGate);
+    const head = pickHead(candidates, heads, headEditions, channelGate, rankOf);
     if (!head) continue;
     const meta = normalizeChannelMetadata(JSON.parse(head.content) as ChannelMetadata);
     // CORD-03 §2: "Deletion is terminal: the id is never reused, clients drop
@@ -1132,45 +1161,99 @@ function foldOnce(
   {
     const eid = bytesToHex(banlistLocator(communityId));
     const candidates = candidatesOf(VSK_BANLIST).get(eid) ?? [];
-    const banlistGate = (p: ParsedEdition): boolean => {
-      if (!isAuthorized(roster, p.author, ownerHex, Permissions.BAN)) return false;
-      if (!citationOk(p)) return false;
-      try {
-        return Array.isArray(JSON.parse(p.content));
-      } catch {
-        return false;
-      }
-    };
-    const head = pickHead(candidates, heads, headEditions, banlistGate);
-    if (head) {
-      for (const pk of JSON.parse(head.content) as unknown[]) {
-        if (typeof pk === "string" && /^[0-9a-f]{64}$/i.test(pk)) banned.add(pk.toLowerCase());
-      }
-    }
-    // Ban history (for phantom-member suppression, see FoldedControl.bannedAt):
-    // the newest AUTHORIZED edition that named each npub. Same gate as the head,
-    // so a forged banlist can't backdate-suppress a legit member. `createdAt` is
-    // seconds. Editions span every held epoch, so the history is as complete as
-    // the reader's key set — which, by the compaction correlation, is exactly
-    // whenever they also hold the stale Join that would otherwise phantom.
-    for (const p of candidates) {
-      if (!banlistGate(p)) continue;
+    /** The npubs an edition names, normalized; undefined if it is not a list. */
+    const parseList = (p: ParsedEdition): string[] | undefined => {
       let list: unknown;
       try {
         list = JSON.parse(p.content);
       } catch {
-        continue;
+        return undefined;
       }
-      if (!Array.isArray(list)) continue;
-      for (const pk of list) {
-        if (typeof pk !== "string" || !/^[0-9a-f]{64}$/i.test(pk)) continue;
-        const k = pk.toLowerCase();
-        // The owner is never bannable (parity with foldControlState's `banned`
-        // filter): an authorized moderator listing the owner must not durably
-        // suppress them from the roster past the unban.
-        if (k === ownerHex) continue;
-        const prev = bannedAt.get(k);
-        if (prev === undefined || p.createdAt > prev) bannedAt.set(k, p.createdAt);
+      if (!Array.isArray(list)) return undefined;
+      return list
+        .filter((pk): pk is string => typeof pk === "string" && /^[0-9a-f]{64}$/i.test(pk))
+        .map((pk) => pk.toLowerCase());
+    };
+
+    /**
+     * Holding BAN is not authority over everyone. Banning is acting on a
+     * member, so it takes the bit AND a strict outrank — the same rule kicks
+     * go through (`canKick`) and grants go through (the standing-rank walk).
+     * The gate used to ask only for the bit, which let a stock Moderator, who
+     * holds BAN at position 2, publish a list naming every position-1 Admin
+     * and have every client honor it: the admins land in `banned`, and the
+     * re-fold below then drops all of THEIR editions too. `canActOnMember`
+     * also refuses the owner as a target, so supremacy needs no special case.
+     */
+    const entitled = (author: string, pk: string): boolean =>
+      canActOnMember(roster, author, ownerHex, pk, Permissions.BAN);
+
+    const wellFormed = (p: ParsedEdition): boolean =>
+      isAuthorized(roster, p.author, ownerHex, Permissions.BAN) && citationOk(p) && parseList(p) !== undefined;
+
+    /**
+     * Equal-version fork siblings, highest authority first — the same ordering
+     * `authorizeDelegation` applies to roles and grants, for the same reason.
+     * The rumor id is a hash of content the publisher chooses, so a sibling
+     * that ties on version can be ground until it sorts first; rank cannot.
+     */
+    const banlistAuthorityFirst = (a: ParsedEdition, b: ParsedEdition): number => {
+      const ra = rankOf(a.author);
+      const rb = rankOf(b.author);
+      if (ra !== rb) return ra - rb;
+      const ia = bytesToHex(a.rumorId);
+      const ib = bytesToHex(b.rumorId);
+      return ia < ib ? -1 : ia > ib ? 1 : 0;
+    };
+
+    /**
+     * Walk the versions ascending, carrying the standing list, and decide each
+     * edition against the state it inherits rather than against nothing.
+     *
+     * Two things fall out that a head-only rule cannot express. An author the
+     * standing list already bans is not admissible, which is what stops a
+     * banned moderator who still holds BAN from publishing the next version
+     * without themselves in it — the ban does not strip the bit, so under the
+     * old rule the unban was simply the newest authorized edition and won.
+     * And an edition rewrites only the entries its author is entitled to:
+     * everything else is carried over, so "the list replaces entire" can no
+     * longer be used to lift a ban its author could never have issued.
+     */
+    const standingAt = new Map<ParsedEdition, Set<string>>();
+    const admissible = new Set<ParsedEdition>();
+    let standing = new Set<string>();
+    for (const group of versionGroups(candidates.map((parsed) => ({ parsed })))) {
+      for (const { parsed: p } of [...group].sort((a, b) => banlistAuthorityFirst(a.parsed, b.parsed))) {
+        if (!wellFormed(p) || standing.has(p.author)) continue;
+        const named = new Set(parseList(p)!.filter((pk) => entitled(p.author, pk)));
+        for (const pk of standing) if (!entitled(p.author, pk)) named.add(pk);
+        standing = named;
+        standingAt.set(p, named);
+        admissible.add(p);
+        break;
+      }
+    }
+
+    // The head is still chosen by the existing ordering — the chain decides it,
+    // not the version number alone — so the list is read from the state as of
+    // whichever edition that is, not from the walk's last step.
+    const head = pickHead(candidates, heads, headEditions, (p) => admissible.has(p), rankOf);
+    if (head) for (const pk of standingAt.get(head) ?? []) banned.add(pk);
+
+    // Ban history (for phantom-member suppression, see FoldedControl.bannedAt):
+    // the newest ADMISSIBLE edition that named each npub, counting only the
+    // names its author was entitled to name. Same rules as the head, so a
+    // forged or over-reaching banlist can't backdate-suppress a legit member.
+    // `createdAt` is seconds. Editions span every held epoch, so the history is
+    // as complete as the reader's key set — which, by the compaction
+    // correlation, is exactly whenever they also hold the stale Join that would
+    // otherwise phantom.
+    for (const p of candidates) {
+      if (!admissible.has(p)) continue;
+      for (const pk of parseList(p)!) {
+        if (!entitled(p.author, pk)) continue;
+        const prev = bannedAt.get(pk);
+        if (prev === undefined || p.createdAt > prev) bannedAt.set(pk, p.createdAt);
       }
     }
   }
@@ -1191,7 +1274,7 @@ function foldOnce(
       } catch {
         return false;
       }
-    });
+    }, rankOf);
     if (!head) continue;
     const list = (JSON.parse(head.content) as unknown[]).filter(
       (s): s is string => typeof s === "string" && /^[0-9a-f]{64}$/i.test(s),
@@ -1208,7 +1291,7 @@ function foldOnce(
     const head = pickHead(candidates, heads, headEditions, (p) => {
       if (!isAuthorized(roster, p.author, ownerHex, Permissions.PIN_MESSAGES)) return false;
       return citationOk(p);
-    });
+    }, rankOf);
     if (!head) continue;
     pinLists.set(eid, { content: head.content, author: head.author });
   }

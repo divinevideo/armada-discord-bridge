@@ -46,6 +46,15 @@ FILES=(
 # nip44keys.ts and two more deps, and the bridge folds Pin Lists but never
 # renders them). Drop that one line and its `./pins` import after syncing.
 #
+# The Banlist section of control.ts was fixed here first — a moderator could
+# ban every admin above them, a banned BAN holder could publish the version
+# that unbanned them, and equal-version forks were decided on the grindable
+# rumor id. The same fix now lives upstream, so the two are byte-identical and
+# a sync is a no-op there rather than a silent revert. `controlBanlist.test.ts`
+# is not vendored and pins the behaviour from this side; upstream's own
+# control.test.ts covers it too, and once a sync has brought those down the
+# local file is duplicate coverage and can go.
+#
 # Excluded, and kept as this repo's own: `protocol.test.ts` (bridge-specific),
 # `chat.test.ts` and `directInvite.test.ts` (they need client test infra —
 # @nostrify/indexeddb, a bolt11 mock, vitest's importOriginal mocking — and
