@@ -1195,6 +1195,23 @@ export class Importer {
 
     for (const channel of plan.channels) {
       if (!channel.selected || !channel.bridge || !channel.bridgeable || channel.bridgeId) continue;
+
+      // A channel someone already bridged by hand: one live bridge per Discord
+      // channel is a database invariant, so activating a second would throw
+      // and take the whole import down with it. Note it and move on — the
+      // owner can unlink the old bridge and re-run if they meant to replace it.
+      const [claimed] = await this.sql<{ bridge_id: string }[]>`
+        SELECT bridge_id FROM bridges
+         WHERE discord_channel_id = ${channel.discordId}
+           AND status IN ('pending_confirm', 'active')`;
+      if (claimed) {
+        channel.bridgeSkipped = "another bridge already mirrors this Discord channel";
+        await this.sql`
+          UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
+          WHERE import_id = ${importId}`;
+        continue;
+      }
+
       const [bridge] = await this.sql<BridgeRow[]>`
         INSERT INTO bridges (owner_discord_id, status, invite_url_sealed, community_id, community_name,
                              discord_guild_id, discord_channel_id, concord_channel_id)

@@ -80,6 +80,15 @@ function fakeSql(store: { imports: Map<string, Record<string, unknown>>; bridges
     if (text.startsWith("SELECT 1 FROM messages")) {
       return []; // nothing pre-imported in tests
     }
+    // One live bridge per Discord channel: wireBridges skips a channel someone
+    // already bridged rather than tripping the unique index mid-import.
+    if (text.startsWith("SELECT bridge_id FROM bridges")) {
+      const channelId = next();
+      return store.bridges.filter(
+        (b) =>
+          b.discord_channel_id === channelId && (b.status === "active" || b.status === "pending_confirm"),
+      );
+    }
     if (text.startsWith("SELECT status FROM bridges")) {
       const guildId = next();
       const communityId = next();

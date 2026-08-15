@@ -102,6 +102,12 @@ export interface PlannedChannel {
   publishedAt?: number;
   /** Set once a bridges row was created and activated for this channel. */
   bridgeId?: string;
+  /**
+   * Why a live bridge was asked for but not wired. One live bridge per Discord
+   * channel is a database invariant (migration 017), so a channel someone had
+   * already bridged by hand is skipped here rather than aborting the import.
+   */
+  bridgeSkipped?: string;
 }
 
 export interface PlannedRole {

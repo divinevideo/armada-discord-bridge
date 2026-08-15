@@ -607,6 +607,33 @@ app.post("/api/bridges/:id/link", async (c) => {
   const authority = await guildAuthority(c, session, body.guildId);
   if (!authority.ok) return c.json({ error: authority.error }, authority.status);
 
+  // Authority over `guildId` says nothing about `channelId`: a channel id is
+  // not a claim about the guild it lives in, and both arrive in the same body.
+  // Without tying them together, someone links a bridge naming a throwaway
+  // guild they own and a channel id lifted from a server they do not — ids are
+  // not secret — then confirms it from their own community, where they are the
+  // owner. One shared bot serves every tenant and BridgeManager routes on the
+  // channel id alone, so that mirrors a stranger's channel into their
+  // community and lets them post into it through the webhook.
+  if (!env.discordBotToken) return c.json({ error: "bot token not configured" }, 501);
+  const guildChannels = await botGuildTextChannels(env.discordBotToken, body.guildId);
+  if (!guildChannels) {
+    return c.json({ error: "the bot is not in that guild" }, 409);
+  }
+  if (!guildChannels.some((ch) => ch.id === body.channelId)) {
+    return c.json({ error: "that channel is not in that guild" }, 403);
+  }
+  // Second live bridge on one channel: last writer would win `byDiscordChannel`
+  // and steal the channel from the bridge already mirroring it. A unique index
+  // (migration 017) is the backstop for the race between two of these checks;
+  // this is here to answer with a 409 rather than a constraint violation.
+  const [taken] = await sql<{ bridge_id: string }[]>`
+    SELECT bridge_id FROM bridges
+     WHERE discord_channel_id = ${body.channelId}
+       AND status IN ('pending_confirm', 'active')
+       AND bridge_id <> ${row.bridge_id}`;
+  if (taken) return c.json({ error: "that channel is already bridged" }, 409);
+
   await sql`
     UPDATE bridges SET discord_guild_id = ${body.guildId}, discord_channel_id = ${body.channelId},
       concord_channel_id = ${body.concordChannelId}, updated_at = now()
