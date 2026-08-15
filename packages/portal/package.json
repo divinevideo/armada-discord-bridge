@@ -13,7 +13,7 @@
     "@armada-bridge/bridge": "*",
     "@armada-bridge/concord-core": "*",
     "@noble/hashes": "^1.8.0",
-    "hono": "^4.6.0",
+    "hono": "^4.13.2",
     "nostr-tools": "^2.13.0",
     "postgres": "^3.4.5"
   },
