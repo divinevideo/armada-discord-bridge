@@ -133,6 +133,36 @@ describe.skipIf(!dbUp)("Sessions", () => {
     expect((await h.me(minted))?.user.username).toBe("pending");
   });
 
+  it("approveHandoff spends the callback page's token, once", async () => {
+    const sid = await h.create();
+    const approval = "9f".repeat(24);
+    const pending = data({
+      claimNonce: "cafebabe",
+      claimApproval: hashOf(approval),
+      user: { id: USER, username: "awaiting-click" },
+    });
+    const minted = await sessions.rotate(hashOf(sid), pending, true);
+
+    // Before the click there is nothing for the poller to act on.
+    expect((await sessions.findByClaimNonce("cafebabe"))?.data.claimApproved).toBeUndefined();
+    // The raw token is never in the row — only its hash can be looked up.
+    expect(JSON.stringify((await rowFor(minted)).data)).not.toContain(approval);
+
+    expect(await sessions.approveHandoff(approval)).toBe(true);
+    const found = await sessions.findByClaimNonce("cafebabe");
+    expect(found?.data.claimApproved).toBe(true);
+    expect(found?.data.claimApproval).toBeUndefined();
+    // Single-use: a replayed click finds no run to approve.
+    expect(await sessions.approveHandoff(approval)).toBe(false);
+    // The rest of the session is untouched by the jsonb surgery.
+    expect(found?.data.user.username).toBe("awaiting-click");
+    expect((await h.me(minted))?.accessToken).toBe(TOKEN);
+  });
+
+  it("approveHandoff refuses a token that names no run", async () => {
+    expect(await sessions.approveHandoff("01".repeat(24))).toBe(false);
+  });
+
   it("destroy removes the row", async () => {
     const sid = await h.create();
     await h.logout(sid);

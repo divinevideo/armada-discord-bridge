@@ -57,8 +57,21 @@ export interface SessionData {
    * postMessage handoff cannot be relied on. The opener instead polls
    * `/api/auth/claim` with this nonce; the first claim after the callback
    * completes returns the session token and spends the nonce.
+   *
+   * The nonce is chosen by whoever composed the auth-start URL, which is the
+   * reason for the two fields below. See `/api/auth/claim` in index.ts.
    */
   claimNonce?: string;
+  /**
+   * SHA-256 of the one-time token embedded in the callback page, which the
+   * Connect button spends to make the handoff collectable. Present only
+   * between the callback and that click.
+   */
+  claimApproval?: string;
+  /** Set by that click. Until it is, `/api/auth/claim` reports pending. */
+  claimApproved?: boolean;
+  /** When the popup run started (epoch ms), so the handoff can go stale. */
+  claimStartedAt?: number;
   /**
    * OAuth bearer, kept so `guildAuthority` can re-read the manageable-guild
    * list from Discord rather than trusting the snapshot taken at login.
@@ -226,6 +239,21 @@ export class Sessions {
       data: this.fromStored(row.data as SessionData)!,
       expires: new Date(row.expires_at as string),
     };
+  }
+
+  /**
+   * Spend the callback page's one-time approval token, marking the popup
+   * handoff collectable. Returns false if the token names no run, or names one
+   * that was already approved — a single statement, so two clicks race in
+   * Postgres rather than in a read-modify-write.
+   */
+  async approveHandoff(approvalToken: string): Promise<boolean> {
+    const rows = await this.sql`
+      UPDATE portal_sessions
+      SET data = jsonb_set(data - 'claimApproval', '{claimApproved}', 'true')
+      WHERE data->>'claimApproval' = ${hashSid(approvalToken)} AND expires_at > now()
+      RETURNING sid`;
+    return rows.length > 0;
   }
 
   /** The completed-or-pending OAuth run named by a claim nonce. */

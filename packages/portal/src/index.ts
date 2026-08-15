@@ -4,7 +4,7 @@
  * proxies /api here; in prod this serves web/dist directly.
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { migrate } from "@armada-bridge/bridge/src/db/migrate";
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -89,6 +89,20 @@ const GUILD_AUTHORITY_TTL_MS = 5 * 60_000;
 /** Popup handoff nonce: client-generated, so hold it to 128 bits or better. */
 const CLAIM_NONCE_RE = /^[0-9a-f]{32,64}$/i;
 
+/**
+ * How long a popup handoff stays collectable, measured from auth-start.
+ *
+ * The opener is polling in real time, so minutes is generous. A run that is
+ * never collected currently sits there for the session's whole seven days,
+ * which is seven days in which a stashed token is one leaked nonce from being
+ * spent.
+ */
+const CLAIM_WINDOW_MS = 10 * 60_000;
+
+/** For the one server-rendered page in the codebase (the popup callback). */
+const escapeHtml = (text: string): string =>
+  text.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+
 const toSessionGuilds = (guilds: OAuthGuild[]): SessionGuild[] =>
   guilds.map((g) => ({
     id: g.id,
@@ -150,9 +164,18 @@ app.get("/api/auth/discord", async (c) => {
   }
   const nonce = c.req.query("nonce");
   // 128 bits minimum: whoever knows the nonce collects the session token, and
-  // the poll that spends it is necessarily unauthenticated.
+  // the poll that spends it is necessarily unauthenticated. Entropy is not the
+  // property that matters, though — the nonce arrives in the URL, so the
+  // author of that URL knows it without guessing. See the claim route.
   const claimNonce = popupOrigin && nonce && CLAIM_NONCE_RE.test(nonce) ? nonce.toLowerCase() : undefined;
-  await sessions.create(c, { user: { id: "", username: "" }, guilds: [], oauthState: state, popupOrigin, claimNonce });
+  await sessions.create(c, {
+    user: { id: "", username: "" },
+    guilds: [],
+    oauthState: state,
+    popupOrigin,
+    claimNonce,
+    claimStartedAt: claimNonce ? Date.now() : undefined,
+  });
   return c.redirect(oauthUrl(env.discordClientId, redirectUri, state));
 });
 
@@ -209,7 +232,16 @@ app.get("/api/auth/discord/callback", async (c) => {
     accessToken: token,
     popupOrigin: stored.popupOrigin,
     claimNonce: stored.claimNonce,
+    claimStartedAt: stored.claimStartedAt,
   };
+  // The nonce poll is a bearer channel whose bearer was chosen by whoever
+  // composed the auth-start URL, so the callback alone must not make the token
+  // collectable: a stranger can pick a nonce, lure someone through this flow,
+  // and poll for their session from anywhere. This token exists only in the
+  // page below, in the browser that actually ran the login, and the click that
+  // spends it is the one step that browser's owner has to take deliberately.
+  const approvalToken = stored.claimNonce ? randomBytes(24).toString("hex") : undefined;
+  if (approvalToken) data.claimApproval = createHash("sha256").update(approvalToken, "utf8").digest("hex");
   // Rotate: the pre-auth id becomes an authenticated session, and the table
   // stores only hashes, so this is also where the token to hand back is
   // minted. When a nonce is in play the same token is sealed into the row for
@@ -237,18 +269,54 @@ app.get("/api/auth/discord/callback", async (c) => {
     // The only inline script in the codebase, so it gets a policy of its own:
     // a fresh nonce, and nothing else permitted to run.
     const nonce = randomBytes(16).toString("base64");
+    // `connect-src 'self'` is what lets the Connect button reach
+    // /api/auth/popup-approve; under the inherited `default-src 'none'` the
+    // fetch is blocked and the button silently does nothing.
     c.header(
       "Content-Security-Policy",
-      `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'`,
+      `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'`,
     );
-    return c.html(
-      `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
+    // postMessage stays unconditional and needs no confirmation: the browser
+    // checks targetOrigin against the receiving window's ACTUAL origin, so a
+    // hostile opener is handed nothing. It is the poll that cannot tell the
+    // two apart, and only the poll is gated.
+    const handoff = `try { window.opener && window.opener.postMessage(
+    { type: "armada-bridge-session", token: ${JSON.stringify(sid)} },
+    ${JSON.stringify(stored.popupOrigin)}); } catch (e) {}`;
+    const origin = escapeHtml(stored.popupOrigin);
+    if (!approvalToken) {
+      return c.html(
+        `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
 <body style="font:14px system-ui;padding:2rem;text-align:center">Discord connected. You can close this window.
 <script nonce="${nonce}">(function(){
-  try { window.opener && window.opener.postMessage(
-    { type: "armada-bridge-session", token: ${JSON.stringify(sid)} },
-    ${JSON.stringify(stored.popupOrigin)}); } catch (e) {}
+  ${handoff}
   window.close();
+})();</script>`,
+      );
+    }
+    return c.html(
+      `<!doctype html><meta charset="utf-8"><title>Discord connected</title>
+<body style="font:14px system-ui;padding:2rem;text-align:center">
+<p>Connect your Discord account to <b>${origin}</b>?</p>
+<p style="color:#666">Only do this if you started this login from that site.</p>
+<button id="go" style="font:inherit;padding:.6rem 1.2rem">Connect</button>
+<p id="msg"></p>
+<script nonce="${nonce}">(function(){
+  ${handoff}
+  document.getElementById("go").addEventListener("click", function(){
+    this.disabled = true;
+    fetch("/api/auth/popup-approve", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approval: ${JSON.stringify(approvalToken)} })
+    }).then(function(r){
+      if (!r.ok) throw new Error("failed");
+      document.getElementById("msg").textContent = "Connected. You can close this window.";
+      window.close();
+    }).catch(function(){
+      document.getElementById("msg").textContent = "Could not complete the connection.";
+    });
+  });
 })();</script>`,
     );
   }
@@ -256,10 +324,51 @@ app.get("/api/auth/discord/callback", async (c) => {
 });
 
 /**
+ * Approval side of the popup flow: the Connect button on the callback page.
+ *
+ * Unauthenticated by necessity — popup mode never plants a cookie — but not
+ * unauthorized: the token it spends was generated by the callback and written
+ * into that page and nowhere else, so possessing it means being the browser
+ * that just completed the login.
+ */
+app.post("/api/auth/popup-approve", async (c) => {
+  const { approval } = (await c.req.json().catch(() => ({}))) as { approval?: string };
+  if (!approval || !/^[0-9a-f]{48}$/.test(approval)) return c.json({ error: "approval required" }, 400);
+  const ok = await sessions.approveHandoff(approval);
+  if (!ok) return c.json({ error: "no pending connection" }, 404);
+  console.log("portal: popup handoff approved");
+  return c.json({ ok: true });
+});
+
+/**
  * Poll-side of the popup flow. The opener cannot count on the callback's
  * postMessage (Discord's COOP severs `window.opener` during the login
  * navigation), so it polls here with the nonce it minted. Pending until the
- * callback lands; the first successful claim spends the nonce.
+ * callback lands AND the person in front of the popup has confirmed; the first
+ * successful claim spends the nonce.
+ *
+ * The confirmation is what makes the flow safe, and it is worth being precise
+ * about why nothing cheaper works. The nonce travels in the auth-start URL, so
+ * its author knows it: a stranger picks a nonce, links a victim to
+ * `/api/auth/discord?mode=popup&origin=<allow-listed>&nonce=…`, and polls here
+ * from their own server for the session that victim's login produced. Naming
+ * an allow-listed origin is enough; controlling it is not required.
+ *
+ * Neither of the obvious fixes closes that. Minting the nonce server-side
+ * fails because the attacker can mint one too and then send the link. Binding
+ * the callback to the auth-start cookie fails because the lure makes the
+ * server set that cookie in the VICTIM's browser, for the attacker's run — the
+ * check passes and the poll still collects. An `Origin` requirement fails
+ * because a poller that is not a browser sends whatever Origin it likes.
+ *
+ * What distinguishes the honest case is that the opener is running in the same
+ * browser the login ran in. Proving that to the server needs a credential that
+ * reaches that browser AFTER the URL was composed and travels to the opener
+ * over a same-origin channel — which is a redirect back to `popupOrigin` with
+ * the token in the fragment, and a matching change in the client that reads
+ * it. Until that ships on both sides, the deliberate click stands in for it:
+ * it cannot be performed from the attacker's server, and the page names the
+ * origin being connected to.
  */
 app.post("/api/auth/claim", async (c) => {
   const { nonce } = (await c.req.json().catch(() => ({}))) as { nonce?: string };
@@ -269,7 +378,24 @@ app.post("/api/auth/claim", async (c) => {
     console.log(`portal: claim ${nonce.slice(0, 8)}…: pending (${found ? "awaiting callback" : "no session"})`);
     return c.json({ pending: true });
   }
-  const { claimNonce: _spent, ...rest } = found.data;
+  if (!found.data.claimApproved) {
+    console.log(`portal: claim ${nonce.slice(0, 8)}…: pending (awaiting confirmation in the popup)`);
+    return c.json({ pending: true });
+  }
+  const startedAt = found.data.claimStartedAt ?? 0;
+  if (Date.now() - startedAt > CLAIM_WINDOW_MS) {
+    console.warn(`portal: claim ${nonce.slice(0, 8)}…: refused, handoff window expired`);
+    return c.json({ error: "handoff expired" }, 410);
+  }
+  // Every field the handoff used goes with it: a spent run leaves no nonce to
+  // look up and no approval to re-spend.
+  const {
+    claimNonce: _spent,
+    claimApproved: _approved,
+    claimApproval: _approval,
+    claimStartedAt: _started,
+    ...rest
+  } = found.data;
   const token = await sessions.collectHandoff(found.sidHash, rest as SessionData);
   if (!token) {
     // The stash is single-use and the nonce is spent with it, so this is a
