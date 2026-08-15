@@ -56,3 +56,32 @@ export function securityHeaders(overHttps: boolean) {
     return next();
   };
 }
+
+/**
+ * Refuse state-changing requests from an origin we do not recognise, so CSRF
+ * defence does not rest on `SameSite=Lax` alone.
+ *
+ * Lax is a real control and does block cross-site POST in current browsers.
+ * But it is one layer, enforced entirely by the client, and it stops covering
+ * anything that later becomes reachable by a top-level GET or a form post.
+ * This is the server-side half of the same claim.
+ *
+ * A request with NO `Origin` header passes. Browsers always send it on these
+ * methods, so its absence means a non-browser caller — curl, or the popup
+ * handoff's server-side poller — which could never have ridden a victim's
+ * cookies to begin with. Refusing those would break real callers to defend
+ * against a shape that cannot occur. `Origin` present but unrecognised is the
+ * attack, and that is what this turns away.
+ */
+export function originGuard(baseUrl: string, allowedOrigins: readonly string[]) {
+  const self = new URL(baseUrl).origin;
+  return async (c: Context, next: Next) => {
+    if (c.req.method === "GET" || c.req.method === "HEAD" || c.req.method === "OPTIONS") return next();
+    const origin = c.req.header("Origin");
+    if (origin && origin !== self && !allowedOrigins.includes(origin)) {
+      console.warn(`portal: refused ${c.req.method} ${c.req.path} from origin ${JSON.stringify(origin)}`);
+      return c.json({ error: "origin not allowed" }, 403);
+    }
+    return next();
+  };
+}

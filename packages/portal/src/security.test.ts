@@ -9,7 +9,9 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "bun:test";
 
-import { CSP, SPA_RELAYS } from "./security";
+import { Hono } from "hono";
+
+import { CSP, SPA_RELAYS, originGuard } from "./security";
 
 const web = join(import.meta.dir, "..", "web");
 const distIndex = join(web, "dist", "index.html");
@@ -56,5 +58,49 @@ describe.skipIf(!existsSync(distIndex))("built SPA", () => {
   it("carries no inline stylesheet or event-handler attribute", () => {
     expect(html).not.toMatch(/<style\b/);
     expect(html).not.toMatch(/\son(click|load|error)=/i);
+  });
+});
+
+/**
+ * The server-side half of CSRF defence. `SameSite=Lax` blocks the same shape
+ * in the browser, but that is one control enforced by the client; these are
+ * the cases that must not depend on it.
+ */
+describe("originGuard", () => {
+  const guard = originGuard("https://bridge.armada.buzz", ["https://armada.buzz"]);
+  const app = new Hono();
+  app.use("/api/*", guard);
+  app.all("/api/x", (c) => c.json({ ok: true }));
+
+  const post = (headers: Record<string, string> = {}) =>
+    app.request("/api/x", { method: "POST", headers });
+
+  it("allows same-origin and allow-listed origins", async () => {
+    expect((await post({ Origin: "https://bridge.armada.buzz" })).status).toBe(200);
+    expect((await post({ Origin: "https://armada.buzz" })).status).toBe(200);
+  });
+
+  it("refuses a state-changing request from anywhere else", async () => {
+    for (const origin of [
+      "https://evil.example",
+      // Neighbours of the real origins: substring matching would pass these.
+      "https://armada.buzz.evil.example",
+      "https://bridge.armada.buzz.evil.example",
+      "http://bridge.armada.buzz",
+      "null",
+    ]) {
+      expect((await post({ Origin: origin })).status).toBe(403);
+    }
+  });
+
+  it("allows a caller that sends no Origin at all", async () => {
+    // Browsers always send Origin on POST, so this is a non-browser client —
+    // which never had a victim's cookies to ride in the first place.
+    expect((await post()).status).toBe(200);
+  });
+
+  it("leaves reads alone", async () => {
+    const res = await app.request("/api/x", { headers: { Origin: "https://evil.example" } });
+    expect(res.status).toBe(200);
   });
 });

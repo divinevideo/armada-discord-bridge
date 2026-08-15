@@ -29,7 +29,7 @@ import type { ConfirmBody, PrepareBody } from "./importer";
 import { BridgeManager } from "./manager";
 import type { BridgeRow } from "./manager";
 import { seal, unseal } from "./seal";
-import { securityHeaders } from "./security";
+import { originGuard, securityHeaders } from "./security";
 
 const env = loadPortalEnv();
 await migrate(env.databaseUrl);
@@ -79,6 +79,8 @@ app.use("/api/*", async (c, next) => {
   if (c.req.method === "OPTIONS") return c.body(null, allowed ? 204 : 403);
   return next();
 });
+
+app.use("/api/*", originGuard(env.baseUrl, env.allowedOrigins));
 
 /**
  * How long a captured guild list may keep authorising mutations before it has
