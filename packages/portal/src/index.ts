@@ -146,6 +146,33 @@ async function guildAuthority(c: Context, session: SessionData, guildId: string)
   return { ok: true, guild };
 }
 
+/**
+ * Whether this session may still act on an import: owner of the row, and still
+ * holding Manage Server in the guild that import draws from.
+ *
+ * `POST /api/imports` establishes authority once. Every route below it used to
+ * check `owner_discord_id` alone, which made that first check permanent — and
+ * these are not read-only routes. `rerun-history` in particular fetches LIVE
+ * Discord history with the bot token at call time, not the snapshot the plan
+ * was built from, so someone since demoted or removed from a server could keep
+ * pumping its fresh messages into a community they control.
+ */
+async function importAuthority(
+  c: Context,
+  session: SessionData,
+  importId: string,
+): Promise<{ ok: true } | { ok: false; status: 401 | 403 | 404; error: string }> {
+  const [row] = await sql<{ discord_guild_id: string | null }[]>`
+    SELECT discord_guild_id FROM imports
+     WHERE import_id = ${importId} AND owner_discord_id = ${session.user.id}`;
+  if (!row) return { ok: false, status: 404, error: "not found" };
+  // An import with no guild recorded cannot be re-checked; the owner test
+  // already passed, and the importer will fail on its own if it needs one.
+  if (!row.discord_guild_id) return { ok: true };
+  const authority = await guildAuthority(c, session, row.discord_guild_id);
+  return authority.ok ? { ok: true } : { ok: false, status: authority.status, error: authority.error };
+}
+
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
 app.get("/api/auth/discord", async (c) => {
@@ -486,6 +513,8 @@ app.get("/api/imports/:id", async (c) => {
 app.post("/api/imports/:id/prepare", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
+  const allowed = await importAuthority(c, session, c.req.param("id"));
+  if (!allowed.ok) return c.json({ error: allowed.error }, allowed.status);
   const body = (await c.req.json()) as PrepareBody;
   try {
     return c.json(await importer.prepare(c.req.param("id"), session.user.id, body));
@@ -497,6 +526,8 @@ app.post("/api/imports/:id/prepare", async (c) => {
 app.post("/api/imports/:id/confirm", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
+  const allowed = await importAuthority(c, session, c.req.param("id"));
+  if (!allowed.ok) return c.json({ error: allowed.error }, allowed.status);
   const body = (await c.req.json()) as ConfirmBody;
   try {
     await importer.confirm(c.req.param("id"), session.user.id, body);
@@ -509,6 +540,8 @@ app.post("/api/imports/:id/confirm", async (c) => {
 app.post("/api/imports/:id/retry", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
+  const allowed = await importAuthority(c, session, c.req.param("id"));
+  if (!allowed.ok) return c.json({ error: allowed.error }, allowed.status);
   try {
     await importer.retry(c.req.param("id"), session.user.id);
     return c.json({ ok: true });
@@ -521,6 +554,8 @@ app.post("/api/imports/:id/retry", async (c) => {
 app.post("/api/imports/:id/rerun-history", async (c) => {
   const session = await requireSession(c, sessions);
   if (!session) return c.json({ error: "unauthorized" }, 401);
+  const allowed = await importAuthority(c, session, c.req.param("id"));
+  if (!allowed.ok) return c.json({ error: allowed.error }, allowed.status);
   try {
     await importer.rerunHistory(c.req.param("id"), session.user.id);
     return c.json({ ok: true });
@@ -542,6 +577,8 @@ app.post("/api/communities/:communityId/rerun-history", async (c) => {
       AND plan->'checkpoints'->>'communityIdHex' = ${c.req.param("communityId")}
     ORDER BY updated_at DESC LIMIT 1`;
   if (!row) return c.json({ error: "no import found for this community" }, 404);
+  const allowed = await importAuthority(c, session, row.import_id as string);
+  if (!allowed.ok) return c.json({ error: allowed.error }, allowed.status);
   try {
     await importer.rerunHistory(row.import_id as string, session.user.id);
     return c.json({ ok: true });
