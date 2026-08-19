@@ -375,32 +375,42 @@ export class BridgeManager {
       throw new Error("concord channel not found (deleted, or key not held)");
     }
     // Refresh display names each start: renames heal on the next boot, and
-    // rows from before the name columns existed backfill themselves.
-    const discordName = row.discord_channel_id
-      ? await this.adapter?.channelName(row.discord_channel_id).catch(() => null)
-      : null;
-    const guildName = row.discord_guild_id
-      ? await this.adapter?.guildName(row.discord_guild_id).catch(() => null)
-      : null;
+    // rows from before the name columns existed backfill themselves. The two
+    // lookups hit different Discord endpoints and neither reads the other, so
+    // they go together rather than one after the next.
+    const [discordName, guildName] = await Promise.all([
+      row.discord_channel_id
+        ? this.adapter?.channelName(row.discord_channel_id).catch(() => null)
+        : null,
+      row.discord_guild_id ? this.adapter?.guildName(row.discord_guild_id).catch(() => null) : null,
+    ]);
     await this.sql`
       UPDATE bridges SET concord_channel_name = ${channel.name},
         discord_channel_name = ${discordName ?? null},
         discord_guild_name = ${guildName ?? null}
       WHERE bridge_id = ${row.bridge_id}`;
-    await client.publishJoin().catch(() => {});
-    // Our giftwrap inbox, so the next key handoff is delivered to the relays
-    // we actually watch rather than the stock interop floor.
-    await client.publishDmRelays(primary, community.relays).catch(() => {});
-    await client
-      .publishProfile(primary, {
-        name: "Discord <-> Armada Bridge Bot",
-        picture: this.adapter?.botAvatarUrl,
-        about:
-          "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
-        bot: true,
-      })
-      .catch(() => {});
-    await client.publishManifest(BRIDGE_COMMANDS).catch(() => {});
+    // Four announcements the bridge owes the relays, none of which anything
+    // below reads: the join, our giftwrap inbox (so the next key handoff is
+    // delivered to the relays we actually watch rather than the stock interop
+    // floor), the bot's profile, and the command manifest. Awaited in sequence
+    // they cost four publish timeouts — up to ~32s during which the bridge is
+    // fully folded and able to mirror, but routing has not been attached. So
+    // they are fired together and not waited on; each already swallows its own
+    // failure, exactly as announceBridge does.
+    void Promise.all([
+      client.publishJoin().catch(() => {}),
+      client.publishDmRelays(primary, community.relays).catch(() => {}),
+      client
+        .publishProfile(primary, {
+          name: "Discord <-> Armada Bridge Bot",
+          picture: this.adapter?.botAvatarUrl,
+          about:
+            "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
+          bot: true,
+        })
+        .catch(() => {}),
+      client.publishManifest(BRIDGE_COMMANDS).catch(() => {}),
+    ]);
 
     const link: ChannelLink = {
       discordGuildId: row.discord_guild_id ?? "",
