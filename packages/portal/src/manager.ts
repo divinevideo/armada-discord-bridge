@@ -72,6 +72,18 @@ interface Running {
 
 export const CONFIRM_RE = /^\/bridge confirm ([0-9a-f]{8})$/i;
 
+/**
+ * How long a bridge may keep failing to start before the failure is
+ * committed as a sever. Relays give no tombstones: an empty query for the
+ * invite bundle can mean the community was dissolved, or it can mean no
+ * relay happened to answer inside one boot's window — the two are
+ * indistinguishable from a single attempt. Only failure sustained across
+ * retries for this long is treated as the community actually being gone.
+ */
+export const START_FAILURE_SEVER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+const START_RETRY_BASE_MS = 5 * 60 * 1000;
+const START_RETRY_MAX_MS = 6 * 60 * 60 * 1000;
+
 /** The kind 10304 command manifest every bridge primary advertises. */
 export const BRIDGE_COMMANDS = [
   {
@@ -94,6 +106,8 @@ export class BridgeManager {
   private readonly byDiscordChannel = new Map<string, string>();
   /** One shared store: mapping rows for every router, plus catch-up cursors. */
   private readonly store: PostgresMappingStore;
+  /** Pending start-retry timers by bridge id; cancelled by stop(). */
+  private readonly startRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(
     private readonly sql: postgres.Sql,
@@ -145,7 +159,7 @@ export class BridgeManager {
     const rows = await this.sql<BridgeRow[]>`
       SELECT * FROM bridges WHERE status IN ('pending_confirm', 'active')`;
     for (const row of rows) {
-      await this.start(row).catch((error) => this.markSevered(row.bridge_id, String(error)));
+      await this.startTracked(row);
     }
   }
 
@@ -581,6 +595,7 @@ export class BridgeManager {
   }
 
   async stop(bridgeId: string, status: "paused" | "unlinked", detail?: string): Promise<void> {
+    this.cancelStartRetry(bridgeId);
     const rb = this.running.get(bridgeId);
     if (rb) {
       rb.unsubChat();
@@ -608,13 +623,97 @@ export class BridgeManager {
     const next = row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
     await this.sql`UPDATE bridges SET status = ${row.status === "paused" ? "active" : next}, updated_at = now() WHERE bridge_id = ${bridgeId}`;
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
-    await this.start(fresh).catch((error) => this.markSevered(bridgeId, String(error)));
+    await this.startTracked(fresh);
+  }
+
+  /**
+   * start() with failure treated as transient rather than terminal. A start
+   * that throws leaves the row in its current status — still holding the
+   * one-bridge-per-channel slot, so no duplicate can be minted mid-outage —
+   * records when the failing streak began (in options, so it survives
+   * restarts), and retries with backoff. markSevered only fires once the
+   * streak outlives START_FAILURE_SEVER_AFTER_MS: a single relay window
+   * where nobody answered used to sever permanently (see the Lynch Memorial
+   * Park bridge, 2026-08-10), and severed rows are never retried.
+   */
+  private async startTracked(row: BridgeRow, attempt = 0): Promise<void> {
+    try {
+      await this.start(row);
+      await this.clearStartFailure(row);
+    } catch (error) {
+      await this.handleStartFailure(row, String(error), attempt);
+    }
+  }
+
+  private async handleStartFailure(row: BridgeRow, detail: string, attempt: number): Promise<void> {
+    const since = row.options?.startFailedAt;
+    const firstAt = typeof since === "string" ? Date.parse(since) : NaN;
+    if (Number.isFinite(firstAt) && Date.now() - firstAt >= START_FAILURE_SEVER_AFTER_MS) {
+      await this.markSevered(row.bridge_id, detail);
+      return;
+    }
+    console.warn(`bridge ${row.bridge_id}: start failed (attempt ${attempt + 1}), will retry: ${detail}`);
+    if (Number.isFinite(firstAt)) {
+      await this.sql`
+        UPDATE bridges SET status_detail = ${detail}, updated_at = now()
+        WHERE bridge_id = ${row.bridge_id}`;
+    } else {
+      await this.sql`
+        UPDATE bridges SET options = options || ${this.sql.json({ startFailedAt: new Date().toISOString() })},
+          status_detail = ${detail}, updated_at = now()
+        WHERE bridge_id = ${row.bridge_id}`;
+    }
+    this.scheduleStartRetry(row.bridge_id, attempt);
+  }
+
+  private scheduleStartRetry(bridgeId: string, attempt: number): void {
+    if (this.startRetryTimers.has(bridgeId)) return;
+    // Full jitter: bridges share relays, so one relay outage puts many
+    // bridges into this path at once — identical delays would line them all
+    // up on the same retry tick against a host that is already struggling.
+    const cap = Math.min(START_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), START_RETRY_MAX_MS);
+    const delay = cap / 2 + Math.random() * (cap / 2);
+    const timer = setTimeout(() => {
+      this.startRetryTimers.delete(bridgeId);
+      void this.retryStart(bridgeId, attempt + 1);
+    }, delay);
+    this.startRetryTimers.set(bridgeId, timer);
+  }
+
+  private async retryStart(bridgeId: string, attempt: number): Promise<void> {
+    if (this.running.has(bridgeId)) return;
+    // Re-read the row: an operator may have paused or unlinked the bridge
+    // while the retry was pending, and that decision wins.
+    const [row] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
+    if (!row || (row.status !== "active" && row.status !== "pending_confirm")) return;
+    await this.startTracked(row, attempt);
+  }
+
+  private cancelStartRetry(bridgeId: string): void {
+    const timer = this.startRetryTimers.get(bridgeId);
+    if (timer) {
+      clearTimeout(timer);
+      this.startRetryTimers.delete(bridgeId);
+    }
+  }
+
+  private async clearStartFailure(row: BridgeRow): Promise<void> {
+    this.cancelStartRetry(row.bridge_id);
+    if (row.options?.startFailedAt === undefined) return;
+    console.log(`bridge ${row.bridge_id}: recovered from failing start`);
+    await this.sql`
+      UPDATE bridges SET options = options - 'startFailedAt', status_detail = NULL, updated_at = now()
+      WHERE bridge_id = ${row.bridge_id}`;
   }
 
   private async markSevered(bridgeId: string, detail: string): Promise<void> {
+    this.cancelStartRetry(bridgeId);
     console.error(`bridge ${bridgeId}: severed: ${detail}`);
+    // Drop the failing-streak marker so a manual resume after a sever starts
+    // a fresh grace window instead of instantly re-severing on one failure.
     await this.sql`
-      UPDATE bridges SET status = 'severed', status_detail = ${detail}, updated_at = now()
+      UPDATE bridges SET status = 'severed', status_detail = ${detail},
+        options = options - 'startFailedAt', updated_at = now()
       WHERE bridge_id = ${bridgeId}`;
   }
 
