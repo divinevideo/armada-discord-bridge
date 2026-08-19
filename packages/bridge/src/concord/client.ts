@@ -80,14 +80,20 @@ export interface JoinResult {
  * Resolve an Armada invite URL into join material: fetch the kind 33301
  * bundle from the pool, decrypt with the fragment token, validate the
  * self-certifying community id, and rehydrate the community.
+ *
+ * Raced across relays rather than merged (`queryRace`, not `query`): one
+ * bundle is all this needs, every relay serving it serves the same
+ * self-certifying bytes, and `validateBundle` below refuses a forgery — so
+ * the first relay to answer is as good as all of them. Merging made every
+ * boot wait out the slowest relay in the set for each of ~200 bridges, and
+ * worse, made one unresponsive relay look exactly like a deleted bundle.
  */
 export async function resolveInvite(inviteUrl: string, pool: RelayLike): Promise<JoinResult> {
   const invite = parseInviteLink(inviteUrl);
   if (!invite) throw new Error("not a valid Armada invite URL");
 
-  const events = await pool.query([
-    { kinds: [KIND_INVITE_BUNDLE], authors: [invite.linkSigner], limit: 8 },
-  ]);
+  const filters = [{ kinds: [KIND_INVITE_BUNDLE], authors: [invite.linkSigner], limit: 8 }];
+  const events = await (pool.queryRace?.(filters) ?? pool.query(filters));
   const newest = events.sort((a, b) => b.created_at - a.created_at)[0];
   if (!newest) throw new Error("invite bundle not found on bootstrap relays");
 

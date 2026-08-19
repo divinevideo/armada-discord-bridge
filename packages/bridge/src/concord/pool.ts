@@ -29,6 +29,8 @@ export interface SubscriptionHandlers {
 
 export interface RelayLike {
   query(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
+  /** First relay holding a match wins; see {@link RelayPool.queryRace}. */
+  queryRace?(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
   publish(event: NostrEvent, opts?: { signal?: AbortSignal }): Promise<void>;
   /** Standing REQ across relays, deduped by event id. Returns unsubscribe. */
   subscribe(filters: NostrFilter[], handlers: SubscriptionHandlers): () => void;
@@ -107,6 +109,39 @@ export class RelayPool implements RelayLike {
       for (const event of result.value) byId.set(event.id, event);
     }
     return [...byId.values()].sort((a, b) => b.created_at - a.created_at);
+  }
+
+  /**
+   * First relay holding a match wins; empty after the timeout.
+   *
+   * `query` merges every relay and therefore waits for the slowest one, which
+   * is right for a channel's history: the wraps are spread across relays and a
+   * missing one is a missing message. Resolving an invite is the opposite
+   * shape. There is a single self-certifying bundle, every relay carrying it
+   * serves the same bytes, and validation rejects a bad one — so waiting on
+   * the silent peers buys nothing and costs the full timeout on every boot.
+   *
+   * That cost was not merely slow: an empty merged result is indistinguishable
+   * from a deleted bundle, so one unresponsive relay could sever a bridge
+   * whose community was alive the whole time (41 of them, 2026-08-10).
+   *
+   * A relay that answers with nothing loses rather than wins the race — it
+   * simply does not carry the bundle, and its silence must not out-run a peer
+   * that does.
+   */
+  async queryRace(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]> {
+    const signal = opts?.signal ?? AbortSignal.timeout(QUERY_TIMEOUT_MS);
+    try {
+      return await Promise.any(
+        this.urls.map(async (url) => {
+          const events = await this.relay(url).query(filters, { signal });
+          if (events.length === 0) throw new Error(`no match on ${url}`);
+          return events.sort((a, b) => b.created_at - a.created_at);
+        }),
+      );
+    } catch {
+      return [];
+    }
   }
 
   /** Any-accept broadcast; throws only when every relay refused. */
