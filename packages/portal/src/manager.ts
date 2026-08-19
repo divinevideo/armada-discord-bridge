@@ -384,10 +384,15 @@ export class BridgeManager {
         : null,
       row.discord_guild_id ? this.adapter?.guildName(row.discord_guild_id).catch(() => null) : null,
     ]);
+    // A failed lookup is null, and null used to be written straight over a
+    // name that was already correct — so one rate-limited boot silently
+    // blanked the dashboard for bridges nothing was wrong with. Keep what we
+    // knew unless Discord actually answered; a real rename still heals,
+    // because a rename answers.
     await this.sql`
       UPDATE bridges SET concord_channel_name = ${channel.name},
-        discord_channel_name = ${discordName ?? null},
-        discord_guild_name = ${guildName ?? null}
+        discord_channel_name = coalesce(${discordName ?? null}, discord_channel_name),
+        discord_guild_name = coalesce(${guildName ?? null}, discord_guild_name)
       WHERE bridge_id = ${row.bridge_id}`;
     // Four announcements the bridge owes the relays, none of which anything
     // below reads: the join, our giftwrap inbox (so the next key handoff is
