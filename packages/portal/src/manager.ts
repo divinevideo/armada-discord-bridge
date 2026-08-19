@@ -84,6 +84,9 @@ export const START_FAILURE_SEVER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const START_RETRY_BASE_MS = 5 * 60 * 1000;
 const START_RETRY_MAX_MS = 6 * 60 * 60 * 1000;
 
+/** How many bridges may be starting at once during boot; see startAll(). */
+const START_CONCURRENCY = 12;
+
 /** The kind 10304 command manifest every bridge primary advertises. */
 export const BRIDGE_COMMANDS = [
   {
@@ -158,9 +161,41 @@ export class BridgeManager {
     }
     const rows = await this.sql<BridgeRow[]>`
       SELECT * FROM bridges WHERE status IN ('pending_confirm', 'active')`;
-    for (const row of rows) {
-      await this.startTracked(row);
-    }
+    await this.startAll(rows);
+  }
+
+  /**
+   * Bring every stored bridge up, several at a time.
+   *
+   * One at a time took half an hour for a few hundred bridges, and the cost
+   * is not evenly shared: each start() is a chain of relay round trips
+   * (resolve, fold, key intake, four publishes) plus two Discord lookups, so
+   * every bridge queued behind the current one stays dark for the whole
+   * boot. A single unresponsive relay makes that wait unbounded for
+   * everything after it — the bridge at the end of the list pays for every
+   * sick relay in front of it.
+   *
+   * Bounded rather than unbounded: bridges share relays and a single Discord
+   * bot token, so starting all of them at once would aim hundreds of
+   * simultaneous REQs at the same few hosts and spend the token's REST
+   * budget on name lookups.
+   */
+  private async startAll(rows: BridgeRow[]): Promise<void> {
+    const queue = [...rows];
+    const began = Date.now();
+    // shift() needs no lock: the workers only interleave at their awaits.
+    const worker = async (): Promise<void> => {
+      for (let row = queue.shift(); row; row = queue.shift()) {
+        await this.startTracked(row);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(START_CONCURRENCY, queue.length) }, () => worker()),
+    );
+    const live = rows.filter((row) => this.running.has(row.bridge_id)).length;
+    console.log(
+      `portal: ${live}/${rows.length} bridges live in ${Math.round((Date.now() - began) / 1000)}s`,
+    );
   }
 
   private async onDiscord(msg: DiscordInboundMessage): Promise<void> {
