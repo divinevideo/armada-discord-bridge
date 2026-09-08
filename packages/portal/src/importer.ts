@@ -283,6 +283,13 @@ export class Importer {
      * every fixture relay a DNS lookup.
      */
     private readonly vetRelays: (relays: readonly string[]) => Promise<void> = assertPublicRelays,
+    /**
+     * Test seam: how long to wait between a publish and re-checking that it
+     * became readable. Real relays need propagation slack; the in-memory wire
+     * answers instantly, so tests drive it to near-zero to exercise the
+     * give-up path without sleeping for it.
+     */
+    private readonly publishRetryMs: number = 1500,
   ) {}
 
   /** Snapshot the guild and store a previewed plan. */
@@ -595,6 +602,36 @@ export class Importer {
         UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
         WHERE import_id = ${importId}`;
     };
+    // Publish a durable edition and DO NOT return until a relay actually hands
+    // it back. `pool.publish` resolves on the FIRST relay's ACK (any-accept),
+    // so it reports success for a write that never persisted — a relay that
+    // ACKs then drops it, or ordinary propagation lag on the AUTH-gated
+    // community relays. Every edition is a wrap with a stable id, so read it
+    // back by id and only let the caller checkpoint once it is readable.
+    //
+    // This is the verify-then-checkpoint the invite bundle already did; the
+    // MISSING read-back everywhere else is the bug that let the importer mark
+    // channel editions (and the owner's control-key Grant) published when they
+    // never landed — minting bridge rows pointing at a channel absent from
+    // every member's fold, which then can never start, and leaving the owner
+    // able to read the Control Plane but never write to it. Throwing here
+    // matches the bundle's semantics: `retry()` resumes idempotently from the
+    // checkpoints, so a failed publish costs a retry, not a corrupt community.
+    const publishVerified = async (event: NostrEvent, label: string): Promise<void> => {
+      const landed = async () =>
+        (await pool.query([{ ids: [event.id] }]).catch(() => [])).length > 0;
+      // Check-then-sleep, not sleep-then-check: a relay that persists the write
+      // and can answer for it immediately (the common case) returns with no
+      // delay, so verifying every edition costs a query, not a wall of 1.5s
+      // waits. The sleep only pays for genuine propagation lag before a retry.
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (await landed()) return;
+        await pool.publish(event).catch(() => {});
+        if (await landed()) return;
+        await new Promise((resolve) => setTimeout(resolve, this.publishRetryMs));
+      }
+      throw new Error(`${label} did not become readable on the community relays; retry the import`);
+    };
     // Every op-key action cites the owner-signed grant (CORD-04 §5).
     const vac: AuthorityCitation = {
       entityId: grantLocator(community.id, hex32(op.pk)),
@@ -613,22 +650,22 @@ export class Importer {
     try {
       // 1. The owner-signed authority chain, control plane first.
       if (!cp.ownerRolePublishedAt) {
-        await pool.publish(wrapSeal(ownerSeal("admin-role"), control));
+        await publishVerified(wrapSeal(ownerSeal("admin-role"), control), "admin role edition");
         cp.ownerRolePublishedAt = Date.now();
         await save();
       }
       if (!cp.ownerGrantPublishedAt) {
-        await pool.publish(wrapSeal(ownerSeal("op-grant"), control));
+        await publishVerified(wrapSeal(ownerSeal("op-grant"), control), "operator grant edition");
         cp.ownerGrantPublishedAt = Date.now();
         await save();
       }
       if (!cp.ownerRegistryPublishedAt) {
-        await pool.publish(wrapSeal(ownerSeal("invite-registry"), control));
+        await publishVerified(wrapSeal(ownerSeal("invite-registry"), control), "invite registry edition");
         cp.ownerRegistryPublishedAt = Date.now();
         await save();
       }
       if (!cp.ownerJoinPublishedAt) {
-        await pool.publish(wrapSeal(ownerSeal("owner-join"), guestbook));
+        await publishVerified(wrapSeal(ownerSeal("owner-join"), guestbook), "owner join");
         cp.ownerJoinPublishedAt = Date.now();
         await save();
       }
@@ -651,7 +688,7 @@ export class Importer {
           bytesToBase64(encodeControlWrap(community.rootEpoch, community.controlRoot)),
           getConversationKey(opSk, community.owner),
         );
-        await pool.publish(
+        await publishVerified(
           await sealEdition(
             buildGrantEdition(
               community.id,
@@ -661,6 +698,7 @@ export class Importer {
             control,
             op.signer,
           ),
+          "owner control-key grant",
         );
         cp.ownerControlKeyPublishedAt = Date.now();
         await save();
@@ -702,8 +740,9 @@ export class Importer {
             ? { custom: { [DISCORD_IMPORT_METADATA_KEY]: { emojiPack: `30030:${op.pk}:discord-import` } } }
             : {}),
         };
-        await pool.publish(
+        await publishVerified(
           await sealEdition(buildMetadataEdition(community.id, metadata, opV1), control, op.signer),
+          "community metadata edition",
         );
         cp.metadataPublishedAt = Date.now();
         await save();
@@ -731,7 +770,7 @@ export class Importer {
         // while a private channel whose Role mint then failed is a room with
         // no access list at all.
         if (channel.private && !channel.accessRolePublishedAt) {
-          await pool.publish(
+          await publishVerified(
             await sealEdition(
               buildRoleEdition(
                 {
@@ -747,6 +786,7 @@ export class Importer {
               control,
               op.signer,
             ),
+            `access role edition for #${channel.name}`,
           );
           channel.accessRolePublishedAt = Date.now();
           await save();
@@ -772,8 +812,9 @@ export class Importer {
             },
           };
         }
-        await pool.publish(
+        await publishVerified(
           await sealEdition(buildChannelEdition(hex32(channel.channelIdHex!), metadata, opV1), control, op.signer),
+          `channel edition for #${channel.name}`,
         );
         channel.publishedAt = Date.now();
         await save();
@@ -781,7 +822,7 @@ export class Importer {
 
       for (const role of plan.roles) {
         if (role.publishedAt) continue;
-        await pool.publish(
+        await publishVerified(
           await sealEdition(
             buildRoleEdition(
               {
@@ -797,6 +838,7 @@ export class Importer {
             control,
             op.signer,
           ),
+          `role edition "${role.name}"`,
         );
         role.publishedAt = Date.now();
         await save();

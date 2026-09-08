@@ -135,15 +135,22 @@ function fakeSql(store: { imports: Map<string, Record<string, unknown>>; bridges
   return fn as never;
 }
 
-function wirePool(wire: NostrEvent[]): RelayLike {
+function wirePool(wire: NostrEvent[], opts: { drop?: (event: NostrEvent) => boolean } = {}): RelayLike {
   return {
     query: async (filters) =>
       wire.filter((e) =>
         filters.some(
-          (f) => (!f.kinds || f.kinds.includes(e.kind)) && (!f.authors || f.authors.includes(e.pubkey)),
+          (f) =>
+            (!f.ids || f.ids.includes(e.id)) &&
+            (!f.kinds || f.kinds.includes(e.kind)) &&
+            (!f.authors || f.authors.includes(e.pubkey)),
         ),
       ),
     publish: async (event) => {
+      // `drop` models the any-accept hazard the importer's read-back guards
+      // against: a relay that ACKs a publish (this resolves) but never
+      // actually persists it, so a later query never returns it.
+      if (opts.drop?.(event)) return;
       wire.push(event);
     },
     subscribe: () => () => {},
@@ -508,5 +515,70 @@ describe("importer pipeline", () => {
     expect(wire.length).toBe(wireLen);
     expect(activated.length).toBe(2);
     expect(row().status).toBe("done");
+  });
+
+  it("fails the import when an edition is ACKed but never persists, instead of half-succeeding", async () => {
+    // The bug this guards: `pool.publish` resolves on the first relay's ACK,
+    // so an edition that never actually landed used to be checkpointed as
+    // published — minting bridge rows that point at a channel absent from
+    // every member's fold and a bridge that can never start. A relay that
+    // accepts the write and drops it must now FAIL the import (recoverable via
+    // retry), never mark it done.
+    const store = { imports: new Map<string, Record<string, unknown>>(), bridges: [] as Array<Record<string, unknown>> };
+    const wire: NostrEvent[] = [];
+    const manager = {
+      activateImported: async () => {},
+      provisionImported: async (row: BridgeRow) => ({ ...row, primary_pk: `pk-${row.bridge_id}` }),
+      startImported: async () => {},
+      resyncFor: async () => {},
+      channelKnown: () => true,
+    };
+    // A pool that ACKs every publish but persists nothing: publish resolves,
+    // the subsequent read-back finds nothing.
+    const importer = new Importer(
+      fakeSql(store),
+      env,
+      manager as never,
+      () => wirePool(wire, { drop: () => true }),
+      async () => [],
+      async () => {},
+      1, // publishRetryMs: don't sleep out the retry budget in a unit test
+    );
+
+    const plan = buildImportPlan(snapshot);
+    store.imports.set("impDrop", {
+      import_id: "impDrop",
+      owner_discord_id: "user1",
+      discord_guild_id: "100",
+      discord_guild_name: "Test Fleet",
+      status: "previewed",
+      status_detail: null,
+      plan,
+      owner_sk_sealed: null,
+      community_sealed: null,
+      community_id: null,
+      invite_url_sealed: null,
+      link_signer_sk_sealed: null,
+    });
+
+    const userSk = generateSecretKey();
+    const userPk = getPublicKey(userSk);
+    const prep = await importer.prepare("impDrop", "user1", {
+      ownerNpub: nip19.npubEncode(userPk),
+      relays: ["wss://relay.example"],
+    });
+    const signedEvents = prep.templates.map(
+      (t) => finalizeEvent(t.template as EventTemplate, userSk) as unknown as SignedSeal,
+    );
+    await importer.confirm("impDrop", "user1", { signedEvents });
+
+    const row = () => store.imports.get("impDrop")! as unknown as ImportRow;
+    await waitFor(() => row().status === "done" || row().status === "failed", 30000);
+
+    // Failed, not done — and the reason names the read-back, not a silent stop.
+    expect(row().status).toBe("failed");
+    expect(row().status_detail).toContain("did not become readable");
+    // Nothing was wired: no bridge row points at a channel that never landed.
+    expect(store.bridges.length).toBe(0);
   });
 });
