@@ -84,6 +84,31 @@ export const START_FAILURE_SEVER_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const START_RETRY_BASE_MS = 5 * 60 * 1000;
 const START_RETRY_MAX_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * Backoff for reconnecting the shared Discord gateway after its login throws.
+ * Short, because the gateway being down blocks every active bridge, so the
+ * cost of waiting is paid by all of them at once.
+ */
+const GATEWAY_RETRY_BASE_MS = 10 * 1000;
+const GATEWAY_RETRY_MAX_MS = 10 * 60 * 1000;
+
+/**
+ * Raised when an active bridge is asked to start while the shared Discord
+ * gateway is down. It is deliberately its OWN error type, not a start failure:
+ * the gateway being unreachable is a process-wide, transient condition that
+ * says NOTHING about the community, so it must never advance the seven-day
+ * sever streak or reach markSevered. Treating it as a start failure once
+ * severed every active bridge on a boot that raced a Discord API blip
+ * (2026-08-27, ~378 bridges). Bridges that throw this defer and retry; the
+ * gateway heals via connectAdapter() and onAdapterConnected() brings them up.
+ */
+class GatewayUnavailableError extends Error {
+  constructor() {
+    super("Discord gateway not connected; deferring bridge start");
+    this.name = "GatewayUnavailableError";
+  }
+}
+
 /** How many bridges may be starting at once during boot; see startAll(). */
 const START_CONCURRENCY = 12;
 
@@ -111,6 +136,11 @@ export class BridgeManager {
   private readonly store: PostgresMappingStore;
   /** Pending start-retry timers by bridge id; cancelled by stop(). */
   private readonly startRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Pending gateway reconnect timer, if the last login attempt failed. */
+  private adapterRetryTimer?: ReturnType<typeof setTimeout>;
+  /** Set once the initial boot's startAll has run, so a LATE gateway connect
+   *  knows to bring up deferred bridges rather than double-starting them. */
+  private booted = false;
 
   constructor(
     private readonly sql: postgres.Sql,
@@ -121,47 +151,92 @@ export class BridgeManager {
 
   async init(): Promise<void> {
     if (this.env.discordBotToken) {
-      try {
-        this.adapter = new DiscordAdapter(this.env.discordBotToken, {
-          onMessage: async (msg) => this.onDiscord(msg),
-          onBotCommand: (message) => this.handleBotCommand(message),
-          onMessageUpdate: async (msg) => {
-            const rb = this.activeRouterFor(msg.channelId);
-            if (rb) await rb.router!.onDiscordEdit(msg, rb.link);
-          },
-          onMessageDelete: async (del) => {
-            const rb = this.activeRouterFor(del.channelId);
-            if (rb) await rb.router!.onDiscordDelete(del, rb.link);
-          },
-          onReactionAdd: async (reaction) => {
-            const rb = this.activeRouterFor(reaction.channelId);
-            if (rb) await rb.router!.onDiscordReaction(reaction, rb.link);
-          },
-          onReactionRemove: async (reaction) => {
-            const rb = this.activeRouterFor(reaction.channelId);
-            if (rb) await rb.router!.onDiscordReactionRemove(reaction, rb.link);
-          },
-          onTyping: async (typing) => {
-            if (typing.bot) return;
-            const rb = this.activeRouterFor(typing.channelId);
-            if (rb) await rb.router!.onDiscordTyping(typing.userId, rb.link);
-          },
-        });
-        await this.adapter.start();
-        console.log("portal: discord gateway up");
-      } catch (error) {
-        // Common cause: MESSAGE_CONTENT privileged intent not enabled on the
-        // bot ("Used disallowed intents"). The portal stays up so the rest of
-        // the flow keeps working; fix the app settings and restart.
-        this.adapter = undefined;
-        console.error("portal: discord gateway failed to start:", error);
-      }
+      await this.connectAdapter();
     } else {
       console.warn("portal: DISCORD_TOKEN not set; bridges cannot go live");
     }
     const rows = await this.sql<BridgeRow[]>`
       SELECT * FROM bridges WHERE status IN ('pending_confirm', 'active')`;
     await this.startAll(rows);
+    this.booted = true;
+  }
+
+  /** A fresh gateway client wired to this manager's handlers. */
+  private buildAdapter(token: string): DiscordAdapter {
+    return new DiscordAdapter(token, {
+      onMessage: async (msg) => this.onDiscord(msg),
+      onBotCommand: (message) => this.handleBotCommand(message),
+      onMessageUpdate: async (msg) => {
+        const rb = this.activeRouterFor(msg.channelId);
+        if (rb) await rb.router!.onDiscordEdit(msg, rb.link);
+      },
+      onMessageDelete: async (del) => {
+        const rb = this.activeRouterFor(del.channelId);
+        if (rb) await rb.router!.onDiscordDelete(del, rb.link);
+      },
+      onReactionAdd: async (reaction) => {
+        const rb = this.activeRouterFor(reaction.channelId);
+        if (rb) await rb.router!.onDiscordReaction(reaction, rb.link);
+      },
+      onReactionRemove: async (reaction) => {
+        const rb = this.activeRouterFor(reaction.channelId);
+        if (rb) await rb.router!.onDiscordReactionRemove(reaction, rb.link);
+      },
+      onTyping: async (typing) => {
+        if (typing.bot) return;
+        const rb = this.activeRouterFor(typing.channelId);
+        if (rb) await rb.router!.onDiscordTyping(typing.userId, rb.link);
+      },
+    });
+  }
+
+  /**
+   * Bring up the shared Discord gateway, retrying on failure with capped
+   * backoff. A failed login (e.g. the REST preflight to discord.com refused
+   * during a network blip — 2026-08-27) used to leave the gateway down for the
+   * whole process lifetime, which is what turned that blip into a mass sever:
+   * every active bridge then found no adapter and was severed on the spot. Now
+   * the gateway heals on its own and onAdapterConnected() brings the bridges
+   * up, so a transient outage no longer needs a manual restart. A persistent
+   * error (a bad token, or MESSAGE_CONTENT not enabled) just keeps logging
+   * until the config is fixed — harmless, and the right failure mode.
+   */
+  private async connectAdapter(attempt = 0): Promise<void> {
+    const token = this.env.discordBotToken;
+    if (!token) return;
+    const adapter = this.buildAdapter(token);
+    try {
+      await adapter.start();
+      this.adapter = adapter;
+      console.log("portal: discord gateway up");
+      if (this.booted) void this.onAdapterConnected();
+    } catch (error) {
+      await adapter.stop().catch(() => {}); // don't leak a half-open client
+      this.adapter = undefined;
+      const cap = Math.min(GATEWAY_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), GATEWAY_RETRY_MAX_MS);
+      const delay = cap / 2 + Math.random() * (cap / 2);
+      console.error(
+        `portal: discord gateway failed to start (attempt ${attempt + 1}); retrying in ${Math.round(delay / 1000)}s:`,
+        error,
+      );
+      this.adapterRetryTimer = setTimeout(() => void this.connectAdapter(attempt + 1), delay);
+    }
+  }
+
+  /**
+   * The gateway came up AFTER boot (a reconnect). Bridges that deferred their
+   * start while it was down are not running and are sitting on a backoff timer;
+   * start them now rather than wait the backoff out.
+   */
+  private async onAdapterConnected(): Promise<void> {
+    const rows = await this.sql<BridgeRow[]>`
+      SELECT * FROM bridges WHERE status IN ('pending_confirm', 'active')`;
+    const deferred = rows.filter((row) => !this.running.has(row.bridge_id));
+    for (const row of deferred) this.cancelStartRetry(row.bridge_id);
+    if (deferred.length > 0) {
+      console.log(`portal: gateway back; starting ${deferred.length} deferred bridge(s)`);
+      await this.startAll(deferred);
+    }
   }
 
   /**
@@ -330,6 +405,12 @@ export class BridgeManager {
 
   private async start(row: BridgeRow): Promise<void> {
     if (this.running.has(row.bridge_id)) return;
+    // An active bridge mirrors in both directions through the shared gateway,
+    // so without it there is nothing to attach — defer before doing the relay
+    // work (resolve, fold, key intake) rather than fold a whole community only
+    // to find nowhere to route it. GatewayUnavailableError is caught in
+    // startTracked and never counts toward a sever (see its definition).
+    if (row.status === "active" && !this.adapter) throw new GatewayUnavailableError();
     if (!row.invite_url_sealed || !row.master_secret_sealed || !row.primary_sk_sealed) {
       throw new Error("bridge is missing sealed key material");
     }
@@ -540,7 +621,15 @@ export class BridgeManager {
         UPDATE bridges SET status = 'active', status_detail = NULL, updated_at = now()
         WHERE bridge_id = ${rb.id} RETURNING *`;
       rb.status = "active";
-      this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
+      try {
+        this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
+      } catch (error) {
+        if (!(error instanceof GatewayUnavailableError)) throw error;
+        // Confirmed while the gateway was down. The row stays active; routing
+        // attaches on the next restart. Don't sever, and don't claim it's live.
+        console.warn(`bridge ${rb.id}: confirmed while Discord gateway down; will attach on reconnect`);
+        return;
+      }
       await rb.client
         .sendChat(rb.channel, {
           content: "Bridge confirmed. This channel is now mirrored with Discord.",
@@ -597,10 +686,10 @@ export class BridgeManager {
     masterSecretHex: string,
     options?: Record<string, unknown> | null,
   ): void {
-    if (!this.adapter) {
-      void this.markSevered(rb.id, "no Discord bot token configured");
-      return;
-    }
+    // The boot path guards this earlier (start()); this covers a live confirm
+    // that races the gateway being down. Throwing — never severing — is the
+    // whole point: a missing gateway is not the community going away.
+    if (!this.adapter) throw new GatewayUnavailableError();
     rb.router = new BridgeRouter(
       rb.client,
       new PuppetCache(masterSecretHex),
@@ -687,10 +776,23 @@ export class BridgeManager {
    * Park bridge, 2026-08-10), and severed rows are never retried.
    */
   private async startTracked(row: BridgeRow, attempt = 0): Promise<void> {
+    // A deferred bridge can be nudged by both onAdapterConnected() and its own
+    // backoff timer; start() also guards, but skip the work up front.
+    if (this.running.has(row.bridge_id)) return;
     try {
       await this.start(row);
       await this.clearStartFailure(row);
     } catch (error) {
+      if (error instanceof GatewayUnavailableError) {
+        // Not a start failure: the community is fine, the local gateway is
+        // down. Retry without touching status_detail or the sever streak, so
+        // no amount of gateway downtime can ever sever a bridge. The gateway
+        // healing (connectAdapter) will bring it up via onAdapterConnected;
+        // this timer is just a backstop.
+        console.warn(`bridge ${row.bridge_id}: deferring start, Discord gateway down (attempt ${attempt + 1})`);
+        this.scheduleStartRetry(row.bridge_id, attempt);
+        return;
+      }
       await this.handleStartFailure(row, String(error), attempt);
     }
   }

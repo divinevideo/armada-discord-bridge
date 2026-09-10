@@ -74,3 +74,31 @@ describe("activate preconditions", () => {
     await expect(mgr.activate(draft as never)).rejects.toThrow(/linked/);
   });
 });
+
+/**
+ * Regression for 2026-08-27: a boot that raced a Discord API outage found no
+ * gateway and severed every active bridge on the spot (~378 of them). An
+ * active bridge with no gateway must DEFER — a distinct, retryable condition
+ * that never reaches a sever — and the guard must not touch a pending_confirm
+ * bridge, which does not route to Discord. No gateway and no DB is needed:
+ * the guard fires before any relay or Postgres work.
+ */
+describe("a down gateway defers, never severs", () => {
+  const mgr = new BridgeManager(sql, { sealKeyHex: SEAL_KEY } as PortalEnv);
+  const start = (row: unknown) =>
+    (mgr as unknown as { start(r: unknown): Promise<void> }).start(row);
+
+  it("an active bridge with no gateway defers (does not sever)", async () => {
+    await expect(start({ bridge_id: "no-gw", status: "active" })).rejects.toThrow(
+      /gateway not connected/i,
+    );
+  });
+
+  it("the guard is scoped to active — a pending_confirm bridge falls through it", async () => {
+    // Past the gateway guard it hits the ordinary key-material precondition,
+    // proving a missing gateway did not short-circuit the non-routing path.
+    await expect(start({ bridge_id: "pc", status: "pending_confirm" })).rejects.toThrow(
+      /sealed key material/i,
+    );
+  });
+});
