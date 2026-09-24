@@ -22,6 +22,7 @@ import type { PollVote } from "./vendor/polls";
 import { verifyOnchainZapRumor, verifyZapRumor, type ZapEntry } from "./vendor/zaps";
 import { citationFromTags, type AuthorityCitation } from "./edition";
 import { checkChannelBinding, openWrap, type OpenedEvent, type Rumor } from "./stream";
+import { MEMO_CAP, memoSet } from "./boundedMemo";
 import type { ChannelV2 } from "./types";
 
 /** An opened chat event with its verified channel/epoch coordinate. */
@@ -37,6 +38,13 @@ export interface OpenedChat extends OpenedEvent {
 const decodeMemo = new Map<string, OpenedChat | null>();
 /** Memo keys that failed as "no held stream key" — retryable after a rekey catch-up. */
 const skippedNoKey = new Set<string>();
+/** An evicted memo entry takes its skip marker with it, so the set stays bounded too. */
+const forgetSkip = (memoKey: string) => skippedNoKey.delete(memoKey);
+
+/** Entry counts of this module's memos (operational visibility). */
+export function chatMemoSize(): number {
+  return decodeMemo.size;
+}
 
 /** Forget remembered no-key failures (a caught-up rekey may now decode them). */
 export function forgetChatSkips(): void {
@@ -51,7 +59,7 @@ function openOne(wrap: Rumor, channel: ChannelV2): OpenedChat | null {
 
   const stream = channel.streams.find((s) => s.group.pk === wrap.pubkey);
   if (!stream) {
-    decodeMemo.set(memoKey, null);
+    memoSet(decodeMemo, memoKey, null, MEMO_CAP, forgetSkip);
     skippedNoKey.add(memoKey);
     return null;
   }
@@ -74,7 +82,7 @@ function openOne(wrap: Rumor, channel: ChannelV2): OpenedChat | null {
   } catch {
     opened = null;
   }
-  decodeMemo.set(memoKey, opened);
+  memoSet(decodeMemo, memoKey, opened, MEMO_CAP, forgetSkip);
   return opened;
 }
 

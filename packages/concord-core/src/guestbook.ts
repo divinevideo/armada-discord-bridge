@@ -19,6 +19,7 @@ import { citationFromTags, type AuthorityCitation } from "./edition";
 import { KIND_JOIN_LEAVE, KIND_KICK, KIND_SEAL_ENCRYPTED, KIND_SNAPSHOT } from "./kinds";
 import { buildRumor, openWrap, sealRumor, wrapSeal, type OpenedEvent, type StreamSigner, type Rumor } from "./stream";
 import type { CommunityV2 } from "./types";
+import { memoSet } from "./boundedMemo";
 
 /** Entries dated further than this ahead of the local clock are dropped outright. */
 export const GUESTBOOK_MAX_FUTURE_MS = 60 * 60 * 1000;
@@ -152,7 +153,7 @@ export function openGuestbookWraps(wraps: NostrEvent[], groups: GroupKey[]): Ope
     } catch {
       opened = null;
     }
-    openedGuestbookMemo.set(wrap.id, opened);
+    memoSet(openedGuestbookMemo, wrap.id, opened);
     if (opened) out.push(opened);
   }
   return out;

@@ -69,6 +69,7 @@ import {
 } from "./roles";
 import { buildRumor, openWrap, sealRumor, wrapSeal, type OpenedEvent, type StreamSigner, type Rumor } from "./stream";
 import { readFolded } from "./vendor/foldedCache";
+import { memoSet } from "./boundedMemo";
 import {
   utf8Len,
   DESCRIPTION_MAX_BYTES,
@@ -188,7 +189,7 @@ export function openControlWraps(wraps: NostrEvent[], groups: StreamKeyView[]): 
     } catch {
       parsed = null;
     }
-    parsedEditionMemo.set(wrap.id, parsed);
+    memoSet(parsedEditionMemo, wrap.id, parsed);
     if (parsed) out.push(parsed);
   }
   return out;
@@ -213,7 +214,7 @@ export function openControlEditions(opened: OpenedEvent[]): ParsedEdition[] {
     } catch {
       parsed = null;
     }
-    parsedEditionMemo.set(ev.rumorId, parsed);
+    memoSet(parsedEditionMemo, ev.rumorId, parsed);
     if (parsed) out.push(parsed);
   }
   return out;
