@@ -196,6 +196,9 @@ function plaintextSealTemplate(rumor: Rumor): OwnerSignTemplate["template"] {
 /** The Armada client's stock blob host, used when BLOSSOM_SERVER is unset. */
 const DEFAULT_BLOSSOM = "https://blossom.ditto.pub";
 
+/** How recently an interrupted import must have progressed to auto-resume on boot. */
+const RESUME_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 /** Largest icon/banner we bother rehosting. */
 const MAX_ASSET_BYTES = 8 * 1024 * 1024;
 
@@ -501,6 +504,41 @@ export class Importer {
       UPDATE imports SET status = 'publishing', status_detail = NULL, updated_at = now()
       WHERE import_id = ${importId}`;
     this.launch(importId);
+  }
+
+  /**
+   * Pick up imports a restart cut off mid-pipeline. Call once bridges are up:
+   * the wiring and history stages route through the live bridges.
+   *
+   * `launch` only ever ran from a request, so a process that died mid-import
+   * left the row in publishing/wiring/history for good — and `retry` refuses
+   * anything that isn't `failed`, so the owner could not even restart it.
+   * Rows back to August were stranded that way.
+   *
+   * The pipeline resumes idempotently from its checkpoints, so a recent one is
+   * simply relaunched. One older than RESUME_WINDOW_MS is marked failed
+   * instead, with a detail saying why: its owner has likely moved on, and a
+   * history backfill starting up weeks later on its own would be a surprise.
+   * Failed is retryable, so the choice stays theirs.
+   */
+  async resumeInterrupted(): Promise<void> {
+    const stranded = await this.sql<{ import_id: string; updated_at: Date }[]>`
+      SELECT import_id, updated_at FROM imports
+      WHERE status IN ('minting', 'publishing', 'wiring', 'history')`;
+    for (const row of stranded) {
+      if (this.running.has(row.import_id)) continue;
+      if (Date.now() - row.updated_at.getTime() <= RESUME_WINDOW_MS) {
+        console.log(`import ${row.import_id}: resuming after restart`);
+        this.launch(row.import_id);
+        continue;
+      }
+      await this.sql`
+        UPDATE imports SET status = 'failed',
+          status_detail = 'interrupted by a portal restart; retry to resume from where it stopped',
+          updated_at = now()
+        WHERE import_id = ${row.import_id} AND status IN ('minting', 'publishing', 'wiring', 'history')`;
+      console.warn(`import ${row.import_id}: stranded since ${row.updated_at.toISOString()}; marked failed (retryable)`);
+    }
   }
 
   private launch(importId: string): void {

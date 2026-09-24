@@ -44,8 +44,14 @@ const manager = new BridgeManager(sql, env);
  * module's top-level awaits settle. The API must come up regardless; bridges
  * go live as they finish folding, a poolful at a time (see startAll).
  */
-void manager.init().catch((error) => console.error("portal: bridge resume failed:", error));
 const importer = new Importer(sql, env, manager);
+void manager
+  .init()
+  .catch((error) => console.error("portal: bridge resume failed:", error))
+  // After the bridges, whatever became of them: a resumed import's wiring and
+  // history stages route through the live bridges.
+  .then(() => importer.resumeInterrupted())
+  .catch((error) => console.error("portal: import resume failed:", error));
 
 const app = new Hono();
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;

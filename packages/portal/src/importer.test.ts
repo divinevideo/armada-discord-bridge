@@ -99,6 +99,10 @@ function fakeSql(store: { imports: Map<string, Record<string, unknown>>; bridges
           b.community_id !== communityId,
       );
     }
+    if (text.startsWith("SELECT import_id, updated_at FROM imports")) {
+      const inFlight = ["minting", "publishing", "wiring", "history"];
+      return [...store.imports.values()].filter((r) => inFlight.includes(r.status as string));
+    }
     if (text.startsWith("SELECT * FROM imports")) {
       const row = store.imports.get(next() as string);
       if (!row) return [];
@@ -247,6 +251,42 @@ describe("import dedupe guard", () => {
     // Nothing minted: the import stays previewed, no key material written.
     expect(store.imports.get("imp2")!.status).toBe("previewed");
     expect(store.imports.get("imp2")!.community_id).toBeNull();
+  });
+});
+
+describe("resuming imports a restart interrupted", () => {
+  function row(importId: string, status: string, updatedAgoMs: number): Record<string, unknown> {
+    return {
+      import_id: importId,
+      owner_discord_id: "user1",
+      discord_guild_id: "100",
+      status,
+      status_detail: null,
+      plan: buildImportPlan(snapshot),
+      owner_sk_sealed: null,
+      community_sealed: null,
+      updated_at: new Date(Date.now() - updatedAgoMs),
+    };
+  }
+
+  it("relaunches a recent one and hands a stale one back to its owner as retryable", async () => {
+    const store = { imports: new Map<string, Record<string, unknown>>(), bridges: [] as Array<Record<string, unknown>> };
+    store.imports.set("recent", row("recent", "wiring", 60_000));
+    store.imports.set("stale", row("stale", "history", 30 * 24 * 60 * 60 * 1000));
+    store.imports.set("finished", row("finished", "done", 60_000));
+    const importer = new Importer(fakeSql(store), env, {} as never, () => wirePool([]));
+
+    await importer.resumeInterrupted();
+    await new Promise((resolve) => setTimeout(resolve, 20)); // let the relaunch settle
+
+    // Relaunched: the pipeline ran (and, with no genesis material in this
+    // fixture, failed on its first step rather than sitting in `wiring`).
+    expect(store.imports.get("recent")!.status).toBe("failed");
+    expect(String(store.imports.get("recent")!.status_detail)).toMatch(/never prepared/);
+    // Not relaunched on its own, but no longer stranded: retry accepts it.
+    expect(store.imports.get("stale")!.status).toBe("failed");
+    expect(String(store.imports.get("stale")!.status_detail)).toMatch(/interrupted by a portal restart/);
+    expect(store.imports.get("finished")!.status).toBe("done");
   });
 });
 
