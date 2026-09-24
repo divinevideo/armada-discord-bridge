@@ -453,9 +453,16 @@ export class BridgeManager {
     );
     const { community } = await resolveInvite(inviteUrl, bootstrap).finally(() => void bootstrap.close());
 
-    const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS));
-    const primarySkHex = unseal(this.env.sealKeyHex, row.primary_sk_sealed);
-    const primary = localIdentity(Uint8Array.from(Buffer.from(primarySkHex, "hex")));
+    const primarySk = Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, row.primary_sk_sealed), "hex"));
+    const primary = localIdentity(primarySk);
+    // NIP-42 identity: the bridge's own npub, not a throwaway. Relays that gate
+    // kind 1059 serve a giftwrap only to the pubkey it is addressed to, and the
+    // Direct Invites carrying private-channel keys are addressed to this npub.
+    // Under a random identity the bridge could never read its own key
+    // deliveries on relay.ditto.pub or relay.dreamith.to — every private
+    // channel an import admitted it to failed "concord channel not found" on
+    // every start (2026-09-24). The npub is public already (kind 0, guestbook).
+    const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), { authSk: primarySk });
 
     // Fold the Control Plane first: it reads from the community root the
     // invite carried, so the roster — and with it, who may vend a channel key
@@ -467,7 +474,7 @@ export class BridgeManager {
     // delivered as Direct Invites (see keyIntake.ts). Runs before the client
     // that serves `channels()` is built, so a gated channel is present on the
     // first pass.
-    const floor = new RelayPool(inviteDeliveryRelays([]));
+    const floor = new RelayPool(inviteDeliveryRelays([]), { authSk: primarySk });
     const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
       isAuthorizedSender: (pk) =>
         isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
