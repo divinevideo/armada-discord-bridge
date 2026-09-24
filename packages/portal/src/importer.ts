@@ -84,7 +84,6 @@ import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import type { LocalIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { discordEmojiUrl } from "@armada-bridge/bridge/src/router";
-import type { DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { encrypt as nip44Encrypt, getConversationKey } from "nostr-tools/nip44";
@@ -94,7 +93,7 @@ import type { NostrEvent } from "nostr-tools/pure";
 import type postgres from "postgres";
 
 import { botCanManageWebhooks } from "./discordRest";
-import { botChannelMessagesBefore, botGuildSnapshot, botInstallUrl } from "./discordRest";
+import { botChannelMessagesBefore, botGuildSnapshot, botInstallUrl, restToInbound } from "./discordRest";
 import type { RestMessage } from "./discordRest";
 import type { PortalEnv } from "./env";
 import { HISTORY_MESSAGE_CAP, buildImportPlan } from "./importPlan";
@@ -196,34 +195,6 @@ function plaintextSealTemplate(rumor: Rumor): OwnerSignTemplate["template"] {
 
 /** The Armada client's stock blob host, used when BLOSSOM_SERVER is unset. */
 const DEFAULT_BLOSSOM = "https://blossom.ditto.pub";
-
-/** A REST history message -> the router's inbound shape (same as gateway). */
-export function restToInbound(message: RestMessage, guildId: string, channelId: string): DiscordInboundMessage {
-  return {
-    id: message.id,
-    channelId,
-    guildId,
-    content: message.content ?? "",
-    author: {
-      id: message.author.id,
-      display: message.author.global_name || message.author.username,
-      avatarUrl: message.author.avatar
-        ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`
-        : undefined,
-      bot: message.author.bot === true,
-    },
-    webhookId: message.webhook_id,
-    applicationId: message.application_id ?? undefined,
-    referencedMessageId: message.message_reference?.message_id,
-    timestampMs: Date.parse(message.timestamp),
-    attachments: message.attachments?.map((a) => ({ url: a.url, filename: a.filename })),
-    embeds: message.embeds?.map((e) => ({
-      url: e.url,
-      mediaUrl: e.video?.url ?? e.image?.url ?? e.thumbnail?.url,
-    })),
-    mentions: message.mentions?.map((m) => ({ id: m.id, display: m.global_name || m.username })),
-  };
-}
 
 /** Largest icon/banner we bother rehosting. */
 const MAX_ASSET_BYTES = 8 * 1024 * 1024;

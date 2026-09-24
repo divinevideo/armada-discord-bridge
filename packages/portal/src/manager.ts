@@ -33,6 +33,8 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { generateSecretKey } from "nostr-tools/pure";
 import type postgres from "postgres";
 
+import { replayDiscordSince } from "./catchup";
+import { botChannelMessagesAfter, restToInbound } from "./discordRest";
 import type { PortalEnv } from "./env";
 import { filterPublicRelays } from "./relayGuard";
 import { seal, unseal } from "./seal";
@@ -111,6 +113,13 @@ class GatewayUnavailableError extends Error {
 
 /** How many bridges may be starting at once during boot; see startAll(). */
 const START_CONCURRENCY = 12;
+
+/**
+ * Most Discord messages one start-time catch-up will read per channel (see
+ * catchUpDiscord). Bounds an old anchor — a bridge that was down for weeks —
+ * to a burst the channel can absorb.
+ */
+const DISCORD_CATCHUP_MAX = 500;
 
 /** The kind 10304 command manifest every bridge primary advertises. */
 export const BRIDGE_COMMANDS = [
@@ -538,9 +547,13 @@ export class BridgeManager {
     });
 
     if (rb.status === "active") {
+      const liveFromMs = Date.now();
       this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed), row.options);
       this.backfillMissed(rb).catch((error) =>
         console.warn(`bridge ${rb.id}: catch-up backfill failed:`, error),
+      );
+      this.catchUpDiscord(rb, liveFromMs).catch((error) =>
+        console.warn(`bridge ${rb.id}: Discord catch-up failed:`, error),
       );
     } else {
       await client.sendChat(channel, {
@@ -585,6 +598,62 @@ export class BridgeManager {
       }
     }
     if (mirrored > 0) console.log(`bridge ${rb.id}: backfilled ${mirrored} missed messages`);
+  }
+
+  /**
+   * Discord-side catch-up after downtime: replay what the Discord channel
+   * said since the newest message this bridge has mirrored in either
+   * direction.
+   *
+   * The gateway only delivers what happens while we are connected, and
+   * backfillMissed covers the Armada side alone, so every restart dropped
+   * whatever Discord said while the process was down — seven hours of it on
+   * 2026-09-23. A channel with nothing mirrored yet has no anchor and is left
+   * alone: history is the importer's job, not a restart's.
+   *
+   * Stops at `liveFromMs`, when routing attached: from then on the gateway
+   * delivers, and replaying past it would race the live path into
+   * publishing the same message twice.
+   */
+  private async catchUpDiscord(rb: Running, liveFromMs: number): Promise<void> {
+    if (!this.env.discordBotToken || !rb.router) return;
+    // created_at orders by when WE wrote the row, which a concurrent history
+    // import can scramble; the snowflake is Discord's own clock. Take the
+    // newest few by the index and the largest id among them.
+    const recent = await this.sql<{ discord_message_id: string }[]>`
+      SELECT discord_message_id FROM messages
+      WHERE tenant_id = 'default' AND discord_channel_id = ${rb.link.discordChannelId}
+        AND community_id = ${rb.link.communityId}
+      ORDER BY created_at DESC LIMIT 50`;
+    if (recent.length === 0) return;
+    const anchor = recent
+      .map((r) => BigInt(r.discord_message_id))
+      .reduce((max, id) => (id > max ? id : max))
+      .toString();
+
+    const { mirrored, capped } = await replayDiscordSince(anchor, liveFromMs, DISCORD_CATCHUP_MAX, {
+      fetchAfter: (afterId) => botChannelMessagesAfter(this.env.discordBotToken, rb.link.discordChannelId, afterId),
+      alreadyMirrored: async (messageId) => {
+        const [exists] = await this.sql`
+          SELECT 1 FROM messages
+          WHERE tenant_id = 'default' AND discord_message_id = ${messageId}
+            AND community_id = ${rb.link.communityId} LIMIT 1`;
+        return !!exists;
+      },
+      mirror: async (message) => {
+        // A bridge stopped mid-replay has no router; the rest is moot.
+        if (!rb.router) return false;
+        const rumorId = await rb.router
+          .onDiscordMessage(restToInbound(message, rb.link.discordGuildId, rb.link.discordChannelId), rb.link)
+          .catch((error) => {
+            console.warn(`bridge ${rb.id}: catch-up of Discord message ${message.id} failed:`, error);
+            return undefined;
+          });
+        return rumorId !== undefined;
+      },
+    });
+    if (mirrored > 0) console.log(`bridge ${rb.id}: caught up ${mirrored} missed Discord messages`);
+    if (capped) console.warn(`bridge ${rb.id}: Discord catch-up stopped at ${DISCORD_CATCHUP_MAX} messages`);
   }
 
   /** Tear down and rebuild the chat REQ when the channel's stream set changes. */

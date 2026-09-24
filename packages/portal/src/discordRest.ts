@@ -4,6 +4,8 @@
  * the BridgeManager owns the gateway connection.
  */
 
+import type { DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
+
 const API = "https://discord.com/api/v10";
 
 /** Manage Webhooks + View Channel + Send Messages + Read History + Add Reactions + Manage Messages. */
@@ -265,4 +267,48 @@ export async function botChannelMessagesBefore(
   const q = new URLSearchParams({ limit: String(limit) });
   if (beforeId) q.set("before", beforeId);
   return botGet<RestMessage[]>(botToken, `/channels/${channelId}/messages?${q}`);
+}
+
+/**
+ * One page of channel history strictly AFTER `afterId`: the oldest `limit`
+ * messages past it, NEWEST first like every history page (so the next page
+ * is after this page's first id). Undefined when the bot cannot read the
+ * channel.
+ */
+export async function botChannelMessagesAfter(
+  botToken: string,
+  channelId: string,
+  afterId: string,
+  limit = 100,
+): Promise<RestMessage[] | undefined> {
+  const q = new URLSearchParams({ limit: String(limit), after: afterId });
+  return botGet<RestMessage[]>(botToken, `/channels/${channelId}/messages?${q}`);
+}
+
+/** A REST history message -> the router's inbound shape (same as gateway). */
+export function restToInbound(message: RestMessage, guildId: string, channelId: string): DiscordInboundMessage {
+  return {
+    id: message.id,
+    channelId,
+    guildId,
+    content: message.content ?? "",
+    author: {
+      id: message.author.id,
+      display: message.author.global_name || message.author.username,
+      avatarUrl: message.author.avatar
+        ? `https://cdn.discordapp.com/avatars/${message.author.id}/${message.author.avatar}.png`
+        : undefined,
+      bot: message.author.bot === true,
+    },
+    webhookId: message.webhook_id,
+    applicationId: message.application_id ?? undefined,
+    referencedMessageId: message.message_reference?.message_id,
+    timestampMs: Date.parse(message.timestamp),
+    attachments: message.attachments?.map((a) => ({ url: a.url, filename: a.filename })),
+    embeds: message.embeds?.map((e) => ({
+      url: e.url,
+      mediaUrl: e.video?.url ?? e.image?.url ?? e.thumbnail?.url,
+    })),
+    mentions: message.mentions?.map((m) => ({ id: m.id, display: m.global_name || m.username })),
+  };
 }
