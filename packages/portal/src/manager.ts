@@ -781,7 +781,6 @@ export class BridgeManager {
     if (this.running.has(row.bridge_id)) return;
     try {
       await this.start(row);
-      await this.clearStartFailure(row);
     } catch (error) {
       if (error instanceof GatewayUnavailableError) {
         // Not a start failure: the community is fine, the local gateway is
@@ -793,8 +792,22 @@ export class BridgeManager {
         this.scheduleStartRetry(row.bridge_id, attempt);
         return;
       }
-      await this.handleStartFailure(row, String(error), attempt);
+      // The bookkeeping is best-effort; the retry is not. This runs from a
+      // bare timer and from startAll's workers, so a throw here was an
+      // unhandled rejection that killed the process — 2026-09-24, a postgres
+      // CONNECT_TIMEOUT 70 minutes into a CPU-bound boot restarted the whole
+      // thousand-bridge boot from zero.
+      await this.handleStartFailure(row, String(error), attempt).catch((bookkeepingError) => {
+        console.error(`bridge ${row.bridge_id}: could not record start failure; retrying anyway:`, bookkeepingError);
+        this.scheduleStartRetry(row.bridge_id, attempt);
+      });
+      return;
     }
+    // Started and running: failing to clear the streak marker must not be
+    // mistaken for a failed start. The next successful boot clears it.
+    await this.clearStartFailure(row).catch((error) =>
+      console.warn(`bridge ${row.bridge_id}: could not clear start-failure marker:`, error),
+    );
   }
 
   private async handleStartFailure(row: BridgeRow, detail: string, attempt: number): Promise<void> {
@@ -827,7 +840,12 @@ export class BridgeManager {
     const delay = cap / 2 + Math.random() * (cap / 2);
     const timer = setTimeout(() => {
       this.startRetryTimers.delete(bridgeId);
-      void this.retryStart(bridgeId, attempt + 1);
+      // retryStart's own row read can fail the same way; back off and try
+      // again rather than let the rejection take the process down.
+      this.retryStart(bridgeId, attempt + 1).catch((error) => {
+        console.error(`bridge ${bridgeId}: retry failed before starting; rescheduling:`, error);
+        this.scheduleStartRetry(bridgeId, attempt + 1);
+      });
     }, delay);
     this.startRetryTimers.set(bridgeId, timer);
   }
