@@ -5,7 +5,9 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { heapStats } from "bun:jsc";
 import { chatMemoSize } from "@armada-bridge/concord-core";
+import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { migrate } from "@armada-bridge/bridge/src/db/migrate";
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -62,11 +64,29 @@ void manager
 setInterval(() => {
   const m = process.memoryUsage();
   const mb = (bytes: number) => Math.round(bytes / 2 ** 20);
+  const relays = RelayPool.backlog();
   console.log(
     `portal: memory rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}MB external=${mb(m.external)}MB ` +
-      `bridges=${manager.liveCount} imports=${importer.activeCount} chatMemo=${chatMemoSize()}`,
+      `bridges=${manager.liveCount} imports=${importer.activeCount} chatMemo=${chatMemoSize()} ` +
+      `pools=${relays.pools} sockets=${relays.sockets} down=${relays.down} ` +
+      `queued=${relays.queued} unsent=${mb(relays.unsentBytes)}MB`,
   );
 }, 10 * 60 * 1000).unref();
+
+/**
+ * `systemctl kill -s USR2 bridge-portal` logs the live heap by object type.
+ * On demand only: the census walks the whole heap, a second or more of
+ * blocked event loop at production size.
+ */
+process.on("SIGUSR2", () => {
+  const { objectTypeCounts, heapSize, objectCount } = heapStats();
+  const top = Object.entries(objectTypeCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30)
+    .map(([type, n]) => `${type}=${n}`)
+    .join(" ");
+  console.log(`portal: heap census ${Math.round(heapSize / 2 ** 20)}MB, ${objectCount} objects: ${top}`);
+});
 
 const app = new Hono();
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;

@@ -69,7 +69,32 @@ function verifyOnce(event: NostrEvent): boolean {
   return true;
 }
 
+/** Every pool not yet closed, for {@link RelayPool.backlog}. */
+const openPools = new Set<RelayPool>();
+
 export class RelayPool implements RelayLike {
+  /**
+   * What the process's sockets are holding that the relays have not taken:
+   * messages queued while a socket was down (websocket-ts buffers every send
+   * made then, without bound, until it reconnects) and bytes the kernel has
+   * not drained from open ones. Operational visibility only.
+   */
+  static backlog(): { pools: number; sockets: number; down: number; queued: number; unsentBytes: number } {
+    const out = { pools: openPools.size, sockets: 0, down: 0, queued: 0, unsentBytes: 0 };
+    for (const pool of openPools) {
+      for (const conn of pool.conns.values()) {
+        out.sockets++;
+        const ws = conn.socket;
+        if (ws.readyState !== WebSocket.OPEN) out.down++;
+        // NRelay1 always builds its socket with an ArrayQueue, which has length().
+        const buffer = ws.buffer as { length?: () => number } | undefined;
+        out.queued += buffer?.length?.() ?? 0;
+        out.unsentBytes += ws.bufferedAmount ?? 0;
+      }
+    }
+    return out;
+  }
+
   private readonly conns = new Map<string, AuthedNRelay1>();
   private readonly challenges = new Map<string, string>();
   /**
@@ -92,6 +117,7 @@ export class RelayPool implements RelayLike {
   constructor(readonly urls: string[], opts?: { authSk?: Uint8Array }) {
     if (urls.length === 0) throw new Error("RelayPool needs at least one relay URL");
     this.authSk = opts?.authSk ?? generateSecretKey();
+    openPools.add(this);
     // A key can gain its secret or widen its relay scope after this pool
     // first wanted it; sign it then, on sockets that are already challenged.
     this.stopKeyListener = onStreamKeysAdded((pks) => {
@@ -273,6 +299,7 @@ export class RelayPool implements RelayLike {
   }
 
   async close(): Promise<void> {
+    openPools.delete(this);
     this.stopKeyListener();
     this.challenges.clear();
     this.authed.clear();
