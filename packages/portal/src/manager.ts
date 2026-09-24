@@ -991,6 +991,11 @@ export class BridgeManager {
       WHERE bridge_id = ${bridgeId}`;
   }
 
+  /** How many bridges are running in this process. */
+  get liveCount(): number {
+    return this.running.size;
+  }
+
   isLive(bridgeId: string): boolean {
     return this.running.has(bridgeId);
   }

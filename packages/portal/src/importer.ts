@@ -239,6 +239,11 @@ export class Importer {
   /** Imports with a pipeline currently running in this process. */
   private readonly running = new Set<string>();
 
+  /** Imports with a pipeline running in this process right now. */
+  get activeCount(): number {
+    return this.running.size;
+  }
+
   constructor(
     private readonly sql: postgres.Sql,
     private readonly env: PortalEnv,

@@ -5,6 +5,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { chatMemoSize } from "@armada-bridge/concord-core";
 import { migrate } from "@armada-bridge/bridge/src/db/migrate";
 import { Hono } from "hono";
 import type { Context } from "hono";
@@ -52,6 +53,20 @@ void manager
   // history stages route through the live bridges.
   .then(() => importer.resumeInterrupted())
   .catch((error) => console.error("portal: import resume failed:", error));
+
+/**
+ * One line every ten minutes on where the memory is. The 2026-09-23 OOM left
+ * nothing to tell a leak from a baseline or JS heap from native buffers; with
+ * this, the journal before any kill says which one grew and alongside what.
+ */
+setInterval(() => {
+  const m = process.memoryUsage();
+  const mb = (bytes: number) => Math.round(bytes / 2 ** 20);
+  console.log(
+    `portal: memory rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}MB external=${mb(m.external)}MB ` +
+      `bridges=${manager.liveCount} imports=${importer.activeCount} chatMemo=${chatMemoSize()}`,
+  );
+}, 10 * 60 * 1000).unref();
 
 const app = new Hono();
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;
