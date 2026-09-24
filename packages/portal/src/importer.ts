@@ -627,8 +627,11 @@ export class Importer {
     // matches the bundle's semantics: `retry()` resumes idempotently from the
     // checkpoints, so a failed publish costs a retry, not a corrupt community.
     const publishVerified = async (event: NostrEvent, label: string): Promise<void> => {
+      // `authors` narrows nothing — the id already fixes the author — but it is
+      // how the pool learns which stream key to AUTH as, and AUTH-gated relays
+      // serve a kind-1059 read to nobody else.
       const landed = async () =>
-        (await pool.query([{ ids: [event.id] }]).catch(() => [])).length > 0;
+        (await pool.query([{ ids: [event.id], authors: [event.pubkey] }]).catch(() => [])).length > 0;
       // Check-then-sleep, not sleep-then-check: a relay that persists the write
       // and can answer for it immediately (the common case) returns with no
       // delay, so verifying every edition costs a query, not a wall of 1.5s
