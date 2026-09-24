@@ -642,11 +642,23 @@ export class BridgeManager {
    */
   private async catchUpDiscord(rb: Running, liveFromMs: number): Promise<void> {
     if (!this.env.discordBotToken || !rb.router) return;
+    // A channel whose history import hasn't finished belongs to the importer.
+    // It publishes oldest first, so mid-run the largest mirrored snowflake is
+    // wherever it had got to — 2022, for one channel on 2026-09-24 — and a
+    // catch-up from there races it over the same messages, with only a
+    // check-then-insert between them. The importer needs no help: a resumed
+    // run re-collects everything newer than its cursor, up to the moment it
+    // resumes, and the gateway has everything after.
+    const [importing] = await this.sql`
+      SELECT 1 FROM imports i, jsonb_array_elements(i.plan->'channels') c
+      WHERE i.status IN ('publishing', 'wiring', 'history')
+        AND c->>'discordId' = ${rb.link.discordChannelId}
+        AND (c->>'history')::boolean AND c->>'historyDoneAt' IS NULL
+      LIMIT 1`;
+    if (importing) return;
     // The anchor is the largest snowflake mirrored, never the newest row:
     // created_at is when WE wrote a row, and a history import writes old
-    // messages now. Anchored on the newest rows, a channel mid-import replayed
-    // from 2020 alongside the importer (2026-09-24). The snowflake is
-    // Discord's own clock.
+    // messages now. The snowflake is Discord's own clock.
     const before = new Date(this.env.catchUpSinceMs ?? Date.now());
     const [{ anchor }] = await this.sql<{ anchor: string | null }[]>`
       SELECT max(discord_message_id::numeric)::text AS anchor FROM messages
