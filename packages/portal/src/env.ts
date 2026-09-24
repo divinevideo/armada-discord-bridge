@@ -34,6 +34,16 @@ export interface PortalEnv {
    * cannot be used to ride a visitor's existing portal session.
    */
   allowedOrigins: string[];
+  /**
+   * Recovery knob for the Discord catch-up (epoch ms; unset in normal
+   * operation). Anchors each channel's replay on the newest message mirrored
+   * BEFORE this moment instead of the newest overall, so one boot can walk a
+   * gap that later traffic has already papered over — a restart on code that
+   * had no catch-up leaves exactly that. Already-mirrored messages are
+   * skipped, so starting early costs reads, not duplicates. Set for one boot,
+   * then remove.
+   */
+  catchUpSinceMs?: number;
 }
 
 function required(name: string): string {
@@ -79,5 +89,15 @@ export function loadPortalEnv(): PortalEnv {
       .split(",")
       .map((o) => o.trim().replace(/\/+$/, ""))
       .filter(Boolean),
+    catchUpSinceMs: parseCatchUpSince(process.env.DISCORD_CATCHUP_SINCE),
   };
+}
+
+function parseCatchUpSince(value: string | undefined): number | undefined {
+  if (!value?.trim()) return undefined;
+  const ms = Date.parse(value.trim());
+  // Refuse rather than ignore: a typo here would silently skip the recovery
+  // the operator set it for.
+  if (!Number.isFinite(ms)) throw new Error(`DISCORD_CATCHUP_SINCE is not a date: ${value}`);
+  return ms;
 }

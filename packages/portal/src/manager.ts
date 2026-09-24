@@ -620,10 +620,11 @@ export class BridgeManager {
     // created_at orders by when WE wrote the row, which a concurrent history
     // import can scramble; the snowflake is Discord's own clock. Take the
     // newest few by the index and the largest id among them.
+    const before = new Date(this.env.catchUpSinceMs ?? Date.now());
     const recent = await this.sql<{ discord_message_id: string }[]>`
       SELECT discord_message_id FROM messages
       WHERE tenant_id = 'default' AND discord_channel_id = ${rb.link.discordChannelId}
-        AND community_id = ${rb.link.communityId}
+        AND community_id = ${rb.link.communityId} AND created_at < ${before}
       ORDER BY created_at DESC LIMIT 50`;
     if (recent.length === 0) return;
     const anchor = recent
