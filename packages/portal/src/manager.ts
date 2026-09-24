@@ -164,10 +164,29 @@ export class BridgeManager {
     } else {
       console.warn("portal: DISCORD_TOKEN not set; bridges cannot go live");
     }
-    const rows = await this.sql<BridgeRow[]>`
-      SELECT * FROM bridges WHERE status IN ('pending_confirm', 'active')`;
-    await this.startAll(rows);
+    await this.startAll(await this.bridgesToStart());
     this.booted = true;
+  }
+
+  /**
+   * Every bridge that should be running, the most recently active first.
+   *
+   * Boot is a queue, and whatever sits at the back of it stays dark until the
+   * front has started; in heap order that was arbitrary, so a busy channel
+   * could wait out the whole boot behind hundreds that never speak. Ordering
+   * by the newest mirrored message puts the conversations people are having
+   * first. Bridges with no traffic yet (new, or pending confirm) go last.
+   */
+  private bridgesToStart(): Promise<BridgeRow[]> {
+    return this.sql<BridgeRow[]>`
+      SELECT b.* FROM bridges b
+      LEFT JOIN LATERAL (
+        SELECT m.created_at FROM messages m
+        WHERE m.tenant_id = 'default' AND m.discord_channel_id = b.discord_channel_id
+        ORDER BY m.created_at DESC LIMIT 1
+      ) last ON true
+      WHERE b.status IN ('pending_confirm', 'active')
+      ORDER BY last.created_at DESC NULLS LAST`;
   }
 
   /** A fresh gateway client wired to this manager's handlers. */
@@ -238,8 +257,7 @@ export class BridgeManager {
    * start them now rather than wait the backoff out.
    */
   private async onAdapterConnected(): Promise<void> {
-    const rows = await this.sql<BridgeRow[]>`
-      SELECT * FROM bridges WHERE status IN ('pending_confirm', 'active')`;
+    const rows = await this.bridgesToStart();
     const deferred = rows.filter((row) => !this.running.has(row.bridge_id));
     for (const row of deferred) this.cancelStartRetry(row.bridge_id);
     if (deferred.length > 0) {
