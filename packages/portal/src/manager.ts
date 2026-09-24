@@ -642,20 +642,17 @@ export class BridgeManager {
    */
   private async catchUpDiscord(rb: Running, liveFromMs: number): Promise<void> {
     if (!this.env.discordBotToken || !rb.router) return;
-    // created_at orders by when WE wrote the row, which a concurrent history
-    // import can scramble; the snowflake is Discord's own clock. Take the
-    // newest few by the index and the largest id among them.
+    // The anchor is the largest snowflake mirrored, never the newest row:
+    // created_at is when WE wrote a row, and a history import writes old
+    // messages now. Anchored on the newest rows, a channel mid-import replayed
+    // from 2020 alongside the importer (2026-09-24). The snowflake is
+    // Discord's own clock.
     const before = new Date(this.env.catchUpSinceMs ?? Date.now());
-    const recent = await this.sql<{ discord_message_id: string }[]>`
-      SELECT discord_message_id FROM messages
+    const [{ anchor }] = await this.sql<{ anchor: string | null }[]>`
+      SELECT max(discord_message_id::numeric)::text AS anchor FROM messages
       WHERE tenant_id = 'default' AND discord_channel_id = ${rb.link.discordChannelId}
-        AND community_id = ${rb.link.communityId} AND created_at < ${before}
-      ORDER BY created_at DESC LIMIT 50`;
-    if (recent.length === 0) return;
-    const anchor = recent
-      .map((r) => BigInt(r.discord_message_id))
-      .reduce((max, id) => (id > max ? id : max))
-      .toString();
+        AND community_id = ${rb.link.communityId} AND created_at < ${before}`;
+    if (!anchor) return;
 
     const { mirrored, capped } = await replayDiscordSince(anchor, liveFromMs, DISCORD_CATCHUP_MAX, {
       fetchAfter: (afterId) => botChannelMessagesAfter(this.env.discordBotToken, rb.link.discordChannelId, afterId),
