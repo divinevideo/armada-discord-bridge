@@ -14,6 +14,7 @@ import {
   ChannelType,
   Client,
   GatewayIntentBits,
+  Options,
   Partials,
   type Message,
   type MessageReaction,
@@ -101,6 +102,21 @@ export class DiscordAdapter implements WebhookSender {
       ],
       // Deletes and reactions arrive for uncached (pre-boot) messages too.
       partials: [Partials.Message, Partials.Reaction, Partials.User],
+      // discord.js's defaults keep 200 messages per channel and every user
+      // and member ever seen, forever. The GuildMessages intent delivers every
+      // message in every channel of every guild the bot is in — bridged or
+      // not, a hundred guilds of them — so those caches only ever grew, and
+      // with the rest of the process they ran the container out of memory
+      // (2026-09-23). Nothing here needs history from the cache: every handler
+      // above already fetches a partial message, reaction or user. Members
+      // stay cached within a bound because server nicknames are resolved from
+      // it; a member just seen on a message is always inside the bound.
+      makeCache: Options.cacheWithLimits({
+        ...Options.DefaultMakeCacheSettings,
+        MessageManager: 25,
+        GuildMemberManager: { maxSize: 200, keepOverLimit: (member) => member.id === member.client.user.id },
+        UserManager: { maxSize: 2_000, keepOverLimit: (user) => user.id === user.client.user.id },
+      }),
     });
     this.client.on("messageCreate", (message) => {
       // Guild-scoped bot commands the host intercepts BEFORE any router
