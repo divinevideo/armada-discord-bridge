@@ -61,6 +61,9 @@ import type { LocalIdentity } from "./signer";
  */
 export const TAG_PROXY = "proxy";
 
+/** How long subscribeControl gathers arriving control wraps before re-folding. */
+export const CONTROL_REFOLD_MS = 250;
+
 export function proxyTag(guildId: string, channelId: string, messageId: string): string[] {
   return [TAG_PROXY, `https://discord.com/channels/${guildId}/${channelId}/${messageId}`, "web"];
 }
@@ -365,28 +368,42 @@ export class ConcordClient {
   }
 
   /**
-   * Live-fold the Control Plane: each incoming control wrap re-folds the
-   * accumulated edition set (control history is small by design; the fold
-   * itself is memoized in core). Keeps `this.folded` current so bans and
-   * channel changes apply to the very next send.
+   * Live-fold the Control Plane: incoming control wraps re-fold the
+   * accumulated edition set. Keeps `this.folded` current so bans and channel
+   * changes apply to (nearly) the very next send.
+   *
+   * Re-folds are batched over CONTROL_REFOLD_MS. The REQ has no `since`, so
+   * every relay replays the whole plane on subscribe, and folding once per
+   * arriving wrap made that replay quadratic — for every bridge, and core's
+   * fold memo keeps one entry per community, so sibling bridges of a large
+   * community kept evicting each other's.
    */
   subscribeControl(onFold?: (folded: FoldedControl) => void): () => void {
     const groups = controlGroups(this.community);
     const wraps: NostrEvent[] = [];
     const seen = new Set<string>();
-    return this.pool.subscribe(
+    let pending: ReturnType<typeof setTimeout> | undefined;
+    const refold = () => {
+      pending = undefined;
+      const editions = openControlWraps(wraps, groups);
+      this.folded = foldControlState(editions, this.community.id, this.community.owner);
+      onFold?.(this.folded);
+    };
+    const unsubscribe = this.pool.subscribe(
       [{ kinds: [KIND_WRAP], authors: groups.map((g) => g.pk) }],
       {
         onEvent: (wrap) => {
           if (seen.has(wrap.id)) return;
           seen.add(wrap.id);
           wraps.push(wrap);
-          const editions = openControlWraps(wraps, groups);
-          this.folded = foldControlState(editions, this.community.id, this.community.owner);
-          onFold?.(this.folded);
+          pending ??= setTimeout(refold, CONTROL_REFOLD_MS);
         },
       },
     );
+    return () => {
+      clearTimeout(pending);
+      unsubscribe();
+    };
   }
 
   /**

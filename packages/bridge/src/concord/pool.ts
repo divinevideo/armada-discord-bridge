@@ -5,15 +5,20 @@
  *
  * NIP-42: relays that gate kind 1059 (ditto-relay's default) require every
  * `authors` entry in a REQ to be an authenticated pubkey on the connection.
- * Stream addresses are derived keys the client holds, so on each challenge
- * we AUTH as every registered stream key (core `streamAuth` registry) plus
- * an identity key, all on the same socket; NRelay1 then retries the REQ.
+ * Stream addresses are derived keys the client holds, so a pool AUTHs as the
+ * stream keys its own REQs name (see `want`) plus an identity key, all on the
+ * same socket; NRelay1 retries a REQ the relay closed as auth-required.
  */
 
-import { onStreamKeysAdded, signStreamAuths, streamPubkeysForRelay } from "@armada-bridge/concord-core";
+import {
+  isStreamPubkey,
+  onStreamKeysAdded,
+  signStreamAuths,
+  streamPubkeysForRelay,
+} from "@armada-bridge/concord-core";
 import { NRelay1 } from "@nostrify/nostrify";
 import type { NostrClientMsg, NostrEvent, NostrFilter } from "@nostrify/nostrify";
-import { finalizeEvent, generateSecretKey } from "nostr-tools/pure";
+import { finalizeEvent, generateSecretKey, getEventHash, verifyEvent } from "nostr-tools/pure";
 
 /** NRelay1 keeps `send` protected; the AUTH fan-out needs it. */
 class AuthedNRelay1 extends NRelay1 {
@@ -40,46 +45,115 @@ export interface RelayLike {
 const QUERY_TIMEOUT_MS = 10_000;
 const PUBLISH_TIMEOUT_MS = 8_000;
 
+/** Bound on the process-wide verified-signature memo; see verifyOnce. */
+const VERIFIED_MAX = 200_000;
+const verified = new Set<string>();
+
+/**
+ * NRelay1's event verifier, remembering signatures it has already checked.
+ *
+ * Every bridge holds its own pool, and every pool hears every event from all
+ * of its relays: a community's control history arrives once per relay per
+ * bridge, so a fifty-bridge community Schnorr-verified each wrap two hundred
+ * times — about a quarter of all boot CPU (2026-09-24 profile). The hash is
+ * still recomputed every time, since it is what binds the id to the content;
+ * only the signature check over that id is remembered.
+ */
+function verifyOnce(event: NostrEvent): boolean {
+  if (getEventHash(event) !== event.id) return false;
+  const key = event.id + event.sig;
+  if (verified.has(key)) return true;
+  if (!verifyEvent(event)) return false;
+  if (verified.size >= VERIFIED_MAX) verified.clear();
+  verified.add(key);
+  return true;
+}
+
 export class RelayPool implements RelayLike {
   private readonly conns = new Map<string, AuthedNRelay1>();
   private readonly challenges = new Map<string, string>();
+  /**
+   * The stream pubkeys this pool's own REQs have named as authors. A pool
+   * AUTHs as these and nothing else.
+   *
+   * It used to AUTH as every stream key in the process-wide registry, on every
+   * challenge and again whenever any pool registered a new key. With one pool
+   * per bridge on the same four stock relays, that is quadratic in bridges:
+   * each of ~1100 pools signed thousands of keys it never queried, at ~4ms a
+   * Schnorr signature, on the main thread — 56% of boot CPU, and a boot that
+   * pinned the event loop for 90 minutes (2026-09-24).
+   */
+  private readonly wanted = new Set<string>();
+  /** Per relay, the stream pubkeys already AUTHed on its current challenge. */
+  private readonly authed = new Map<string, Set<string>>();
   private readonly authSk: Uint8Array;
   private readonly stopKeyListener: () => void;
 
   constructor(readonly urls: string[], opts?: { authSk?: Uint8Array }) {
     if (urls.length === 0) throw new Error("RelayPool needs at least one relay URL");
     this.authSk = opts?.authSk ?? generateSecretKey();
-    // Channel stream keys register only after the control fold, which is
-    // AFTER the socket answered its AUTH challenge with the keys known at
-    // that moment. Without this fan-out the chat REQ's authors were never
-    // authenticated, and the relay served it nothing, silently.
+    // A key can gain its secret or widen its relay scope after this pool
+    // first wanted it; sign it then, on sockets that are already challenged.
     this.stopKeyListener = onStreamKeysAdded((pks) => {
-      for (const [url, challenge] of this.challenges) {
-        const conn = this.conns.get(url);
-        if (!conn) continue;
-        const scoped = new Set(streamPubkeysForRelay(url));
-        const late = pks.filter((pk) => scoped.has(pk));
-        for (const event of signStreamAuths(challenge, url, late)) {
-          conn.sendRaw(["AUTH", event]);
-        }
-      }
+      const mine = pks.filter((pk) => this.wanted.has(pk));
+      if (mine.length === 0) return;
+      for (const url of this.challenges.keys()) this.sendStreamAuths(url, mine);
     });
+  }
+
+  /**
+   * Record the stream authors a REQ is about to name, and AUTH as the new
+   * ones on every socket already challenged. Sent ahead of the REQ on the
+   * same socket; should the relay still close it as auth-required, NRelay1
+   * retries it once the AUTH has settled.
+   *
+   * Only registered stream keys are recorded: the callers register a stream
+   * (ConcordClient's constructor, channels()) before they query it, and the
+   * other authors a pool sees — profile lookups — are not ours to sign for.
+   */
+  private want(filters: NostrFilter[]): void {
+    const fresh: string[] = [];
+    for (const filter of filters) {
+      for (const pk of filter.authors ?? []) {
+        if (this.wanted.has(pk) || !isStreamPubkey(pk)) continue;
+        this.wanted.add(pk);
+        fresh.push(pk);
+      }
+    }
+    if (fresh.length === 0) return;
+    for (const url of this.challenges.keys()) this.sendStreamAuths(url, fresh);
+  }
+
+  /** AUTH as each of `pks` on `url`'s live challenge, skipping ones already done. */
+  private sendStreamAuths(url: string, pks: Iterable<string>): void {
+    const challenge = this.challenges.get(url);
+    const conn = this.conns.get(url);
+    if (!challenge || !conn) return;
+    let done = this.authed.get(url);
+    if (!done) this.authed.set(url, (done = new Set()));
+    const todo = [...pks].filter((pk) => !done.has(pk));
+    if (todo.length === 0) return;
+    const scoped = new Set(streamPubkeysForRelay(url));
+    for (const event of signStreamAuths(challenge, url, todo.filter((pk) => scoped.has(pk)))) {
+      conn.sendRaw(["AUTH", event]);
+      done.add(event.pubkey);
+    }
   }
 
   private relay(url: string): AuthedNRelay1 {
     let conn = this.conns.get(url);
     if (!conn) {
-      const box: { conn?: AuthedNRelay1 } = {};
       conn = new AuthedNRelay1(url, {
+        verifyEvent: verifyOnce,
         auth: async (challenge) => {
-          // Fan out one AUTH per registered stream key on the live challenge,
-          // then hand NRelay1 the identity auth it awaits an OK for. The
-          // challenge stays valid for the connection's lifetime; keep it so
-          // late-registered keys can AUTH on this socket too.
+          // A challenge is per socket: a reconnect earns a fresh one on which
+          // nothing is authenticated yet. AUTH as the wanted stream keys, then
+          // hand NRelay1 the identity auth it awaits an OK for. Keep the
+          // challenge — it stays valid for the socket's lifetime — so keys
+          // wanted later can AUTH on this socket too.
           this.challenges.set(url, challenge);
-          for (const event of signStreamAuths(challenge, url)) {
-            box.conn?.sendRaw(["AUTH", event]);
-          }
+          this.authed.set(url, new Set());
+          this.sendStreamAuths(url, this.wanted);
           return finalizeEvent(
             {
               kind: 22242,
@@ -91,7 +165,6 @@ export class RelayPool implements RelayLike {
           );
         },
       });
-      box.conn = conn;
       this.conns.set(url, conn);
     }
     return conn;
@@ -100,6 +173,7 @@ export class RelayPool implements RelayLike {
   /** Merge results from every relay, deduped by event id, newest first. */
   async query(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]> {
     const signal = opts?.signal ?? AbortSignal.timeout(QUERY_TIMEOUT_MS);
+    this.want(filters);
     const settled = await Promise.allSettled(
       this.urls.map((url) => this.relay(url).query(filters, { signal })),
     );
@@ -131,6 +205,7 @@ export class RelayPool implements RelayLike {
    */
   async queryRace(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]> {
     const signal = opts?.signal ?? AbortSignal.timeout(QUERY_TIMEOUT_MS);
+    this.want(filters);
     try {
       return await Promise.any(
         this.urls.map(async (url) => {
@@ -157,6 +232,7 @@ export class RelayPool implements RelayLike {
   subscribe(filters: NostrFilter[], handlers: SubscriptionHandlers): () => void {
     const controller = new AbortController();
     const seen = new Set<string>();
+    this.want(filters);
     for (const url of this.urls) {
       void (async () => {
         // One retry: an auth-required CLOSED can race the AUTH fan-out for
@@ -199,6 +275,7 @@ export class RelayPool implements RelayLike {
   async close(): Promise<void> {
     this.stopKeyListener();
     this.challenges.clear();
+    this.authed.clear();
     await Promise.allSettled([...this.conns.values()].map((conn) => conn.close()));
     this.conns.clear();
   }

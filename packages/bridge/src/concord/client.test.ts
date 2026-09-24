@@ -27,7 +27,7 @@ import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { NostrFilter } from "@nostrify/nostrify";
 
-import { ConcordClient, hasProxyTag, proxyTag, resolveInvite } from "./client";
+import { CONTROL_REFOLD_MS, ConcordClient, hasProxyTag, proxyTag, resolveInvite } from "./client";
 import type { RelayLike } from "./pool";
 import { localIdentity } from "./signer";
 
@@ -208,20 +208,27 @@ describe("ConcordClient", () => {
     const client = new ConcordClient(memberView, pool, localIdentity(generateSecretKey()));
 
     let folds = 0;
-    client.subscribeControl(() => folds++);
+    const unsubscribe = client.subscribeControl(() => folds++);
 
     const owner = localIdentity(ownerSk);
     const channelId = new Uint8Array(32).fill(9);
-    const edition = buildChannelEdition(channelId, { name: "bridged", private: false }, {
-      actorPubkey: owner.pk,
-      version: 1n,
-    });
-    const wrap = await sealEdition(edition, currentControlWriteGroup(community), owner.signer);
-    pool.emit(wrap);
+    const otherId = new Uint8Array(32).fill(10);
+    for (const [id, name] of [[channelId, "bridged"], [otherId, "other"]] as const) {
+      const edition = buildChannelEdition(id, { name, private: false }, {
+        actorPubkey: owner.pk,
+        version: 1n,
+      });
+      pool.emit(await sealEdition(edition, currentControlWriteGroup(community), owner.signer));
+    }
 
+    // A replayed plane arrives as a burst; it folds once, not once per wrap.
+    expect(folds).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, CONTROL_REFOLD_MS + 50));
+    unsubscribe();
     expect(folds).toBe(1);
     const names = client.channels().map((c) => c.name);
     expect(names).toContain("bridged");
+    expect(names).toContain("other");
     expect(client.channel(bytesToHex(channelId))).toBeDefined();
   });
 
