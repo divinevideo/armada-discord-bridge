@@ -79,6 +79,16 @@ setInterval(() => {
  * blocked event loop at production size.
  */
 process.on("SIGUSR2", () => {
+  // Collect first, and report both sides: the gap between them is garbage
+  // not yet collected, which the ten-minute line cannot tell from growth.
+  const mb = (bytes: number) => Math.round(bytes / 2 ** 20);
+  const before = process.memoryUsage();
+  Bun.gc(true);
+  const after = process.memoryUsage();
+  console.log(
+    `portal: full gc: heap ${mb(before.heapUsed)}->${mb(after.heapUsed)}MB ` +
+      `external ${mb(before.external)}->${mb(after.external)}MB rss ${mb(before.rss)}->${mb(after.rss)}MB`,
+  );
   const { objectTypeCounts, heapSize, objectCount } = heapStats();
   const top = Object.entries(objectTypeCounts)
     .sort((a, b) => b[1] - a[1])
