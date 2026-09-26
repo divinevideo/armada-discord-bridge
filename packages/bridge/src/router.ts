@@ -28,6 +28,8 @@ import {
   parseImetaEncryption,
   withExtension,
 } from "./imeta";
+import { isKlipyMediaHost, klipyItem } from "./klipy";
+import type { KlipyClient } from "./klipy";
 import { safeProbe } from "./net";
 
 type LocalIdentitySigner = LocalIdentity["signer"];
@@ -149,6 +151,8 @@ export interface RouterOptions {
   bridgeEdits?: boolean;
   /** When set, attachments rehost through Blossom instead of rotting CDN links. */
   blobs?: BlobPort;
+  /** Resolves Klipy GIF-picker sends to their real GIF (KLIPY_API_KEY). */
+  klipy?: Pick<KlipyClient, "resolveGif">;
 }
 
 /** Attachment ceiling both ways (webhook upload limit for standard guilds). */
@@ -352,6 +356,12 @@ export async function resolveGifVariant(
   probe: typeof safeProbe = safeProbe,
 ): Promise<string> {
   if (/\.gif(\?|$)/i.test(mediaUrl)) return mediaUrl;
+  // Klipy answers every missing rendition with one placeholder image — 200,
+  // `image/gif` — so the swap below "verifies" for every Klipy send and the
+  // placeholder crosses instead of the GIF. Its page URL is behind a
+  // Cloudflare challenge besides. Only the Items API (see klipy.ts) knows the
+  // real .gif; without it the mp4 goes to the transcode fallback.
+  if (isKlipyMediaHost(mediaUrl) || isKlipyMediaHost(pageUrl)) return mediaUrl;
   const candidates = [
     mediaUrl.replace(/\.mp4(\?|$)/i, ".gif$1"),
     `${pageUrl.replace(/\/+$/, "")}.gif`,
@@ -471,8 +481,9 @@ export class BridgeRouter {
     const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
 
     const tags = [proxyTag(msg.guildId, msg.channelId, msg.id), ...customEmojiTags(msg.content)];
-    let source = await upgradeGifEmbed(msg);
-    source = await this.transcodedGifFallback(source, identity, tags);
+    let source =
+      (await this.klipyGif(msg, identity, tags)) ??
+      (await this.transcodedGifFallback(await upgradeGifEmbed(msg), identity, tags));
     this.tagEmbedMedia(source, tags);
     const attachments = await this.rehostAttachments(source, identity, tags);
     const content = discordToConcord({ ...source, attachments });
@@ -932,6 +943,50 @@ export class BridgeRouter {
       console.warn(`gif transcode fallback failed for ${embed.mediaUrl}:`, error);
       return msg;
     }
+  }
+
+  /**
+   * A Klipy GIF-picker send, resolved to its real GIF through the Items API
+   * and rehosted on Blossom; undefined leaves the message to the generic
+   * embed path.
+   *
+   * Keyed on the content alone, not on Discord's embed: the embed can arrive
+   * in a later MESSAGE_UPDATE, and the slug in the page URL is all the lookup
+   * needs. If Blossom is absent or refuses the upload, the Klipy URL itself is
+   * still the real GIF, so it crosses tagged rather than falling back to the
+   * mp4.
+   */
+  private async klipyGif(
+    msg: DiscordInboundMessage,
+    identity: LocalIdentity,
+    tags: string[][],
+  ): Promise<DiscordInboundMessage | undefined> {
+    const klipy = this.options.klipy;
+    const page = msg.content.trim();
+    if (!klipy || !klipyItem(page)) return undefined;
+    const gif = await klipy.resolveGif(page, MAX_BLOB_BYTES);
+    if (!gif) return undefined;
+    const dim = gif.width && gif.height ? [`dim ${String(gif.width)}x${String(gif.height)}`] : [];
+
+    const blobs = this.options.blobs;
+    if (blobs) {
+      try {
+        const { data } = await blobs.download(gif.url, MAX_BLOB_BYTES);
+        // "GIF8": the Items API named this file, but the CDN is the one that
+        // serves a placeholder for anything it cannot find.
+        if (data.length < 4 || String.fromCharCode(...data.subarray(0, 4)) !== "GIF8") {
+          throw new Error("klipy served something that is not a GIF");
+        }
+        const uploaded = await blobs.upload(data, "image/gif", identity);
+        const url = withExtension(uploaded.url, "image/gif");
+        tags.push(["imeta", `url ${url}`, "m image/gif", `x ${uploaded.sha256}`, `size ${String(data.length)}`, ...dim]);
+        return { ...msg, embeds: [{ url: page, mediaUrl: url }] };
+      } catch (error) {
+        console.warn(`bridge: klipy rehost failed for ${gif.url}:`, error);
+      }
+    }
+    tags.push(["imeta", `url ${gif.url}`, "m image/gif", ...dim]);
+    return { ...msg, embeds: [{ url: page, mediaUrl: gif.url }] };
   }
 
   /**

@@ -25,6 +25,8 @@ export interface BridgeConfig {
   bridgeEdits: boolean;
   /** Blossom server URL(s) for attachment rehosting, comma-separated in preference order; empty leaves CDN links. */
   blossomServer: string;
+  /** KLIPY API key; resolves Klipy GIF-picker sends to their real GIF. Empty transcodes the mp4 instead. */
+  klipyApiKey: string;
 }
 
 function required(name: string): string {
@@ -46,5 +48,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     logLevel: env.LOG_LEVEL?.trim() || "info",
     bridgeEdits: env.BRIDGE_EDITS === "1",
     blossomServer: env.BLOSSOM_SERVER?.trim() ?? "",
+    klipyApiKey: env.KLIPY_API_KEY?.trim() ?? "",
   };
 }

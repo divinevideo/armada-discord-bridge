@@ -22,6 +22,7 @@ import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
 
 import { BlossomStore } from "./blossom";
+import { KlipyClient } from "./klipy";
 import { ConcordClient, resolveInvite } from "./concord/client";
 import { intakeDirectInviteKeys } from "./concord/keyIntake";
 import { RelayPool } from "./concord/pool";
@@ -170,6 +171,7 @@ router = new BridgeRouter(
   {
     bridgeEdits: config.bridgeEdits,
     blobs: config.blossomServer ? new BlossomStore(config.blossomServer) : undefined,
+    klipy: config.klipyApiKey ? new KlipyClient(config.klipyApiKey) : undefined,
   },
 );
 console.log("bridge: discord gateway up");

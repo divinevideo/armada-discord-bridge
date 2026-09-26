@@ -19,6 +19,7 @@ import {
 } from "@armada-bridge/concord-core";
 import type { ChannelV2, OpenedChat } from "@armada-bridge/concord-core";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
+import { KlipyClient } from "@armada-bridge/bridge/src/klipy";
 import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/client";
 import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyIntake";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
@@ -804,6 +805,7 @@ export class BridgeManager {
       {
         bridgeEdits: options?.edits === true,
         blobs: this.env.blossomServer ? new BlossomStore(this.env.blossomServer) : undefined,
+        klipy: this.env.klipyApiKey ? new KlipyClient(this.env.klipyApiKey) : undefined,
       },
     );
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);

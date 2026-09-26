@@ -18,6 +18,8 @@ export interface PortalEnv {
   discordBotToken: string;
   /** Blossom server URL(s) for attachment rehosting, comma-separated in preference order; empty leaves CDN links. */
   blossomServer: string;
+  /** KLIPY API key; resolves Klipy GIF-picker sends to their real GIF. Empty transcodes the mp4 instead. */
+  klipyApiKey: string;
   /** When "1", /api/auth/dev issues a fake session for UI development. */
   devLogin: boolean;
   /** Cosmetic base for minted invite URLs (any deeplink domain parses). */
@@ -79,6 +81,7 @@ export function loadPortalEnv(): PortalEnv {
     discordClientSecret: process.env.DISCORD_CLIENT_SECRET?.trim() ?? "",
     discordBotToken: process.env.DISCORD_TOKEN?.trim() ?? "",
     blossomServer: process.env.BLOSSOM_SERVER?.trim() ?? "",
+    klipyApiKey: process.env.KLIPY_API_KEY?.trim() ?? "",
     devLogin,
     inviteBaseUrl: process.env.INVITE_BASE_URL?.trim() || "https://armada.buzz",
     importRelays: (process.env.IMPORT_DEFAULT_RELAYS ?? "")

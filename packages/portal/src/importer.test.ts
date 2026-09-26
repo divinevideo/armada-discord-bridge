@@ -63,6 +63,7 @@ const env: PortalEnv = {
   discordClientSecret: "",
   discordBotToken: "",
   blossomServer: "",
+  klipyApiKey: "",
   devLogin: false,
   inviteBaseUrl: "https://armada.example",
   importRelays: [],

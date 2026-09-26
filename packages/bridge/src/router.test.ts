@@ -268,6 +268,73 @@ describe("BridgeRouter: Discord -> Concord", () => {
     expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
   });
 
+  it("resolves a Klipy send through the Items API and rehosts the real GIF", async () => {
+    const blobs = new FakeBlobs(new TextEncoder().encode("GIF89a..."), "image/gif");
+    const asked: string[] = [];
+    const klipy = {
+      resolveGif: async (page: string) => {
+        asked.push(page);
+        return { url: "https://static.klipy.com/ii/a/b/REAL.gif", width: 300, height: 200, size: 9 };
+      },
+    };
+    const { router, pool, channel, link } = harness({ blobs, klipy });
+    // No embed: Discord can attach it later, and the slug is all the lookup needs.
+    await router.onDiscordMessage(discordMsg({ content: "https://klipy.com/gifs/monday-1" }), link);
+    const opened = openWrap(
+      pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!,
+      channel.current.group,
+    );
+    expect(asked).toEqual(["https://klipy.com/gifs/monday-1"]);
+    expect(opened.content).toBe("https://blossom.example/abc123.gif");
+    const imeta = opened.tags.filter((t) => t[0] === "imeta");
+    expect(imeta).toHaveLength(1);
+    expect(imeta[0]).toContain("url https://blossom.example/abc123.gif");
+    expect(imeta[0]).toContain("m image/gif");
+    expect(imeta[0]).toContain("dim 300x200");
+    expect(blobs.uploads[0].mime).toBe("image/gif");
+  });
+
+  it("links the real Klipy GIF when Blossom refuses it", async () => {
+    const blobs = new FakeBlobs(new TextEncoder().encode("GIF89a..."), "image/gif");
+    blobs.upload = async () => {
+      throw new Error("blossom down");
+    };
+    const klipy = { resolveGif: async () => ({ url: "https://static.klipy.com/ii/a/b/REAL.gif" }) };
+    const { router, pool, channel, link } = harness({ blobs, klipy });
+    await router.onDiscordMessage(discordMsg({ content: "https://klipy.com/gifs/monday-1" }), link);
+    const opened = openWrap(
+      pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!,
+      channel.current.group,
+    );
+    expect(opened.content).toBe("https://static.klipy.com/ii/a/b/REAL.gif");
+    expect(opened.tags.find((t) => t[0] === "imeta")).toEqual([
+      "imeta",
+      "url https://static.klipy.com/ii/a/b/REAL.gif",
+      "m image/gif",
+    ]);
+  });
+
+  it("does not rehost bytes from Klipy that are not a GIF", async () => {
+    const blobs = new FakeBlobs(new TextEncoder().encode("<html>"), "image/gif");
+    const klipy = { resolveGif: async () => ({ url: "https://static.klipy.com/ii/a/b/REAL.gif" }) };
+    const { router, link } = harness({ blobs, klipy });
+    await router.onDiscordMessage(discordMsg({ content: "https://klipy.com/gifs/monday-1" }), link);
+    expect(blobs.uploads).toHaveLength(0);
+  });
+
+  it("leaves a Klipy link in prose to the ordinary path", async () => {
+    const asked: string[] = [];
+    const klipy = {
+      resolveGif: async (page: string) => {
+        asked.push(page);
+        return undefined;
+      },
+    };
+    const { router, link } = harness({ klipy });
+    await router.onDiscordMessage(discordMsg({ content: "lol https://klipy.com/gifs/monday-1" }), link);
+    expect(asked).toHaveLength(0);
+  });
+
   it("resolveGifVariant probes for a real .gif and falls back to the mp4", async () => {
     const gifOk: typeof safeProbe = async () => ({ ok: true, mime: "image/gif" });
     const allDead: typeof safeProbe = async () => ({ ok: false, mime: "" });
@@ -276,8 +343,13 @@ describe("BridgeRouter: Discord -> Concord", () => {
     // Already a gif: no probing.
     expect(await resolveGifVariant("https://p", "https://cdn/x.gif", allDead)).toBe("https://cdn/x.gif");
     // Extension swap verified by HEAD.
+    expect(await resolveGifVariant("https://tenor.com/view/x", "https://media.tenor.com/a.mp4", gifOk)).toBe(
+      "https://media.tenor.com/a.gif",
+    );
+    // Never on Klipy: its CDN answers every missing rendition with a
+    // placeholder GIF, so a probe that says yes proves nothing.
     expect(await resolveGifVariant("https://klipy.com/gifs/x", "https://static.klipy.com/a.mp4", gifOk)).toBe(
-      "https://static.klipy.com/a.gif",
+      "https://static.klipy.com/a.mp4",
     );
     // A 200 that serves html is not a gif.
     expect(await resolveGifVariant("https://tenor.com/view/x", "https://media.tenor.com/a.mp4", htmlTrap)).toBe(
