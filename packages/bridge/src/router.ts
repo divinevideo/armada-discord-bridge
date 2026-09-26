@@ -19,6 +19,14 @@ import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
 import type { LocalIdentity } from "./concord/signer";
 import { ffmpegAvailable, mp4ToGif } from "./gif";
+import {
+  attachmentFilename,
+  decryptBlob,
+  imetaFields,
+  isSupportedEncryption,
+  mimeFromUrl,
+  parseImetaEncryption,
+} from "./imeta";
 import { safeProbe } from "./net";
 
 type LocalIdentitySigner = LocalIdentity["signer"];
@@ -942,7 +950,17 @@ export class BridgeRouter {
     return out;
   }
 
-  /** NIP-92 imeta tags -> downloaded webhook file uploads (URL fallback). */
+  /**
+   * NIP-92 imeta tags -> downloaded webhook file uploads (URL fallback).
+   *
+   * Every attachment sent from a Concord community is client-encrypted, and
+   * this read only ever looked at `url` and `size` — so the bytes handed to
+   * Discord were AES-GCM ciphertext, uploaded under a filename taken from a
+   * content-addressed URL that carries no extension either. Both halves of
+   * that are fixed here: `imeta.ts` supplies the key material the tag was
+   * already carrying, and the name comes from the `m` field, which is the only
+   * thing that knows the plaintext type.
+   */
   private async filesFromImeta(
     chat: OpenedChat,
   ): Promise<{ files: Array<{ name: string; data: Uint8Array }>; urls: string[] } | undefined> {
@@ -967,9 +985,18 @@ export class BridgeRouter {
       if (attempted >= MAX_IMETA_DOWNLOADS) break;
       const remaining = MAX_IMETA_TOTAL_BYTES - held;
       if (remaining <= 0) break;
-      const fields = new Map(tag.slice(1).map((f) => [f.split(" ")[0], f.slice(f.indexOf(" ") + 1)]));
+      const fields = imetaFields(tag);
       const url = fields.get("url");
       if (!url) continue;
+      const encryption = parseImetaEncryption(fields);
+      // Encrypted with something we cannot apply. Fail closed the way Armada
+      // does: leave the URL in the text rather than downloading. Uploading the
+      // blob anyway is exactly the bug — Discord would attach ciphertext under
+      // the sender's name, and nothing downstream would ever say why.
+      if (encryption && !isSupportedEncryption(encryption)) {
+        console.warn(`bridge: imeta ${url} uses unsupported encryption ${encryption.algorithm}`);
+        continue;
+      }
       // Advisory only: `size` is whatever the sender wrote, and is absent (so
       // 0) on a tag built to evade this. The real bound is the byte counter in
       // safeFetch; this just avoids starting a download that admits it is
@@ -980,9 +1007,15 @@ export class BridgeRouter {
       attempted++;
       try {
         const { data, mime } = await blobs.download(url, cap);
-        const name = new URL(url).pathname.split("/").pop() || `file.${(mime.split("/")[1] ?? "bin").split("+")[0]}`;
-        files.push({ name, data });
-        held += data.length;
+        const plaintext = encryption ? decryptBlob(data, encryption) : data;
+        // The `m` field wins over the served content-type. On an encrypted
+        // attachment the response describes the CIPHERTEXT (Armada uploads it
+        // under the plaintext type, but a Blossom server is free to serve
+        // `application/octet-stream`), and the filename derived from it is the
+        // only thing that tells Discord what it is holding.
+        const type = fields.get("m") || mimeFromUrl(url) || mime;
+        files.push({ name: attachmentFilename(url, type, fields.get("name")), data: plaintext });
+        held += plaintext.length;
         urls.push(url);
       } catch (error) {
         console.warn(`bridge: imeta download failed for ${url}`, error);

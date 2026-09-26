@@ -1,4 +1,7 @@
 import { describe, expect, it } from "bun:test";
+import { createCipheriv, randomBytes } from "node:crypto";
+
+import { sha256 } from "@noble/hashes/sha2.js";
 import {
   KIND_JOIN_LEAVE,
   KIND_TYPING,
@@ -696,8 +699,13 @@ describe("BridgeRouter: edits (kind 3302, behind flag)", () => {
 
 class FakeBlobs {
   uploads: Array<{ size: number; mime: string; author: string }> = [];
+  /** Served bytes and content-type; overridable to stand in for a real blob host. */
+  constructor(
+    public data: Uint8Array = new Uint8Array([1, 2, 3]),
+    public mime = "image/png",
+  ) {}
   async download(_url: string, _maxBytes: number): Promise<{ data: Uint8Array; mime: string }> {
-    return { data: new Uint8Array([1, 2, 3]), mime: "image/png" };
+    return { data: this.data, mime: this.mime };
   }
   async upload(
     data: Uint8Array,
@@ -707,6 +715,34 @@ class FakeBlobs {
     this.uploads.push({ size: data.length, mime, author: author.pk });
     return { url: "https://blossom.example/abc123", sha256: "ab".repeat(32) };
   }
+}
+
+/**
+ * One attachment as Armada's composer would send it: AES-256-GCM under a
+ * 32-byte key and a 16-byte nonce, tag appended, `ox` over the PLAINTEXT.
+ */
+function encryptedAttachment(
+  plaintext: Uint8Array,
+  mime = "image/png",
+): { blobs: FakeBlobs; tag: string[] } {
+  const key = randomBytes(32);
+  const nonce = randomBytes(16);
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+  return {
+    // Served as octet-stream: the host describes the CIPHERTEXT, so only `m` knows.
+    blobs: new FakeBlobs(new Uint8Array(ciphertext), "application/octet-stream"),
+    tag: [
+      "imeta",
+      "url https://blossom.example/abc123",
+      `m ${mime}`,
+      `size ${String(ciphertext.length)}`,
+      "encryption-algorithm aes-gcm",
+      `decryption-key ${key.toString("hex")}`,
+      `decryption-nonce ${nonce.toString("hex")}`,
+      `ox ${bytesToHex(sha256(plaintext))}`,
+    ],
+  };
 }
 
 describe("BridgeRouter: attachments via Blossom", () => {
@@ -751,9 +787,132 @@ describe("BridgeRouter: attachments via Blossom", () => {
       link,
     );
     expect(webhooks.sent[0].files).toHaveLength(1);
-    expect(webhooks.sent[0].files![0].name).toBe("abc123");
+    // Discord types an upload by its FILENAME. A content-addressed Blossom URL
+    // has no extension, so the name comes from `m`, which is the only field
+    // that knows — the served content-type describes the ciphertext.
+    expect(webhooks.sent[0].files![0].name).toBe("abc123.png");
     expect(webhooks.sent[0].files![0].data).toEqual(new Uint8Array([1, 2, 3]));
     expect(webhooks.sent[0].content).toBe("pic");
+  });
+
+  it("decrypts an encrypted attachment before handing it to Discord", async () => {
+    // The whole reported bug: every Concord community attachment is
+    // client-encrypted, and the bridge used to upload the AES-GCM ciphertext
+    // to Discord verbatim, under a name with no extension.
+    const plaintext = new Uint8Array([9, 8, 7, 6, 5]);
+    const { blobs, tag } = encryptedAttachment(plaintext);
+    const { router, webhooks, link } = harness({ blobs });
+    await router.onConcordChat(
+      concordChat({ content: "pic https://blossom.example/abc123", tags: [tag] }),
+      link,
+    );
+    expect(webhooks.sent[0].files).toHaveLength(1);
+    expect(webhooks.sent[0].files![0].data).toEqual(plaintext);
+    expect(webhooks.sent[0].files![0].name).toBe("abc123.png");
+    expect(webhooks.sent[0].content).toBe("pic");
+  });
+
+  it("accepts base64 key material, which Armada's own reader does", async () => {
+    const plaintext = new Uint8Array([4, 4, 4]);
+    const { blobs, tag } = encryptedAttachment(plaintext);
+    const rebased = tag.map((field) => {
+      const [name, value] = [field.slice(0, field.indexOf(" ")), field.slice(field.indexOf(" ") + 1)];
+      if (name !== "decryption-key" && name !== "decryption-nonce") return field;
+      return `${name} ${Buffer.from(value, "hex").toString("base64")}`;
+    });
+    const { router, webhooks, link } = harness({ blobs });
+    await router.onConcordChat(concordChat({ content: "pic", tags: [rebased] }), link);
+    expect(webhooks.sent[0].files![0].data).toEqual(plaintext);
+  });
+
+  it("refuses a blob whose plaintext does not match its `ox`", async () => {
+    // A swapped blob under a key the sender published. Attaching it anyway
+    // would republish someone else's bytes into Discord under that name.
+    const { blobs, tag } = encryptedAttachment(new Uint8Array([1, 1, 1]));
+    const lying = tag.map((f) => (f.startsWith("ox ") ? `ox ${"cd".repeat(32)}` : f));
+    const { router, webhooks, link } = harness({ blobs });
+    await router.onConcordChat(
+      concordChat({ content: "pic https://blossom.example/abc123", tags: [lying] }),
+      link,
+    );
+    expect(webhooks.sent[0].files).toBeUndefined();
+    // The download failed, so the URL survives as a link rather than vanishing.
+    expect(webhooks.sent[0].content).toBe("pic https://blossom.example/abc123");
+  });
+
+  it("never attaches a blob encrypted with something it cannot apply", async () => {
+    // Fail closed. Treating an unreadable `encryption-algorithm` as plaintext
+    // is precisely how ciphertext reached Discord in the first place.
+    const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
+    await router.onConcordChat(
+      concordChat({
+        content: "pic https://blossom.example/abc123",
+        tags: [
+          [
+            "imeta",
+            "url https://blossom.example/abc123",
+            "m image/png",
+            "size 3",
+            "encryption-algorithm chacha20-poly1305",
+            `decryption-key ${"ab".repeat(32)}`,
+            `decryption-nonce ${"cd".repeat(16)}`,
+          ],
+        ],
+      }),
+      link,
+    );
+    expect(webhooks.sent[0].files).toBeUndefined();
+    expect(webhooks.sent[0].content).toBe("pic https://blossom.example/abc123");
+  });
+
+  it("refuses an aes-gcm tag whose key material is the wrong length", async () => {
+    const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
+    await router.onConcordChat(
+      concordChat({
+        content: "pic https://blossom.example/abc123",
+        tags: [
+          [
+            "imeta",
+            "url https://blossom.example/abc123",
+            "m image/png",
+            "size 3",
+            "encryption-algorithm aes-gcm",
+            `decryption-key ${"ab".repeat(16)}`,
+            `decryption-nonce ${"cd".repeat(16)}`,
+          ],
+        ],
+      }),
+      link,
+    );
+    expect(webhooks.sent[0].files).toBeUndefined();
+  });
+
+  it("keeps a sender-chosen filename out of the multipart header", async () => {
+    // `name` is remote input that lands in `filename=`; a quote or a newline
+    // there rewrites the part header, and a path is one the far side may honor.
+    const { router, webhooks, link } = harness({ blobs: new FakeBlobs() });
+    await router.onConcordChat(
+      concordChat({
+        content: "pic",
+        tags: [
+          [
+            "imeta",
+            "url https://blossom.example/abc123",
+            "m image/png",
+            "size 3",
+            'name ../../etc/"passwd\r\n.png',
+          ],
+        ],
+      }),
+      link,
+    );
+    const name = webhooks.sent[0].files![0].name;
+    expect(name).not.toContain("/");
+    expect(name).not.toContain('"');
+    expect(name).not.toContain("\r");
+    expect(name).not.toContain("\n");
+    expect(name.startsWith(".")).toBe(false);
+    expect(name.endsWith(".png")).toBe(true);
   });
 
   it("sends a media-only message as just the file, never URL plus file", async () => {
