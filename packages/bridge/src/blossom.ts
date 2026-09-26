@@ -15,8 +15,39 @@ import type { BlobPort } from "./router";
 
 const KIND_BLOSSOM_AUTH = 24242;
 
+/**
+ * How long one server gets to accept an upload before the next is tried.
+ *
+ * The upload used to be a bare `fetch` with no deadline, so a server that
+ * accepted the connection and then stalled held the message — and every one
+ * queued behind it — indefinitely.
+ */
+const UPLOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * Parse `BLOSSOM_SERVER`: one URL, or several comma-separated in preference
+ * order. Blank entries and trailing slashes are dropped.
+ */
+export function blossomServers(value: string): string[] {
+  return value
+    .split(",")
+    .map((s) => s.trim().replace(/\/+$/, ""))
+    .filter((s) => s !== "");
+}
+
 export class BlossomStore implements BlobPort {
-  constructor(private readonly server: string) {}
+  private readonly servers: string[];
+
+  /**
+   * `servers` is tried in order on every upload. One host was the whole
+   * story before, and blossom.primal.net spent days answering 500 and 401 —
+   * hundreds of Discord attachments crossed as CDN links that expire in a
+   * day. A second host turns that outage into a slower upload instead.
+   */
+  constructor(servers: string | string[]) {
+    this.servers = typeof servers === "string" ? blossomServers(servers) : servers;
+    if (this.servers.length === 0) throw new Error("BlossomStore needs at least one server");
+  }
 
   /**
    * Fetch a blob named by someone else.
@@ -41,6 +72,8 @@ export class BlossomStore implements BlobPort {
   ): Promise<{ url: string; sha256: string }> {
     const hash = bytesToHex(sha256(data));
     const now = Math.floor(Date.now() / 1000);
+    // One auth event covers every server: BUD-02 scopes it by `x`, not by host
+    // (a `server` tag is optional, and adding one would pin it to a single host).
     const auth = await author.signer.signEvent({
       kind: KIND_BLOSSOM_AUTH,
       content: "Upload bridged Discord attachment",
@@ -51,19 +84,26 @@ export class BlossomStore implements BlobPort {
         ["expiration", String(now + 300)],
       ],
     });
+    const authorization = `Nostr ${Buffer.from(JSON.stringify(auth)).toString("base64")}`;
+    // Concrete ArrayBuffer slice: TS will not accept Uint8Array<ArrayBufferLike> as BodyInit.
+    const body = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
 
-    const base = this.server.replace(/\/$/, "");
-    const res = await fetch(`${base}/upload`, {
-      method: "PUT",
-      headers: {
-        Authorization: `Nostr ${Buffer.from(JSON.stringify(auth)).toString("base64")}`,
-        "Content-Type": mime,
-      },
-      // Concrete ArrayBuffer slice: TS will not accept Uint8Array<ArrayBufferLike> as BodyInit.
-      body: data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
-    });
-    if (!res.ok) throw new Error(`blossom upload to ${base}: HTTP ${res.status}`);
-    const descriptor = (await res.json().catch(() => ({}))) as { url?: string };
-    return { url: descriptor.url || `${base}/${hash}`, sha256: hash };
+    const failures: string[] = [];
+    for (const base of this.servers) {
+      try {
+        const res = await fetch(`${base}/upload`, {
+          method: "PUT",
+          headers: { Authorization: authorization, "Content-Type": mime },
+          body,
+          signal: AbortSignal.timeout(UPLOAD_TIMEOUT_MS),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const descriptor = (await res.json().catch(() => ({}))) as { url?: string };
+        return { url: descriptor.url || `${base}/${hash}`, sha256: hash };
+      } catch (error) {
+        failures.push(`${base}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    throw new Error(`blossom upload failed on every server (${failures.join("; ")})`);
   }
 }

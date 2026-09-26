@@ -16,7 +16,7 @@ export interface PortalEnv {
   discordClientId: string;
   discordClientSecret: string;
   discordBotToken: string;
-  /** Blossom server URL for attachment rehosting; empty leaves CDN links. */
+  /** Blossom server URL(s) for attachment rehosting, comma-separated in preference order; empty leaves CDN links. */
   blossomServer: string;
   /** When "1", /api/auth/dev issues a fake session for UI development. */
   devLogin: boolean;

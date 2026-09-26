@@ -102,7 +102,7 @@ Portal:
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | OAuth application credentials. |
 | `DISCORD_TOKEN` | Bot token. Without it, bridges cannot go live. |
 | `PORTAL_DEV_LOGIN` | `1` enables the fake-session login, which hands any anonymous caller a session. The portal refuses to boot with it set when `PORTAL_BASE_URL` is `https:` or `NODE_ENV=production`. |
-| `BLOSSOM_SERVER` | Attachment re-hosting target; empty leaves CDN links. |
+| `BLOSSOM_SERVER` | Attachment re-hosting targets, comma-separated in preference order (e.g. `https://blossom.ditto.pub,https://blossom.primal.net`); each upload falls through to the next on failure. Empty leaves CDN links. |
 | `INVITE_BASE_URL` | Cosmetic base for minted invite URLs. |
 | `IMPORT_DEFAULT_RELAYS` | Comma-separated relays for imported communities. |
 | `PORTAL_ALLOWED_ORIGINS` | Comma-separated origins allowed to drive the API cross-origin with a bearer token. Empty means same-origin only. |

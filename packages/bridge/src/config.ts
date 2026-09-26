@@ -23,7 +23,7 @@ export interface BridgeConfig {
   logLevel: string;
   /** Bridge message edits (kind 3302; payload not frozen in the CORDs). */
   bridgeEdits: boolean;
-  /** Blossom server URL for attachment rehosting; empty leaves CDN links. */
+  /** Blossom server URL(s) for attachment rehosting, comma-separated in preference order; empty leaves CDN links. */
   blossomServer: string;
 }
 
