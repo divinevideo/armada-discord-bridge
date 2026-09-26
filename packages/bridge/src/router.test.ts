@@ -209,6 +209,65 @@ describe("BridgeRouter: Discord -> Concord", () => {
     expect(openWrap(wraps[wraps.length - 1], channel.current.group).content).toBe("look at https://klipy.com/gifs/x");
   });
 
+  it("tags the substituted GIF-picker media, naming exactly the URL in the content", async () => {
+    // A picker send has no `attachments`, so it used to cross carrying nothing
+    // but a bare URL — and Armada exempts only imeta-tagged URLs from
+    // tracking-param stripping, so a signed provider URL broke on the way in.
+    const { router, pool, channel, link } = harness();
+    await router.onDiscordMessage(
+      discordMsg({
+        content: "https://klipy.com/gifs/x",
+        embeds: [{ url: "https://klipy.com/gifs/x", mediaUrl: "https://static.klipy.com/x.gif" }],
+      }),
+      link,
+    );
+    const opened = openWrap(
+      pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!,
+      channel.current.group,
+    );
+    const imeta = opened.tags.find((t) => t[0] === "imeta")!;
+    expect(imeta).toEqual(["imeta", "url https://static.klipy.com/x.gif", "m image/gif"]);
+    expect(imeta).toContain(`url ${opened.content}`);
+  });
+
+  it("leaves prose containing a link untagged", async () => {
+    const { router, pool, channel, link } = harness();
+    await router.onDiscordMessage(
+      discordMsg({
+        content: "look at https://klipy.com/gifs/x",
+        embeds: [{ url: "https://klipy.com/gifs/x", mediaUrl: "https://static.klipy.com/x.gif" }],
+      }),
+      link,
+    );
+    const opened = openWrap(
+      pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!,
+      channel.current.group,
+    );
+    // No substitution happened, so a tag naming the media URL would name a URL
+    // the content does not contain — an orphan Armada appends a second embed for.
+    expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
+  });
+
+  it("does not tag an embed media URL it cannot type", async () => {
+    // `x` and `size` would be lies (the bytes are never downloaded) and a
+    // guessed `m` is worse than none: Armada renders a file card for an imeta
+    // whose MIME is neither image, video nor audio.
+    const { router, pool, channel, link } = harness();
+    await router.onDiscordMessage(
+      discordMsg({
+        content: "https://example.com/page",
+        embeds: [{ url: "https://example.com/page", mediaUrl: "https://example.com/media" }],
+      }),
+      link,
+    );
+    const opened = openWrap(
+      pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!,
+      channel.current.group,
+    );
+    expect(opened.content).toBe("https://example.com/media");
+    expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
+  });
+
   it("resolveGifVariant probes for a real .gif and falls back to the mp4", async () => {
     const gifOk: typeof safeProbe = async () => ({ ok: true, mime: "image/gif" });
     const allDead: typeof safeProbe = async () => ({ ok: false, mime: "" });
@@ -755,11 +814,35 @@ describe("BridgeRouter: attachments via Blossom", () => {
     );
     const wrap = pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!;
     const opened = openWrap(wrap, channel.current.group);
-    expect(opened.content).toBe("look\nhttps://blossom.example/abc123");
+    // The extension is on the URL: Blossom is content-addressed, and the
+    // extension is the only thing Armada's inline-media test can read off a
+    // bare URL in the content.
+    expect(opened.content).toBe("look\nhttps://blossom.example/abc123.png");
     const imeta = opened.tags.find((t) => t[0] === "imeta")!;
-    expect(imeta).toContain("url https://blossom.example/abc123");
+    // Byte-for-byte the URL in the content: Armada keys its imeta map on the
+    // string, and a mismatch reads as untagged AND appends a duplicate embed.
+    expect(imeta).toContain("url https://blossom.example/abc123.png");
     expect(imeta).toContain("m image/png");
+    expect(imeta).toContain("name x.png");
     expect(blobs.uploads[0].author).toBe(puppets.get("80351110224678912").pk);
+  });
+
+  it("types an octet-stream attachment by its CDN filename, not by the served header", async () => {
+    // Discord serves some attachments as application/octet-stream. Trusting it
+    // names the blob `.octet-stream` and Armada renders a download card for
+    // what is plainly a png.
+    const blobs = new FakeBlobs(new Uint8Array([1, 2, 3]), "application/octet-stream");
+    const { router, pool, channel, link } = harness({ blobs });
+    await router.onDiscordMessage(
+      discordMsg({ content: "look", attachments: [{ url: "https://cdn.discordapp.com/x.png", filename: "x.png" }] }),
+      link,
+    );
+    const opened = openWrap(
+      pool.published.find((e) => e.kind === 1059 && e.pubkey === channel.current.group.pk)!,
+      channel.current.group,
+    );
+    expect(opened.tags.find((t) => t[0] === "imeta")!).toContain("m image/png");
+    expect(blobs.uploads[0].mime).toBe("image/png");
   });
 
   it("falls back to the CDN link when rehosting fails", async () => {

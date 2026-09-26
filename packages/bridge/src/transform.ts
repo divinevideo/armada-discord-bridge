@@ -31,18 +31,32 @@ export const CONCORD_MAX_CHARS = 60_000;
 /** Discord hard limit for webhook/bot message content. */
 export const DISCORD_MAX_CHARS = 2_000;
 
+/**
+ * The embed media URL that will REPLACE the whole content, or undefined when
+ * the text is left alone.
+ *
+ * GIF-picker sends (Tenor, Klipy) put a provider PAGE url in the content and
+ * hide the real media behind Discord's embed; Armada only inlines direct
+ * media, so the substitution below swaps it in.
+ *
+ * Exported because the router has to attach an `imeta` tag naming EXACTLY the
+ * URL that ends up in the content, and Armada keys its imeta map on the URL
+ * string byte-for-byte. Two copies of this condition drift, and a drifted copy
+ * is worse than none: the inline URL reads as untagged AND a duplicate embed
+ * gets appended from the orphaned tag.
+ */
+export function substitutedEmbedMedia(msg: DiscordMessageContent): string | undefined {
+  const bare = msg.content.trim();
+  if (!/^https?:\/\/\S+$/.test(bare)) return undefined;
+  return msg.embeds?.find((e) => e.url === bare && e.mediaUrl)?.mediaUrl;
+}
+
 /** Discord markup -> Concord plain text. */
 export function discordToConcord(msg: DiscordMessageContent): string {
   let text = msg.content;
 
-  // GIF-picker sends (Tenor, Klipy): the content is a provider PAGE url that
-  // Discord renders via its embed. Armada only inlines direct media, so swap
-  // in the embed's actual media URL when the message is just that page link.
-  const bare = text.trim();
-  if (/^https?:\/\/\S+$/.test(bare)) {
-    const embed = msg.embeds?.find((e) => e.url === bare && e.mediaUrl);
-    if (embed?.mediaUrl) text = embed.mediaUrl;
-  }
+  const substituted = substitutedEmbedMedia(msg);
+  if (substituted) text = substituted;
 
   // <@id> and <@!id> user mentions -> @display
   text = text.replace(/<@!?(\d+)>/g, (raw, id: string) => {

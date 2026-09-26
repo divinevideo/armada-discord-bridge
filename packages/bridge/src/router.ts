@@ -26,12 +26,13 @@ import {
   isSupportedEncryption,
   mimeFromUrl,
   parseImetaEncryption,
+  withExtension,
 } from "./imeta";
 import { safeProbe } from "./net";
 
 type LocalIdentitySigner = LocalIdentity["signer"];
 import type { PuppetCache } from "./puppets";
-import { DISCORD_MAX_CHARS, concordToDiscord, discordToConcord, splitForDiscord } from "./transform";
+import { DISCORD_MAX_CHARS, concordToDiscord, discordToConcord, splitForDiscord, substitutedEmbedMedia } from "./transform";
 import type { DiscordMessageContent } from "./transform";
 
 export interface ChannelLink {
@@ -471,7 +472,8 @@ export class BridgeRouter {
 
     const tags = [proxyTag(msg.guildId, msg.channelId, msg.id), ...customEmojiTags(msg.content)];
     let source = await upgradeGifEmbed(msg);
-    source = await this.transcodedGifFallback(source, identity);
+    source = await this.transcodedGifFallback(source, identity, tags);
+    this.tagEmbedMedia(source, tags);
     const attachments = await this.rehostAttachments(source, identity, tags);
     const content = discordToConcord({ ...source, attachments });
     if (content.length === 0) return undefined;
@@ -898,18 +900,21 @@ export class BridgeRouter {
   }
 
   /**
-   * Rehost Discord CDN attachments (signed URLs expire in ~24h) on Blossom,
-   * signed by the puppet, and record NIP-92 imeta tags. Any failure falls
-   * back to the CDN link so the message still bridges.
-   */
-  /**
    * Last resort for gifv embeds with no real .gif anywhere (Klipy): download
    * the short mp4, transcode with ffmpeg, rehost on Blossom. Skipped without
    * ffmpeg or a Blossom server; any failure keeps the mp4 URL.
+   *
+   * The transcode used to succeed and still arrive as a link, because a
+   * Blossom URL is content-addressed (`/<sha256>`) and the bytes never got an
+   * `imeta` tag — this function only ever rewrote the embed, and only
+   * `rehostAttachments` emitted tags, for `msg.attachments`, which a GIF-picker
+   * send does not have. Both halves are fixed: the extension goes back on the
+   * URL, and {@link tagEmbedMedia} tags what lands in the content.
    */
   private async transcodedGifFallback(
     msg: DiscordInboundMessage,
     identity: LocalIdentity,
+    tags: string[][],
   ): Promise<DiscordInboundMessage> {
     const blobs = this.options.blobs;
     const embed = msg.embeds?.[0];
@@ -919,7 +924,9 @@ export class BridgeRouter {
       const { data } = await blobs.download(embed.mediaUrl, MAX_BLOB_BYTES);
       const gif = await mp4ToGif(data);
       if (gif.length > MAX_BLOB_BYTES) return msg;
-      const { url } = await blobs.upload(gif, "image/gif", identity);
+      const uploaded = await blobs.upload(gif, "image/gif", identity);
+      const url = withExtension(uploaded.url, "image/gif");
+      tags.push(["imeta", `url ${url}`, "m image/gif", `x ${uploaded.sha256}`, `size ${String(gif.length)}`]);
       return { ...msg, embeds: [{ url: embed.url, mediaUrl: url }] };
     } catch (error) {
       console.warn(`gif transcode fallback failed for ${embed.mediaUrl}:`, error);
@@ -927,6 +934,35 @@ export class BridgeRouter {
     }
   }
 
+  /**
+   * Tag the media URL that replaces a GIF-picker page link in the content.
+   *
+   * Without this a picker send crosses as a bare URL and nothing else: no `m`,
+   * no `x`, no `size`. Armada does inline a bare `…/x.gif` by extension, which
+   * is why some of these worked — but a Klipy embed is an mp4 or a webp, a
+   * transcoded rehost is an extension-less Blossom hash, and a URL with an
+   * imeta entry is also the only one Armada exempts from tracking-param
+   * stripping, which is what breaks a signed provider URL.
+   *
+   * Only the fields we actually know: the bytes here belong to a third-party
+   * provider and are not downloaded, so there is no honest `x` or `size` to
+   * publish. This is the same shape Armada's own GIF picker emits.
+   */
+  private tagEmbedMedia(msg: DiscordInboundMessage, tags: string[][]): void {
+    const url = substitutedEmbedMedia(msg);
+    if (!url) return;
+    // The transcode path already published a fuller tag for this exact URL.
+    if (tags.some((t) => t[0] === "imeta" && t.includes(`url ${url}`))) return;
+    const mime = mimeFromUrl(url);
+    if (!mime) return;
+    tags.push(["imeta", `url ${url}`, `m ${mime}`]);
+  }
+
+  /**
+   * Rehost Discord CDN attachments (signed URLs expire in ~24h) on Blossom,
+   * signed by the puppet, and record NIP-92 imeta tags. Any failure falls back
+   * to the CDN link so the message still bridges.
+   */
   private async rehostAttachments(
     msg: DiscordInboundMessage,
     identity: LocalIdentity,
@@ -939,8 +975,21 @@ export class BridgeRouter {
     for (const attachment of msg.attachments) {
       try {
         const { data, mime } = await blobs.download(attachment.url, MAX_BLOB_BYTES);
-        const { url, sha256 } = await blobs.upload(data, mime, identity);
-        tags.push(["imeta", `url ${url}`, `m ${mime}`, `x ${sha256}`, `size ${String(data.length)}`]);
+        // A served `application/octet-stream` tells us nothing, and it is what
+        // decides whether the far side renders the image or a download card.
+        // The Discord CDN filename is the better witness in exactly that case.
+        const type =
+          mime === "application/octet-stream" ? (mimeFromUrl(attachment.url) ?? mime) : mime;
+        const uploaded = await blobs.upload(data, type, identity);
+        // Content-addressed URLs arrive extension-less unless the server chose
+        // to add one; BUD-01 serves the same blob either way, and the extension
+        // is what Discord's unfurl and Armada's sniffing read.
+        const url = withExtension(uploaded.url, type);
+        const imeta = ["imeta", `url ${url}`, `m ${type}`, `x ${uploaded.sha256}`, `size ${String(data.length)}`];
+        // The original filename, so the far side can name a download and, if
+        // the blob ever comes back through the bridge, so can we.
+        if (attachment.filename) imeta.push(`name ${attachment.filename}`);
+        tags.push(imeta);
         out.push({ url, filename: attachment.filename });
       } catch (error) {
         console.warn(`bridge: blossom rehost failed for ${attachment.url}`, error);

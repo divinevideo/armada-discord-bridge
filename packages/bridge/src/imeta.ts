@@ -175,6 +175,30 @@ export function mimeFromUrl(url: string): string | undefined {
 }
 
 /**
+ * Append the extension a content-addressed blob URL is missing.
+ *
+ * Blossom names blobs `/<sha256>`, and BUD-01 requires servers to serve the
+ * same blob at `/<sha256>.<ext>` — so this costs nothing and buys the two
+ * things that read the URL rather than the metadata: Discord's link unfurl and
+ * Armada's extension sniffing, which is the only signal a bare URL in message
+ * content carries.
+ */
+export function withExtension(url: string, mime: string): string {
+  const ext = extensionForMime(mime);
+  if (!ext) return url;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return url;
+  }
+  const last = parsed.pathname.split("/").pop() ?? "";
+  if (last === "" || EXTENSION_RE.test(last)) return url;
+  parsed.pathname = `${parsed.pathname}.${ext}`;
+  return parsed.toString();
+}
+
+/**
  * A filename Discord will accept and can type, out of values the sender chose.
  *
  * Both candidate sources — the imeta `name` field and the URL's last path
