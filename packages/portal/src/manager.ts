@@ -1028,8 +1028,14 @@ export class BridgeManager {
    * Any `/command` posted in a bridged channel gets handled or answered
    * (never silently swallowed): /help and unknown commands get the same help
    * text. Unbridged channels stay silent.
+   *
+   * Only a human typing in Discord issues a command. Our webhook relays
+   * Armada messages verbatim, so a `/claim` sent from Armada arrives here as
+   * a webhook post; answering it — or any bot, our own replies included —
+   * let a reply that itself began with `/claim` re-trigger forever.
    */
   private handleBotCommand(message: import("discord.js").Message): boolean {
+    if (message.author.bot || message.webhookId) return false;
     const command = parseBotCommand(message.content);
     if (!command) return false;
     const rb = this.activeRouterFor(message.channelId);
@@ -1047,14 +1053,6 @@ export class BridgeManager {
   ): Promise<void> {
     if (command === "help") {
       await message.reply(this.helpText());
-      return;
-    }
-    // /claim is answered by name rather than falling through to "unknown".
-    // The bot advertised it in this very channel when the bridge went live,
-    // and that welcome cannot be unsent, so people will keep running it for
-    // as long as the scrollback lasts. "Unknown command" would read as a bug.
-    if (command === "claim") {
-      await message.reply("/claim has been retired; there is nothing to run in its place.");
       return;
     }
     await message.reply(`Unknown command /${command}. ${this.helpText()}`);
