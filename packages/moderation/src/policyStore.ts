@@ -8,10 +8,10 @@ import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
 export async function migrateModeration(sql: postgres.Sql): Promise<void> {
-  const body = await readFile(new URL("../db/migrations/001_moderation.sql", import.meta.url), "utf8");
+  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}, 1)`;
-    await tx.unsafe(body);
+    for (const body of bodies) await tx.unsafe(body);
   });
 }
 export function policyLock(sql: Sql, communityId: string, shared = false) {
@@ -76,6 +76,8 @@ export class PolicyStore {
     }
     return { ...row.payload, banned: [...banned], revision: Number(row.revision), controlStreams: streams.map(streamOf) };
   }
+
+  async getPolicy(communityId: string) { requireId(communityId); return this.load(this.sql, communityId); }
 
   async admit(event: NostrEvent): Promise<AdmissionResult> {
     const id = typeof event?.id === "string" && HEX_ID.test(event.id) ? event.id : "0".repeat(64);
