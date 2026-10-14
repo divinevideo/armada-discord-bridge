@@ -78,3 +78,23 @@ test("delivery results remain visible after evidence expires, but expired action
   expect((await decisions.forCase(caseId, { ...actor, permissions: ['view'] })).some((decision) => decision.decisionId === accepted.decisionId)).toBe(true);
   await expect(decisions.retry(accepted.decisionId, actor)).rejects.toThrow(/retry/i);
 });
+
+test("crash at the final attempt becomes terminal instead of pending forever", async () => {
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  await sql`UPDATE moderation.deliveries SET attempts = 8, lease_until = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId}`;
+  await decisions.claim();
+  const status = await decisions.get(accepted.decisionId, actor);
+  expect(status.deliveries.every((d) => d.state === "failed" && d.resultCode === "retry_budget_exhausted")).toBe(true);
+});
+test("transient failure respects retry delay and can be claimed again", async () => {
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id != ${accepted.decisionId}`;
+  const claim = (await decisions.claim())!;
+  await decisions.complete(claim, "pending", "discord_rate_limited", 120);
+  const [row] = await sql`SELECT extract(epoch FROM available_at - clock_timestamp()) AS delay FROM moderation.deliveries WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target}`;
+  expect(Number(row.delay)).toBeGreaterThan(118);
+  await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE target != ${claim.target}`;
+  expect(await decisions.claim()).toBeUndefined();
+  await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target}`;
+  expect((await decisions.claim())?.attempts).toBe(claim.attempts + 1);
+});

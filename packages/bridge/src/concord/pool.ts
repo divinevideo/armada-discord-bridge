@@ -22,6 +22,37 @@ import { finalizeEvent, generateSecretKey, getEventHash, verifyEvent } from "nos
 
 /** NRelay1 keeps `send` protected; the AUTH fan-out needs it. */
 class AuthedNRelay1 extends NRelay1 {
+  /** Publications never enter websocket-ts's reconnect queue or NRelay1's
+   * automatic AUTH replay. A caller must retry through its current guard. */
+  override async event(event: NostrEvent, opts?: { signal?: AbortSignal }): Promise<void> {
+    const signal = opts?.signal;
+    signal?.throwIfAborted();
+    if (this.socket.readyState !== WebSocket.OPEN) throw new Error("Relay is not connected");
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        this.socket.removeEventListener("message", message);
+        this.socket.removeEventListener("close", closed);
+        this.socket.removeEventListener("error", closed);
+        signal?.removeEventListener("abort", aborted);
+      };
+      const finish = (error?: Error) => { cleanup(); error ? reject(error) : resolve(); };
+      const closed = () => finish(new Error("Relay disconnected before acknowledgement"));
+      const aborted = () => finish(new Error("Relay publication aborted"));
+      const message = (_socket: unknown, incoming: MessageEvent) => {
+        let frame: unknown;
+        try { frame = JSON.parse(String(incoming.data)); } catch { return; }
+        if (Array.isArray(frame) && frame[0] === "OK" && frame[1] === event.id) {
+          finish(frame[2] === true ? undefined : new Error("Relay refused publication"));
+        }
+      };
+      this.socket.addEventListener("message", message);
+      this.socket.addEventListener("close", closed);
+      this.socket.addEventListener("error", closed);
+      signal?.addEventListener("abort", aborted, { once: true });
+      // No await between the live-socket check and dispatch.
+      try { this.socket.send(JSON.stringify(["EVENT", event])); } catch { closed(); }
+    });
+  }
   sendRaw(msg: NostrClientMsg): void {
     this.send(msg);
   }

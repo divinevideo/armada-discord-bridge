@@ -58,10 +58,10 @@ async function connect(url: string) {
 async function relay(mode: string) {
   const name = `${label}-${mode}`;
   const plugin = ["normal", "restored"].includes(mode) ? "/usr/local/bin/relay-policy" : mode === "missing" ? "" : "/data/fault.sh";
-  const config = `db = "/data/db/"\nrelay { bind = "0.0.0.0" port = 7777 auth { enabled = true serviceUrl = "wss://relay.example" } writePolicy { plugin = "${plugin}" timeoutSeconds = 3 } logging { dumpInAll = false dumpInEvents = false dumpInReqs = false invalidEvents = false } }\n`;
+  const config = `db = "/data/db/"\nrelay { nofiles = 0 bind = "0.0.0.0" port = 7777 auth { enabled = true serviceUrl = "wss://relay.example" } writePolicy { plugin = "${plugin}" timeoutSeconds = 3 } logging { dumpInAll = false dumpInEvents = false dumpInReqs = false invalidEvents = false } }\n`;
   const configPath = join(directory, `${mode}.conf`);
   await writeFile(configPath, config, { mode: 0o644 });
-  const args = ["run", "-d", "--name", name, "--network", label, "-p", "127.0.0.1::7777", "-p", "127.0.0.1::8080", "-p", "127.0.0.1::8081", "-e", "MODERATION_DATABASE_URL=postgres://bridge@pg/bridge", "-v", `${configPath}:/data/strfry.conf:ro`];
+  const args = ["run", "-d", "--ulimit", "nofile=65536:65536", "--name", name, "--network", label, "-p", "127.0.0.1::7777", "-p", "127.0.0.1::8080", "-p", "127.0.0.1::8081", "-e", "MODERATION_DATABASE_URL=postgres://bridge@pg/bridge", "-v", `${configPath}:/data/strfry.conf:ro`];
   if (!["normal", "restored"].includes(mode)) {
     const fault = join(directory, `${mode}.sh`);
     const body = mode === "race" ? 'while IFS= read -r request; do response="$(printf "%s\\n" "$request" | /usr/local/bin/relay-policy)"; touch /data/admitted; while [ ! -f /data/release ]; do sleep 0.02; done; printf "%s\\n" "$response"; done' : mode === "timeout" ? "sleep 10" : mode === "malformed" ? 'IFS= read -r request\nprintf "invalid %s\\n" "$request"' : "exit 1";

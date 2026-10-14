@@ -14,14 +14,21 @@ test("native authors are not guessed and guild bans require explicit scope confi
   expect((await actions.execute({ ...decision, action: "ban_member", discordGuildConfirmed: true })).state).toBe("not_applicable");
   expect(calls).toBe(0);
 });
-test("rate limits remain failed and permission changes prevent the next effect", async () => {
+test("rate limits retry after the provider delay and permission changes prevent the next effect", async () => {
   const mapping = { guildId: "100000000000000000", channelId: "100000000000000003", messageId: "100000000000000001" };
-  const actions = new DiscordActions({ async messages() { return [mapping]; }, async member() { return undefined; } }, { async assertPublicChannel() {} }, async () => new Response(null, { status: 429 }));
-  expect((await actions.execute(decision)).state).toBe("failed");
+  const actions = new DiscordActions({ async messages() { return [mapping]; }, async member() { return undefined; } }, { async assertPublicChannel() {} }, async () => Response.json({ retry_after: 12 }, { status: 429 }));
+  expect(await actions.execute(decision)).toEqual({ state: "pending", code: "discord_rate_limited", retryAfterSeconds: 12 });
   const closed = new DiscordActions({ async messages() { return [mapping]; }, async member() { return undefined; } }, { async assertPublicChannel() { throw new Error("private now"); } }, async () => { throw new Error("must not call"); });
   expect((await closed.execute(decision)).state).toBe("failed");
 });
 test("a missing channel is not evidence that a message was deleted", async () => {
   const actions = new DiscordActions({ async messages() { return [{ guildId: "100000000000000000", channelId: "100000000000000003", messageId: "100000000000000001" }]; }, async member() { return undefined; } }, { async assertPublicChannel() {} }, async () => Response.json({ code: 10003 }, { status: 404 }));
   expect((await actions.execute(decision)).state).toBe("failed");
+});
+
+test("transport exceptions retry but permission denial is terminal", async () => {
+  const mappings = { async messages() { return [{ guildId: "100000000000000000", channelId: "100000000000000003", messageId: "100000000000000001" }]; }, async member() { return undefined; } };
+  const policy = { async assertPublicChannel() {} };
+  expect((await new DiscordActions(mappings, policy, async () => { throw new TypeError("network down"); }).execute(decision)).state).toBe("pending");
+  expect((await new DiscordActions(mappings, policy, async () => new Response(null, { status: 403 })).execute(decision)).state).toBe("failed");
 });

@@ -1,7 +1,7 @@
 import type postgres from "postgres";
 import type { DeliveryTarget, RoomTarget } from "./contracts";
 import type { Decisions, DeliveryClaim, StoredDecision } from "./decisions";
-import type { DiscordActions, DeliveryAttempt } from "./discordActions";
+import { RetryableDeliveryError, type DiscordActions, type DeliveryAttempt } from "./discordActions";
 export interface ExecutionContext {
   authorize(decision: StoredDecision): Promise<unknown>;
   assertCurrent(): Promise<void>;
@@ -23,7 +23,7 @@ export async function executeDelivery(decision: StoredDecision, target: Delivery
     return await context.setRelayBan(decision)
       ? { state: "verified", code: "relay_member_policy_verified" }
       : { state: "acknowledged", code: "relay_awaiting_concord_state" };
-  } catch { return { state: "failed", code: "current_authority_or_delivery_unavailable" }; }
+  } catch (error) { return error instanceof RetryableDeliveryError ? { state: "pending", code: error.code } : { state: "failed", code: "current_authority_or_delivery_unavailable" }; }
 }
 /** A session transaction serializes mutations for one community. Every side
  * effect checks both the live transaction and the renewable outbox token. */
@@ -48,7 +48,7 @@ export class ModerationWorker {
         const context = await this.context(claim, assertCurrent);
         const result = await executeDelivery(claim.decision, claim.target, context);
         await assertCurrent();
-        await this.decisions.complete(claim, result.state, result.code);
+        await this.decisions.complete(claim, result.state, result.code, result.retryAfterSeconds);
       });
     } catch {
       await this.decisions.complete(claim, "failed", "worker_ownership_or_delivery_failed").catch(() => {});

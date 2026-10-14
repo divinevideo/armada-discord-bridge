@@ -64,6 +64,8 @@ export class Decisions {
     return this.get(decisionId, actor);
   }
   async claim(): Promise<DeliveryClaim | undefined> {
+    await this.sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'retry_budget_exhausted', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+      WHERE state IN ('pending', 'acknowledged') AND attempts >= 8 AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
     return this.sql.begin(async (tx) => {
       const [job] = await tx`SELECT d.* FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
         WHERE d.state IN ('pending', 'acknowledged') AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
@@ -93,11 +95,11 @@ export class Decisions {
     if (!rows.length) throw new Error("Delivery lease lost");
     return rows[0].signed_events;
   }
-  async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string): Promise<void> {
-    if (!/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
+  async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0): Promise<void> {
+    if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0 || !/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
     if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
     const rows = await this.sql`UPDATE moderation.deliveries SET state = ${state}, result_code = ${resultCode}, lease_until = NULL, token = NULL, updated_at = clock_timestamp(),
-      available_at = clock_timestamp() + (${Math.min(300, 2 ** claim.attempts)} * interval '1 second')
+      available_at = clock_timestamp() + (${Math.max(retryAfterSeconds, Math.min(300, 2 ** claim.attempts))} * interval '1 second')
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease lost");
   }
