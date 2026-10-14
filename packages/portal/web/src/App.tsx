@@ -109,7 +109,7 @@ function Footer() {
         <span>Armada &#8646; Discord Bridge</span>
       </div>
       <nav className="footer-links">
-        <a href="https://gitworkshop.dev/npub1jvnpg4c6ljadf5t6ry0w9q0rnm4mksde87kglkrc993z46c39axsgq89sc/armada-discord-bridge" target="_blank" rel="noreferrer">
+        <a href="https://github.com/divinevideo/armada-discord-bridge" target="_blank" rel="noreferrer">
           Source code
         </a>
         <a href="https://soapbox.pub/armada" target="_blank" rel="noreferrer">About Armada</a>

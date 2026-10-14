@@ -9,7 +9,12 @@ RUN patch -p1 < /patches/0003-admission-purge-barrier.patch && make -j2
 RUN mkdir -p /source && git ls-files --recurse-submodules -z | tar --null -T - -cf /source/strfry-source.tar && cp LICENSE /source/LICENSE
 
 FROM oven/bun:1.3.10-slim@sha256:5d5863f35ad9b3acceee8dc134fb2b89f07831129eaeec81af2b19a23dabe3e0 AS bun
-FROM strfry-build AS relay
+FROM ubuntu:22.04@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401 AS relay
+ARG VCS_REF
+LABEL org.opencontainers.image.source="https://github.com/divinevideo/armada-discord-bridge" \
+      org.opencontainers.image.revision=$VCS_REF \
+      org.opencontainers.image.licenses="AGPL-3.0-only AND GPL-3.0-only"
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates liblmdb0 libssl3 zlib1g libsecp256k1-0 libzstd1 libstdc++6 && rm -rf /var/lib/apt/lists/*
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 RUN useradd --uid 10001 --create-home relay && mkdir -p /data/db /opt/divine && chown -R 10001:10001 /data /opt/divine
 WORKDIR /opt/divine
@@ -18,7 +23,7 @@ COPY packages/concord-core/package.json packages/concord-core/package.json
 COPY packages/bridge/package.json packages/bridge/package.json
 COPY packages/portal/package.json packages/portal/package.json
 COPY packages/moderation/package.json packages/moderation/package.json
-RUN bun install --ignore-scripts --frozen-lockfile
+RUN bun install --ignore-scripts --frozen-lockfile --production
 COPY packages/concord-core packages/concord-core
 COPY packages/moderation packages/moderation
 COPY packages/bridge/src packages/bridge/src
