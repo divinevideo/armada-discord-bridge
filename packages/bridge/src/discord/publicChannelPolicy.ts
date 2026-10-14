@@ -47,6 +47,12 @@ export class PublicChannelPolicy {
     const everyone = roles.map(object).filter((role) => role.id === guildId);
     if (everyone.length !== 1 || !Array.isArray(channel.permission_overwrites)) throw new Error("Discord permissions unavailable");
     let permissions = bits(everyone[0].permissions);
+    // Only the channel's own overwrites, never the category's. Discord does not
+    // inherit category overwrites when it evaluates a channel: a synced channel
+    // carries copies of them in its own list, and a desynced one stops following
+    // its category entirely. Applying the parent's deny here would disagree with
+    // what Discord shows members. importPlan's isPrivate is stricter on purpose:
+    // it can only narrow what an import offers, never widen what is bridged.
     const overrides = channel.permission_overwrites.map(object).filter((o) => o.id === guildId);
     if (overrides.length > 1) throw new Error("Discord permissions unavailable");
     if (overrides.length) {
