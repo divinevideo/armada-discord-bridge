@@ -46,6 +46,12 @@ export class Decisions {
     const deliveries = await this.sql`SELECT target, state, attempts, result_code FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
     return { decisionId, target: stored(row).target, action: row.action, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
   }
+  async forCase(caseId: string, actor: VerifiedCoopActor): Promise<DecisionStatus[]> {
+    assertActor(actor, "view");
+    if (!uuid.test(caseId)) throw new Error("Invalid case");
+    const rows = await this.sql`SELECT decision_id FROM moderation.decisions WHERE org_id = ${actor.orgId} AND case_id = ${caseId} AND expires_at > clock_timestamp() ORDER BY created_at DESC LIMIT 100`;
+    return Promise.all(rows.map((row) => this.get(row.decision_id, actor)));
+  }
   async retry(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor, "retry");
     const status = await this.get(decisionId, actor);

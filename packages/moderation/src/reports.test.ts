@@ -56,3 +56,14 @@ test("forged carrier content never becomes evidence and expired cases are erased
     await tx`SELECT * FROM moderation.cases`;
   })).rejects.toThrow(/permission denied/);
 });
+test("only authorized same-org staff can read live evidence; carriers and reporter stay internal", async () => {
+  const { caseId } = await reports.submitReport({ target, reason: "synthetic staff case" }, { ...reporter, authEventId: "5".repeat(64) });
+  const actor = { orgId: org, actorId: "synthetic-staff", permissions: ["view"] };
+  const view = await reports.getCase(caseId, actor);
+  expect(view.author).toBe(f.member.pk);
+  expect(view.reason).toBe("synthetic staff case");
+  expect("carrier" in view).toBe(false);
+  expect("reporter" in view).toBe(false);
+  await expect(reports.getCase(caseId, { ...actor, orgId: "other" })).rejects.toThrow();
+  await expect(reports.getCase(caseId, { ...actor, permissions: [] })).rejects.toThrow();
+});

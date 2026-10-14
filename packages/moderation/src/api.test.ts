@@ -31,3 +31,14 @@ test("only approved web origins can preflight the public report endpoint", async
   const staff = await corsApi(new Request("https://rooms.example/v1/decisions", { method: "OPTIONS", headers: { origin: "https://divine.example" } }));
   expect(staff.headers.get("access-control-allow-origin")).toBeNull();
 });
+
+test("case evidence and delivery status require the signed staff route", async () => {
+  const caseId = crypto.randomUUID(), path = `/v1/cases/${caseId}`;
+  let viewed = 0;
+  const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error(); }, async getCase(id, staff) { expect(id).toBe(caseId); expect(staff.actorId).toBe(actor.actorId); viewed++; return { caseId, target: status.target, author: "d".repeat(64), content: "synthetic evidence", reason: "synthetic report", createdAt: 1, expiresAt: new Date().toISOString() }; } }, decisions: { async acceptDecision() { return status; }, async get() { return status; }, async retry() { return status; }, async forCase() { return [status]; } } });
+  expect((await api(new Request("https://rooms.example" + path))).status).toBe(403);
+  expect(viewed).toBe(0);
+  const response = await api(new Request("https://rooms.example" + path, { headers: signCoopRequest(secret, actor, "GET", path, "") }));
+  expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(await response.json()).toMatchObject({ caseId, content: "synthetic evidence", decisions: [status] });
+});

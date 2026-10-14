@@ -20,6 +20,7 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
     MODERATION_DATABASE_URL: "postgres://bridge@pg/bridge", MODERATION_PUBLIC_ORIGIN: "https://moderation.example",
     MODERATION_COMMUNITY_ORGS: JSON.stringify({ [f.community.idHex]: "synthetic" }), MODERATION_COOP_HMAC_KEY: key.toString("hex"), MODERATION_EVIDENCE_KEY: randomBytes(32).toString("hex"),
     MODERATION_EVIDENCE_RETENTION_SECONDS: "3600", MODERATION_EVIDENCE_MAX_BYTES: "100000", MODERATION_EVIDENCE_MAX_CASES: "100", MODERATION_REPORT_ORIGINS: "[]",
+    MODERATION_COOP_ORIGIN: "https://coop.example", MODERATION_COOP_API_KEY: "synthetic-api-key", MODERATION_COOP_ORG_ID: "synthetic",
     MODERATION_LOCAL_RELAY_URL: "ws://127.0.0.1:7777", MODERATION_COMMUNITY_ENTRY_FILE: "/data/community.json", MODERATION_MEMBER_KEY: Buffer.from(f.moderatorKey).toString("hex"),
     MODERATION_PUBLIC_AUTHORS: JSON.stringify([f.member.pk]), MODERATION_BRIDGE_TENANT_ID: "default", BRIDGE_MASTER_SECRET: randomBytes(32).toString("hex"), DISCORD_TOKEN: "synthetic-unused",
     BRIDGE_PUBLIC_CHANNELS: JSON.stringify({ guildId: "100000000000000000", channelIds: ["100000000000000001"], excludedCategoryIds: ["100000000000000002"] }),

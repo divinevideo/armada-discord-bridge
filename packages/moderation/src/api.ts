@@ -33,14 +33,15 @@ async function boundedBody(request: Request): Promise<string> {
   } finally { reader.releaseLock(); }
   return Buffer.concat(chunks).toString("utf8");
 }
-export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport">; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> }) {
+export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase">> }) {
   if (options.coopSecret.length < 32) throw new Error("Staff service credential required");
   let remaining = 100, window = Date.now();
   const response = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url), path = url.pathname;
+    const caseRoute = /^\/v1\/cases\/([0-9a-f-]{36})$/.exec(path);
     const decisionRoute = /^\/v1\/decisions\/([0-9a-f-]{36})(\/retry)?$/.exec(path);
-    if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute) return response({ error: "not_found" }, 404);
+    if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute && !caseRoute) return response({ error: "not_found" }, 404);
     if (Date.now() - window >= 1000) { remaining = 100; window = Date.now(); }
     if (--remaining < 0) return response({ error: "rate_limited" }, 429);
     let body: string;
@@ -55,6 +56,7 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
     let actor;
     try { actor = authenticateCoop(request, body, options.coopSecret, options.orgs); } catch { return response({ error: "staff_authorization_required" }, 403); }
     try {
+      if (caseRoute && request.method === "GET" && options.reports.getCase && options.decisions.forCase) return response({ ...await options.reports.getCase(caseRoute[1], actor), decisions: await options.decisions.forCase(caseRoute[1], actor) });
       if (path === "/v1/decisions" && request.method === "POST") return response(await options.decisions.acceptDecision(JSON.parse(body), actor), 202);
       if (decisionRoute && !decisionRoute[2] && request.method === "GET") return response(await options.decisions.get(decisionRoute[1], actor));
       if (decisionRoute?.[2] && request.method === "POST") return response(await options.decisions.retry(decisionRoute[1], actor), 202);

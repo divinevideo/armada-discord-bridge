@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type postgres from "postgres";
+import type { VerifiedCoopActor } from "./decisions";
 import type { RoomTarget } from "./contracts";
 import { EvidenceCipher, type VerifiedEvidence } from "./evidence";
 import { HEX_ID, verifiedEvent } from "./relayPolicy";
@@ -46,6 +47,13 @@ export class Reports {
         VALUES (${caseId}, ${org}, ${input.target.communityId}, ${input.target.channelId}, ${input.target.rumorId}, ${evidence.author}, ${fingerprint}, ${encrypted}, ${new Date(Date.now() + this.cipher.retentionSeconds * 1000)})`;
       return { caseId };
     });
+  }
+  async getCase(caseId: string, actor: VerifiedCoopActor) {
+    if (!actor.actorId || !actor.permissions.includes("view") || !/^[0-9a-f-]{36}$/.test(caseId)) throw new Error("Case unavailable");
+    const [row] = await this.sql`SELECT * FROM moderation.cases WHERE case_id = ${caseId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp()`;
+    if (!row || this.communities.get(row.community_id) !== actor.orgId) throw new Error("Case unavailable");
+    const value = this.cipher.open(`${actor.orgId}:${caseId}`, row.evidence);
+    return { caseId, target: { communityId: row.community_id as string, channelId: row.channel_id as string, rumorId: row.rumor_id as string }, author: row.author as string, content: value.evidence.content as string, reason: value.reason as string, createdAt: value.evidence.createdAt as number, expiresAt: (row.expires_at as Date).toISOString() };
   }
   async expire(): Promise<void> { await this.sql`DELETE FROM moderation.cases WHERE expires_at <= clock_timestamp()`; await this.sql`DELETE FROM moderation.report_auth WHERE expires_at <= clock_timestamp()`; }
 }

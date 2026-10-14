@@ -1,3 +1,4 @@
+import { CoopHandoff } from "./coopHandoff";
 import postgres from "postgres";
 import { rehydrateCommunity } from "@armada-bridge/concord-core";
 import { localIdentity } from "../../bridge/src/concord/signer";
@@ -42,19 +43,22 @@ async function main() {
     try { await runModerationWorker({ sql, decisions, community, identity: localIdentity(Buffer.from(key, "hex")), communities: config.communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
     finally { await server.stop(true); await sql.end(); }
   } else {
+    const handoff = new CoopHandoff(sql, { origin: required("MODERATION_COOP_ORIGIN"), apiKey: required("MODERATION_COOP_API_KEY"), orgId: required("MODERATION_COOP_ORG_ID"), accessClientId: process.env.MODERATION_COOP_ACCESS_CLIENT_ID, accessClientSecret: process.env.MODERATION_COOP_ACCESS_CLIENT_SECRET });
+    if (config.communities.size !== 1 || ![...config.communities.values()].includes(required("MODERATION_COOP_ORG_ID"))) throw new Error("Coop organization mismatch");
     const pool = new RelayPool([relayUrl]);
     const reports = new Reports(sql, cipher, new RelayEvidenceResolver(sql, (ids) => pool.queryStrict([{ ids }])), config.communities, config.evidenceMaxCases);
     const api = createModerationApi({ ...config, orgs: new Set(config.communities.values()), reports, decisions });
-    let cleanupFailed = false;
+    let cleanupFailed = false, handoffRunning = false;
+    const dispatch = setInterval(() => { if (handoffRunning) return; handoffRunning = true; void handoff.tick().catch(() => {}).finally(() => { handoffRunning = false; }); }, 1000);
     const cleanup = setInterval(() => { void reports.expire().then(() => { cleanupFailed = false; }, () => { cleanupFailed = true; }); }, 30_000);
     const server = Bun.serve({ hostname: "0.0.0.0", port, maxRequestBodySize: 65_536, idleTimeout: 30, async fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/healthz") return new Response("ok");
-      if (path === "/readyz") { try { await sql`SELECT 1`; if (cleanupFailed) throw new Error(); return new Response("ok"); } catch { return new Response("unavailable", { status: 503 }); } }
+      if (path === "/readyz") { try { await sql`SELECT 1`; if (cleanupFailed || !await handoff.healthy()) throw new Error(); return new Response("ok"); } catch { return new Response("unavailable", { status: 503 }); } }
       try { return await api(request); } catch { return Response.json({ error: "unavailable" }, { status: 503 }); }
     } });
     try { await new Promise<void>((resolve) => { if (stop.signal.aborted) resolve(); else stop.signal.addEventListener("abort", () => resolve(), { once: true }); }); }
-    finally { clearInterval(cleanup); await server.stop(true); await pool.close(); await sql.end(); }
+    finally { clearInterval(dispatch); clearInterval(cleanup); await server.stop(true); await pool.close(); await sql.end(); }
   }
 }
 if (import.meta.main) await main().catch(() => { console.error("moderation: service startup or ownership failed; check configuration and readiness"); process.exit(1); });
