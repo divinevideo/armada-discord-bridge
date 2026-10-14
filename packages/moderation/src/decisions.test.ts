@@ -61,3 +61,11 @@ test("waiting for community serialization does not exhaust delivery attempts", a
   expect(row.token).toBeNull();
   expect(row.state).toBe("pending");
 });
+test("an unverified delivery that exhausts its retry budget becomes visibly failed", async () => {
+  const claim = await decisions.claim();
+  expect(claim).toBeDefined();
+  await decisions.complete({ ...claim!, attempts: 8 }, "acknowledged", "concord_awaiting_fold");
+  const [row] = await sql`SELECT state, result_code FROM moderation.deliveries WHERE decision_id = ${claim!.decision.decisionId} AND target = ${claim!.target}`;
+  expect(row.state).toBe("failed");
+  expect(row.result_code).toBe("retry_budget_exhausted");
+});

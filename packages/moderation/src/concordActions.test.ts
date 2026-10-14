@@ -46,3 +46,13 @@ test("a competing banlist edit makes a prepared action stale instead of overwrit
   f.policy.controlEvents.push(competing);
   await expect(actions.validatePrepared(decision, events)).rejects.toThrow();
 });
+test("a large canonical banlist yields a visible preparation failure without truncating members", async () => {
+  const f = await moderationFixture();
+  const head = parseEdition(openWrap(f.policy.controlEvents.at(-1)!, f.controlStream.key));
+  const members = Array.from({ length: 600 }, (_, index) => index.toString(16).padStart(64, "0"));
+  const full = await sealEdition(buildBanlistEdition(f.community.id, members, { actorPubkey: f.owner.pk, version: 2n, prevHash: head.selfHash }), currentControlWriteGroup(f.community), f.owner.signer);
+  f.policy.controlEvents.push(full);
+  const actions = new ConcordActions(f.community, f.moderator, async () => f.policy);
+  await expect(actions.prepare({ ...f.decision, action: "ban_member" })).rejects.toThrow();
+  expect(JSON.parse(parseEdition(openWrap(full, f.controlStream.key)).content)).toHaveLength(600);
+});

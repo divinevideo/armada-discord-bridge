@@ -21,6 +21,7 @@ COPY packages/moderation/package.json packages/moderation/package.json
 RUN bun install --ignore-scripts --frozen-lockfile
 COPY packages/concord-core packages/concord-core
 COPY packages/moderation packages/moderation
+COPY packages/bridge/src packages/bridge/src
 COPY --from=strfry-build /build/strfry /usr/local/bin/strfry
 COPY --from=strfry-build /source /usr/share/strfry-source
 COPY docker/relay-policy.sh /usr/local/bin/relay-policy

@@ -86,6 +86,7 @@ export class Decisions {
   }
   async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string): Promise<void> {
     if (!/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
+    if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
     const rows = await this.sql`UPDATE moderation.deliveries SET state = ${state}, result_code = ${resultCode}, lease_until = NULL, token = NULL, updated_at = clock_timestamp(),
       available_at = clock_timestamp() + (${Math.min(300, 2 ** claim.attempts)} * interval '1 second')
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
