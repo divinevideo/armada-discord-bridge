@@ -31,18 +31,21 @@ export class BridgeLeases {
     const token = BigInt(row.token);
     let live = true;
     const check = () => { if (!live) throw new BridgeLeaseUnavailableError("Bridge lease is no longer current"); };
+    // Only a renewal the database refused ends the lease. A failed round trip
+    // proves nothing about ownership, and nothing re-acquires a dead lease, so
+    // treating one dropped connection as loss would silence the bridge until a
+    // restart. Fencing does not depend on this: assertCurrent re-reads the row
+    // before every effect and fails closed while storage is unreachable.
     const renew = async () => {
       check();
-      try {
-        const renewed = await this.sql`
-          UPDATE bridge_leases SET expires_at = clock_timestamp() + interval '90 seconds'
-          WHERE resource = ${resource} AND holder = ${holder} AND token = ${token.toString()}
-            AND expires_at > clock_timestamp() RETURNING resource`;
-        if (!renewed.length) throw new BridgeLeaseUnavailableError("Bridge lease expired or was superseded");
-      } catch (error) {
+      const renewed = await this.sql`
+        UPDATE bridge_leases SET expires_at = clock_timestamp() + interval '90 seconds'
+        WHERE resource = ${resource} AND holder = ${holder} AND token = ${token.toString()}
+          AND expires_at > clock_timestamp() RETURNING resource`;
+      if (!renewed.length) {
         live = false;
         clearInterval(timer);
-        throw error;
+        throw new BridgeLeaseUnavailableError("Bridge lease expired or was superseded");
       }
     };
     const timer = setInterval(() => { void renew().catch(() => {}); }, 30_000);

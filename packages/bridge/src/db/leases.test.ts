@@ -37,6 +37,22 @@ test("expiry transfers ownership and fences the old worker, including renewal an
   await restarted.release();
 });
 
+test("a failed renewal round trip does not end a lease the database still holds", async () => {
+  let failing = false;
+  const flaky = ((...args: unknown[]) => {
+    if (failing) return Promise.reject(new Error("connection reset"));
+    return (sql as unknown as (...a: unknown[]) => unknown)(...args);
+  }) as unknown as postgres.Sql;
+  const lease = (await new BridgeLeases(flaky).acquire(prefix + "transient"))!;
+  failing = true;
+  await expect(lease.renew()).rejects.toThrow("connection reset");
+  await expect(lease.assertCurrent()).rejects.toThrow("connection reset");
+  failing = false;
+  await lease.renew();
+  await lease.assertCurrent();
+  await lease.release();
+});
+
 test("unavailable storage never authorizes an effect", async () => {
   const connection = postgres(url, { max: 1 });
   const lease = (await new BridgeLeases(connection).acquire(prefix + "failure"))!;
