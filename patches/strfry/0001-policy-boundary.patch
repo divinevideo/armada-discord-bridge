@@ -1,0 +1,47 @@
+--- a/src/PluginEventSifter.h
++++ b/src/PluginEventSifter.h
+@@ -60,7 +60,8 @@
+     PluginEventSifterResult acceptEvent(const std::string &pluginCmd, const tao::json::value &evJson, EventSourceType sourceType, std::string_view sourceInfo, const Bytes32 &authed, std::string &okMsg) {
+         if (pluginCmd.size() == 0) {
+             running.reset();
+-            return PluginEventSifterResult::Accept;
++            okMsg = "error: write policy required";
++            return PluginEventSifterResult::Reject;
+         }
+ 
+         try {
+@@ -96,7 +97,7 @@
+             try {
+                 running->streamWriter.write(output, cfg().relay__writePolicy__timeoutSeconds * 1'000);
+             } catch (std::exception &e) {
+-                throw herr("Failed to write event: ", e.what(), ". Request was: ", output);
++                throw herr("Write policy request failed");
+             }
+ 
+             tao::json::value response;
+@@ -107,14 +108,13 @@
+                 try {
+                     line = running->streamReader.read(cfg().relay__writePolicy__timeoutSeconds * 1'000);
+                 } catch (std::exception &e) {
+-                    throw herr("Failed to read response: ", e.what(), ". Request was: ", output);
++                    throw herr("Write policy response failed");
+                 }
+ 
+                 try {
+                     response = tao::json::from_string(line);
+                 } catch (std::exception &e) {
+-                    LW << "Got unparseable line from write policy plugin: " << line;
+-                    continue;
++                    throw herr("Invalid write policy response");
+                 }
+ 
+                 if (response.at("id").get_string() != request.at("event").at("id").get_string()) throw herr("id mismatch");
+@@ -130,7 +130,7 @@
+             else if (action == "shadowReject") return PluginEventSifterResult::ShadowReject;
+             else throw herr("unknown action: ", action);
+         } catch (std::exception &e) {
+-            LE << "Plugin error: " << e.what();
++            LE << "Write policy unavailable; event rejected";
+             running.reset();
+             okMsg = "error: internal error";
+             return PluginEventSifterResult::Reject;

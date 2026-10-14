@@ -12,6 +12,8 @@ const sql = postgres(process.env.DATABASE_URL, {connect_timeout: 5, onnotice() {
 try { await sql`select 1`; } finally { await sql.end(); }
 '
 ./node_modules/.bin/tsc -b packages/concord-core
+./node_modules/.bin/tsc -p packages/bridge/tsconfig.json --noEmit
+./node_modules/.bin/tsc -p packages/moderation/tsconfig.json --noEmit
 ./node_modules/.bin/tsc -p packages/portal/tsconfig.json --noEmit
 ./node_modules/.bin/vite build packages/portal/web
 TEST_LOG=$(mktemp)
