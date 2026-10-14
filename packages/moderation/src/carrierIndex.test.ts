@@ -1,0 +1,27 @@
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import postgres from "postgres";
+import { wrapSeal } from "@armada-bridge/concord-core";
+import { relayFixture } from "../../../scripts/fixtures/relay-events";
+import { PolicyStore, migrateModeration } from "./policyStore";
+import { CarrierIndex } from "./carrierIndex";
+const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
+const f = await relayFixture();
+const store = new PolicyStore(sql);
+const target = { communityId: f.policy.communityId, channelId: f.channelId, rumorId: f.allowedRumorId };
+const decision = crypto.randomUUID();
+beforeAll(async () => { await migrateModeration(sql); await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0); });
+afterAll(async () => { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${target.communityId}`; await sql.end(); });
+test("indexes every wrapper and persists removal through restart and retry", async () => {
+  const second = wrapSeal(f.allowedSeal, f.chatKey);
+  expect((await store.admit(f.allowed)).action).toBe("accept");
+  expect((await store.admit(second)).action).toBe("accept");
+  const index = new CarrierIndex(sql);
+  expect(await index.ids(target)).toEqual([f.allowed.id, second.id].sort());
+  await index.start(target, decision);
+  expect((await new PolicyStore(sql).admit(wrapSeal(f.allowedSeal, f.chatKey))).action).toBe("reject");
+  await new CarrierIndex(sql).start(target, decision);
+  await index.finish(decision, "verified");
+  const [row] = await sql`SELECT state, attempts FROM moderation.removals WHERE decision_id = ${decision}`;
+  expect(row.state).toBe("verified"); expect(row.attempts).toBe(2);
+  await expect(index.start({ ...target, rumorId: "f".repeat(64) }, decision)).rejects.toThrow(/conflict/i);
+});

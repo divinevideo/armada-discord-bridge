@@ -86,3 +86,11 @@ test("validator database role performs a full admission and carrier insert", asy
     await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`;
   }
 });
+
+test("restore preserves verified historical control and rejects tombstoned chat", async () => {
+  expect(await store.admitRestored(fixture.allowed)).toBe(false);
+  expect(await store.admitRestored(fixture.policy.controlEvents[0])).toBe(true);
+  const [row] = await sql`SELECT revision FROM moderation.community_policy WHERE community_id = ${fixture.policy.communityId}`;
+  await store.assertRestoreReady({ [fixture.policy.communityId]: Number(row.revision) });
+  await expect(store.assertRestoreReady({ [fixture.policy.communityId]: Number(row.revision) + 1 })).rejects.toThrow(/floor/);
+});

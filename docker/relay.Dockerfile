@@ -2,8 +2,10 @@ FROM ubuntu:22.04@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf
 RUN apt-get update && apt-get install -y --no-install-recommends git g++ make pkg-config libtool ca-certificates patch libssl-dev zlib1g-dev liblmdb-dev libflatbuffers-dev libsecp256k1-dev libzstd-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 RUN git init && git remote add origin https://github.com/hoytech/strfry.git && git fetch --depth=1 origin 3fd1bc538e5e4dc2d122041064753be0177748b4 && git checkout --detach FETCH_HEAD && test "$(git rev-parse HEAD)" = 3fd1bc538e5e4dc2d122041064753be0177748b4 && git submodule update --init --recursive
-COPY patches/strfry /patches
+COPY patches/strfry/0001-policy-boundary.patch patches/strfry/0002-connection-diagnostics.patch /patches/
 RUN patch -p1 < /patches/0001-policy-boundary.patch && patch -p1 < /patches/0002-connection-diagnostics.patch && make setup-golpe && make -j2
+COPY patches/strfry/0003-admission-purge-barrier.patch /patches/
+RUN patch -p1 < /patches/0003-admission-purge-barrier.patch && make -j2
 RUN mkdir -p /source && git ls-files --recurse-submodules -z | tar --null -T - -cf /source/strfry-source.tar && cp LICENSE /source/LICENSE
 
 FROM oven/bun:1.3.10-slim@sha256:5d5863f35ad9b3acceee8dc134fb2b89f07831129eaeec81af2b19a23dabe3e0 AS bun

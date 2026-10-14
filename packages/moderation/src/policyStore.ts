@@ -3,7 +3,7 @@ import type postgres from "postgres";
 import type { NostrEvent } from "nostr-tools/pure";
 import { bytesToHex } from "@armada-bridge/concord-core";
 import type { AdmissionResult, CommunityPolicy, RoomTarget, StreamDescriptor } from "./contracts";
-import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES } from "./relayPolicy";
+import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent } from "./relayPolicy";
 
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
@@ -103,6 +103,30 @@ export class PolicyStore {
         return result;
       });
     } catch { return rejected; }
+  }
+
+  async assertRestoreReady(floors: Record<string, number>): Promise<void> {
+    const rows = await this.sql`SELECT community_id FROM moderation.community_policy`;
+    if (rows.length !== Object.keys(floors).length) throw new Error("Recovery policy scope mismatch");
+    for (const row of rows) {
+      const policy = await this.load(this.sql, row.community_id);
+      const floor = floors[row.community_id];
+      if (!policy || !floor || policy.revision < floor || !policy.complete || policy.validUntil <= Date.now() || controlState(policy).folded.incomplete.length) throw new Error("Recovery policy unavailable or behind floor");
+    }
+  }
+
+  async admitRestored(input: NostrEvent): Promise<boolean> {
+    // Historical control editions are needed to reconstruct authority. They are
+    // retained only if their exact verified bytes are in the installed fold.
+    const event = verifiedEvent(input);
+    const [stream] = await this.sql`SELECT community_id FROM moderation.streams WHERE pubkey = ${event.pubkey} AND plane = 'control'`;
+    if (stream) {
+      const policy = await this.load(this.sql, stream.community_id);
+      if (!policy || !policy.complete || policy.validUntil <= Date.now()) throw new Error("Recovery policy unavailable");
+      controlState(policy);
+      return policy.controlEvents.some((candidate) => candidate.id === event.id);
+    }
+    return (await this.admit(event)).action === "accept";
   }
 
   /** Disconnects revoke admission immediately; a new complete snapshot must win CAS. */

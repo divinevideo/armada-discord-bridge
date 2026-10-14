@@ -51,6 +51,19 @@ END $$;
 REVOKE ALL ON SCHEMA moderation FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA moderation FROM PUBLIC;
 GRANT USAGE ON SCHEMA moderation TO moderation_validator, moderation_operator;
-GRANT SELECT ON ALL TABLES IN SCHEMA moderation TO moderation_validator;
+GRANT SELECT ON moderation.community_policy, moderation.streams, moderation.member_bans, moderation.tombstones, moderation.carriers TO moderation_validator;
 GRANT INSERT ON moderation.carriers TO moderation_validator;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA moderation TO moderation_operator;
+
+CREATE TABLE IF NOT EXISTS moderation.removals (
+  decision_id uuid PRIMARY KEY,
+  community_id text NOT NULL REFERENCES moderation.community_policy ON DELETE CASCADE,
+  channel_id text NOT NULL CHECK (channel_id ~ '^[0-9a-f]{64}$'),
+  rumor_id text NOT NULL CHECK (rumor_id ~ '^[0-9a-f]{64}$'),
+  policy_revision bigint NOT NULL,
+  state text NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'verified', 'failed')),
+  attempts integer NOT NULL DEFAULT 1,
+  verified_at timestamptz
+);
+REVOKE ALL ON moderation.removals FROM PUBLIC, moderation_validator;
+GRANT SELECT, INSERT, UPDATE, DELETE ON moderation.removals TO moderation_operator;

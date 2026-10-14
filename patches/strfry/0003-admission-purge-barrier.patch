@@ -1,0 +1,43 @@
+--- a/src/apps/relay/RelayWriter.cpp
++++ b/src/apps/relay/RelayWriter.cpp
+@@ -1,6 +1,31 @@
+ #include "RelayServer.h"
+ 
+ #include "PluginEventSifter.h"
++#include <sys/file.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <cerrno>
++
++// The local purge worker acquires the same lock only after committing its
++// tombstone. Hold it from BEFORE policy validation through the LMDB commit;
++// otherwise an accepted event can appear after a successful purge.
++class AdmissionBarrier {
++    int fd = -1;
++public:
++    AdmissionBarrier() {
++        fd = ::open("/data/admission.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
++        if (fd < 0) throw std::runtime_error("Admission barrier unavailable");
++        while (::flock(fd, LOCK_EX) != 0) {
++            if (errno == EINTR) continue;
++            ::close(fd);
++            fd = -1;
++            throw std::runtime_error("Admission barrier unavailable");
++        }
++    }
++    ~AdmissionBarrier() { if (fd >= 0) ::close(fd); }
++    AdmissionBarrier(const AdmissionBarrier&) = delete;
++    AdmissionBarrier& operator=(const AdmissionBarrier&) = delete;
++};
+ 
+ 
+ void RelayServer::runWriter(ThreadPool<MsgWriter>::Thread &thr) {
+@@ -31,6 +56,8 @@
+                 std::swap(newMsgs, newMsgsFiltered);
+             }
+         }
++
++        AdmissionBarrier admissionBarrier;
+ 
+         // Prepare messages
+ 
