@@ -58,6 +58,16 @@ describe.skipIf(!dbUp)("sharedMasterSecret", () => {
     expect(unseal(SEAL_KEY, other)).not.toBe(unseal(SEAL_KEY, one));
   });
 
+  it("uses the provisioned worker puppet root and rejects drift on relink", async () => {
+    const provisioned = { communityId: COMMUNITY, guildId: "100000000000000043", key: "cd".repeat(32) };
+    const manager = new BridgeManager(sql, { ...env, puppetMaster: provisioned });
+    const sealed = await secretFor(manager, COMMUNITY, provisioned.guildId);
+    expect(derivePuppet(unseal(SEAL_KEY, sealed), "200000000000000002").pk).toBe(derivePuppet(provisioned.key, "200000000000000002").pk);
+    const changed = new BridgeManager(sql, { ...env, puppetMaster: { ...provisioned, key: "ef".repeat(32) } });
+    await expect(secretFor(changed, COMMUNITY, provisioned.guildId)).rejects.toThrow();
+    await expect(secretFor(manager, COMMUNITY, "100000000000000044")).rejects.toThrow();
+  });
+
   it("concurrent first activations converge on one secret", async () => {
     const [x, y] = await Promise.all([
       secretFor(mgr, COMMUNITY, "100000000000000042"),

@@ -373,7 +373,9 @@ export class BridgeManager {
    * back the same row.
    */
   private async sharedMasterSecret(communityId: string, guildId: string): Promise<Uint8Array> {
-    const candidate = seal(this.env.sealKeyHex, randomBytes(32).toString("hex"));
+    const master = this.env.puppetMaster;
+    if (master && (master.communityId !== communityId || master.guildId !== guildId)) throw new Error("Provisioned puppet scope mismatch");
+    const candidate = seal(this.env.sealKeyHex, master?.key ?? randomBytes(32).toString("hex"));
     await this.sql`
       INSERT INTO guild_community_secrets (community_id, discord_guild_id, master_secret_sealed)
       VALUES (${communityId}, ${guildId}, ${candidate})
@@ -381,6 +383,7 @@ export class BridgeManager {
     const [row] = await this.sql<{ master_secret_sealed: Uint8Array }[]>`
       SELECT master_secret_sealed FROM guild_community_secrets
       WHERE community_id = ${communityId} AND discord_guild_id = ${guildId}`;
+    if (master && unseal(this.env.sealKeyHex, row.master_secret_sealed) !== master.key) throw new Error("Puppet root differs from provisioned worker identity");
     return row.master_secret_sealed;
   }
 
