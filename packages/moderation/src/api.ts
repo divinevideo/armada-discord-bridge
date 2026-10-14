@@ -56,7 +56,11 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
     let actor;
     try { actor = authenticateCoop(request, body, options.coopSecret, options.orgs); } catch { return response({ error: "staff_authorization_required" }, 403); }
     try {
-      if (caseRoute && request.method === "GET" && options.reports.getCase && options.decisions.forCase) return response({ ...await options.reports.getCase(caseRoute[1], actor), decisions: await options.decisions.forCase(caseRoute[1], actor) });
+      if (caseRoute && request.method === "GET" && options.reports.getCase && options.decisions.forCase) {
+        const decisions = await options.decisions.forCase(caseRoute[1], actor);
+        try { return response({ ...await options.reports.getCase(caseRoute[1], actor), evidenceAvailable: true, decisions }); }
+        catch { if (!decisions.length) throw new Error("Case unavailable"); return response({ caseId: caseRoute[1], evidenceAvailable: false, content: null, reason: null, expiresAt: null, decisions }); }
+      }
       if (path === "/v1/decisions" && request.method === "POST") return response(await options.decisions.acceptDecision(JSON.parse(body), actor), 202);
       if (decisionRoute && !decisionRoute[2] && request.method === "GET") return response(await options.decisions.get(decisionRoute[1], actor));
       if (decisionRoute?.[2] && request.method === "POST") return response(await options.decisions.retry(decisionRoute[1], actor), 202);

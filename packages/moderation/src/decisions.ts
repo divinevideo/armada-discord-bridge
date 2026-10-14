@@ -41,7 +41,7 @@ export class Decisions {
   async get(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor);
     if (!uuid.test(decisionId)) throw new Error("Decision unavailable");
-    const [row] = await this.sql`SELECT * FROM moderation.decisions WHERE decision_id = ${decisionId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp()`;
+    const [row] = await this.sql`SELECT * FROM moderation.decisions WHERE decision_id = ${decisionId} AND org_id = ${actor.orgId}`;
     if (!row || this.communities.get(row.community_id) !== actor.orgId || (!actor.permissions.includes("view") && !actor.permissions.includes(row.action))) throw new Error("Decision unavailable");
     const deliveries = await this.sql`SELECT target, state, attempts, result_code FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
     return { decisionId, target: stored(row).target, action: row.action, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
@@ -49,15 +49,16 @@ export class Decisions {
   async forCase(caseId: string, actor: VerifiedCoopActor): Promise<DecisionStatus[]> {
     assertActor(actor, "view");
     if (!uuid.test(caseId)) throw new Error("Invalid case");
-    const rows = await this.sql`SELECT decision_id FROM moderation.decisions WHERE org_id = ${actor.orgId} AND case_id = ${caseId} AND expires_at > clock_timestamp() ORDER BY created_at DESC LIMIT 100`;
+    const rows = await this.sql`SELECT decision_id FROM moderation.decisions WHERE org_id = ${actor.orgId} AND case_id = ${caseId} ORDER BY created_at DESC LIMIT 100`;
     return Promise.all(rows.map((row) => this.get(row.decision_id, actor)));
   }
   async retry(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor, "retry");
     const status = await this.get(decisionId, actor);
     assertActor(actor, status.action);
-    await this.sql`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
-      WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8`;
+    const retried = await this.sql`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+      WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8 AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
+    if (!retried.length) throw new Error("No retryable delivery; escalate expired or exhausted decisions");
     return this.get(decisionId, actor);
   }
   async claim(): Promise<DeliveryClaim | undefined> {

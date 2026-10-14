@@ -69,3 +69,12 @@ test("an unverified delivery that exhausts its retry budget becomes visibly fail
   expect(row.state).toBe("failed");
   expect(row.result_code).toBe("retry_budget_exhausted");
 });
+test("delivery results remain visible after evidence expires, but expired actions cannot retry", async () => {
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId}`;
+  await decisions.expire();
+  const status = await decisions.get(accepted.decisionId, actor);
+  expect(status.deliveries.every((delivery) => delivery.state === 'failed')).toBe(true);
+  expect((await decisions.forCase(caseId, { ...actor, permissions: ['view'] })).some((decision) => decision.decisionId === accepted.decisionId)).toBe(true);
+  await expect(decisions.retry(accepted.decisionId, actor)).rejects.toThrow(/retry/i);
+});
