@@ -635,3 +635,14 @@ describe("public-only import boundary", () => {
     expect(sent).toBe(0);
   });
 });
+
+it("does not mark history complete when this worker does not own the bridge", async () => {
+  const plan = buildImportPlan(snapshot);
+  plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
+  const channel = plan.channels[0];
+  const store = { imports: new Map<string, Record<string, unknown>>([["unowned", { import_id: "unowned", plan }]]), bridges: [] as Array<Record<string, unknown>> };
+  const manager = { assertPublicChannel: async () => {}, resyncFor: async () => {}, routerFor: () => undefined };
+  const importer = new Importer(fakeSql(store), env, manager as never);
+  await expect((importer as unknown as { backfillChannel(id: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> }).backfillChannel("unowned", plan, channel)).rejects.toThrow(/not owned/);
+  expect(channel.historyDoneAt).toBeUndefined();
+});

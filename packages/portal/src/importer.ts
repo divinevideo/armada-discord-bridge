@@ -1032,10 +1032,7 @@ export class Importer {
     await this.manager.resyncFor(channel.discordId).catch(() => {});
     const running = this.manager.routerFor(channel.discordId);
     if (!running) {
-      console.warn(`import ${importId}: no live bridge for #${channel.name}; history skipped`);
-      channel.historyDoneAt = Date.now();
-      await this.savePlan(importId, plan);
-      return;
+      throw new Error("History bridge is not owned by this worker; retry after it is running");
     }
 
     // Collect the newest cap-worth of messages, stopping at the resume
