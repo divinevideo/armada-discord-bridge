@@ -3,6 +3,7 @@ import { buildRumor, channelBindingTags, sealRumor, wrapSeal, KIND_SEAL_ENCRYPTE
 import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import { relayFixture } from "../../../scripts/fixtures/relay-events";
 import { evaluateRelayEvent } from "./relayPolicy";
+import type { AdmissionContext } from "./contracts";
 
 const fixture = await relayFixture();
 function context(overrides = {}) {
@@ -85,4 +86,24 @@ test("policy expiring while a tombstone lookup is pending cannot admit a write",
   let now = fixture.policy.validUntil - 1;
   const result = await evaluateRelayEvent(fixture.allowed, context({ now: () => now, isRemoved: async () => { now++; return false; } }));
   expect(result.action).toBe("reject");
+});
+
+test("retired channel epochs reject newly authored messages", async () => {
+  const f = await relayFixture();
+  const context: AdmissionContext = { policy: f.policy, stream: { ...f.chatStream, retiredAt: 1 }, now: Date.now, isRemoved: async () => false, authorOf: async () => f.member.pk };
+  expect((await evaluateRelayEvent(f.allowed, context)).action).toBe("reject");
+});
+
+test("authorized base rekey chunks remain admissible while public chat is suspended", async () => {
+  const f = await relayFixture();
+  const core = await import("@armada-bridge/concord-core");
+  const group = core.baseRekeyGroupKey(f.community.root, f.community.id, 1n);
+  const prevCommit = core.bytesToHex(core.epochKeyCommitment(0n, f.community.root));
+  const rumor = core.buildRekeyRumors(f.owner.pk, { scope: { kind: "root" }, prevEpoch: 0n, newEpoch: 1n, prevCommit }, [], Date.now())[0];
+  const event = wrapSeal(await sealRumor(rumor, KIND_SEAL_ENCRYPTED, group, f.owner.signer), group);
+  const stream: any = { communityId: f.community.idHex, plane: "rekey", epoch: "1", previousEpoch: "0", previousCommit: prevCommit, key: { pk: group.pk, convKey: group.convKey } };
+  const context: any = { policy: { ...f.policy, rekeyPending: true }, stream, now: Date.now, isRemoved: async () => false, authorOf: async () => undefined };
+  expect((await evaluateRelayEvent(event, context)).action).toBe("accept");
+  expect((await evaluateRelayEvent(f.allowed, { ...context, stream: f.chatStream })).action).toBe("reject");
+  expect((await evaluateRelayEvent(event, { ...context, stream: { ...stream, previousCommit: "f".repeat(64) } })).action).toBe("reject");
 });

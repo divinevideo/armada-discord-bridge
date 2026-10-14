@@ -8,8 +8,11 @@ export type ReadStreamKey = Readonly<Omit<StreamKeyView, "sk">> & { sk?: never }
 export interface StreamDescriptor {
   communityId: string;
   channelId?: string;
-  plane: "chat" | "control" | "guestbook";
+  plane: "chat" | "control" | "guestbook" | "rekey";
   epoch: string;
+  retiredAt?: number;
+  previousEpoch?: string;
+  previousCommit?: string;
   key: ReadStreamKey;
 }
 export interface CommunityPolicy {
@@ -18,6 +21,8 @@ export interface CommunityPolicy {
   ownerSalt: string;
   revision: number;
   complete: boolean;
+  rootEpoch?: string;
+  rekeyPending?: boolean;
   validUntil: number;
   controlStreams: StreamDescriptor[];
   controlEvents: NostrEvent[];
@@ -30,6 +35,7 @@ export interface AdmissionContext {
   stream?: StreamDescriptor;
   /** AUTH never substitutes for the author verified inside a stream wrap. */
   authed?: string;
+  publicAuthorKnown?: boolean;
   now(): number;
   isRemoved(target: RoomTarget): Promise<boolean>;
   authorOf(target: RoomTarget): Promise<string | undefined>;

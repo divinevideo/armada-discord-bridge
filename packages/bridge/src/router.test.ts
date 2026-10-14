@@ -1108,6 +1108,8 @@ describe("BridgeRouter: guestbook joins", () => {
     const joins = openGuestbookWraps(pool.published, guestbookGroups(community));
     expect(joins).toHaveLength(1);
     expect(joins[0].kind).toBe(KIND_JOIN_LEAVE);
+    const guestbookPks = guestbookGroups(community).map((group) => group.pk);
+    expect(pool.published.findIndex((event) => guestbookPks.includes(event.pubkey))).toBeLessThan(pool.published.findIndex((event) => event.kind === 0));
     expect(joins[0].author).toBe(puppets.get("80351110224678912").pk);
   });
 

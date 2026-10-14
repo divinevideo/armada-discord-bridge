@@ -1,4 +1,4 @@
-import { bytesToHex, canActOnMember, checkChannelBinding, citationFromTags, citationSatisfied, communityIdOf, foldControlState, hex32, isAuthorized, KIND_SEAL_ENCRYPTED, KIND_SEAL_PLAINTEXT, openWrap, parseEdition, Permissions } from "@armada-bridge/concord-core";
+import { bytesToHex, canActOnMember, checkChannelBinding, citationFromTags, citationSatisfied, communityIdOf, foldControlState, hex32, isAuthorized, KIND_SEAL_ENCRYPTED, KIND_SEAL_PLAINTEXT, openWrap, parseEdition, parseRekey, Permissions } from "@armada-bridge/concord-core";
 import type { ParsedEdition } from "@armada-bridge/concord-core";
 import { verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
@@ -36,7 +36,7 @@ export function controlState(policy: CommunityPolicy) {
   return { editions, folded: foldControlState(editions, hex32(policy.communityId), policy.owner) };
 }
 
-export async function inspectRelayEvent(input: NostrEvent, context: AdmissionContext): Promise<{ result: AdmissionResult; carrier?: CarrierRecord }> {
+export async function inspectRelayEvent(input: NostrEvent, context: AdmissionContext): Promise<{ result: AdmissionResult; carrier?: CarrierRecord; observedAuthor?: string; control?: NostrEvent; removals?: RoomTarget[]; rekey?: { communityId: string; epoch: string; event: NostrEvent } }> {
   const id = typeof input?.id === "string" && HEX_ID.test(input.id) ? input.id : "0".repeat(64);
   const reject: AdmissionResult = { id, action: "reject", msg: "blocked: room policy unavailable or event not permitted" };
   try {
@@ -55,7 +55,7 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
         const d = event.tags.filter((t) => t[0] === "d");
         requireThat(d.length === 1 && d[0][1] === "");
       } else {
-        requireThat(policy.publicAuthors.includes(event.pubkey));
+        requireThat(policy.publicAuthors.includes(event.pubkey) || context.publicAuthorKnown);
       }
       return { result: accept };
     }
@@ -72,9 +72,17 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
       const next = foldControlState([...editions, candidate], hex32(policy.communityId), policy.owner, folded.heads);
       const head = next.headEditions.get(bytesToHex(candidate.entityId));
       requireThat(head && bytesToHex(head.selfHash) === bytesToHex(candidate.selfHash));
-      return { result: accept };
+      return { result: accept, control: event };
     }
     requireThat(fresh && !banned.has(opened.author) && opened.sealKind === KIND_SEAL_ENCRYPTED);
+    if (descriptor.plane === "rekey") {
+      requireThat(event.kind === 1059);
+      const rotation = parseRekey(opened);
+      requireThat(rotation.scopeIdHex === "0".repeat(64) && rotation.newEpoch.toString() === descriptor.epoch && rotation.prevEpoch.toString() === descriptor.previousEpoch && rotation.prevCommit === descriptor.previousCommit);
+      requireThat(rotation.newEpoch === rotation.prevEpoch + 1n && rotation.chunkCount <= 1024);
+      requireThat(isAuthorized(folded.roster, opened.author, policy.owner, Permissions.BAN) && citationSatisfied(folded, hex32(policy.communityId), opened.author, rotation.authority));
+      return { result: accept, rekey: { communityId: policy.communityId, epoch: descriptor.epoch, event } };
+    }
     if (descriptor.plane === "guestbook") {
       requireThat(event.kind === 1059 && !opened.tags.some((tag) => tag[0] === "channel" || tag[0] === "epoch"));
       if (opened.kind === 3306) requireThat(opened.content === "join" || opened.content === "leave");
@@ -88,12 +96,14 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
         const members = JSON.parse(opened.content);
         requireThat(Array.isArray(members) && members.length <= 400 && members.every((member) => typeof member === "string" && HEX_ID.test(member)));
       } else return { result: reject };
-      return { result: accept };
+      return { result: accept, observedAuthor: opened.kind === 3306 && opened.content === "join" ? opened.author : undefined };
     }
+    requireThat(!policy.rekeyPending);
     requireThat(descriptor.plane === "chat" && descriptor.channelId && CHAT_KINDS.has(opened.kind));
     const channel = folded.channels.get(descriptor.channelId);
     requireThat(channel && !channel.deleted && !channel.metadata.private);
     checkChannelBinding(opened, descriptor.channelId, BigInt(descriptor.epoch));
+    requireThat(descriptor.retiredAt === undefined || opened.createdAt <= descriptor.retiredAt);
     requireThat((opened.kind === 23311) === (event.kind === 21059));
     const target: RoomTarget = { communityId: policy.communityId, channelId: descriptor.channelId, rumorId: opened.rumorId };
     requireThat(!(await context.isRemoved(target)));
@@ -113,7 +123,7 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
     const expiresAt = expiration.length ? Number(expiration[0][1]) * 1000 : undefined;
     if (expiration.length) requireThat(/^[0-9]+$/.test(expiration[0][1]) && Number.isSafeInteger(expiresAt) && expiresAt! > context.now());
     requireThat(context.now() < policy.validUntil);
-    return { result: accept, carrier: { ...target, eventId: event.id, author: opened.author, kind: opened.kind, expiresAt, policyRevision: policy.revision } };
+    return { result: accept, observedAuthor: opened.author, removals: opened.kind === 5 ? opened.tags.filter((tag) => tag[0] === "e").map((tag) => ({ ...target, rumorId: tag[1] })) : undefined, carrier: { ...target, eventId: event.id, author: opened.author, kind: opened.kind, expiresAt, policyRevision: policy.revision } };
   } catch {
     return { result: reject };
   }

@@ -508,10 +508,10 @@ export class BridgeRouter {
     const content = discordToConcord({ ...source, attachments });
     if (content.length === 0) return undefined;
 
+    await this.publishPuppetJoin(msg.author.id, identity, msg.timestampMs);
     await this.syncPuppetProfile(msg.author, identity).catch((error) =>
       console.warn(`bridge: puppet profile publish failed for ${msg.author.id}`, error),
     );
-    await this.publishPuppetJoin(msg.author.id, identity, msg.timestampMs);
     if (msg.referencedMessageId) {
       // NIP-C7 inline quote-reply naming the mapped rumor and its author.
       // An unmapped reference (pre-bridge history) degrades to a bare message.
@@ -740,6 +740,7 @@ export class BridgeRouter {
 
     const puppet = this.puppets.get(reaction.user.id);
     const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
+    await this.publishPuppetJoin(reaction.user.id, identity, Date.now());
     await this.syncPuppetProfile(reaction.user, identity).catch((error) =>
       console.warn(`bridge: puppet profile publish failed for ${reaction.user.id}`, error),
     );

@@ -8,7 +8,7 @@ import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
 export async function migrateModeration(sql: postgres.Sql): Promise<void> {
-  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
+  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}, 1)`;
     for (const body of bodies) await tx.unsafe(body);
@@ -21,7 +21,7 @@ export function policyLock(sql: Sql, communityId: string, shared = false) {
 }
 function requireId(value: string): void { if (!HEX_ID.test(value)) throw new Error("Invalid target"); }
 function streamOf(row: Record<string, any>): StreamDescriptor {
-  return { communityId: row.community_id, channelId: row.channel_id ?? undefined, plane: row.plane, epoch: String(row.epoch), key: { pk: row.pubkey, convKey: new Uint8Array(row.read_key), restricted: row.restricted } };
+  return { communityId: row.community_id, channelId: row.channel_id ?? undefined, plane: row.plane, epoch: String(row.epoch), retiredAt: row.retired_at == null ? undefined : Number(row.retired_at), previousEpoch: row.previous_epoch == null ? undefined : String(row.previous_epoch), previousCommit: row.previous_commit ?? undefined, key: { pk: row.pubkey, convKey: new Uint8Array(row.read_key), restricted: row.restricted } };
 }
 
 export class PolicyStore {
@@ -47,6 +47,7 @@ export class PolicyStore {
       if (Number(old?.revision ?? 0) !== expectedRevision) throw new Error("Policy revision conflict");
       if (old) {
         const oldPolicy = await this.load(tx, policy.communityId);
+        if (BigInt(policy.rootEpoch ?? "0") < BigInt(oldPolicy!.rootEpoch ?? "0")) throw new Error("Root epoch would roll back");
         const previous = controlState(oldPolicy!).folded;
         for (const [entity, head] of previous.heads) {
           const next = folded.heads.get(entity);
@@ -59,8 +60,8 @@ export class PolicyStore {
         ON CONFLICT (community_id) DO UPDATE SET revision = EXCLUDED.revision, payload = EXCLUDED.payload, updated_at = clock_timestamp()`;
       await tx`DELETE FROM moderation.streams WHERE community_id = ${policy.communityId}`;
       for (const s of streams) {
-        await tx`INSERT INTO moderation.streams (pubkey, community_id, channel_id, plane, epoch, read_key, restricted)
-          VALUES (${s.key.pk}, ${s.communityId}, ${s.channelId ?? null}, ${s.plane}, ${s.epoch}, ${Buffer.from(s.key.convKey)}, ${s.key.restricted ?? false})`;
+        await tx`INSERT INTO moderation.streams (pubkey, community_id, channel_id, plane, epoch, read_key, restricted, retired_at, previous_epoch, previous_commit)
+          VALUES (${s.key.pk}, ${s.communityId}, ${s.channelId ?? null}, ${s.plane}, ${s.epoch}, ${Buffer.from(s.key.convKey)}, ${s.key.restricted ?? false}, ${s.retiredAt ?? null}, ${s.previousEpoch ?? null}, ${s.previousCommit ?? null})`;
       }
     });
   }
@@ -69,12 +70,23 @@ export class PolicyStore {
     const [row] = await sql`SELECT revision, payload FROM moderation.community_policy WHERE community_id = ${communityId}`;
     if (!row) return undefined;
     const streams = await sql`SELECT * FROM moderation.streams WHERE community_id = ${communityId} AND plane = 'control'`;
+    const accepted = await sql`SELECT event FROM moderation.accepted_control WHERE community_id = ${communityId} LIMIT 4097`;
+    const controlEvents = [...new Map([...row.payload.controlEvents, ...accepted.map((entry) => entry.event)].map((event) => [event.id, event])).values()];
+    if (controlEvents.length > 4096) throw new Error("Control history exceeds bound");
     const overrides = await sql`SELECT author, blocked FROM moderation.member_bans WHERE community_id = ${communityId}`;
     const banned = new Set<string>(row.payload.banned);
     for (const override of overrides) {
       if (override.blocked) banned.add(override.author); else banned.delete(override.author);
     }
-    return { ...row.payload, banned: [...banned], revision: Number(row.revision), controlStreams: streams.map(streamOf) };
+    const pending = await sql`SELECT 1 FROM moderation.rekey_events WHERE community_id = ${communityId} AND epoch > ${row.payload.rootEpoch ?? "0"} LIMIT 1`;
+    return { ...row.payload, controlEvents, rekeyPending: pending.length > 0, banned: [...banned], revision: Number(row.revision), controlStreams: streams.map(streamOf) };
+  }
+
+  async rekeyEvents(communityId: string): Promise<NostrEvent[]> {
+    requireId(communityId);
+    const rows = await this.sql`SELECT event FROM moderation.rekey_events WHERE community_id = ${communityId} LIMIT 4097`;
+    if (rows.length > 4096) throw new Error("Rekey reconciliation exceeds bound");
+    return rows.map((row) => row.event as NostrEvent);
   }
 
   async getPolicy(communityId: string) { requireId(communityId); return this.load(this.sql, communityId); }
@@ -87,21 +99,31 @@ export class PolicyStore {
       return await this.sql.begin(async (tx) => {
         await tx.unsafe("SET LOCAL statement_timeout = '1500ms'");
         const candidates = await tx`SELECT community_id FROM moderation.streams WHERE pubkey = ${event.pubkey}
-          UNION SELECT community_id FROM moderation.community_policy WHERE payload->'publicAuthors' ? ${event.pubkey} LIMIT 2`;
+          UNION SELECT community_id FROM moderation.community_policy WHERE payload->'publicAuthors' ? ${event.pubkey}
+          UNION SELECT community_id FROM moderation.observed_members WHERE author = ${event.pubkey} LIMIT 2`;
         if (candidates.length !== 1) return rejected;
         const communityId = candidates[0].community_id as string;
-        await policyLock(tx, communityId, true);
+        await policyLock(tx, communityId);
         const policy = await this.load(tx, communityId);
         const [row] = await tx`SELECT * FROM moderation.streams WHERE pubkey = ${event.pubkey} AND community_id = ${communityId}`;
-        const { result, carrier } = await inspectRelayEvent(event, {
-          policy, stream: row && streamOf(row), now: Date.now,
+        const known = await tx`SELECT 1 FROM moderation.observed_members WHERE community_id = ${communityId} AND author = ${event.pubkey}`;
+        const { result, carrier, rekey, observedAuthor, control, removals } = await inspectRelayEvent(event, {
+          policy, stream: row && streamOf(row), now: Date.now, publicAuthorKnown: known.length > 0,
           isRemoved: async (target) => (await tx`SELECT 1 FROM moderation.tombstones WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId}`).length > 0,
           authorOf: async (target) => (await tx`SELECT author FROM moderation.carriers WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} LIMIT 1`)[0]?.author as string | undefined,
         });
+        if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
+        if (result.action === "accept") for (const target of removals ?? []) {
+          await tx`INSERT INTO moderation.tombstones (community_id, channel_id, rumor_id) VALUES (${communityId}, ${target.channelId}, ${target.rumorId}) ON CONFLICT DO NOTHING`;
+          await tx`INSERT INTO moderation.incoming_removals (community_id, channel_id, rumor_id) VALUES (${communityId}, ${target.channelId}, ${target.rumorId}) ON CONFLICT DO NOTHING`;
+        }
+        if (result.action === "accept" && observedAuthor) await tx`INSERT INTO moderation.observed_members (community_id, author) VALUES (${communityId}, ${observedAuthor}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept" && carrier) {
           await tx`INSERT INTO moderation.carriers (community_id, channel_id, rumor_id, event_id, author, kind, policy_revision, expires_at)
             VALUES (${carrier.communityId}, ${carrier.channelId}, ${carrier.rumorId}, ${carrier.eventId}, ${carrier.author}, ${carrier.kind}, ${carrier.policyRevision}, ${carrier.expiresAt ? new Date(carrier.expiresAt) : null}) ON CONFLICT (event_id) DO NOTHING`;
         }
+        if (result.action === "accept" && rekey) await tx`INSERT INTO moderation.rekey_events (event_id, community_id, epoch, event)
+          VALUES (${rekey.event.id}, ${rekey.communityId}, ${rekey.epoch}, ${tx.json(rekey.event as never)}) ON CONFLICT DO NOTHING`;
         return result;
       });
     } catch { return rejected; }

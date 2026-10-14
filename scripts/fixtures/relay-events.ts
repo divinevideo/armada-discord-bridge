@@ -28,5 +28,5 @@ export async function relayFixture() {
     controlStreams: [controlStream], controlEvents: [controlEvent], banned: [bannedMember.pk],
     publicAuthors: [owner.pk, member.pk], snapshotAuthorities: [],
   };
-  return { owner, member, bannedMember, channelId, chatKey, chatStream, controlStream, guestbookStream, controlEvent, unauthorizedControl, allowedSeal, allowedRumorId: openWrap(wrapSeal(allowedSeal, chatKey), chatStream.key).rumorId, policy, allowed: wrapSeal(allowedSeal, chatKey), banned: wrapSeal(await chat(bannedMember), chatKey) };
+  return { community, owner, member, bannedMember, channelId, chatKey, chatStream, controlStream, guestbookStream, controlEvent, unauthorizedControl, allowedSeal, allowedRumorId: openWrap(wrapSeal(allowedSeal, chatKey), chatStream.key).rumorId, policy, allowed: wrapSeal(allowedSeal, chatKey), banned: wrapSeal(await chat(bannedMember), chatKey) };
 }

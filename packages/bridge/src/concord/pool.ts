@@ -114,9 +114,12 @@ export class RelayPool implements RelayLike {
   private readonly authSk: Uint8Array;
   private readonly stopKeyListener: () => void;
 
-  constructor(readonly urls: string[], opts?: { authSk?: Uint8Array }) {
+  private readonly onDisconnect?: () => void;
+
+  constructor(readonly urls: string[], opts?: { authSk?: Uint8Array; onDisconnect?: () => void }) {
     if (urls.length === 0) throw new Error("RelayPool needs at least one relay URL");
     this.authSk = opts?.authSk ?? generateSecretKey();
+    this.onDisconnect = opts?.onDisconnect;
     openPools.add(this);
     // A key can gain its secret or widen its relay scope after this pool
     // first wanted it; sign it then, on sockets that are already challenged.
@@ -191,9 +194,21 @@ export class RelayPool implements RelayLike {
           );
         },
       });
+      conn.socket.addEventListener("close", () => this.onDisconnect?.());
+      conn.socket.addEventListener("error", () => this.onDisconnect?.());
       this.conns.set(url, conn);
     }
     return conn;
+  }
+
+  /** A policy snapshot is incomplete if any configured source failed. */
+  async queryStrict(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]> {
+    const signal = opts?.signal ?? AbortSignal.timeout(QUERY_TIMEOUT_MS);
+    this.want(filters);
+    const results = await Promise.all(this.urls.map((url) => this.relay(url).query(filters, { signal })));
+    const byId = new Map<string, NostrEvent>();
+    for (const events of results) for (const event of events) byId.set(event.id, event);
+    return [...byId.values()].sort((a, b) => b.created_at - a.created_at);
   }
 
   /** Merge results from every relay, deduped by event id, newest first. */

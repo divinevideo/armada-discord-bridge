@@ -51,3 +51,13 @@ test("crashed delivery is reclaimed with persisted events and a stale worker can
   const status = await decisions.retry(claim!.decision.decisionId, actor);
   expect(status.deliveries.find((d) => d.target === reclaimed!.target)?.state).toBe("pending");
 });
+test("waiting for community serialization does not exhaust delivery attempts", async () => {
+  const status = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  const claim = await decisions.claim();
+  expect(claim).toBeDefined();
+  await decisions.defer(claim!);
+  const [row] = await sql`SELECT attempts, token, state FROM moderation.deliveries WHERE decision_id = ${claim!.decision.decisionId} AND target = ${claim!.target}`;
+  expect(row.attempts).toBe(claim!.attempts - 1);
+  expect(row.token).toBeNull();
+  expect(row.state).toBe("pending");
+});

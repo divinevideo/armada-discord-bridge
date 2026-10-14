@@ -68,6 +68,11 @@ export class Decisions {
       return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + 1, signedEvents: job.signed_events };
     });
   }
+  async defer(claim: DeliveryClaim): Promise<void> {
+    const rows = await this.sql`UPDATE moderation.deliveries SET state = 'pending', attempts = attempts - 1, token = NULL, lease_until = NULL, available_at = clock_timestamp() + interval '1 second'
+      WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
+    if (!rows.length) throw new Error("Delivery lease lost");
+  }
   async renew(claim: DeliveryClaim): Promise<void> {
     const rows = await this.sql`UPDATE moderation.deliveries SET lease_until = clock_timestamp() + interval '60 seconds' WHERE decision_id = ${claim.decision.decisionId}
       AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING token`;

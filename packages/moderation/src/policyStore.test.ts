@@ -94,3 +94,21 @@ test("restore preserves verified historical control and rejects tombstoned chat"
   await store.assertRestoreReady({ [fixture.policy.communityId]: Number(row.revision) });
   await expect(store.assertRestoreReady({ [fixture.policy.communityId]: Number(row.revision) + 1 })).rejects.toThrow(/floor/);
 });
+
+test("a verified public guestbook join permits profile bootstrap without granting moderation authority", async () => {
+  const f = await relayFixture();
+  const core = await import("@armada-bridge/concord-core");
+  const nostr = await import("nostr-tools/pure");
+  const newcomer = nostr.generateSecretKey(), pk = nostr.getPublicKey(newcomer);
+  const signer = { signEvent: async (template: any) => nostr.finalizeEvent(template, newcomer) };
+  const profile = await signer.signEvent({ kind: 0, created_at: Math.floor(Date.now() / 1000), tags: [], content: "{}" });
+  try {
+    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    expect((await store.admit(profile)).action).toBe("reject");
+    const joined = await core.sealGuestbook(core.buildJoinRumor(pk, Date.now()), core.currentGuestbookGroup(f.community), signer);
+    expect((await store.admit(joined)).action).toBe("accept");
+    expect((await store.admit(profile)).action).toBe("accept");
+    await store.setBan(f.community.idHex, pk, true);
+    expect((await store.admit(profile)).action).toBe("reject");
+  } finally { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.community.idHex}`; }
+});
