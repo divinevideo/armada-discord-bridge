@@ -1,6 +1,6 @@
 import { verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 
 import { controlGroupKey, random32 } from "./derive";
 import {
@@ -19,6 +19,10 @@ import {
   streamPubkeys,
   streamPubkeysForRelay,
 } from "./streamAuth";
+
+// Other test modules register stream keys during setup; clean before the first
+// assertion too, so this file does not depend on Bun's module execution order.
+beforeEach(() => _resetStreamAuthRegistry());
 
 const RELAY = "wss://relay.example.com";
 
