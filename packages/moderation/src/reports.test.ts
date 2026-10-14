@@ -67,3 +67,12 @@ test("only authorized same-org staff can read live evidence; carriers and report
   await expect(reports.getCase(caseId, { ...actor, orgId: "other" })).rejects.toThrow();
   await expect(reports.getCase(caseId, { ...actor, permissions: [] })).rejects.toThrow();
 });
+test("API database identity can deliver cases but cannot edit relay authority or bans", async () => {
+  await sql.begin(async (tx) => {
+    await tx.unsafe('SET LOCAL ROLE moderation_api');
+    await tx`SELECT case_id FROM moderation.cases LIMIT 0`;
+    await tx`SELECT decision_id FROM moderation.deliveries LIMIT 0`;
+  });
+  await expect(sql.begin(async (tx) => { await tx.unsafe('SET LOCAL ROLE moderation_api'); await tx`DELETE FROM moderation.member_bans WHERE FALSE`; })).rejects.toThrow(/permission denied/);
+  await expect(sql.begin(async (tx) => { await tx.unsafe('SET LOCAL ROLE moderation_api'); await tx`DELETE FROM moderation.community_policy WHERE FALSE`; })).rejects.toThrow(/permission denied/);
+});

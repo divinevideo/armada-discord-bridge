@@ -4,7 +4,7 @@ import { rehydrateCommunity } from "@armada-bridge/concord-core";
 import { localIdentity } from "../../bridge/src/concord/signer";
 import { RelayPool } from "../../bridge/src/concord/pool";
 import { parsePublicChannelRules } from "../../bridge/src/discord/publicChannelPolicy";
-import { loadModerationConfig } from "./config";
+import { loadModerationConfig, loadCommunityOrgs } from "./config";
 import { createModerationApi } from "./api";
 import { EvidenceCipher, RelayEvidenceResolver } from "./evidence";
 import { Decisions } from "./decisions";
@@ -17,9 +17,7 @@ async function main() {
   const mode = required("MODERATION_MODE");
   if (mode === "migrate") { try { await migrateModeration(sql); } finally { await sql.end(); } return; }
   if (!["api", "worker"].includes(mode)) throw new Error("Invalid service mode");
-  const config = loadModerationConfig(process.env);
-  const cipher = new EvidenceCipher(config.evidenceKey, config.evidenceRetentionSeconds, config.evidenceMaxBytes);
-  const decisions = new Decisions(sql, cipher, config.communities);
+  const communities = loadCommunityOrgs(process.env);
   const relayUrl = required("MODERATION_LOCAL_RELAY_URL");
   const parsedRelay = new URL(relayUrl);
   if (parsedRelay.protocol !== "ws:" || !["127.0.0.1", "localhost", "[::1]"].includes(parsedRelay.hostname)) throw new Error("Local relay required");
@@ -28,6 +26,7 @@ async function main() {
   const stop = new AbortController();
   process.once("SIGTERM", () => stop.abort()); process.once("SIGINT", () => stop.abort());
   if (mode === "worker") {
+    const decisions = new Decisions(sql, undefined, communities);
     const community = rehydrateCommunity(await Bun.file(required("MODERATION_COMMUNITY_ENTRY_FILE")).json());
     const key = required("MODERATION_MEMBER_KEY");
     if (!community || !/^[0-9a-f]{64}$/.test(key)) throw new Error("Invalid moderation member provisioning");
@@ -40,9 +39,12 @@ async function main() {
       if (path !== "/readyz") return new Response(null, { status: 404 });
       return Response.json({ code: health.code }, { status: health.ready && Date.now() - health.checkedAt < 30_000 ? 200 : 503, headers: { "cache-control": "no-store" } });
     } });
-    try { await runModerationWorker({ sql, decisions, community, identity: localIdentity(Buffer.from(key, "hex")), communities: config.communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
+    try { await runModerationWorker({ sql, decisions, community, identity: localIdentity(Buffer.from(key, "hex")), communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
     finally { await server.stop(true); await sql.end(); }
   } else {
+    const config = loadModerationConfig(process.env);
+    const cipher = new EvidenceCipher(config.evidenceKey, config.evidenceRetentionSeconds, config.evidenceMaxBytes);
+    const decisions = new Decisions(sql, cipher, communities);
     const handoff = new CoopHandoff(sql, { origin: required("MODERATION_COOP_ORIGIN"), apiKey: required("MODERATION_COOP_API_KEY"), orgId: required("MODERATION_COOP_ORG_ID"), accessClientId: process.env.MODERATION_COOP_ACCESS_CLIENT_ID, accessClientSecret: process.env.MODERATION_COOP_ACCESS_CLIENT_SECRET });
     if (config.communities.size !== 1 || ![...config.communities.values()].includes(required("MODERATION_COOP_ORG_ID"))) throw new Error("Coop organization mismatch");
     const pool = new RelayPool([relayUrl]);

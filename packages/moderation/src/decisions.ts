@@ -17,8 +17,10 @@ function stored(row: any): StoredDecision {
   return { decisionId: row.decision_id, orgId: row.org_id, caseId: row.case_id, target: { communityId: row.community_id, channelId: row.channel_id, rumorId: row.rumor_id }, author: row.author, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, expiresAt: row.expires_at };
 }
 export class Decisions {
-  constructor(private readonly sql: postgres.Sql, private readonly cipher: EvidenceCipher, private readonly communities: ReadonlyMap<string, string>) {}
+  constructor(private readonly sql: postgres.Sql, private readonly cipher: EvidenceCipher | undefined, private readonly communities: ReadonlyMap<string, string>) {}
   async acceptDecision(input: ModerationDecision, actor: VerifiedCoopActor): Promise<DecisionStatus> {
+    const cipher = this.cipher;
+    if (!cipher) throw new Error("Decision acceptance disabled for this process");
     if (!input || Object.keys(input).sort().join(",") !== "action,caseId,discordGuildConfirmed,executionId,reason,scope" || !uuid.test(input.caseId) || !uuid.test(input.executionId) || !actions.has(input.action) || typeof input.reason !== "string" || !input.reason.trim() || input.reason.length > 2048 || typeof input.discordGuildConfirmed !== "boolean" || input.scope !== (input.action === "remove_message" ? "message" : "community")) throw new Error("Invalid decision or scope confirmation");
     assertActor(actor, input.action);
     if (input.discordGuildConfirmed) assertActor(actor, "discord_guild_ban");
@@ -30,7 +32,7 @@ export class Decisions {
       const [evidence] = await tx`SELECT * FROM moderation.cases WHERE case_id = ${input.caseId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp() FOR SHARE`;
       if (!evidence || this.communities.get(evidence.community_id) !== actor.orgId) throw new Error("Case unavailable");
       const decisionId = crypto.randomUUID();
-      const audit = this.cipher.seal(`${actor.orgId}:${decisionId}`, { actorId: actor.actorId, reason: input.reason });
+      const audit = cipher.seal(`${actor.orgId}:${decisionId}`, { actorId: actor.actorId, reason: input.reason });
       await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, audit, expires_at)
         VALUES (${decisionId}, ${actor.orgId}, ${input.executionId}, ${fingerprint}, ${input.caseId}, ${evidence.community_id}, ${evidence.channel_id}, ${evidence.rumor_id}, ${evidence.author}, ${input.action}, ${input.discordGuildConfirmed}, ${audit}, ${evidence.expires_at})`;
       for (const target of ["divine_relay", "concord", "discord"]) await tx`INSERT INTO moderation.deliveries (decision_id, target) VALUES (${decisionId}, ${target})`;
