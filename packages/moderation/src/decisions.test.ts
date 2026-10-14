@@ -98,3 +98,15 @@ test("transient failure respects retry delay and can be claimed again", async ()
   await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target}`;
   expect((await decisions.claim())?.attempts).toBe(claim.attempts + 1);
 });
+test("retrying a guild-scoped decision needs guild authority for its Discord delivery", async () => {
+  const admin = { ...actor, permissions: [...actor.permissions, "discord_guild_ban"] };
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community", discordGuildConfirmed: true }, admin);
+  await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1 WHERE decision_id = ${accepted.decisionId}`;
+  const moderator = await decisions.retry(accepted.decisionId, actor);
+  expect(Object.fromEntries(moderator.deliveries.map((d) => [d.target, d.state]))).toEqual({ concord: "pending", discord: "failed", divine_relay: "pending" });
+  await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId} AND target <> 'discord'`;
+  await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${accepted.decisionId}`;
+  const retried = await decisions.retry(accepted.decisionId, admin);
+  expect(retried.deliveries.every((d) => d.state === "pending")).toBe(true);
+  await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
+});

@@ -58,8 +58,15 @@ export class Decisions {
     assertActor(actor, "retry");
     const status = await this.get(decisionId, actor);
     assertActor(actor, status.action);
+    // A guild-scoped decision reaches the whole Discord server. Restarting that
+    // delivery takes the same admin authority acceptance did, or a community
+    // moderator could re-fire a guild ban they could never have requested. Without
+    // it the retry still covers the community targets.
+    const [scope] = await this.sql`SELECT discord_guild_confirmed FROM moderation.decisions WHERE decision_id = ${decisionId}`;
+    const guildRetryAllowed = !scope?.discord_guild_confirmed || actor.permissions.includes("discord_guild_ban");
     const retried = await this.sql`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
-      WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8 AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
+      WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8 AND (${guildRetryAllowed} OR target <> 'discord')
+        AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
     if (!retried.length) throw new Error("No retryable delivery; escalate expired or exhausted decisions");
     return this.get(decisionId, actor);
   }
