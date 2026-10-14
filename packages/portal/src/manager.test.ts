@@ -102,3 +102,23 @@ describe("a down gateway defers, never severs", () => {
     );
   });
 });
+
+describe("public policy at manager boundaries", () => {
+  const env = { sealKeyHex: SEAL_KEY } as PortalEnv;
+  const denied = { assertPublicChannel: async () => { throw new Error("test visibility denied"); } };
+  const row = {
+    bridge_id: "public-boundary", community_id: "cd".repeat(32),
+    discord_guild_id: "100000000000000001", discord_channel_id: "100000000000000002",
+    status: "pending_confirm", invite_url_sealed: new Uint8Array([1]),
+    master_secret_sealed: new Uint8Array([1]), primary_sk_sealed: new Uint8Array([1]),
+  };
+  it("checks visibility before decoding keys or opening relay connections on restart", async () => {
+    const manager = new BridgeManager(sql, env, denied);
+    await expect(manager.startImported(row as never)).rejects.toThrow("Public channel visibility could not be verified");
+  });
+  it("checks visibility before minting keys or changing activation state", async () => {
+    const manager = new BridgeManager(sql, env, denied);
+    await expect(manager.activate(row as never)).rejects.toThrow("Public channel visibility could not be verified");
+    await expect(manager.provisionImported(row as never)).rejects.toThrow("Public channel visibility could not be verified");
+  });
+});

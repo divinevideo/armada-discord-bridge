@@ -730,6 +730,11 @@ app.post("/api/bridges/:id/link", async (c) => {
   if (!guildChannels.some((ch) => ch.id === body.channelId)) {
     return c.json({ error: "that channel is not in that guild" }, 403);
   }
+  try {
+    await manager.assertPublicChannel(body.guildId, body.channelId);
+  } catch {
+    return c.json({ error: "Channel is excluded, private, or its public visibility could not be verified" }, 403);
+  }
   // Second live bridge on one channel: last writer would win `byDiscordChannel`
   // and steal the channel from the bridge already mirroring it. A unique index
   // (migration 017) is the backstop for the race between two of these checks;

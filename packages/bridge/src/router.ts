@@ -18,6 +18,7 @@ import type { ConcordClient } from "./concord/client";
 import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
 import type { LocalIdentity } from "./concord/signer";
+import { guardEffects } from "./effectGuard";
 import { ffmpegAvailable, mp4ToGif } from "./gif";
 import {
   attachmentFilename,
@@ -147,6 +148,8 @@ export interface BlobPort {
 }
 
 export interface RouterOptions {
+  /** Required at runtime: fresh public-channel permissions and current worker ownership. */
+  beforeSideEffect?: () => Promise<void>;
   /** Kind 3302 is not frozen in the CORDs yet; off by default. */
   bridgeEdits?: boolean;
   /** When set, attachments rehost through Blossom instead of rotting CDN links. */
@@ -408,7 +411,21 @@ export class BridgeRouter {
     private readonly profiles: ProfileResolver,
     private readonly self: { applicationId: string; webhookIds: Set<string> },
     private readonly options: RouterOptions = {},
-  ) {}
+  ) {
+    const before = () => this.assertMayForward();
+    this.client = guardEffects(client, before, new Set(["sendChat", "sendTyping", "publishProfile", "publishJoin"]));
+    this.webhooks = guardEffects(webhooks, before, new Set(["send", "edit", "delete", "react", "unreact", "sendTyping"]));
+    this.options = {
+      ...options,
+      blobs: options.blobs && guardEffects(options.blobs, before, new Set(["download", "upload"])),
+      klipy: options.klipy && guardEffects(options.klipy, before, new Set(["resolveGif"])),
+    };
+  }
+
+  private async assertMayForward(): Promise<void> {
+    if (!this.options.beforeSideEffect) throw new Error("Public channel policy is not configured");
+    await this.options.beforeSideEffect();
+  }
 
   /**
    * Keep the puppet's kind 0 in step with the Discord identity so Armada
@@ -453,6 +470,7 @@ export class BridgeRouter {
    * Throttled per user+channel to Armada's own publisher cadence.
    */
   async onDiscordTyping(userId: string, link: ChannelLink): Promise<void> {
+    await this.assertMayForward();
     if (!link.enabled) return;
     const channel = this.client.channel(link.concordChannelIdHex);
     if (!channel) return;
@@ -467,6 +485,7 @@ export class BridgeRouter {
 
   /** Discord -> Concord. Returns the rumor id, or undefined when skipped. */
   async onDiscordMessage(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!link.enabled) return undefined;
     // Layer 1: our own webhook posts and application messages never bounce back.
     if (msg.webhookId && this.self.webhookIds.has(msg.webhookId)) return undefined;
@@ -539,6 +558,7 @@ export class BridgeRouter {
    * when this rumor's turn finishes.
    */
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
+    await this.assertMayForward();
     if (this.queued >= MAX_QUEUED_CHATS) {
       // Shedding load beats unbounded growth: past this the sender is flooding
       // and the relay copy is still the record. Loud, because it is data loss.
@@ -655,6 +675,7 @@ export class BridgeRouter {
    * puppet cannot (and must not) tombstone someone else's rumor.
    */
   async onDiscordDelete(del: DiscordMessageDelete, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!link.enabled) return undefined;
     const [row] = await this.store.byDiscordId(del.id);
     if (!row || row.origin !== "discord") return undefined;
@@ -677,6 +698,7 @@ export class BridgeRouter {
    * Off unless bridgeEdits: the 3302 payload is not frozen in the CORDs.
    */
   async onDiscordEdit(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!this.options.bridgeEdits || !link.enabled) return undefined;
     const [row] = await this.store.byDiscordId(msg.id);
     if (!row || row.origin !== "discord") return undefined;
@@ -702,6 +724,7 @@ export class BridgeRouter {
    * the stable CDN image, self-contained for any Armada reader.
    */
   async onDiscordReaction(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
     if (!reaction.emoji.name) return undefined;
@@ -750,6 +773,7 @@ export class BridgeRouter {
    * rumor. The `k` tag marks it a reaction delete for Armada's fold.
    */
   async onDiscordReactionRemove(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
     if (!reaction.emoji.name) return undefined;

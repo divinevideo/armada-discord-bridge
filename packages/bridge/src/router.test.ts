@@ -118,7 +118,7 @@ function harness(options?: RouterOptions) {
   };
   const router = new BridgeRouter(client, puppets, store, webhooks, {
     resolve: async (pk: string) => fallbackProfile(pk),
-  }, { applicationId: "app1", webhookIds: new Set(["wh1"]) }, options ?? {});
+  }, { applicationId: "app1", webhookIds: new Set(["wh1"]) }, { beforeSideEffect: async () => {}, ...options });
 
   return { community, channel, pool, client, puppets, store, webhooks, link, router };
 }
@@ -1244,4 +1244,46 @@ describe("escapeMarkdown", () => {
     expect(out.length).toBeLessThan(120);
     expect(out.endsWith("…")).toBe(true);
   });
+});
+
+describe("public channel policy at side-effect boundaries", () => {
+  it("does not publish or map content when authorization is denied", async () => {
+    const h = harness({ beforeSideEffect: async () => { throw new Error("channel unavailable"); } });
+    await expect(h.router.onDiscordMessage(discordMsg(), h.link)).rejects.toThrow("channel unavailable");
+    expect(h.pool.published).toHaveLength(0);
+    expect(await h.store.byDiscordId("111222333")).toHaveLength(0);
+  });
+
+  it("rechecks before uploading an attachment after visibility changes", async () => {
+    let publicNow = true;
+    const uploads: Uint8Array[] = [];
+    const h = harness({
+      beforeSideEffect: async () => { if (!publicNow) throw new Error("channel unavailable"); },
+      blobs: {
+        download: async () => { publicNow = false; return { data: new Uint8Array([1]), mime: "image/png" }; },
+        upload: async (data) => { uploads.push(data); return { url: "https://media.example/test.png", sha256: "a".repeat(64) }; },
+      },
+    });
+    await expect(h.router.onDiscordMessage(discordMsg({ attachments: [{ url: "https://cdn.discordapp.com/test.png", filename: "test.png" }] }), h.link)).rejects.toThrow("channel unavailable");
+    expect(uploads).toHaveLength(0);
+    expect(h.pool.published).toHaveLength(0);
+  });
+});
+
+ it("fails closed when a router has no public policy", async () => {
+   const h = harness({ beforeSideEffect: undefined });
+   await expect(h.router.onDiscordMessage(discordMsg(), h.link)).rejects.toThrow("Public channel policy is not configured");
+   expect(h.pool.published).toHaveLength(0);
+ });
+
+
+describe("revocation applies to all message operations", () => {
+  for (const method of ["onDiscordEdit", "onDiscordDelete", "onDiscordReaction", "onDiscordReactionRemove", "onConcordChat"] as const) {
+    it(`blocks ${method} after permission loss`, async () => {
+      const h = harness({ beforeSideEffect: async () => { throw new Error("visibility denied"); } });
+      await expect(h.router[method]({} as never, h.link)).rejects.toThrow("visibility denied");
+      expect(h.pool.published).toHaveLength(0);
+      expect(h.webhooks.sent).toHaveLength(0);
+    });
+  }
 });

@@ -1,6 +1,9 @@
 /** Portal environment. Discord OAuth vars are optional in dev (dev login). */
 
+import { parsePublicChannelRules, type PublicChannelRules } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
+
 export interface PortalEnv {
+  publicChannels?: PublicChannelRules;
   databaseUrl: string;
   port: number;
   /**
@@ -73,6 +76,7 @@ export function loadPortalEnv(): PortalEnv {
   }
   return {
     databaseUrl: required("DATABASE_URL"),
+    publicChannels: parsePublicChannelRules(process.env.BRIDGE_PUBLIC_CHANNELS),
     port,
     host: process.env.PORTAL_HOST?.trim() || "127.0.0.1",
     baseUrl,

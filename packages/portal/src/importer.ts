@@ -26,7 +26,6 @@ import {
   adminRole,
   buildBundleEvent,
   buildChannelEdition,
-  buildDirectInviteRumor,
   buildGrantEdition,
   buildInviteUrl,
   buildJoinRumor,
@@ -47,20 +46,16 @@ import {
   grantToJSON,
   guestbookGroups,
   hex32,
-  inviteDeliveryRelays,
   mintCommunity,
   mintLinkSigner,
   mintToken,
   parseInviteLink,
   random32,
-  recipientInboxRelays,
   registerStreamKeys,
-  sealDirectInvite,
   sealEdition,
   sealGuestbook,
   withChannelCategory,
   withChannelPosition,
-  wrapDirectInvite,
   wrapSeal,
 } from "@armada-bridge/concord-core";
 import type {
@@ -78,6 +73,8 @@ import type {
  * another project's namespace would collide the day they define it.
  */
 export const DISCORD_IMPORT_METADATA_KEY = "discord.import";
+import { BridgeLeases } from "@armada-bridge/bridge/src/db/leases";
+import { guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
@@ -238,6 +235,7 @@ async function rehostEncryptedImage(
 export class Importer {
   /** Imports with a pipeline currently running in this process. */
   private readonly running = new Set<string>();
+  private readonly importGuards = new Map<string, () => Promise<void>>();
 
   /** Imports with a pipeline running in this process right now. */
   get activeCount(): number {
@@ -269,7 +267,19 @@ export class Importer {
      * give-up path without sleeping for it.
      */
     private readonly publishRetryMs: number = 1500,
+    private readonly withImportLease: (id: string, work: () => Promise<void>) => Promise<void> =
+      (id, work) => new BridgeLeases(sql).withBridgeLease(`import:${id}`, async (lease) => {
+        this.importGuards.set(id, () => lease.assertCurrent());
+        try { await work(); } finally { this.importGuards.delete(id); }
+      }),
   ) {}
+
+  private async assertPublicPlan(plan: ImportPlan): Promise<void> {
+    for (const channel of plan.channels.filter((c) => c.selected)) {
+      if (channel.private || channel.discordType !== 0) throw new Error("Only public text channels may be imported");
+      await this.manager.assertPublicChannel(plan.guild.id, channel.discordId);
+    }
+  }
 
   /** Snapshot the guild and store a previewed plan. */
   async preview(
@@ -285,6 +295,17 @@ export class Importer {
       return { present: false, installUrl: botInstallUrl(this.env.discordClientId, guildId) };
     }
     const plan = buildImportPlan(snapshot);
+    const publicChannels: PlannedChannel[] = [];
+    for (const channel of plan.channels) {
+      if (channel.private || channel.discordType !== 0) continue;
+      try {
+        await this.manager.assertPublicChannel(guildId, channel.discordId);
+        publicChannels.push(channel);
+      } catch { /* Excluded or unverifiable channels never enter a stored preview. */ }
+    }
+    plan.channels = publicChannels;
+    plan.skipped = [];
+    if (!plan.channels.length) throw new Error("No configured public text channels are available");
     // Pre-flight the bot's Manage Webhooks in every live-bridgeable channel,
     // so the review screen can warn before wiring. Sequential (not a burst)
     // to stay gentle on the rate limiter; the helper waits out any 429.
@@ -368,6 +389,8 @@ export class Importer {
     }
     if (!plan.channels.some((c) => c.selected)) throw new Error("select at least one channel");
 
+    await this.assertPublicPlan(plan);
+
     const requested = (body.relays ?? []).map((r) => r.trim()).filter(Boolean);
     // Scheme AND host: the old check was scheme-only, so `ws://127.0.0.1:6379/`
     // passed and the server opened a socket to it on the caller's behalf.
@@ -383,16 +406,7 @@ export class Importer {
     const { community } = mintCommunity(plan.communityName, ownerPk, plan.relays);
     for (const channel of plan.channels) {
       channel.channelIdHex = channel.selected ? bytesToHex(random32()) : undefined;
-      // A Private Channel is born with an independent key and the Role that
-      // gates it (CORD-03 §1, CORD-04 §2). Both are minted here so a resumed
-      // import republishes the SAME pair instead of forking the channel into
-      // two generations, and the key is sealed at rest like every other
-      // secret in this row.
-      if (channel.selected && channel.private) {
-        channel.accessRoleIdHex = bytesToHex(random32());
-        // Hex, not the raw Buffer: this rides the plan's jsonb column.
-        channel.keySealed = seal(this.env.sealKeyHex, bytesToHex(random32())).toString("hex");
-      }
+
     }
     for (const role of plan.roles) role.roleIdHex = bytesToHex(random32());
     const token = mintToken();
@@ -562,6 +576,10 @@ export class Importer {
   // ── The pipeline ───────────────────────────────────────────────────────────
 
   private async run(importId: string): Promise<void> {
+    await this.withImportLease(importId, () => this.runOwned(importId));
+  }
+
+  private async runOwned(importId: string): Promise<void> {
     const { community, opSk, plan } = await this.load(importId);
     await this.publishEditions(importId, community, opSk, plan);
     await this.wireBridges(importId, community, opSk, plan);
@@ -610,7 +628,12 @@ export class Importer {
     const control = currentControlWriteGroup(community);
     const guestbook = currentGuestbookGroup(community);
     registerStreamKeys([...controlGroups(community), ...guestbookGroups(community)], community.relays);
-    const pool = this.poolFactory(community.relays);
+    await this.assertPublicPlan(plan);
+    const beforeEffect = async () => {
+      await this.assertPublicPlan(plan);
+      await this.importGuards.get(importId)?.();
+    };
+    const pool = guardEffects(this.poolFactory(community.relays), beforeEffect, new Set(["publish"]));
     const save = async () => {
       await this.sql`
         UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
@@ -725,7 +748,7 @@ export class Importer {
       // metadata edition that references them. Best effort — an unreachable
       // CDN or blob host costs the images, never the import.
       if (!cp.assetsAt && !cp.metadataPublishedAt) {
-        const blossom = new BlossomStore(this.env.blossomServer || DEFAULT_BLOSSOM);
+        const blossom = guardEffects(new BlossomStore(this.env.blossomServer || DEFAULT_BLOSSOM), beforeEffect, new Set(["download", "upload"]));
         try {
           if (plan.guild.iconUrl) {
             cp.iconPointer = await rehostEncryptedImage(plan.guild.iconUrl, blossom, op);
@@ -765,12 +788,6 @@ export class Importer {
         await save();
       }
 
-      // Channel-access Roles sit below every imported Role. They are peers of
-      // each other (CORD-04 §3 lets Roles share a position; display order
-      // tiebreaks on role_id), and the op key holds the stock Admin at
-      // position 1, so it outranks them and may mint them.
-      const accessRolePosition = plan.roles.length + 2;
-
       let position = 0;
       for (const channel of plan.channels) {
         if (!channel.selected) continue;
@@ -781,34 +798,7 @@ export class Importer {
         // `armada.category` and `armada.order` and nothing else, so an import
         // that invents its own spelling lands as a flat alphabetical list with
         // the sidebar arrangement computed and then discarded.
-        // The access Role publishes BEFORE the channel edition, the ordering
-        // Armada's own createChannel takes: a Role scoped to a channel that
-        // never appeared is inert (it confers no key and grants nothing),
-        // while a private channel whose Role mint then failed is a room with
-        // no access list at all.
-        if (channel.private && !channel.accessRolePublishedAt) {
-          await publishVerified(
-            await sealEdition(
-              buildRoleEdition(
-                {
-                  roleId: channel.accessRoleIdHex!,
-                  name: channel.name,
-                  position: accessRolePosition,
-                  permissions: 0n,
-                  scope: { kind: "channel", channelId: channel.channelIdHex! },
-                  color: 0,
-                },
-                opV1,
-              ),
-              control,
-              op.signer,
-            ),
-            `access role edition for #${channel.name}`,
-          );
-          channel.accessRolePublishedAt = Date.now();
-          await save();
-        }
-        let metadata: ChannelMetadata = { name: channel.name, private: Boolean(channel.private) };
+        let metadata: ChannelMetadata = { name: channel.name, private: false };
         metadata = withChannelPosition(metadata, thisPosition);
         metadata = withChannelCategory(metadata, channel.category);
         // Discord facts Concord has no field for. Kept under a namespace this
@@ -951,49 +941,6 @@ export class Importer {
         await save();
       }
 
-      // 5. The private-channel keys, handed to the OWNER as a Direct Invite
-      // (CORD-05 §6). They cannot ride the public bundle above — that bundle
-      // is what every joiner reads, so a key in it gates nothing — and the
-      // owner never receives one otherwise: they join their own community
-      // through that same public link.
-      //
-      // Only the owner. Everyone else's access is a grant of the channel's
-      // Role, made from Armada once real npubs exist (see PlannedChannel.private).
-      const privateChannels = plan.channels.filter((c) => c.selected && c.private && c.keySealed);
-      if (privateChannels.length > 0 && !cp.ownerChannelKeysSentAt) {
-        const keyBundle: InviteBundle = {
-          ...bundle,
-          channels: privateChannels.map((c) => ({
-            id: c.channelIdHex!,
-            key: unseal(this.env.sealKeyHex, Buffer.from(c.keySealed!, "hex")),
-            epoch: 0,
-            name: c.name,
-          })),
-          label: "Imported from Discord — private channel keys",
-        };
-        const rumor = buildDirectInviteRumor(keyBundle, op.pk);
-        const directSeal = await sealDirectInvite(rumor, community.owner, op.signer);
-        const wrap = wrapDirectInvite(directSeal, community.owner);
-        // The owner's giftwrap inbox, not the community relays: that is where
-        // their client scans (their 10050 DM relays, else NIP-65 reads). A
-        // FAILED lookup is not "no list" — delivering to the stock floor would
-        // report success while the invite sat somewhere they never read.
-        const inbox = await recipientInboxRelays(pool, community.owner);
-        const deliveryPool = this.poolFactory(inviteDeliveryRelays(inbox ?? []));
-        try {
-          await deliveryPool.publish(wrap);
-          cp.ownerChannelKeysSentAt = Date.now();
-        } catch (error) {
-          // Non-fatal: the community is fully published and the channels are
-          // gated. What is missing is the owner's copy of the keys, which is
-          // recoverable by re-running the import (this step is idempotent —
-          // the keys are checkpointed, not re-minted).
-          cp.ownerChannelKeysError = String(error);
-        } finally {
-          await deliveryPool.close().catch(() => {});
-        }
-        await save();
-      }
     } finally {
       await pool.close();
     }
@@ -1061,13 +1008,13 @@ export class Importer {
   private launchHistoryOnly(importId: string): void {
     if (this.running.has(importId)) return;
     this.running.add(importId);
-    void (async () => {
+    void this.withImportLease(importId, async () => {
       const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
       await this.importHistory(importId, row!.plan);
       await this.sql`
         UPDATE imports SET status = 'done', status_detail = NULL, updated_at = now()
         WHERE import_id = ${importId}`;
-    })()
+    })
       .catch(async (error) => {
         console.error(`import ${importId}: history re-run failed:`, error);
         await this.sql`
@@ -1078,6 +1025,7 @@ export class Importer {
   }
 
   private async backfillChannel(importId: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> {
+    await this.assertPublicPlan(plan);
     // Re-fold control so the running bridge knows the channels the import
     // just created; without this client.channel() returns undefined and the
     // router silently skips every history message (the invisible-history bug).
@@ -1096,6 +1044,8 @@ export class Importer {
     const collected: RestMessage[] = [];
     let before: string | undefined;
     while (collected.length < HISTORY_MESSAGE_CAP) {
+      await this.manager.assertPublicChannel(plan.guild.id, channel.discordId);
+      await this.importGuards.get(importId)?.();
       const page = await this.historyFetch(channel.discordId, before);
       if (!page || page.length === 0) break;
       let stop = false;
@@ -1115,6 +1065,8 @@ export class Importer {
     let published = channel.historyImported ?? 0;
     let skipped = 0;
     for (const message of collected) {
+      await this.importGuards.get(importId)?.();
+      await this.manager.assertPublicChannel(plan.guild.id, channel.discordId);
       if (message.type !== 0 && message.type !== 19) continue;
       // Scoped to this community: re-importing the same guild elsewhere left
       // rows for the same discord_message_id, which made every history
@@ -1161,91 +1113,13 @@ export class Importer {
   }
 
   /** Create + activate a bridges row per selected text channel, no consent gate (D4). */
-  /**
-   * Let a bridge into a private channel the owner ticked for mirroring.
-   *
-   * Two steps, in this order:
-   *
-   * 1. Grant the bridge's npub the channel-scoped access Role. This is the
-   *    access list Armada shows and revokes from — without it the bridge would
-   *    hold a key nobody can see it holding, and a revoke would have nothing to
-   *    remove. The op key mints it under the Admin role the owner granted it.
-   * 2. Hand it the key as a Direct Invite (CORD-05 §6), giftwrapped to that
-   *    npub and published where the bridge scans at boot: the community relays
-   *    plus the stock floor. Nothing is persisted for it — the wrap is a
-   *    durable relay event, so a restart re-reads the same key.
-   *
-   * Rotation is still not covered: a CORD-06 rekey after a revoke mints an
-   * epoch the bridge does not follow, so it goes quiet on that channel until
-   * re-granted. That is the known bound on this feature, not a failure here.
-   */
-  private async admitBridgeToPrivateChannel(
-    community: CommunityV2,
-    opSk: Uint8Array,
-    plan: ImportPlan,
-    channel: PlannedChannel,
-    bridgePk: string,
-  ): Promise<void> {
-    const op = localIdentity(opSk);
-    const control = currentControlWriteGroup(community);
-    registerStreamKeys(controlGroups(community), community.relays);
-    const pool = this.poolFactory(community.relays);
-    try {
-      const opV1 = {
-        actorPubkey: op.pk,
-        version: 1n,
-        authority: {
-          entityId: grantLocator(community.id, hex32(op.pk)),
-          version: 1n,
-          editionHash: hex32(plan.checkpoints.grantHashHex!),
-        },
-      };
-      await pool.publish(
-        await sealEdition(
-          buildGrantEdition(
-            community.id,
-            { member: bridgePk, roleIds: [channel.accessRoleIdHex!] },
-            opV1,
-          ),
-          control,
-          op.signer,
-        ),
-      );
-
-      const keyBundle: InviteBundle = {
-        community_id: community.idHex,
-        owner: community.owner,
-        owner_salt: bytesToHex(community.ownerSalt),
-        community_root: bytesToHex(community.root),
-        root_epoch: 0,
-        control_pk: community.controlPk,
-        channels: [
-          {
-            id: channel.channelIdHex!,
-            key: unseal(this.env.sealKeyHex, Buffer.from(channel.keySealed!, "hex")),
-            epoch: 0,
-            name: channel.name,
-          },
-        ],
-        relays: community.relays,
-        name: plan.communityName,
-        creator_npub: community.owner,
-        label: `Bridge access — ${channel.name}`,
-      };
-      const rumor = buildDirectInviteRumor(keyBundle, op.pk);
-      const directSeal = await sealDirectInvite(rumor, bridgePk, op.signer);
-      await pool.publish(wrapDirectInvite(directSeal, bridgePk));
-    } finally {
-      await pool.close?.();
-    }
-  }
-
   private async wireBridges(
     importId: string,
     community: CommunityV2,
     opSk: Uint8Array,
     plan: ImportPlan,
   ): Promise<void> {
+    await this.assertPublicPlan(plan);
     await this.sql`
       UPDATE imports SET status = 'wiring', updated_at = now() WHERE import_id = ${importId}`;
     const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
@@ -1255,6 +1129,8 @@ export class Importer {
     for (const channel of plan.channels) {
       if (!channel.selected || !channel.bridge || !channel.bridgeable || channel.bridgeId) continue;
 
+      await this.manager.assertPublicChannel(plan.guild.id, channel.discordId);
+      await this.importGuards.get(importId)?.();
       // A channel someone already bridged by hand: one live bridge per Discord
       // channel is a database invariant, so activating a second would throw
       // and take the whole import down with it. Note it and move on — the
@@ -1279,12 +1155,7 @@ export class Importer {
                 ${row.discord_guild_id}, ${channel.discordId}, ${channel.channelIdHex!})
         RETURNING *`;
 
-      // Mint the identity first, so a private channel's key can reach it
-      // before it boots — key intake happens once, at start.
       const provisioned = await this.manager.provisionImported(bridge);
-      if (channel.private && channel.keySealed && provisioned.primary_pk) {
-        await this.admitBridgeToPrivateChannel(community, opSk, plan, channel, provisioned.primary_pk);
-      }
 
       // resolveInvite inside start() races relay propagation of the fresh
       // bundle; a couple of spaced retries absorb that.

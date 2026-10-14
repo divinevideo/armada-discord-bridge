@@ -10,10 +10,7 @@
  */
 
 import {
-  Permissions,
   STOCK_RELAYS,
-  inviteDeliveryRelays,
-  isAuthorized,
   parseInviteLink,
 } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
@@ -21,10 +18,12 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
 
+import { guardEffects } from "./effectGuard";
+import { BridgeLeases, bridgeResource } from "./db/leases";
+import { parsePublicChannelRules, discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
 import { BlossomStore } from "./blossom";
 import { KlipyClient } from "./klipy";
 import { ConcordClient, resolveInvite } from "./concord/client";
-import { intakeDirectInviteKeys } from "./concord/keyIntake";
 import { RelayPool } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { loadConfig } from "./config";
@@ -57,13 +56,26 @@ if (!inviteUrl || !guildId || !channelId || !config.discordToken) {
   process.exit(0);
 }
 
+const publicPolicy = discordPublicChannelPolicy(parsePublicChannelRules(process.env.BRIDGE_PUBLIC_CHANNELS), config.discordToken);
+await publicPolicy.assertPublicChannel(guildId, channelId);
+const sql = postgres(config.databaseUrl, { onnotice: () => {} });
+const lease = await new BridgeLeases(sql).acquire(bridgeResource(guildId, channelId));
+if (!lease) throw new Error("Bridge lease is owned by another worker");
+const assertMayForward = async () => {
+  await lease.assertCurrent();
+  await publicPolicy.assertPublicChannel(guildId, channelId);
+  const current = rawClient.channel(concordChannelId!);
+  if (!current || current.isPrivate) throw new Error("Concord channel must be public");
+  await lease.assertCurrent();
+};
+
 // ── Concord side ─────────────────────────────────────────────────────────────
 const invite = parseInviteLink(inviteUrl);
 if (!invite) throw new Error("BRIDGE_INVITE_URL is not a valid Armada invite");
 const bootstrap = new RelayPool(invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS);
 const { community } = await resolveInvite(inviteUrl, bootstrap);
 await bootstrap.close();
-console.log(`bridge: joined material for community ${community.name} (${community.idHex.slice(0, 8)}…)`);
+console.log(`bridge: joined material for community ${community.name} (${community.idHex})`);
 
 const pool = new RelayPool(community.relays);
 const primary = localIdentity(primarySk(config.primarySecretKey));
@@ -73,33 +85,16 @@ const primary = localIdentity(primarySk(config.primarySecretKey));
 // roster, and therefore who is entitled to vend a channel key, is knowable
 // before we accept any. The intake below refuses bundles from anyone else.
 const preflight = new ConcordClient(community, pool, primary);
-const folded = await preflight.syncControl();
+await preflight.syncControl();
 
-// Private-channel keys addressed to us since the last boot. The join bundle
-// only ever carried what the inviter vended at the time, so a channel we were
-// granted afterwards is readable only once its Direct Invite is opened — and
-// this has to run BEFORE the client that serves `channels()` is built, or the
-// grant is invisible until the next restart. The stock floor is scanned
-// alongside the community relays because that is where a sender delivers to an
-// npub with no published inbox (which we were, until the 10050 below).
-const floor = new RelayPool(inviteDeliveryRelays([]));
-const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
-  isAuthorizedSender: (pk) =>
-    isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
-}).finally(() => void floor.close());
-if (intake.learned.length > 0) {
-  console.log(`bridge: learned ${intake.learned.length} private-channel key(s) from direct invites`);
-}
-
-// Re-fold only when the intake actually changed the key set; otherwise the
-// preflight client already holds the answer.
-const client = intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
-if (intake.learned.length > 0) await client.syncControl();
+const rawClient = preflight;
+const client = guardEffects(rawClient, assertMayForward, new Set(["sendChat", "sendTyping", "publishJoin", "publishProfile", "publishDmRelays", "backfillChannel"]));
 
 const concordChannelId =
   process.env.CONCORD_CHANNEL_ID?.trim() || client.channels()[0]?.idHex;
 const channel = concordChannelId ? client.channel(concordChannelId) : undefined;
-if (!channel) throw new Error(`concord channel not found (have: ${client.channels().map((c) => c.idHex.slice(0, 8)).join(", ")})`);
+if (!channel) throw new Error(`concord channel not found (have: ${client.channels().map((c) => c.idHex).join(", ")})`);
+if (channel.isPrivate) throw new Error("Concord channel must be public");
 console.log(`bridge: target channel #${channel.name}`);
 
 await client.publishJoin().catch((error) => console.warn("bridge: guestbook join failed", error));
@@ -118,7 +113,6 @@ await client
   .catch((error) => console.warn("bridge: DM relay list publish failed", error));
 
 // ── Storage, Discord, router ────────────────────────────────────────────────
-const sql = postgres(config.databaseUrl, { onnotice: () => {} });
 const store = new PostgresMappingStore(sql);
 
 const link: ChannelLink = {
@@ -159,6 +153,9 @@ const adapter = new DiscordAdapter(config.discordToken, {
     if (typing.bot || typing.channelId !== link.discordChannelId) return;
     await router.onDiscordTyping(typing.userId, link);
   },
+}, async (id) => {
+  if (id !== channelId) throw new Error("Channel not configured");
+  await assertMayForward();
 });
 await adapter.start();
 router = new BridgeRouter(
@@ -169,6 +166,7 @@ router = new BridgeRouter(
   profiles,
   { applicationId: adapter.applicationId, webhookIds: adapter.ownWebhookIds },
   {
+    beforeSideEffect: assertMayForward,
     bridgeEdits: config.bridgeEdits,
     blobs: config.blossomServer ? new BlossomStore(config.blossomServer) : undefined,
     klipy: config.klipyApiKey ? new KlipyClient(config.klipyApiKey) : undefined,
@@ -226,6 +224,7 @@ async function shutdown(): Promise<void> {
   unsubControl();
   await adapter.stop().catch(() => {});
   await pool.close().catch(() => {});
+  await lease!.release().catch(() => {});
   await sql.end().catch(() => {});
   process.exit(0);
 }
