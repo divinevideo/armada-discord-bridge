@@ -172,6 +172,8 @@ export class BridgeManager {
     catch { throw new PublicPolicyUnavailableError("Public channel visibility could not be verified"); }
   }
 
+  get discordConnected(): boolean { return this.adapter?.client.isReady() ?? false; }
+
   async init(): Promise<void> {
     if (this.env.discordBotToken) {
       await this.connectAdapter();

@@ -99,6 +99,15 @@ process.on("SIGUSR2", () => {
 });
 
 const app = new Hono();
+// Metrics listen on a separate, internal-only port; public portal routes expose none.
+if (process.env.PORTAL_METRICS_PORT) {
+  const port = Number(process.env.PORTAL_METRICS_PORT);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === env.port) throw new Error("Invalid metrics port");
+  Bun.serve({ hostname: "0.0.0.0", port, fetch(request) {
+    if (new URL(request.url).pathname !== "/metrics") return new Response(null, { status: 404 });
+    return new Response(`armada_discord_connected ${Number(manager.discordConnected)}\narmada_relay_sockets_down ${RelayPool.backlog().down}\n`, { headers: { "content-type": "text/plain; version=0.0.4" } });
+  } });
+}
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;
 const overHttps = env.baseUrl.startsWith("https:");
 
