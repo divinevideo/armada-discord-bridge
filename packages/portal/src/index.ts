@@ -35,7 +35,8 @@ import { seal, unseal } from "./seal";
 import { originGuard, securityHeaders } from "./security";
 
 const env = loadPortalEnv();
-await migrate(env.databaseUrl);
+if (process.env.PORTAL_SCHEMA_MODE && process.env.PORTAL_SCHEMA_MODE !== "verify") throw new Error("Invalid schema mode");
+await migrate(env.databaseUrl, { readOnly: process.env.PORTAL_SCHEMA_MODE === "verify" });
 const sql = postgres(env.databaseUrl, { onnotice: () => {} });
 const sessions = new Sessions(sql, env.sealKeyHex, env.baseUrl.startsWith("https:"));
 const manager = new BridgeManager(sql, env);
