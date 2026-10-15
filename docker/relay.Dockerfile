@@ -28,7 +28,7 @@ COPY packages/bridge/src packages/bridge/src
 COPY --from=strfry-build /build/strfry /usr/local/bin/strfry
 COPY --from=strfry-build /source /usr/share/strfry-source
 COPY docker/relay-policy.sh /usr/local/bin/relay-policy
-RUN chmod 0755 /usr/local/bin/relay-policy
+RUN chmod 0755 /usr/local/bin/relay-policy && chmod -R go-w /opt/divine
 USER 10001:10001
 ENTRYPOINT ["/usr/local/bin/strfry"]
 CMD ["--config=/data/strfry.conf", "relay"]

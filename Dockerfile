@@ -29,6 +29,7 @@ COPY packages/moderation packages/moderation
 COPY packages/portal/package.json packages/portal/package.json
 COPY packages/portal/src packages/portal/src
 COPY --from=webbuild /app/packages/portal/web/dist ./packages/portal/web/dist
+RUN chmod -R go-w /app
 ENV NODE_ENV=production
 USER 10001:10001
 

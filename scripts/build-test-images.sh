@@ -13,6 +13,7 @@ for target in portal moderation bridge; do
   docker buildx build --platform "$platform" --load "${target_args[@]}" --build-arg "VCS_REF=$revision" -t "$image" .
   test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
   docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --entrypoint bun "$image" -e 'if(process.getuid()!==10001)process.exit(1); await import("./packages/portal/src/env.ts"); await import("./packages/moderation/src/coopHandoff.ts"); console.log("PASS application runtime")'
+  docker run --rm --entrypoint sh "$image" -ec 'test -z "$(find /app -writable -print -quit)"'
 done
 BRIDGE_TEST_IMAGE="$IMAGE_PREFIX/bridge:$revision" bash scripts/test-bridge-runtime.sh
 relay="$IMAGE_PREFIX/relay:$revision"
