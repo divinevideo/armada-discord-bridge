@@ -8,9 +8,10 @@ platform=${BUILD_PLATFORM:-linux/amd64}
 for target in portal moderation bridge; do
   image="$IMAGE_PREFIX/$target:$revision"
   # The final Dockerfile stage is the public default; exercise it without --target.
-  target_args=()
-  if [ "$target" != bridge ]; then target_args=(--target "$target"); fi
-  docker buildx build --platform "$platform" --load "${target_args[@]}" --build-arg "VCS_REF=$revision" -t "$image" .
+  # Keep the array nonempty: macOS bash 3.2 treats an empty one as unset with -u.
+  build_args=(--platform "$platform" --load --build-arg "VCS_REF=$revision" -t "$image")
+  if [ "$target" != bridge ]; then build_args+=(--target "$target"); fi
+  docker buildx build "${build_args[@]}" .
   test "$(docker image inspect "$image" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$revision"
   docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --entrypoint bun "$image" -e 'if(process.getuid()!==10001)process.exit(1); await import("./packages/portal/src/env.ts"); await import("./packages/moderation/src/coopHandoff.ts"); console.log("PASS application runtime")'
   docker run --rm --entrypoint sh "$image" -ec 'test -z "$(find /app -writable -print -quit)"'
