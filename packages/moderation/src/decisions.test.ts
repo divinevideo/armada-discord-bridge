@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { migrateModeration } from "./policyStore";
 import { Decisions } from "./decisions";
 import { EvidenceCipher } from "./evidence";
+import { collectMetrics } from "./metrics";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 const org = crypto.randomUUID(), caseId = crypto.randomUUID(), executionId = crypto.randomUUID();
 const actor = { orgId: org, actorId: "synthetic-reviewer", permissions: ["remove_message", "ban_member", "unban_member", "retry"] };
@@ -169,4 +170,17 @@ test("the actual API role accepts decisions while retaining case locks and colum
     await expect(api`UPDATE moderation.cases SET expires_at = expires_at WHERE case_id = ${caseId}`.execute()).rejects.toThrow(/permission denied/);
     await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
   } finally { await api.end(); }
+});
+
+test("pending age survives delivery renewal, rescheduling and manual retry", async () => {
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  await sql`UPDATE moderation.decisions SET created_at = clock_timestamp() - interval '1 hour' WHERE decision_id = ${accepted.decisionId}`;
+  await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1, updated_at = clock_timestamp() WHERE decision_id = ${accepted.decisionId}`;
+  await decisions.retry(accepted.decisionId, actor);
+  await sql`UPDATE moderation.deliveries SET lease_until = clock_timestamp() + interval '60 seconds', available_at = clock_timestamp() + interval '5 minutes', updated_at = clock_timestamp() WHERE decision_id = ${accepted.decisionId}`;
+  const metrics = await collectMetrics(sql);
+  const age = Number(metrics.match(/^concord_oldest_pending_seconds (.+)$/m)?.[1]);
+  expect(Number.isFinite(age)).toBe(true);
+  expect(age).toBeGreaterThanOrEqual(3600);
+  await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
 });
