@@ -62,8 +62,18 @@ export class ConcordActions {
       const edition = parseEdition(opened);
       if (opened.author !== this.identity.pk || bytesToHex(edition.entityId) !== bytesToHex(banlistLocator(this.community.id))) throw new Error("Prepared banlist has wrong authority or scope");
       const current = folded.heads.get(bytesToHex(edition.entityId));
-      const alreadyApplied = current && bytesToHex(current.hash) === bytesToHex(edition.selfHash);
-      if (!alreadyApplied && (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash))))) throw new StalePreparedBanlistError("Prepared banlist would overwrite a concurrent edit");
+      // Readback may arrive after another valid edition extends ours. Follow
+      // the canonical head's actual hashes, not just its current member set:
+      // matching intent alone would credit an unrelated moderator's edit.
+      const history = new Map(editions.filter((candidate) => bytesToHex(candidate.entityId) === bytesToHex(edition.entityId)).map((candidate) => [bytesToHex(candidate.selfHash), candidate]));
+      let ancestor = current && history.get(bytesToHex(current.hash));
+      while (ancestor) {
+        if (bytesToHex(ancestor.selfHash) === bytesToHex(edition.selfHash)) return;
+        const previous = ancestor.prevHash && history.get(bytesToHex(ancestor.prevHash));
+        if (!previous || previous.version >= ancestor.version) break;
+        ancestor = previous;
+      }
+      if (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash)))) throw new StalePreparedBanlistError("Prepared banlist would overwrite a concurrent edit");
       const next = foldControlState([...editions, edition], this.community.id, this.community.owner, folded.heads);
       const head = next.headEditions.get(bytesToHex(edition.entityId));
       if (!head || bytesToHex(head.selfHash) !== bytesToHex(edition.selfHash) || next.banned.has(decision.author) !== (decision.action === "ban_member")) throw new Error("Prepared banlist is stale or unauthorized");

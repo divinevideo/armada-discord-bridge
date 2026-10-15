@@ -97,6 +97,49 @@ test("an already applied ban is replayed, not rebased into a new generation", as
   expect(result.state).toBe("verified");
   expect(calls).toEqual(["attempt"]);
 });
+test("ban and unban readback survives canonical successors without replacing the signed generation", async () => {
+  for (const action of ["ban_member", "unban_member"] as const) {
+    for (const onRetry of [false, true]) {
+      const f = await moderationFixture();
+      const actions = new ConcordActions(f.community, f.moderator, async () => f.policy);
+      const decision = { ...f.decision, author: f.bannedMember.pk, action };
+      const events = await actions.prepare(decision);
+      const claim: DeliveryClaim = { decision, target: "concord", attempts: 2, token: crypto.randomUUID(), signedEvents: events, publicationAttempted: onRetry };
+      const extend = async () => {
+        f.policy.controlEvents.push(events[0]);
+        let head = parseEdition(openWrap(events[0], f.controlStream.key));
+        for (let i = 0; i < 2; i++) {
+          const members = [...JSON.parse(head.content), String(i + 1).repeat(64)];
+          const successor = await sealEdition(buildBanlistEdition(f.community.id, members, { actorPubkey: f.owner.pk, version: head.version + 1n, prevHash: head.selfHash }), currentControlWriteGroup(f.community), f.owner.signer);
+          f.policy.controlEvents.push(successor);
+          head = parseEdition(openWrap(successor, f.controlStream.key));
+        }
+      };
+      if (onRetry) await extend();
+      const calls: string[] = [];
+      const result = await deliverConcord(claim, actions, memoryDecisions(calls), { publish: async () => { if (!onRetry) await extend(); }, queryStrict: async () => events }, async () => {});
+      expect(result).toEqual({ state: "verified", code: "concord_enforcement_verified" });
+      expect(claim.signedEvents).toEqual(events);
+      expect(calls).toEqual(["attempt"]);
+    }
+  }
+});
+
+test("a canonical successor reversing an applied unban does not verify enforcement", async () => {
+  const f = await moderationFixture();
+  const actions = new ConcordActions(f.community, f.moderator, async () => f.policy);
+  const decision = { ...f.decision, author: f.bannedMember.pk, action: "unban_member" as const };
+  const events = await actions.prepare(decision);
+  const claim: DeliveryClaim = { decision, target: "concord", attempts: 1, token: crypto.randomUUID(), signedEvents: events, publicationAttempted: false };
+  const result = await deliverConcord(claim, actions, memoryDecisions(), {
+    publish: async () => {
+      f.policy.controlEvents.push(events[0]);
+      const head = parseEdition(openWrap(events[0], f.controlStream.key));
+      f.policy.controlEvents.push(await sealEdition(buildBanlistEdition(f.community.id, [decision.author], { actorPubkey: f.owner.pk, version: head.version + 1n, prevHash: head.selfHash }), currentControlWriteGroup(f.community), f.owner.signer));
+    }, queryStrict: async () => events,
+  }, async () => {});
+  expect(result).toEqual({ state: "acknowledged", code: "concord_awaiting_fold" });
+});
 test("revoked authority cannot recover an unattempted stale ban", async () => {
   const { f, actions, claim, events, compete } = await preparedBan();
   await compete();
