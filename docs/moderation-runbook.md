@@ -10,6 +10,13 @@ After acting, check all three delivery rows: **Divine relay**, **Concord**, **Di
 
 Use Retry for a failed, unexpired, authorized action with attempts remaining. Keep unresolved delivery failures in escalation; do not interpret a closed review item as successful enforcement. Evidence expiry preserves the delivery record, clears plaintext/audit material and signed pending bytes, and disables further execution. Re-reporting requires live verifiable evidence. The portal's pause control stops a mapping; it does not remove old content or delete the Discord server.
 
+Concord retries preserve signed event bytes once publication may have begun.
+Only a persisted generation proved unattempted may be rebuilt against a newer
+banlist. `concord_recovery_requires_operator` is not an ordinary Retry action:
+keep that delivery failed and inspect the current canonical banlist and original
+action with an authorized operator. Do not clear its signed bytes or send marker
+to force a retry. Existing generations are conservatively treated as attempted.
+
 ## Provisioning and key boundaries
 
 Owner signs genesis and grants locally. No owner private key belongs in the portal, database, relay, bot, moderation service or Kubernetes. Give the moderation member only the public community grants needed for removal/ban actions. Bot removal still needs the protocol's rekey/refounding ceremony. Public reading and previously copied messages cannot be revoked by an account ban.
@@ -36,6 +43,20 @@ The first command requires `DATABASE_URL` set securely to the disposable instanc
 Failing/stale policy, disconnected control state, missing validator, malformed output and validator timeout/crash reject writes. Do not disable the mandatory write hook to restore availability. A rekey-pending state requires matching recovery material; a missing owner grant cannot be repaired by elevating the workload to owner.
 
 A worker owns the community through a Postgres transaction lock; delivery leases and stable decision IDs survive replacement. Acknowledge/verify is a separate step. Inspect target status before retrying; automatic retries stop at their configured budget and preserve failure. Rate limits are failures to retry, never successes.
+
+When upgrading the publication-attempt schema, stop old moderation workers
+before starting new workers. Do not mix versions across that transition: all
+publishers must record intent before sending. This is a deployment prerequisite,
+not permission to deploy.
+
+Relay purge accepts up to 128 indexed carriers per removal. Overflow, SQL work
+exceeding its 1.5-second statement limit, or exhausted barrier database budget
+(30 seconds) fails the removal rather than reporting a partial purge as verified.
+Keep the tombstone and escalate an overflow for controlled reconciliation; do
+not remove the admission barrier to increase throughput. Discord visibility
+reads use a process-local, bot-scoped queue (64 pending reads, four attempts,
+30-second wait budget). Provider delays beyond that budget defer the effect;
+there is no successful-authorization cache shared between effects.
 
 Before restoring an older relay snapshot: stop the public listener, restore current moderation state independently, supply explicit minimum policy revisions, run `offlineRelayRestore.ts` against the offline relay volume, and require success before bringing the listener back. Never roll moderation policy/tombstones back to the relay snapshot. Restore into an isolated namespace first. A failed reconciliation leaves the public listener stopped. Keep community read material, evidence keys and bot keys in the restricted secret store; keep the owner backup separate and audit logged.
 
