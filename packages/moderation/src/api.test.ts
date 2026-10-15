@@ -42,3 +42,37 @@ test("case evidence and delivery status require the signed staff route", async (
   expect(response.status).toBe(200); expect(response.headers.get("cache-control")).toBe("no-store");
   expect(await response.json()).toMatchObject({ caseId, content: "synthetic evidence", decisions: [status] });
 });
+
+test("anonymous reports and forged staff signatures cannot exhaust valid staff capacity", async () => {
+  let calls = 0;
+  const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error("unauthenticated report reached storage"); } }, decisions: { async acceptDecision() { calls++; return status; }, async get() { return status; }, async retry() { return status; } } });
+  const url = "https://rooms.example/v1/decisions", body = "{}";
+  const forged = signCoopRequest(randomBytes(32), actor, "POST", "/v1/decisions", body);
+  const results = await Promise.all(Array.from({ length: 101 }, async () => [
+    (await api(new Request("https://rooms.example/v1/reports", { method: "POST", body }))).status,
+    (await api(new Request(url, { method: "POST", body, headers: forged }))).status,
+  ]));
+  expect(results.some(([report]) => report === 429)).toBe(true);
+  expect(results.every(([, staff]) => staff === 403)).toBe(true);
+  expect(calls).toBe(0);
+  const signed = () => new Request(url, { method: "POST", body, headers: signCoopRequest(secret, actor, "POST", "/v1/decisions", body) });
+  const valid = await Promise.all(Array.from({ length: 101 }, () => api(signed())));
+  expect(valid.filter((response) => response.status === 202)).toHaveLength(100);
+  expect(valid.filter((response) => response.status === 429)).toHaveLength(1);
+  expect(calls).toBe(100);
+});
+
+test("pre-auth body reads cancel slow streams and enforce the byte cap without waiting for cancel hooks", async () => {
+  const makeApi = () => createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error("not called"); } }, decisions: { async acceptDecision() { throw new Error("not called"); }, async get() { return status; }, async retry() { return status; } } });
+  for (const path of ["/v1/reports", "/v1/decisions"]) {
+    let canceled = false;
+    const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array([123])); }, cancel() { canceled = true; return new Promise(() => {}); } });
+    const request = new Request("https://rooms.example" + path, { method: "POST", body: stream });
+    expect((await makeApi()(request)).status).toBe(413);
+    expect(canceled).toBe(true);
+  }
+  let canceled = false;
+  const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array(65_537)); }, cancel() { canceled = true; return new Promise(() => {}); } });
+  expect((await makeApi()(new Request("https://rooms.example/v1/decisions", { method: "POST", body: stream }))).status).toBe(413);
+  expect(canceled).toBe(true);
+});

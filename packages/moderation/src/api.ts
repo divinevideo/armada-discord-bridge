@@ -21,29 +21,42 @@ async function boundedBody(request: Request): Promise<string> {
   if (Number(request.headers.get("content-length")) > 65_536) throw new Error("oversized");
   if (!request.body) return "";
   const reader = request.body.getReader(), chunks: Uint8Array[] = [];
+  // A byte cap alone lets a slow anonymous sender retain pre-auth work forever.
+  // Cancel the reader itself, not just a race that leaves reads running behind it.
+  let expired = false;
+  const timer = setTimeout(() => { expired = true; void reader.cancel().catch(() => {}); }, 1500);
   let length = 0;
   try {
     while (true) {
       const next = await reader.read();
+      if (expired) throw new Error("body deadline");
       if (next.done) break;
       length += next.value.length;
-      if (length > 65_536) { await reader.cancel(); throw new Error("oversized"); }
+      if (length > 65_536) { void reader.cancel().catch(() => {}); throw new Error("oversized"); }
       chunks.push(next.value);
     }
-  } finally { reader.releaseLock(); }
+  } finally { clearTimeout(timer); reader.releaseLock(); }
   return Buffer.concat(chunks).toString("utf8");
 }
 export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase">> }) {
   if (options.coopSecret.length < 32) throw new Error("Staff service credential required");
-  let remaining = 100, window = Date.now();
+  const capacity = () => {
+    let remaining = 100, window = Date.now();
+    return () => {
+      if (Date.now() - window >= 1000) { remaining = 100; window = Date.now(); }
+      return --remaining >= 0;
+    };
+  };
+  const reportCapacity = capacity(), staffCapacity = capacity();
   const response = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url), path = url.pathname;
     const caseRoute = /^\/v1\/cases\/([0-9a-f-]{36})$/.exec(path);
     const decisionRoute = /^\/v1\/decisions\/([0-9a-f-]{36})(\/retry)?$/.exec(path);
     if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute && !caseRoute) return response({ error: "not_found" }, 404);
-    if (Date.now() - window >= 1000) { remaining = 100; window = Date.now(); }
-    if (--remaining < 0) return response({ error: "rate_limited" }, 429);
+    // Neither public reports nor forged staff headers spend authenticated staff
+    // capacity. Keep the existing 100/s cap independently for each trust domain.
+    if (path === "/v1/reports" && !reportCapacity()) return response({ error: "rate_limited" }, 429);
     let body: string;
     try { body = await boundedBody(request); } catch { return response({ error: "request_too_large" }, 413); }
     if (path === "/v1/reports") {
@@ -55,6 +68,7 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
     }
     let actor;
     try { actor = authenticateCoop(request, body, options.coopSecret, options.orgs); } catch { return response({ error: "staff_authorization_required" }, 403); }
+    if (!staffCapacity()) return response({ error: "rate_limited" }, 429);
     try {
       if (caseRoute && request.method === "GET" && options.reports.getCase && options.decisions.forCase) {
         const decisions = await options.decisions.forCase(caseRoute[1], actor);
