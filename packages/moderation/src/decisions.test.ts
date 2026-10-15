@@ -37,6 +37,8 @@ test("unknown actors, missing scope confirmation and caller targets are rejected
   await expect(decisions.acceptDecision(input, { ...actor, actorId: "" })).rejects.toThrow();
   await expect(decisions.acceptDecision({ ...input, action: "ban_member" }, actor)).rejects.toThrow();
   await expect(decisions.acceptDecision({ ...input, target: { author: "e".repeat(64) } } as any, actor)).rejects.toThrow();
+  // Community authority must not silently expand to the entire Discord guild.
+  await expect(decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community", discordGuildConfirmed: true }, actor)).rejects.toThrow(/Staff authorization required/);
 });
 
 test("crashed delivery is reclaimed with persisted events and a stale worker cannot finish", async () => {
