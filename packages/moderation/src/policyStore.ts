@@ -92,6 +92,10 @@ export class PolicyStore {
   async getPolicy(communityId: string) { requireId(communityId); return this.load(this.sql, communityId); }
 
   async admit(event: NostrEvent): Promise<AdmissionResult> {
+    return this.admitEvent(event, false);
+  }
+
+  private async admitEvent(event: NostrEvent, restoring: boolean): Promise<AdmissionResult> {
     const id = typeof event?.id === "string" && HEX_ID.test(event.id) ? event.id : "0".repeat(64);
     const rejected: AdmissionResult = { id, action: "reject", msg: "blocked: room policy unavailable or event not permitted" };
     try {
@@ -101,17 +105,32 @@ export class PolicyStore {
         const candidates = await tx`SELECT community_id FROM moderation.streams WHERE pubkey = ${event.pubkey}
           UNION SELECT community_id FROM moderation.community_policy WHERE payload->'publicAuthors' ? ${event.pubkey}
           UNION SELECT community_id FROM moderation.observed_members WHERE author = ${event.pubkey} LIMIT 2`;
-        if (candidates.length !== 1) return rejected;
+        if (candidates.length !== 1) {
+          if (restoring) throw new Error("Recovery policy scope unavailable");
+          return rejected;
+        }
         const communityId = candidates[0].community_id as string;
         await policyLock(tx, communityId);
         const policy = await this.load(tx, communityId);
+        if (restoring) this.assertRecoveryPolicy(policy);
         const [row] = await tx`SELECT * FROM moderation.streams WHERE pubkey = ${event.pubkey} AND community_id = ${communityId}`;
         const known = await tx`SELECT 1 FROM moderation.observed_members WHERE community_id = ${communityId} AND author = ${event.pubkey}`;
+        // The inspector maps callback errors to rejection for live admission.
+        // Restore must retain the distinction before deciding to remove bytes.
+        const lookupFailures: unknown[] = [];
+        const lookup = async <T>(read: () => Promise<T>): Promise<T> => {
+          try { return await read(); }
+          catch (error) { lookupFailures.push(error); throw error; }
+        };
         const { result, carrier, rekey, observedAuthor, control, removals } = await inspectRelayEvent(event, {
           policy, stream: row && streamOf(row), now: Date.now, publicAuthorKnown: known.length > 0,
-          isRemoved: async (target) => (await tx`SELECT 1 FROM moderation.tombstones WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId}`).length > 0,
-          authorOf: async (target) => (await tx`SELECT author FROM moderation.carriers WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} LIMIT 1`)[0]?.author as string | undefined,
+          isRemoved: (target) => lookup(async () => (await tx`SELECT 1 FROM moderation.tombstones WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId}`).length > 0),
+          authorOf: (target) => lookup(async () => (await tx`SELECT author FROM moderation.carriers WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} LIMIT 1`)[0]?.author as string | undefined),
         });
+        if (restoring) {
+          if (lookupFailures.length) throw lookupFailures[0];
+          this.assertRecoveryPolicy(policy);
+        }
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept") for (const target of removals ?? []) {
           await tx`INSERT INTO moderation.tombstones (community_id, channel_id, rumor_id) VALUES (${communityId}, ${target.channelId}, ${target.rumorId}) ON CONFLICT DO NOTHING`;
@@ -126,7 +145,11 @@ export class PolicyStore {
           VALUES (${rekey.event.id}, ${rekey.communityId}, ${rekey.epoch}, ${tx.json(rekey.event as never)}) ON CONFLICT DO NOTHING`;
         return result;
       });
-    } catch { return rejected; }
+    } catch (error) { if (restoring) throw error; return rejected; }
+  }
+
+  private assertRecoveryPolicy(policy: CommunityPolicy | undefined): asserts policy is CommunityPolicy {
+    if (!policy || !Number.isSafeInteger(policy.revision) || policy.revision < 1 || !policy.complete || policy.validUntil <= Date.now() || controlState(policy).folded.incomplete.length) throw new Error("Recovery policy unavailable");
   }
 
   async assertRestoreReady(floors: Record<string, number>): Promise<void> {
@@ -146,11 +169,10 @@ export class PolicyStore {
     const [stream] = await this.sql`SELECT community_id FROM moderation.streams WHERE pubkey = ${event.pubkey} AND plane = 'control'`;
     if (stream) {
       const policy = await this.load(this.sql, stream.community_id);
-      if (!policy || !policy.complete || policy.validUntil <= Date.now()) throw new Error("Recovery policy unavailable");
-      controlState(policy);
+      this.assertRecoveryPolicy(policy);
       return policy.controlEvents.some((candidate) => candidate.id === event.id);
     }
-    return (await this.admit(event)).action === "accept";
+    return (await this.admitEvent(event, true)).action === "accept";
   }
 
   /** Disconnects revoke admission immediately; a new complete snapshot must win CAS. */

@@ -2,6 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
 import { relayFixture } from "../../../scripts/fixtures/relay-events";
 import { PolicyStore, migrateModeration } from "./policyStore";
+import { reconcileRestore } from "./relayRestore";
 const sql = postgres(process.env.DATABASE_URL!, { max: 4, onnotice: () => {} });
 const fixture = await relayFixture();
 const store = new PolicyStore(sql);
@@ -93,6 +94,61 @@ test("restore preserves verified historical control and rejects tombstoned chat"
   const [row] = await sql`SELECT revision FROM moderation.community_policy WHERE community_id = ${fixture.policy.communityId}`;
   await store.assertRestoreReady({ [fixture.policy.communityId]: Number(row.revision) });
   await expect(store.assertRestoreReady({ [fixture.policy.communityId]: Number(row.revision) + 1 })).rejects.toThrow(/floor/);
+});
+
+test("restore aborts without deleting when policy expires after its initial readiness check", async () => {
+  const f = await relayFixture();
+  const deleted: string[] = [];
+  let scanned = false;
+  try {
+    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    const rows = await sql`SELECT community_id, revision FROM moderation.community_policy`;
+    const floors = Object.fromEntries(rows.map((row) => [row.community_id, Number(row.revision)]));
+    await expect(reconcileRestore(store, {
+      async *scan() {
+        scanned = true;
+        await sql`UPDATE moderation.community_policy SET payload = payload || '{"validUntil":0}'::jsonb WHERE community_id = ${f.policy.communityId}`;
+        yield f.allowed;
+      },
+      async delete(ids) { deleted.push(...ids); },
+    }, floors)).rejects.toThrow(/Recovery policy unavailable/);
+    expect(scanned).toBe(true);
+    expect(deleted).toEqual([]);
+    expect((await store.admit(f.allowed)).action).toBe("reject");
+  } finally { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`; }
+});
+
+test("restore propagates an admission lookup failure instead of deleting the carrier", async () => {
+  const f = await relayFixture();
+  const deleted: string[] = [];
+  let failures = 0;
+  const unavailable = new Proxy(sql, {
+    get(target, property, receiver) {
+      if (property === "begin") return (run: (tx: postgres.TransactionSql) => Promise<unknown>) => target.begin(async (tx) => run(new Proxy(tx, {
+        apply(query, thisArg, args) {
+          if (Array.isArray(args[0]) && args[0].join("?").includes("FROM moderation.tombstones")) {
+            failures++;
+            return Promise.reject(new Error("Synthetic admission database failure"));
+          }
+          return Reflect.apply(query, thisArg, args);
+        },
+      })));
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  try {
+    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    const rows = await sql`SELECT community_id, revision FROM moderation.community_policy`;
+    const floors = Object.fromEntries(rows.map((row) => [row.community_id, Number(row.revision)]));
+    await expect(reconcileRestore(new PolicyStore(unavailable), {
+      async *scan() { yield f.allowed; },
+      async delete(ids) { deleted.push(...ids); },
+    }, floors)).rejects.toThrow(/Synthetic admission database failure/);
+    expect(failures).toBe(1);
+    expect(deleted).toEqual([]);
+    expect((await new PolicyStore(unavailable).admit(f.allowed)).action).toBe("reject");
+    expect(failures).toBe(2);
+  } finally { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`; }
 });
 
 test("a verified public guestbook join permits profile bootstrap without granting moderation authority", async () => {
