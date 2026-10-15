@@ -20,6 +20,7 @@ beforeAll(async () => {
 afterAll(async () => { await sql`DELETE FROM moderation.decisions WHERE org_id = ${org}`; await sql`DELETE FROM moderation.cases WHERE org_id = ${org}`; await sql.end(); });
 test("acceptance atomically queues three independent deliveries and immutable replay", async () => {
   const first = await decisions.acceptDecision(input, actor);
+  expect(first.discordGuildConfirmed).toBe(false);
   expect(first.deliveries.map((d) => d.state)).toEqual(["pending", "pending", "pending"]);
   expect((await decisions.acceptDecision(input, actor)).decisionId).toBe(first.decisionId);
   await expect(decisions.acceptDecision({ ...input, reason: "changed" }, actor)).rejects.toThrow(/conflict/i);
@@ -106,10 +107,12 @@ test("retrying a guild-scoped decision needs guild authority for its Discord del
   const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community", discordGuildConfirmed: true }, admin);
   await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1 WHERE decision_id = ${accepted.decisionId}`;
   const moderator = await decisions.retry(accepted.decisionId, actor);
+  expect(moderator.discordGuildConfirmed).toBe(true);
   expect(Object.fromEntries(moderator.deliveries.map((d) => [d.target, d.state]))).toEqual({ concord: "pending", discord: "failed", divine_relay: "pending" });
   await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId} AND target <> 'discord'`;
   await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${accepted.decisionId}`;
   const retried = await decisions.retry(accepted.decisionId, admin);
+  expect(retried.discordGuildConfirmed).toBe(true);
   expect(retried.deliveries.every((d) => d.state === "pending")).toBe(true);
   await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
 });

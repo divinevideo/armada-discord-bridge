@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { createModerationApi, signCoopRequest } from "./api";
 const secret = randomBytes(32);
 const actor = { orgId: "synthetic-org", actorId: "synthetic-reviewer", permissions: ["remove_message", "view", "retry"] };
-const status = { decisionId: crypto.randomUUID(), target: { communityId: "a".repeat(64), channelId: "b".repeat(64), rumorId: "c".repeat(64) }, action: "remove_message" as const, deliveries: [] };
+const status = { decisionId: crypto.randomUUID(), target: { communityId: "a".repeat(64), channelId: "b".repeat(64), rumorId: "c".repeat(64) }, action: "remove_message" as const, discordGuildConfirmed: false, deliveries: [] };
 let accepted = 0;
 const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error("not called"); } }, decisions: { async acceptDecision() { accepted++; return status; }, async get() { return status; }, async retry() { return status; } } });
 test("staff endpoints require signed actor/org, method and body; acceptance is queued", async () => {

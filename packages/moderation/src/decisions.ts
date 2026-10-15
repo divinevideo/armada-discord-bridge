@@ -5,7 +5,7 @@ import { EvidenceCipher } from "./evidence";
 export type RoomAction = "remove_message" | "ban_member" | "unban_member";
 export interface VerifiedCoopActor { orgId: string; actorId: string; permissions: string[] }
 export interface ModerationDecision { caseId: string; executionId: string; action: RoomAction; reason: string; scope: "message" | "community"; discordGuildConfirmed: boolean }
-export interface DecisionStatus { decisionId: string; target: RoomTarget; action: RoomAction; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
+export interface DecisionStatus { decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
 export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationAttempted?: boolean }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -46,7 +46,7 @@ export class Decisions {
     const [row] = await this.sql`SELECT * FROM moderation.decisions WHERE decision_id = ${decisionId} AND org_id = ${actor.orgId}`;
     if (!row || this.communities.get(row.community_id) !== actor.orgId || (!actor.permissions.includes("view") && !actor.permissions.includes(row.action))) throw new Error("Decision unavailable");
     const deliveries = await this.sql`SELECT target, state, attempts, result_code FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
-    return { decisionId, target: stored(row).target, action: row.action, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
+    return { decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
   }
   async forCase(caseId: string, actor: VerifiedCoopActor): Promise<DecisionStatus[]> {
     assertActor(actor, "view");
