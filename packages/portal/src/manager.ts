@@ -420,10 +420,8 @@ export class BridgeManager {
   /**
    * Mint the bridge's identity and mark it active, WITHOUT starting it.
    *
-   * Split out from {@link activateImported} because a private channel's key has
-   * to reach this npub before the bridge boots: `start()` takes key delivery
-   * exactly once, at boot (see keyIntake.ts). A bridge started first simply
-   * cannot see the channel, and would sit there mirroring nothing.
+   * Kept separate from {@link activateImported} so import checkpoints can persist
+   * provisioned identity before starting the public-channel bridge.
    */
   async provisionImported(row: BridgeRow): Promise<BridgeRow> {
     if (!row.community_id || !row.discord_guild_id) {
@@ -459,7 +457,7 @@ export class BridgeManager {
     if (this.running.has(row.bridge_id)) return;
     // An active bridge mirrors in both directions through the shared gateway,
     // so without it there is nothing to attach — defer before doing the relay
-    // work (resolve, fold, key intake) rather than fold a whole community only
+    // work (resolve and fold) rather than fold a whole community only
     // to find nowhere to route it. GatewayUnavailableError is caught in
     // startTracked and never counts toward a sever (see its definition).
     if (row.status === "active" && !this.adapter) throw new GatewayUnavailableError();
@@ -467,12 +465,30 @@ export class BridgeManager {
       throw new Error("bridge is missing sealed key material");
     }
     await this.assertPublicChannel(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
-    const lease = await new BridgeLeases(this.sql).acquire(bridgeResource(row.discord_guild_id!, row.discord_channel_id!));
+    let starting = true;
+    let lost = false;
+    const lease = await new BridgeLeases(this.sql).acquire(bridgeResource(row.discord_guild_id!, row.discord_channel_id!), () => {
+      lost = true;
+      // Startup owns its partial resources until startOwned has unwound. A
+      // callback there must not race cleanup or leave a dead instance registered.
+      if (!starting) void this.onLeaseLost(row.bridge_id, lease!).catch((error) =>
+        console.error(`bridge ${row.bridge_id}: lease loss cleanup failed`, error));
+    });
     if (!lease) throw new BridgeLeaseUnavailableError("Bridge lease is owned by another worker");
     try {
       await this.startOwned(row, lease);
+      starting = false;
+      if (lost) {
+        await this.onLeaseLost(row.bridge_id, lease);
+        throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
+      }
     } catch (error) {
-      await lease.release();
+      starting = false;
+      await lease.release().catch(() => {});
+      if (lost) {
+        this.scheduleStartRetry(row.bridge_id, 0);
+        throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
+      }
       throw error;
     }
   }
@@ -504,9 +520,8 @@ export class BridgeManager {
       const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), { authSk: primarySk });
 
       cleanup.push(() => pool.close());
-      // Fold the Control Plane first: it reads from the community root the
-      // invite carried, so the roster — and with it, who may vend a channel key
-      // — is knowable before we accept any. The intake refuses anyone else.
+      // Fold authority from the invite's community root first. Public-only boot
+      // does not accept private-channel key bundles.
       const preflight = new ConcordClient(community, pool, primary);
       await preflight.syncControl();
 
@@ -645,10 +660,12 @@ export class BridgeManager {
           author: { pk: primary.pk, signer: primary.signer },
         });
       }
+      await lease.assertCurrent();
       this.running.set(rb.id, rb);
     } catch (error) {
       for (const close of cleanup.reverse()) await Promise.resolve().then(close).catch(() => {});
-      this.byDiscordChannel.delete(row.discord_channel_id ?? "");
+      const current = this.running.get(row.bridge_id);
+      if (!current || current.lease === lease) this.byDiscordChannel.delete(row.discord_channel_id ?? "");
       throw error;
     }
   }
@@ -905,17 +922,40 @@ export class BridgeManager {
     }).catch(() => {});
   }
 
+  private async closeRunning(rb: Running): Promise<void> {
+    // Remove only this instance, before yielding: a replacement must never be
+    // deleted by an old lease's delayed cleanup. Fencing is still in the DB.
+    if (this.running.get(rb.id) !== rb) return;
+    this.running.delete(rb.id);
+    if (this.byDiscordChannel.get(rb.link.discordChannelId) === rb.id) {
+      this.byDiscordChannel.delete(rb.link.discordChannelId);
+    }
+    rb.router = undefined;
+    try { rb.unsubChat(); } catch {}
+    try { rb.unsubControl(); } catch {}
+    await rb.pool.close().catch(() => {});
+  }
+
+  private async onLeaseLost(bridgeId: string, lease: BridgeLease): Promise<void> {
+    const rb = this.running.get(bridgeId);
+    if (!rb || rb.lease !== lease) return;
+    try {
+      await this.closeRunning(rb);
+    } finally {
+      // This is not an operator pause: preserve durable status and retry even
+      // if storage is still down. retryStart re-reads any subsequent pause.
+      this.scheduleStartRetry(bridgeId, 0);
+    }
+  }
+
   async stop(bridgeId: string, status: "paused" | "unlinked", detail?: string): Promise<void> {
     this.cancelStartRetry(bridgeId);
     const rb = this.running.get(bridgeId);
     if (rb) {
-      await rb.lease.release();
-      rb.router = undefined;
-      rb.unsubChat();
-      rb.unsubControl();
-      await rb.pool.close().catch(() => {});
-      this.byDiscordChannel.delete(rb.link.discordChannelId);
-      this.running.delete(bridgeId);
+      // release invalidates the local handle before its DB round trip. Failure
+      // must not keep subscriptions alive or prevent the requested status write.
+      await rb.lease.release().catch((error) => console.warn(`bridge ${bridgeId}: lease release failed`, error));
+      await this.closeRunning(rb);
     }
     if (status === "unlinked") {
       await this.sql`
@@ -958,8 +998,13 @@ export class BridgeManager {
       await this.start(row);
     } catch (error) {
       if (error instanceof PublicPolicyUnavailableError || error instanceof BridgeLeaseUnavailableError) {
-        await this.sql`UPDATE bridges SET status_detail = ${error.message}, updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
-        this.scheduleStartRetry(row.bridge_id, attempt);
+        try {
+          await this.sql`UPDATE bridges SET status_detail = ${error.message}, updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
+        } catch (bookkeepingError) {
+          console.warn(`bridge ${row.bridge_id}: could not record deferred start`, bookkeepingError);
+        } finally {
+          this.scheduleStartRetry(row.bridge_id, attempt);
+        }
         return;
       }
       if (error instanceof GatewayUnavailableError) {
@@ -985,6 +1030,7 @@ export class BridgeManager {
     }
     // Started and running: failing to clear the streak marker must not be
     // mistaken for a failed start. The next successful boot clears it.
+    if (!this.running.has(row.bridge_id)) return;
     await this.clearStartFailure(row).catch((error) =>
       console.warn(`bridge ${row.bridge_id}: could not clear start-failure marker:`, error),
     );

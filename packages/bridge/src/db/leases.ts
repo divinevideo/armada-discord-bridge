@@ -18,7 +18,7 @@ export function bridgeResource(guildId: string, channelId: string): string {
 export class BridgeLeases {
   constructor(private readonly sql: postgres.Sql) {}
 
-  async acquire(resource: string): Promise<BridgeLease | undefined> {
+  async acquire(resource: string, onLost?: () => void): Promise<BridgeLease | undefined> {
     const holder = randomUUID();
     const [row] = await this.sql`
       INSERT INTO bridge_leases (resource, holder, token, expires_at)
@@ -31,11 +31,14 @@ export class BridgeLeases {
     const token = BigInt(row.token);
     let live = true;
     const check = () => { if (!live) throw new BridgeLeaseUnavailableError("Bridge lease is no longer current"); };
-    // Only a renewal the database refused ends the lease. A failed round trip
-    // proves nothing about ownership, and nothing re-acquires a dead lease, so
-    // treating one dropped connection as loss would silence the bridge until a
-    // restart. Fencing does not depend on this: assertCurrent re-reads the row
-    // before every effect and fails closed while storage is unreachable.
+    const lose = () => {
+      if (!live) return;
+      live = false;
+      clearInterval(timer);
+      // Release and concurrent checks must not emit a second terminal signal.
+      // A round-trip error never reaches here: it proves no loss of ownership.
+      try { onLost?.(); } catch (error) { console.error("bridge: lease loss handler failed", error); }
+    };
     const renew = async () => {
       check();
       const renewed = await this.sql`
@@ -43,8 +46,7 @@ export class BridgeLeases {
         WHERE resource = ${resource} AND holder = ${holder} AND token = ${token.toString()}
           AND expires_at > clock_timestamp() RETURNING resource`;
       if (!renewed.length) {
-        live = false;
-        clearInterval(timer);
+        lose();
         throw new BridgeLeaseUnavailableError("Bridge lease expired or was superseded");
       }
     };
@@ -60,8 +62,7 @@ export class BridgeLeases {
           AND holder = ${holder} AND token = ${token.toString()} AND expires_at > clock_timestamp()`;
         check();
         if (!current.length) {
-          live = false;
-          clearInterval(timer);
+          lose();
           throw new BridgeLeaseUnavailableError("Bridge lease expired or was superseded");
         }
       },

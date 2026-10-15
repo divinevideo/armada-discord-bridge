@@ -59,8 +59,25 @@ if (!inviteUrl || !guildId || !channelId || !config.discordToken) {
 const publicPolicy = discordPublicChannelPolicy(parsePublicChannelRules(process.env.BRIDGE_PUBLIC_CHANNELS), config.discordToken);
 await publicPolicy.assertPublicChannel(guildId, channelId);
 const sql = postgres(config.databaseUrl, { onnotice: () => {} });
-const lease = await new BridgeLeases(sql).acquire(bridgeResource(guildId, channelId));
+// Register cleanup as resources appear, so loss during startup does not touch
+// bindings that have not initialized yet. A supervisor can then restart us.
+const cleanup: Array<() => void | Promise<void>> = [() => sql.end()];
+let shuttingDown = false;
+let exitCode = 0;
+async function shutdown(code = 0): Promise<void> {
+  exitCode = Math.max(exitCode, code);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("bridge: shutting down");
+  while (cleanup.length) await Promise.resolve().then(cleanup.pop()!).catch(() => {});
+  process.exit(exitCode);
+}
+const lease = await new BridgeLeases(sql).acquire(bridgeResource(guildId, channelId), () => {
+  console.error("bridge: terminal lease loss; restart required");
+  void shutdown(1);
+});
 if (!lease) throw new Error("Bridge lease is owned by another worker");
+cleanup.push(() => lease.release());
 const assertMayForward = async () => {
   await lease.assertCurrent();
   await publicPolicy.assertPublicChannel(guildId, channelId);
@@ -157,6 +174,7 @@ const adapter = new DiscordAdapter(config.discordToken, {
   if (id !== channelId) throw new Error("Channel not configured");
   await assertMayForward();
 });
+cleanup.push(() => adapter.stop());
 await adapter.start();
 router = new BridgeRouter(
   client,
@@ -204,6 +222,7 @@ let currentChannel = channel;
 }
 
 let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);
+cleanup.push(() => unsubscribe());
 // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
 // goes silent while publishes (fresh channel lookup) keep working.
 const unsubControl = client.subscribeControl(() => {
@@ -216,17 +235,8 @@ const unsubControl = client.subscribeControl(() => {
   unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, onCursor);
   console.log("bridge: stream keys rotated; chat subscription refreshed");
 });
+cleanup.push(() => unsubControl());
 console.log("bridge: live in both directions");
 
-async function shutdown(): Promise<void> {
-  console.log("bridge: shutting down");
-  unsubscribe();
-  unsubControl();
-  await adapter.stop().catch(() => {});
-  await pool.close().catch(() => {});
-  await lease!.release().catch(() => {});
-  await sql.end().catch(() => {});
-  process.exit(0);
-}
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());
