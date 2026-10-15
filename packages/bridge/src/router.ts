@@ -470,7 +470,6 @@ export class BridgeRouter {
    * Throttled per user+channel to Armada's own publisher cadence.
    */
   async onDiscordTyping(userId: string, link: ChannelLink): Promise<void> {
-    await this.assertMayForward();
     if (!link.enabled) return;
     const channel = this.client.channel(link.concordChannelIdHex);
     if (!channel) return;
@@ -480,6 +479,8 @@ export class BridgeRouter {
     this.lastTyping.set(key, now);
     const puppet = this.puppets.get(userId);
     if (this.client.isBanned(puppet.pk)) return;
+    // Dropped typing must not consume the visibility lane needed by real sends.
+    await this.assertMayForward();
     await this.client.sendTyping(channel, { pk: puppet.pk, signer: localIdentity(puppet.sk).signer });
   }
 
@@ -558,7 +559,6 @@ export class BridgeRouter {
    * when this rumor's turn finishes.
    */
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
-    await this.assertMayForward();
     if (this.queued >= MAX_QUEUED_CHATS) {
       // Shedding load beats unbounded growth: past this the sender is flooding
       // and the relay copy is still the record. Loud, because it is data loss.

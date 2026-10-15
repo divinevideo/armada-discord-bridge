@@ -1249,6 +1249,50 @@ describe("escapeMarkdown", () => {
 });
 
 describe("public channel policy at side-effect boundaries", () => {
+  it("does not spend visibility reads on throttled Discord typing", async () => {
+    let checks = 0;
+    const h = harness({ beforeSideEffect: async () => { checks++; } });
+    await h.router.onDiscordTyping("80351110224678912", h.link);
+    const before = checks;
+    const published = h.pool.published.length;
+    expect(before).toBeGreaterThan(0);
+    await h.router.onDiscordTyping("80351110224678912", h.link);
+    expect(checks).toBe(before);
+    expect(h.pool.published).toHaveLength(published);
+  });
+
+  it("does not publish typing when visibility is denied", async () => {
+    const h = harness({ beforeSideEffect: async () => { throw new Error("visibility denied"); } });
+    await expect(h.router.onDiscordTyping("80351110224678912", h.link)).rejects.toThrow("visibility denied");
+    expect(h.pool.published).toHaveLength(0);
+  });
+
+  it("sheds a full chat queue without visibility reads and checks queued sends after revocation", async () => {
+    let checks = 0;
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    const h = harness({ beforeSideEffect: async () => {
+      checks++;
+      entered();
+      await blocked;
+      throw new Error("visibility denied");
+    } });
+    const queued = Array.from({ length: 200 }, (_, i) => h.router.onConcordChat(concordChat({ rumorId: String(i).padStart(64, "0") }), h.link));
+    const settled = Promise.allSettled(queued);
+    await started;
+    expect(checks).toBe(1);
+    expect(await h.router.onConcordChat(concordChat(), h.link)).toEqual([]);
+    expect(checks).toBe(1);
+    release();
+    const results = await settled;
+    expect(results.every((result) => result.status === "rejected" && result.reason.message === "visibility denied")).toBe(true);
+    expect(checks).toBe(200);
+    expect(h.webhooks.sent).toHaveLength(0);
+    expect(h.store.rows).toHaveLength(0);
+  });
+
   it("does not spend policy reads on bot or own-webhook/application echoes", async () => {
     let checks = 0;
     const h = harness({ beforeSideEffect: async () => { checks++; throw new Error("unavailable"); } });
@@ -1301,7 +1345,8 @@ describe("revocation applies to all message operations", () => {
   for (const method of ["onDiscordEdit", "onDiscordDelete", "onDiscordReaction", "onDiscordReactionRemove", "onConcordChat"] as const) {
     it(`blocks ${method} after permission loss`, async () => {
       const h = harness({ beforeSideEffect: async () => { throw new Error("visibility denied"); } });
-      await expect(h.router[method]({ user: { bot: false } } as never, h.link)).rejects.toThrow("visibility denied");
+      const event = method === "onConcordChat" ? concordChat() : { user: { bot: false } };
+      await expect(h.router[method](event as never, h.link)).rejects.toThrow("visibility denied");
       expect(h.pool.published).toHaveLength(0);
       expect(h.webhooks.sent).toHaveLength(0);
     });
