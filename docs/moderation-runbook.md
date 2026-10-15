@@ -60,4 +60,15 @@ there is no successful-authorization cache shared between effects.
 
 Before restoring an older relay snapshot: stop the public listener, restore current moderation state independently, supply explicit minimum policy revisions, run `offlineRelayRestore.ts` against the offline relay volume, and require success before bringing the listener back. Never roll moderation policy/tombstones back to the relay snapshot. Restore into an isolated namespace first. A failed reconciliation leaves the public listener stopped. Keep community read material, evidence keys and bot keys in the restricted secret store; keep the owner backup separate and audit logged.
 
+The offline target cannot also be the only source of fresh control policy.
+Keep an independently current control source available to `PolicyWatcher` while
+reconciling the separate offline volume. The bundled worker reads the loopback
+`MODERATION_LOCAL_RELAY_URL`; that source must remain available independently of
+the volume being restored. Its disconnect invalidates policy, and its snapshots
+expire after 30 seconds. A saved database snapshot alone is not a freshness
+source. If no independent source is available, recovery remains blocked with
+the public listener stopped. Do not extend `validUntil` or bypass readiness to
+make the scan finish. The synthetic restore fixture does not establish this
+operational prerequisite; rehearse it before pilot acceptance.
+
 Operator metrics contain aggregates only: policy count/revision/age, pending/failed deliveries, oldest pending age, Discord gateway connectivity and relay socket outages. They are internal scrape endpoints, not public portal routes. Never attach report plaintext, credentials, full request payloads or source addresses to monitoring labels or incident comments.
