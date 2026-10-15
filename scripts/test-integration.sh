@@ -16,10 +16,8 @@ try { await sql`select 1`; } finally { await sql.end(); }
 ./node_modules/.bin/tsc -p packages/moderation/tsconfig.json --noEmit
 ./node_modules/.bin/tsc -p packages/portal/tsconfig.json --noEmit
 ./node_modules/.bin/vite build packages/portal/web
+bash scripts/test-skipped-test-gate.sh
 TEST_LOG=$(mktemp)
 trap 'rm -f "$TEST_LOG"' EXIT
 bun test 2>&1 | tee "$TEST_LOG"
-if rg -q '^[[:space:]]+[1-9][0-9]* skip' "$TEST_LOG"; then
-  echo 'Integration suite skipped tests; check database and SPA setup.' >&2
-  exit 1
-fi
+bash scripts/assert-no-skipped-tests.sh "$TEST_LOG"
