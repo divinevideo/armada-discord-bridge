@@ -4,6 +4,7 @@ import type { NostrEvent } from "nostr-tools/pure";
 import type { CommunityPolicy } from "./contracts";
 import type { StoredDecision } from "./decisions";
 import { controlState, verifiedEvent } from "./relayPolicy";
+export class StalePreparedBanlistError extends Error {}
 export class ConcordActions {
   constructor(readonly community: CommunityV2, readonly identity: { pk: string; signer: StreamSigner }, private readonly refresh: () => Promise<CommunityPolicy>) {
     if (identity.pk === community.owner) throw new Error("Moderation workload must not use the owner identity");
@@ -62,7 +63,7 @@ export class ConcordActions {
       if (opened.author !== this.identity.pk || bytesToHex(edition.entityId) !== bytesToHex(banlistLocator(this.community.id))) throw new Error("Prepared banlist has wrong authority or scope");
       const current = folded.heads.get(bytesToHex(edition.entityId));
       const alreadyApplied = current && bytesToHex(current.hash) === bytesToHex(edition.selfHash);
-      if (!alreadyApplied && (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash))))) throw new Error("Prepared banlist would overwrite a concurrent edit");
+      if (!alreadyApplied && (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash))))) throw new StalePreparedBanlistError("Prepared banlist would overwrite a concurrent edit");
       const next = foldControlState([...editions, edition], this.community.id, this.community.owner, folded.heads);
       const head = next.headEditions.get(bytesToHex(edition.entityId));
       if (!head || bytesToHex(head.selfHash) !== bytesToHex(edition.selfHash) || next.banned.has(decision.author) !== (decision.action === "ban_member")) throw new Error("Prepared banlist is stale or unauthorized");

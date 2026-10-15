@@ -111,6 +111,40 @@ test("retrying a guild-scoped decision needs guild authority for its Discord del
   await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
 });
 
+test("Concord generation replacement and send intent are lease-fenced compare-and-swaps", async () => {
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community" }, actor);
+  await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour'`;
+  await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId} AND target = 'concord'`;
+  const old = (await decisions.claim())!;
+  // The schema default also covers pre-migration generations: no proof means
+  // uncertain, not safe to replace. Only saveEvents on an empty row clears it.
+  expect(old.publicationAttempted).toBe(true);
+  const first = [{ id: "1".repeat(64) }], second = [{ id: "2".repeat(64) }], third = [{ id: "3".repeat(64) }];
+  await decisions.saveEvents(old, first);
+  expect(old.publicationAttempted).toBe(false);
+  await sql`UPDATE moderation.deliveries SET lease_until = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId} AND target = 'concord'`;
+  const current = (await decisions.claim())!;
+  expect(current.signedEvents).toEqual(first);
+  expect(current.publicationAttempted).toBe(false);
+  await expect(decisions.replaceUnattemptedEvents(old, first, second)).rejects.toThrow(/lease/);
+  await expect(decisions.markPublicationAttempted(old, first)).rejects.toThrow(/lease/);
+  await expect(decisions.replaceUnattemptedEvents(current, third, second)).rejects.toThrow(/generation/);
+  expect(await decisions.replaceUnattemptedEvents(current, first, second)).toEqual(second);
+  await expect(decisions.markPublicationAttempted(current, first)).rejects.toThrow(/generation/);
+  await expect(decisions.replaceUnattemptedEvents(current, first, third)).rejects.toThrow(/generation/);
+  await decisions.markPublicationAttempted(current, second);
+  await expect(decisions.replaceUnattemptedEvents(current, second, third)).rejects.toThrow(/generation/);
+  // A repeated save/retry cannot reset uncertain publication to unattempted.
+  expect(await decisions.saveEvents(current, third)).toEqual(second);
+  expect(current.publicationAttempted).toBe(true);
+  await decisions.complete(current, "failed", "concord_recovery_requires_operator");
+  await sql`UPDATE moderation.deliveries SET state = 'verified' WHERE decision_id = ${accepted.decisionId} AND target <> 'concord'`;
+  await expect(decisions.retry(accepted.decisionId, actor)).rejects.toThrow(/retryable/);
+  const [row] = await sql`SELECT signed_events, publication_attempted FROM moderation.deliveries WHERE decision_id = ${accepted.decisionId} AND target = 'concord'`;
+  expect(row.signed_events).toEqual(second);
+  expect(row.publication_attempted).toBe(true);
+});
+
 test("the actual API role accepts decisions while retaining case locks and column-scoped privileges", async () => {
   const api = postgres(process.env.DATABASE_URL!, { max: 1, connection: { options: "-c role=moderation_api" }, onnotice: () => {} });
   try {

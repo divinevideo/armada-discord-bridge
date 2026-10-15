@@ -7,7 +7,7 @@ export interface VerifiedCoopActor { orgId: string; actorId: string; permissions
 export interface ModerationDecision { caseId: string; executionId: string; action: RoomAction; reason: string; scope: "message" | "community"; discordGuildConfirmed: boolean }
 export interface DecisionStatus { decisionId: string; target: RoomTarget; action: RoomAction; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
-export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null }
+export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationAttempted?: boolean }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const actions = new Set(["remove_message", "ban_member", "unban_member"]);
 function assertActor(actor: VerifiedCoopActor, permission?: string) {
@@ -66,6 +66,7 @@ export class Decisions {
     const guildRetryAllowed = !scope?.discord_guild_confirmed || actor.permissions.includes("discord_guild_ban");
     const retried = await this.sql`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
       WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8 AND (${guildRetryAllowed} OR target <> 'discord')
+        AND result_code IS DISTINCT FROM 'concord_recovery_requires_operator'
         AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
     if (!retried.length) throw new Error("No retryable delivery; escalate expired or exhausted decisions");
     return this.get(decisionId, actor);
@@ -83,7 +84,7 @@ export class Decisions {
       await tx`UPDATE moderation.deliveries SET token = ${token}, attempts = attempts + 1, lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp()
         WHERE decision_id = ${job.decision_id} AND target = ${job.target}`;
       const [row] = await tx`SELECT * FROM moderation.decisions WHERE decision_id = ${job.decision_id}`;
-      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + 1, signedEvents: job.signed_events };
+      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + 1, signedEvents: job.signed_events, publicationAttempted: job.publication_attempted };
     });
   }
   async defer(claim: DeliveryClaim): Promise<void> {
@@ -97,10 +98,35 @@ export class Decisions {
     if (!rows.length) throw new Error("Delivery lease lost");
   }
   async saveEvents(claim: DeliveryClaim, events: unknown[]): Promise<unknown[]> {
-    const rows = await this.sql`UPDATE moderation.deliveries SET signed_events = COALESCE(signed_events, ${this.sql.json(events as never)})
-      WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING signed_events`;
+    const rows = await this.sql`UPDATE moderation.deliveries SET signed_events = COALESCE(signed_events, ${this.sql.json(events as never)}),
+      publication_attempted = CASE WHEN signed_events IS NULL THEN false ELSE publication_attempted END
+      WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING signed_events, publication_attempted`;
     if (!rows.length) throw new Error("Delivery lease lost");
+    claim.signedEvents = rows[0].signed_events;
+    claim.publicationAttempted = rows[0].publication_attempted;
     return rows[0].signed_events;
+  }
+  async replaceUnattemptedEvents(claim: DeliveryClaim, previous: unknown[], events: unknown[]): Promise<unknown[]> {
+    // Only the exact generation proved never sent may be replaced. A stale
+    // lease or a publisher that won this CAS must leave its signed bytes intact.
+    const rows = await this.sql`UPDATE moderation.deliveries SET signed_events = ${this.sql.json(events as never)}, updated_at = clock_timestamp()
+      WHERE decision_id = ${claim.decision.decisionId} AND target = 'concord' AND target = ${claim.target}
+        AND token = ${claim.token} AND lease_until > clock_timestamp() AND publication_attempted = false
+        AND signed_events = ${this.sql.json(previous as never)} RETURNING signed_events`;
+    if (!rows.length) throw new Error("Delivery lease or unattempted generation lost");
+    claim.signedEvents = rows[0].signed_events;
+    claim.publicationAttempted = false;
+    return rows[0].signed_events;
+  }
+  async markPublicationAttempted(claim: DeliveryClaim, events: unknown[]): Promise<void> {
+    // Commit this BEFORE network I/O: a crash or timeout is not proof that a
+    // relay did not receive the edition. Such generations remain replay-only.
+    const rows = await this.sql`UPDATE moderation.deliveries SET publication_attempted = true, updated_at = clock_timestamp()
+      WHERE decision_id = ${claim.decision.decisionId} AND target = 'concord' AND target = ${claim.target}
+        AND token = ${claim.token} AND lease_until > clock_timestamp()
+        AND signed_events = ${this.sql.json(events as never)} RETURNING target`;
+    if (!rows.length) throw new Error("Delivery lease or generation lost");
+    claim.publicationAttempted = true;
   }
   async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0): Promise<void> {
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0 || !/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
