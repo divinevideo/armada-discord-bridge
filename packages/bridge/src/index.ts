@@ -18,7 +18,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
 
-import { guardEffects } from "./effectGuard";
+import { CONCORD_EFFECT_METHODS, guardEffects } from "./effectGuard";
 import { BridgeLeases, bridgeResource } from "./db/leases";
 import { parsePublicChannelRules, discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
 import { BlossomStore } from "./blossom";
@@ -90,22 +90,22 @@ const assertMayForward = async () => {
 const invite = parseInviteLink(inviteUrl);
 if (!invite) throw new Error("BRIDGE_INVITE_URL is not a valid Armada invite");
 const bootstrap = new RelayPool(invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS);
+cleanup.push(() => bootstrap.close());
 const { community } = await resolveInvite(inviteUrl, bootstrap);
 await bootstrap.close();
 console.log(`bridge: joined material for community ${community.name} (${community.idHex})`);
 
 const pool = new RelayPool(community.relays);
+cleanup.push(() => pool.close());
 const primary = localIdentity(primarySk(config.primarySecretKey));
 
-// Fold the Control Plane FIRST. It reads from the community root the invite
-// already carried, so it needs no private-channel key — which means the
-// roster, and therefore who is entitled to vend a channel key, is knowable
-// before we accept any. The intake below refuses bundles from anyone else.
+// Fold authority from the invite's community root before using its public channels.
+// Public-only production boot does not accept private-channel key bundles.
 const preflight = new ConcordClient(community, pool, primary);
 await preflight.syncControl();
 
 const rawClient = preflight;
-const client = guardEffects(rawClient, assertMayForward, new Set(["sendChat", "sendTyping", "publishJoin", "publishProfile", "publishDmRelays", "backfillChannel"]));
+const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
 
 const concordChannelId =
   process.env.CONCORD_CHANNEL_ID?.trim() || client.channels()[0]?.idHex;

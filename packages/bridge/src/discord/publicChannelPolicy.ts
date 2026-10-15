@@ -1,3 +1,5 @@
+import { DiscordReadScheduler } from "./rateAwareRead";
+
 /** Divine bridges only explicit public channels, independently of the bot's permissions. */
 export interface PublicChannelRules {
   guildId: string;
@@ -31,18 +33,53 @@ export class PublicChannelPolicy {
   ) {}
 
   async assertPublicChannel(guildId: string, channelId: string): Promise<void> {
-    if (guildId !== this.rules.guildId || !this.rules.channelIds.includes(channelId)) throw new Error("Discord channel not allowlisted");
+    this.assertAllowlisted(guildId, channelId);
     // Do not use gateway caches: a permission change must apply to replay and the next effect.
     const channel = object(await this.get(`/channels/${channelId}`));
     if (channel.id !== channelId || channel.guild_id !== guildId || channel.type !== 0) throw new Error("Discord channel not public");
     if (channel.parent_id !== null) {
       if (typeof channel.parent_id !== "string" || !SNOWFLAKE.test(channel.parent_id)) throw new Error("Discord category unavailable");
       if (this.rules.excludedCategoryIds.includes(channel.parent_id)) throw new Error("Discord channel in excluded category");
-      const parent = object(await this.get(`/channels/${channel.parent_id}`));
-      if (parent.id !== channel.parent_id || parent.guild_id !== guildId || parent.type !== 4 || typeof parent.name !== "string") throw new Error("Discord category unavailable");
-      if (parent.name.trim().toLowerCase() === "tickets") throw new Error("Discord channel in excluded category");
+    }
+    const parent = typeof channel.parent_id === "string"
+      ? object(await this.get(`/channels/${channel.parent_id}`)) : undefined;
+    this.assertChannel(guildId, channelId, channel, parent, await this.get(`/guilds/${guildId}/roles`));
+  }
+
+  async assertPublicChannels(guildId: string, channelIds: readonly string[]): Promise<void> {
+    for (const id of channelIds) this.assertAllowlisted(guildId, id);
+    if (!channelIds.length) return;
+    // A new snapshot per effect, never shared across publishes: the all-selected
+    // gate must still observe a revocation on any other selected channel.
+    const channels = await this.get(`/guilds/${guildId}/channels`);
+    if (!Array.isArray(channels)) throw new Error("Discord visibility data unavailable");
+    const byId = new Map<string, Record<string, unknown>>();
+    for (const value of channels) {
+      const channel = object(value);
+      if (typeof channel.id !== "string" || byId.has(channel.id)) throw new Error("Discord visibility data unavailable");
+      // Guild-scoped list responses may omit guild_id; the authenticated route
+      // supplies that binding. An explicit conflicting guild still fails below.
+      byId.set(channel.id, channel.guild_id === undefined ? { ...channel, guild_id: guildId } : channel);
     }
     const roles = await this.get(`/guilds/${guildId}/roles`);
+    for (const id of channelIds) {
+      const channel = object(byId.get(id));
+      this.assertChannel(guildId, id, channel, typeof channel.parent_id === "string" ? byId.get(channel.parent_id) : undefined, roles);
+    }
+  }
+
+  private assertAllowlisted(guildId: string, channelId: string): void {
+    if (guildId !== this.rules.guildId || !this.rules.channelIds.includes(channelId)) throw new Error("Discord channel not allowlisted");
+  }
+
+  private assertChannel(guildId: string, channelId: string, channel: Record<string, unknown>, parent: Record<string, unknown> | undefined, roles: unknown): void {
+    if (channel.id !== channelId || channel.guild_id !== guildId || channel.type !== 0) throw new Error("Discord channel not public");
+    if (channel.parent_id !== null) {
+      if (typeof channel.parent_id !== "string" || !SNOWFLAKE.test(channel.parent_id)) throw new Error("Discord category unavailable");
+      if (this.rules.excludedCategoryIds.includes(channel.parent_id)) throw new Error("Discord channel in excluded category");
+      if (!parent || parent.id !== channel.parent_id || parent.guild_id !== guildId || parent.type !== 4 || typeof parent.name !== "string") throw new Error("Discord category unavailable");
+      if (parent.name.trim().toLowerCase() === "tickets") throw new Error("Discord channel in excluded category");
+    }
     if (!Array.isArray(roles)) throw new Error("Discord permissions unavailable");
     const everyone = roles.map(object).filter((role) => role.id === guildId);
     if (everyone.length !== 1 || !Array.isArray(channel.permission_overwrites)) throw new Error("Discord permissions unavailable");
@@ -64,15 +101,20 @@ export class PublicChannelPolicy {
   }
 }
 
+// Multiple policy instances for the same bot must not evade each other's limits.
+const readers = new Map<string, DiscordReadScheduler>();
 export function discordPublicChannelPolicy(rules: PublicChannelRules, token: string): PublicChannelPolicy {
-  return new PublicChannelPolicy(rules, async (path) => {
-    if (!token) throw new Error("Discord bot not configured");
-    const response = await fetch(`https://discord.com/api/v10${path}`, {
-      headers: { Authorization: `Bot ${token}` },
-      signal: AbortSignal.timeout(5000),
-      redirect: "error",
+  let reader = readers.get(token);
+  if (!reader) {
+    reader = new DiscordReadScheduler(async (path) => {
+      if (!token) throw new Error("Discord bot not configured");
+      return fetch(`https://discord.com/api/v10${path}`, {
+        headers: { Authorization: `Bot ${token}` },
+        signal: AbortSignal.timeout(5000),
+        redirect: "error",
+      });
     });
-    if (!response.ok) throw new Error("Discord visibility data unavailable");
-    return response.json();
-  });
+    readers.set(token, reader);
+  }
+  return new PublicChannelPolicy(rules, (path) => reader!.get(path));
 }

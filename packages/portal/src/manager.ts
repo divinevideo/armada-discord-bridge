@@ -10,7 +10,7 @@
  */
 
 import { BridgeLeases, BridgeLeaseUnavailableError, bridgeResource, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
-import { guardEffects } from "@armada-bridge/bridge/src/effectGuard";
+import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
 import { randomBytes } from "node:crypto";
 import {
@@ -160,7 +160,7 @@ export class BridgeManager {
   constructor(
     private readonly sql: postgres.Sql,
     private readonly env: PortalEnv,
-    private readonly publicPolicy?: Pick<PublicChannelPolicy, "assertPublicChannel">,
+    private readonly publicPolicy?: Pick<PublicChannelPolicy, "assertPublicChannel"> & Partial<Pick<PublicChannelPolicy, "assertPublicChannels">>,
   ) {
     this.store = new PostgresMappingStore(sql);
   }
@@ -170,6 +170,15 @@ export class BridgeManager {
     if (!policy) throw new PublicPolicyUnavailableError("Public channel policy is not configured");
     try { await policy.assertPublicChannel(guildId, channelId); }
     catch { throw new PublicPolicyUnavailableError("Public channel visibility could not be verified"); }
+  }
+
+  async assertPublicChannels(guildId: string, channelIds: readonly string[]): Promise<void> {
+    const policy = this.publicPolicy ?? (this.env.publicChannels && discordPublicChannelPolicy(this.env.publicChannels, this.env.discordBotToken));
+    if (!policy) throw new PublicPolicyUnavailableError("Public channel policy is not configured");
+    try {
+      if (policy.assertPublicChannels) await policy.assertPublicChannels(guildId, channelIds);
+      else for (const id of channelIds) await policy.assertPublicChannel(guildId, id);
+    } catch { throw new PublicPolicyUnavailableError("Public channel visibility could not be verified"); }
   }
 
   get discordConnected(): boolean { return this.adapter?.client.isReady() ?? false; }
@@ -543,9 +552,7 @@ export class BridgeManager {
         await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
           AND status_detail = 'Forwarding blocked: public visibility unavailable'`;
       };
-      const client = guardEffects(rawClient, assertMayForward, new Set([
-        "sendChat", "sendTyping", "publishJoin", "publishProfile", "publishDmRelays", "publishManifest", "backfillChannel",
-      ]));
+      const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
 
       const channel = row.concord_channel_id ? client.channel(row.concord_channel_id) : undefined;
       if (!channel) {

@@ -275,10 +275,11 @@ export class Importer {
   ) {}
 
   private async assertPublicPlan(plan: ImportPlan): Promise<void> {
-    for (const channel of plan.channels.filter((c) => c.selected)) {
+    const selected = plan.channels.filter((c) => c.selected);
+    for (const channel of selected) {
       if (channel.private || channel.discordType !== 0) throw new Error("Only public text channels may be imported");
-      await this.manager.assertPublicChannel(plan.guild.id, channel.discordId);
     }
+    await this.manager.assertPublicChannels(plan.guild.id, selected.map((c) => c.discordId));
   }
 
   /** Snapshot the guild and store a previewed plan. */
@@ -297,14 +298,19 @@ export class Importer {
     const plan = buildImportPlan(snapshot);
     const publicChannels: PlannedChannel[] = [];
     for (const channel of plan.channels) {
-      if (channel.private || channel.discordType !== 0) continue;
+      if (channel.private || channel.discordType !== 0) {
+        plan.skipped.push({ kind: "channel", name: channel.name, reason: "only public text channels may be imported" });
+        continue;
+      }
       try {
         await this.manager.assertPublicChannel(guildId, channel.discordId);
         publicChannels.push(channel);
-      } catch { /* Excluded or unverifiable channels never enter a stored preview. */ }
+      } catch {
+        // Report the exclusion, not Discord errors or policy configuration.
+        plan.skipped.push({ kind: "channel", name: channel.name, reason: "excluded by public channel policy or visibility unavailable" });
+      }
     }
     plan.channels = publicChannels;
-    plan.skipped = [];
     if (!plan.channels.length) throw new Error("No configured public text channels are available");
     // Pre-flight the bot's Manage Webhooks in every live-bridgeable channel,
     // so the review screen can warn before wiring. Sequential (not a burst)

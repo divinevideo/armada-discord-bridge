@@ -299,6 +299,7 @@ describe("importer pipeline", () => {
     const routed: Array<{ channelId: string; id: string; timestampMs?: number }> = [];
     const manager = {
       assertPublicChannel: async () => {},
+      assertPublicChannels: async () => {},
       activateImported: async (row: BridgeRow) => void activated.push(row),
       // The wiring step provisions the identity, admits the bridge to any
       // private channel, then starts it — so the stub hands back a row with a
@@ -542,6 +543,7 @@ describe("importer pipeline", () => {
     const wire: NostrEvent[] = [];
     const manager = {
       assertPublicChannel: async () => {},
+      assertPublicChannels: async () => {},
       activateImported: async () => {},
       provisionImported: async (row: BridgeRow) => ({ ...row, primary_pk: `pk-${row.bridge_id}` }),
       startImported: async () => {},
@@ -607,7 +609,7 @@ describe("public-only import boundary", () => {
       import_id: "private-preview", owner_discord_id: "user1", discord_guild_id: "100",
       status: "previewed", plan: buildImportPlan(snapshot), community_id: null,
     });
-    const manager = { assertPublicChannel: async () => {} };
+    const manager = { assertPublicChannel: async () => {}, assertPublicChannels: async () => {} };
     const importer = new Importer(fakeSql(store), env, manager as never, () => wirePool([]), async () => [], async () => {});
     await expect(importer.prepare("private-preview", "user1", { ownerNpub: getPublicKey(generateSecretKey()) })).rejects.toThrow(/public/i);
     expect(store.imports.get("private-preview")!.community_id).toBeNull();
@@ -619,6 +621,7 @@ describe("public-only import boundary", () => {
     let sent = 0;
     const manager = {
       assertPublicChannel: async () => { if (!allowed) throw new Error("visibility denied"); },
+      assertPublicChannels: async () => { if (!allowed) throw new Error("visibility denied"); },
       resyncFor: async () => {},
       routerFor: () => ({ router: { onDiscordMessage: async () => { sent++; } }, link: {} }),
     };
@@ -641,8 +644,31 @@ it("does not mark history complete when this worker does not own the bridge", as
   plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
   const channel = plan.channels[0];
   const store = { imports: new Map<string, Record<string, unknown>>([["unowned", { import_id: "unowned", plan }]]), bridges: [] as Array<Record<string, unknown>> };
-  const manager = { assertPublicChannel: async () => {}, resyncFor: async () => {}, routerFor: () => undefined };
+  const manager = { assertPublicChannel: async () => {}, assertPublicChannels: async () => {}, resyncFor: async () => {}, routerFor: () => undefined };
   const importer = new Importer(fakeSql(store), env, manager as never);
   await expect((importer as unknown as { backfillChannel(id: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> }).backfillChannel("unowned", plan, channel)).rejects.toThrow(/not owned/);
   expect(channel.historyDoneAt).toBeUndefined();
+});
+
+it("authorizes the whole selected import once per effect, including other-channel revocation", async () => {
+  const plan = buildImportPlan(snapshot);
+  plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
+  expect(plan.channels.length).toBeGreaterThan(1);
+  let allowed = true;
+  const batches: string[][] = [];
+  const manager = {
+    assertPublicChannel: async () => { throw new Error("unexpected per-channel read"); },
+    assertPublicChannels: async (guild: string, ids: string[]) => {
+      expect(guild).toBe(plan.guild.id);
+      batches.push(ids);
+      if (!allowed) throw new Error("other selected channel revoked");
+    },
+  };
+  const importer = new Importer(fakeSql({ imports: new Map(), bridges: [] }), env, manager as never);
+  const gate = importer as unknown as { assertPublicPlan(plan: ImportPlan): Promise<void> };
+  await gate.assertPublicPlan(plan);
+  allowed = false;
+  await expect(gate.assertPublicPlan(plan)).rejects.toThrow("other selected channel revoked");
+  const selected = plan.channels.filter((c) => c.selected).map((c) => c.discordId);
+  expect(batches).toEqual([selected, selected]);
 });

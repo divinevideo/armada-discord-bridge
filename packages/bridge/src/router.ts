@@ -18,7 +18,7 @@ import type { ConcordClient } from "./concord/client";
 import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
 import type { LocalIdentity } from "./concord/signer";
-import { guardEffects } from "./effectGuard";
+import { CONCORD_EFFECT_METHODS, guardEffects } from "./effectGuard";
 import { ffmpegAvailable, mp4ToGif } from "./gif";
 import {
   attachmentFilename,
@@ -412,8 +412,8 @@ export class BridgeRouter {
     private readonly self: { applicationId: string; webhookIds: Set<string> },
     private readonly options: RouterOptions = {},
   ) {
-    const before = () => this.assertMayForward();
-    this.client = guardEffects(client, before, new Set(["sendChat", "sendTyping", "publishProfile", "publishJoin"]));
+    const before = options.beforeSideEffect ?? (() => this.assertMayForward());
+    this.client = guardEffects(client, before, CONCORD_EFFECT_METHODS);
     this.webhooks = guardEffects(webhooks, before, new Set(["send", "edit", "delete", "react", "unreact", "sendTyping"]));
     this.options = {
       ...options,
@@ -485,13 +485,13 @@ export class BridgeRouter {
 
   /** Discord -> Concord. Returns the rumor id, or undefined when skipped. */
   async onDiscordMessage(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
-    await this.assertMayForward();
     if (!link.enabled) return undefined;
     // Layer 1: our own webhook posts and application messages never bounce back.
     if (msg.webhookId && this.self.webhookIds.has(msg.webhookId)) return undefined;
     if (msg.applicationId && msg.applicationId === this.self.applicationId) return undefined;
     // Other bots are configurable later; skipped by default to avoid bot loops.
     if (msg.author.bot) return undefined;
+    await this.assertMayForward();
 
     const channel = this.client.channel(link.concordChannelIdHex);
     if (!channel) return undefined; // deleted or key not held; nothing to do
@@ -724,9 +724,9 @@ export class BridgeRouter {
    * the stable CDN image, self-contained for any Armada reader.
    */
   async onDiscordReaction(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
-    await this.assertMayForward();
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
+    await this.assertMayForward();
     if (!reaction.emoji.name) return undefined;
     const custom = reaction.emoji.id !== null;
     const content = custom ? `:${reaction.emoji.name}:` : reaction.emoji.name;
@@ -774,9 +774,9 @@ export class BridgeRouter {
    * rumor. The `k` tag marks it a reaction delete for Armada's fold.
    */
   async onDiscordReactionRemove(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
-    await this.assertMayForward();
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
+    await this.assertMayForward();
     if (!reaction.emoji.name) return undefined;
     const emojiKey = reaction.emoji.id ? `${reaction.emoji.name}:${reaction.emoji.id}` : reaction.emoji.name;
 

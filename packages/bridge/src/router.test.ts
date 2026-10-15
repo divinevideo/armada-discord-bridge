@@ -1249,6 +1249,24 @@ describe("escapeMarkdown", () => {
 });
 
 describe("public channel policy at side-effect boundaries", () => {
+  it("does not spend policy reads on bot or own-webhook/application echoes", async () => {
+    let checks = 0;
+    const h = harness({ beforeSideEffect: async () => { checks++; throw new Error("unavailable"); } });
+    for (const msg of [
+      discordMsg({ webhookId: "wh1" }),
+      discordMsg({ applicationId: "app1" }),
+      discordMsg({ author: { ...discordMsg().author, bot: true } }),
+    ]) {
+      expect(await h.router.onDiscordMessage(msg, h.link)).toBeUndefined();
+    }
+    for (const method of ["onDiscordReaction", "onDiscordReactionRemove"] as const) {
+      expect(await h.router[method]({ user: { bot: true } } as never, h.link)).toBeUndefined();
+    }
+    expect(checks).toBe(0);
+    expect(h.pool.published).toHaveLength(0);
+    expect(h.webhooks.sent).toHaveLength(0);
+  });
+
   it("does not publish or map content when authorization is denied", async () => {
     const h = harness({ beforeSideEffect: async () => { throw new Error("channel unavailable"); } });
     await expect(h.router.onDiscordMessage(discordMsg(), h.link)).rejects.toThrow("channel unavailable");
@@ -1283,7 +1301,7 @@ describe("revocation applies to all message operations", () => {
   for (const method of ["onDiscordEdit", "onDiscordDelete", "onDiscordReaction", "onDiscordReactionRemove", "onConcordChat"] as const) {
     it(`blocks ${method} after permission loss`, async () => {
       const h = harness({ beforeSideEffect: async () => { throw new Error("visibility denied"); } });
-      await expect(h.router[method]({} as never, h.link)).rejects.toThrow("visibility denied");
+      await expect(h.router[method]({ user: { bot: false } } as never, h.link)).rejects.toThrow("visibility denied");
       expect(h.pool.published).toHaveLength(0);
       expect(h.webhooks.sent).toHaveLength(0);
     });
