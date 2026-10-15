@@ -56,7 +56,7 @@ export class DiscordActions {
           await this.assertCurrent();
           const response = await providerRequest(this.request, "DELETE", `/channels/${copy.channelId}/messages/${copy.messageId}`);
           const deleted = response.status === 204 || await unknownResource(response, 10008);
-          if (!deleted) return { state: "failed", code: response.status === 429 ? "discord_rate_limited" : "discord_delete_failed" };
+          if (!deleted) return { state: "failed", code: "discord_delete_failed" };
           const verification = await providerRequest(this.request, "GET", `/channels/${copy.channelId}/messages/${copy.messageId}`);
           if (!await unknownResource(verification, 10008)) return { state: "failed", code: "discord_delete_unverified" };
         }
@@ -70,7 +70,7 @@ export class DiscordActions {
         const path = `/guilds/${member.guildId}/bans/${member.userId}`;
         const response = await providerRequest(this.request, decision.action === "ban_member" ? "PUT" : "DELETE", path);
         const applied = response.status === 204 || (decision.action === "unban_member" && await unknownResource(response, 10026));
-        if (!applied) return { state: "failed", code: response.status === 429 ? "discord_rate_limited" : "discord_member_action_failed" };
+        if (!applied) return { state: "failed", code: "discord_member_action_failed" };
         const verification = await providerRequest(this.request, "GET", path);
         const verified = decision.action === "ban_member" ? verification.status === 200 && (await verification.json() as { user?: { id?: string } }).user?.id === member.userId : await unknownResource(verification, 10026);
         if (!verified) return { state: "failed", code: "discord_member_action_unverified" };
