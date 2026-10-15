@@ -147,6 +147,8 @@ test("Concord generation replacement and send intent are lease-fenced compare-an
 });
 
 test("the actual API role accepts decisions while retaining case locks and column-scoped privileges", async () => {
+  // Boot reruns the earlier broad grant before the narrowing migrations.
+  await migrateModeration(sql);
   const api = postgres(process.env.DATABASE_URL!, { max: 1, connection: { options: "-c role=moderation_api" }, onnotice: () => {} });
   try {
     const [identity] = await api`SELECT current_user AS role,
@@ -168,6 +170,28 @@ test("the actual API role accepts decisions while retaining case locks and colum
     });
     await expect(api`UPDATE moderation.cases SET evidence = evidence WHERE case_id = ${caseId}`.execute()).rejects.toThrow(/permission denied/);
     await expect(api`UPDATE moderation.cases SET expires_at = expires_at WHERE case_id = ${caseId}`.execute()).rejects.toThrow(/permission denied/);
+    const events = [{ id: "4".repeat(64) }];
+    const token = crypto.randomUUID();
+    await sql`UPDATE moderation.deliveries SET state = 'failed', token = ${token}, lease_until = clock_timestamp() + interval '1 minute',
+      available_at = clock_timestamp() + interval '1 hour', updated_at = clock_timestamp() - interval '1 hour',
+      signed_events = ${sql.json(events)}, publication_attempted = true WHERE decision_id = ${accepted.decisionId}`;
+    const retried = await apiDecisions.retry(accepted.decisionId, actor);
+    expect(retried.deliveries.every((delivery) => delivery.state === "pending")).toBe(true);
+    expect((await apiDecisions.forCase(caseId, { ...actor, permissions: ["view"] })).some((decision) => decision.decisionId === accepted.decisionId)).toBe(true);
+    const rows = await sql`SELECT token, lease_until, available_at <= clock_timestamp() AS available,
+      updated_at > clock_timestamp() - interval '1 minute' AS updated, signed_events, publication_attempted
+      FROM moderation.deliveries WHERE decision_id = ${accepted.decisionId}`;
+    expect(rows).toHaveLength(3);
+    for (const row of rows) expect(row).toEqual({ token: null, lease_until: null, available: true, updated: true, signed_events: events, publication_attempted: true });
+    const columns = await sql`SELECT column_name FROM information_schema.columns WHERE table_schema = 'moderation' AND table_name = 'decisions'`;
+    for (const { column_name } of columns) {
+      await expect(api`UPDATE moderation.decisions SET ${api(column_name)} = ${api(column_name)} WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
+    }
+    for (const column of ["signed_events", "publication_attempted", "decision_id", "target", "attempts", "result_code"]) {
+      await expect(api`UPDATE moderation.deliveries SET ${api(column)} = ${api(column)} WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
+    }
+    await expect(api`DELETE FROM moderation.deliveries WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
+    await expect(api`DELETE FROM moderation.decisions WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
     await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
   } finally { await api.end(); }
 });
