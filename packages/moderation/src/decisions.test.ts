@@ -110,3 +110,29 @@ test("retrying a guild-scoped decision needs guild authority for its Discord del
   expect(retried.deliveries.every((d) => d.state === "pending")).toBe(true);
   await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
 });
+
+test("the actual API role accepts decisions while retaining case locks and column-scoped privileges", async () => {
+  const api = postgres(process.env.DATABASE_URL!, { max: 1, connection: { options: "-c role=moderation_api" }, onnotice: () => {} });
+  try {
+    const [identity] = await api`SELECT current_user AS role,
+      has_column_privilege(current_user, 'moderation.cases', 'case_id', 'UPDATE') AS can_lock,
+      has_column_privilege(current_user, 'moderation.cases', 'evidence', 'UPDATE') AS can_edit_evidence,
+      has_column_privilege(current_user, 'moderation.cases', 'expires_at', 'UPDATE') AS can_edit_expiry`;
+    expect(identity).toEqual({ role: "moderation_api", can_lock: true, can_edit_evidence: false, can_edit_expiry: false });
+    const apiDecisions = new Decisions(api, cipher, new Map([["a".repeat(64), org]]));
+    const request = { ...input, executionId: crypto.randomUUID() };
+    const accepted = await apiDecisions.acceptDecision(request, actor);
+    expect(accepted.deliveries.map((delivery) => delivery.state)).toEqual(["pending", "pending", "pending"]);
+    expect((await apiDecisions.acceptDecision(request, actor)).decisionId).toBe(accepted.decisionId);
+    await api.begin(async (tx) => {
+      await tx`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId} FOR SHARE`;
+      await expect(sql.begin(async (other) => {
+        await other.unsafe("SET LOCAL lock_timeout = '100ms'");
+        await other`DELETE FROM moderation.cases WHERE case_id = ${caseId}`;
+      })).rejects.toThrow(/lock timeout/);
+    });
+    await expect(api`UPDATE moderation.cases SET evidence = evidence WHERE case_id = ${caseId}`.execute()).rejects.toThrow(/permission denied/);
+    await expect(api`UPDATE moderation.cases SET expires_at = expires_at WHERE case_id = ${caseId}`.execute()).rejects.toThrow(/permission denied/);
+    await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
+  } finally { await api.end(); }
+});
