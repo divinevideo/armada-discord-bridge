@@ -7,7 +7,7 @@ export class LocalRelayDriver implements PurgeDriver {
     const url = new URL(relayUrl);
     if (url.protocol !== "ws:" || !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)) throw new Error("Purge verification must use the local relay");
   }
-  async barrier<T>(work: () => Promise<T>): Promise<T> {
+  async barrier<T>(work: (signal?: AbortSignal) => Promise<T>): Promise<T> {
     const holder = Bun.spawn(["flock", "--exclusive", "--wait", "30", "/data/admission.lock", "/bin/sh", "-c", "printf 'locked\\n'; read -r release"], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
     const reader = holder.stdout.getReader();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -15,7 +15,13 @@ export class LocalRelayDriver implements PurgeDriver {
       const first = await Promise.race([reader.read(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Relay barrier unavailable")), 31_000); })]);
       clearTimeout(timer);
       if (first.done || new TextDecoder().decode(first.value) !== "locked\n") throw new Error("Relay barrier unavailable");
-      return await Promise.race([work(), holder.exited.then(() => { throw new Error("Relay barrier lost"); })]);
+      const controller = new AbortController();
+      void holder.exited.then(() => controller.abort());
+      // Cancellation must settle the callback before cleanup releases resources;
+      // racing it lets database updates continue after the barrier has returned.
+      const result = await work(controller.signal);
+      if (controller.signal.aborted) throw new Error("Relay barrier lost");
+      return result;
     } finally {
       clearTimeout(timer);
       try { holder.stdin.write("release\n"); holder.stdin.end(); } catch { holder.kill(); }

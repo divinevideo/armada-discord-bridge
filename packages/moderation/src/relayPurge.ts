@@ -1,12 +1,13 @@
 import type { RoomTarget } from "./contracts";
 import { HEX_ID } from "./relayPolicy";
 export interface RemovalIndex {
+  underBarrier?<T>(driver: PurgeDriver, work: (index: RemovalIndex, signal?: AbortSignal) => Promise<T>): Promise<T>;
   start(target: RoomTarget, decisionId: string): Promise<number>;
   ids(target: RoomTarget): Promise<string[]>;
   finish(decisionId: string, state: "verified" | "failed"): Promise<void>;
 }
 export interface PurgeDriver {
-  barrier<T>(work: () => Promise<T>): Promise<T>;
+  barrier<T>(work: (signal?: AbortSignal) => Promise<T>): Promise<T>;
   delete(ids: string[]): Promise<void>;
   remaining(ids: string[]): Promise<string[]>;
 }
@@ -21,21 +22,28 @@ export class RelayPurger {
     let carrierIds: string[] = [];
     let stage = "barrier";
     try {
-      await this.driver.barrier(async () => {
+      const work = async (index: RemovalIndex, signal?: AbortSignal) => {
+        signal?.throwIfAborted();
         stage = "index";
-        carrierIds = await this.index.ids(target);
+        carrierIds = await index.ids(target);
+        signal?.throwIfAborted();
         stage = "delete";
         if (carrierIds.length) await this.driver.delete(carrierIds);
+        signal?.throwIfAborted();
         stage = "rescan";
-        const rescanned = await this.index.ids(target);
+        const rescanned = await index.ids(target);
+        signal?.throwIfAborted();
         if (rescanned.some((id) => !carrierIds.includes(id))) throw new Error("Carrier reconciliation changed");
         stage = "verify";
         if ((await this.driver.remaining(rescanned)).length) { stage = "carriers_remain"; throw new Error("Removal verification failed"); }
+        signal?.throwIfAborted();
         stage = "record";
-        await this.index.finish(decisionId, "verified");
-        state = "verified";
-        stage = "complete";
-      });
+        await index.finish(decisionId, "verified");
+      };
+      if (this.index.underBarrier) await this.index.underBarrier(this.driver, work);
+      else await this.driver.barrier((signal) => work(this.index, signal));
+      state = "verified";
+      stage = "complete";
     } catch { await this.index.finish(decisionId, "failed"); }
     return { decisionId, target, policyRevision: revision, state, carrierIds, stage };
   }
