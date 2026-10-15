@@ -151,6 +151,31 @@ test("restore propagates an admission lookup failure instead of deleting the car
   } finally { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`; }
 });
 
+test("restore deletes an old public carrier after its channel is deleted or made private", async () => {
+  const { buildChannelEdition, currentControlWriteGroup, hex32, openWrap, parseEdition, sealEdition } = await import("@armada-bridge/concord-core");
+  for (const deleted of [false, true]) {
+    const f = await relayFixture();
+    try {
+      await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+      expect((await store.admit(f.allowed)).action).toBe("accept");
+      const head = parseEdition(openWrap(f.controlEvent, f.controlStream.key));
+      const options = { actorPubkey: f.owner.pk, version: 2n, prevHash: head.selfHash };
+      const rumor = buildChannelEdition(hex32(f.channelId), { name: "general", private: !deleted, ...(deleted ? { deleted: true } : {}) }, options);
+      const event = await sealEdition(rumor, currentControlWriteGroup(f.community), f.owner.signer);
+      await store.install({ ...f.policy, revision: 2, controlEvents: [...f.policy.controlEvents, event] }, [f.controlStream, f.guestbookStream], 1);
+      expect((await store.admit(f.allowed)).action).toBe("reject");
+      const rows = await sql`SELECT community_id, revision FROM moderation.community_policy`;
+      const floors = Object.fromEntries(rows.map((row) => [row.community_id, Number(row.revision)]));
+      const removed: string[] = [];
+      expect(await reconcileRestore(store, { async *scan() { yield f.allowed; }, async delete(ids) { removed.push(...ids); } }, floors)).toEqual({ retained: 0, removed: 1 });
+      expect(removed).toEqual([f.allowed.id]);
+      // Unknown scope must still abort when another recovery policy goes stale.
+      await sql`UPDATE moderation.community_policy SET payload = payload || '{"validUntil":0}'::jsonb WHERE community_id = ${f.policy.communityId}`;
+      await expect(store.admitRestored(f.allowed)).rejects.toThrow(/Recovery policy unavailable/);
+    } finally { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`; }
+  }
+});
+
 test("a verified public guestbook join permits profile bootstrap without granting moderation authority", async () => {
   const f = await relayFixture();
   const core = await import("@armada-bridge/concord-core");

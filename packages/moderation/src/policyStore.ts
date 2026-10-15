@@ -102,11 +102,23 @@ export class PolicyStore {
       if (Buffer.byteLength(JSON.stringify(event)) > MAX_EVENT_BYTES || !HEX_ID.test(event.pubkey)) return rejected;
       return await this.sql.begin(async (tx) => {
         await tx.unsafe("SET LOCAL statement_timeout = '1500ms'");
+        if (restoring) {
+          // A removed public stream has no current scope. Rejecting it is safe
+          // only while the whole recovery policy is available, not merely when
+          // a key lookup returns no rows. Lock before lookup so a refresh cannot
+          // turn that absence into permission while we decide to delete bytes.
+          const communities = await tx`SELECT community_id FROM moderation.community_policy ORDER BY community_id`;
+          if (!communities.length) throw new Error("Recovery policy unavailable");
+          for (const row of communities) {
+            await policyLock(tx, row.community_id);
+            this.assertRecoveryPolicy(await this.load(tx, row.community_id));
+          }
+        }
         const candidates = await tx`SELECT community_id FROM moderation.streams WHERE pubkey = ${event.pubkey}
           UNION SELECT community_id FROM moderation.community_policy WHERE payload->'publicAuthors' ? ${event.pubkey}
           UNION SELECT community_id FROM moderation.observed_members WHERE author = ${event.pubkey} LIMIT 2`;
         if (candidates.length !== 1) {
-          if (restoring) throw new Error("Recovery policy scope unavailable");
+          if (restoring && candidates.length > 1) throw new Error("Recovery policy scope unavailable");
           return rejected;
         }
         const communityId = candidates[0].community_id as string;
