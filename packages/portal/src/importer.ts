@@ -73,7 +73,7 @@ import type {
  * another project's namespace would collide the day they define it.
  */
 export const DISCORD_IMPORT_METADATA_KEY = "discord.import";
-import { BridgeLeases } from "@armada-bridge/bridge/src/db/leases";
+import { BridgeLeases, BridgeLeaseUnavailableError, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
 import { guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
@@ -236,6 +236,7 @@ export class Importer {
   /** Imports with a pipeline currently running in this process. */
   private readonly running = new Set<string>();
   private readonly importGuards = new Map<string, () => Promise<void>>();
+  private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Imports with a pipeline running in this process right now. */
   get activeCount(): number {
@@ -267,11 +268,13 @@ export class Importer {
      * give-up path without sleeping for it.
      */
     private readonly publishRetryMs: number = 1500,
-    private readonly withImportLease: (id: string, work: () => Promise<void>) => Promise<void> =
+    private readonly withImportLease: (id: string, work: (lease?: BridgeLease) => Promise<void>) => Promise<void> =
       (id, work) => new BridgeLeases(sql).withBridgeLease(`import:${id}`, async (lease) => {
         this.importGuards.set(id, () => lease.assertCurrent());
-        try { await work(); } finally { this.importGuards.delete(id); }
+        try { await work(lease); } finally { this.importGuards.delete(id); }
       }),
+    /** Test seam: shorten the capped contention retry without changing lease TTL. */
+    private readonly leaseRetryMs = 5_000,
   ) {}
 
   private async assertPublicPlan(plan: ImportPlan): Promise<void> {
@@ -557,32 +560,53 @@ export class Importer {
         this.launch(row.import_id);
         continue;
       }
-      await this.sql`
-        UPDATE imports SET status = 'failed',
-          status_detail = 'interrupted by a portal restart; retry to resume from where it stopped',
-          updated_at = now()
-        WHERE import_id = ${row.import_id} AND status IN ('minting', 'publishing', 'wiring', 'history')`;
-      console.warn(`import ${row.import_id}: stranded since ${row.updated_at.toISOString()}; marked failed (retryable)`);
+      this.launchWithLease(row.import_id, async () => {
+        // A stale timestamp is not authority to interrupt a live owner.
+        throw new Error("interrupted by a portal restart; retry to resume from where it stopped");
+      });
     }
   }
 
   private launch(importId: string): void {
-    if (this.running.has(importId)) return;
-    this.running.add(importId);
-    void this.run(importId)
-      .catch(async (error) => {
-        console.error(`import ${importId}: failed:`, error);
-        await this.sql`
-          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
-          WHERE import_id = ${importId}`;
-      })
-      .finally(() => this.running.delete(importId));
+    this.launchWithLease(importId, () => this.runOwned(importId));
   }
 
   // ── The pipeline ───────────────────────────────────────────────────────────
 
-  private async run(importId: string): Promise<void> {
-    await this.withImportLease(importId, () => this.runOwned(importId));
+  private launchWithLease(importId: string, work: () => Promise<void>): void {
+    if (this.running.has(importId) || this.retryTimers.has(importId)) return;
+    this.running.add(importId);
+    void this.withImportLease(importId, async (lease) => {
+      // A retry may find that the other worker has already finished. Do not
+      // replay its pipeline or turn its completed import into a failure.
+      const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
+      if (!row || !["minting", "publishing", "wiring", "history"].includes(row.status)) return;
+      try {
+        await work();
+      } catch (error) {
+        if (error instanceof BridgeLeaseUnavailableError) throw error;
+        // The exception itself proves no ownership. Keep this inside the
+        // acquired lease and fence the UPDATE too: expiry can race the write.
+        const failed = await this.sql`
+          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
+          WHERE import_id = ${importId} AND EXISTS (
+            SELECT 1 FROM bridge_leases WHERE resource = ${`import:${importId}`}
+              AND token = ${lease?.token.toString() ?? null} AND expires_at > clock_timestamp()
+          ) RETURNING import_id`;
+        if (!failed.length) throw new BridgeLeaseUnavailableError("Import lease expired before failure recording");
+        console.error(`import ${importId}: failed:`, error);
+      }
+    }).catch((error) => {
+      console.warn(`import ${importId}: deferred without changing status:`, error);
+      // Contention and terminal lease loss leave the checkpoint/status intact.
+      // One capped, jittered timer per import also bounds DB-outage retries.
+      const timer = setTimeout(() => {
+        this.retryTimers.delete(importId);
+        this.launchWithLease(importId, work);
+      }, this.leaseRetryMs / 2 + Math.random() * this.leaseRetryMs / 2);
+      timer.unref();
+      this.retryTimers.set(importId, timer);
+    }).finally(() => this.running.delete(importId));
   }
 
   private async runOwned(importId: string): Promise<void> {
@@ -1012,22 +1036,13 @@ export class Importer {
 
   /** Backfill-only pipeline for rerunHistory (no re-mint, no re-wire). */
   private launchHistoryOnly(importId: string): void {
-    if (this.running.has(importId)) return;
-    this.running.add(importId);
-    void this.withImportLease(importId, async () => {
+    this.launchWithLease(importId, async () => {
       const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
       await this.importHistory(importId, row!.plan);
       await this.sql`
         UPDATE imports SET status = 'done', status_detail = NULL, updated_at = now()
         WHERE import_id = ${importId}`;
-    })
-      .catch(async (error) => {
-        console.error(`import ${importId}: history re-run failed:`, error);
-        await this.sql`
-          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
-          WHERE import_id = ${importId}`;
-      })
-      .finally(() => this.running.delete(importId));
+    });
   }
 
   private async backfillChannel(importId: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> {

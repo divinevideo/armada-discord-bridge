@@ -526,7 +526,7 @@ describe("importer pipeline", () => {
 
     // Idempotency: a re-run from checkpoints publishes nothing new.
     const wireLen = wire.length;
-    await (importer as unknown as { run: (id: string) => Promise<void> }).run("imp1");
+    await (importer as unknown as { runOwned: (id: string) => Promise<void> }).runOwned("imp1");
     expect(wire.length).toBe(wireLen);
     expect(activated.length).toBe(2);
     expect(row().status).toBe("done");

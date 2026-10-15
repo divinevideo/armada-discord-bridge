@@ -495,7 +495,7 @@ export class BridgeManager {
       starting = false;
       await lease.release().catch(() => {});
       if (lost) {
-        this.scheduleStartRetry(row.bridge_id, 0);
+        this.scheduleStartRetry(row.bridge_id, 0, true);
         throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
       }
       throw error;
@@ -951,7 +951,7 @@ export class BridgeManager {
     } finally {
       // This is not an operator pause: preserve durable status and retry even
       // if storage is still down. retryStart re-reads any subsequent pause.
-      this.scheduleStartRetry(bridgeId, 0);
+      this.scheduleStartRetry(bridgeId, 0, true);
     }
   }
 
@@ -1004,7 +1004,13 @@ export class BridgeManager {
     try {
       await this.start(row);
     } catch (error) {
-      if (error instanceof PublicPolicyUnavailableError || error instanceof BridgeLeaseUnavailableError) {
+      if (error instanceof BridgeLeaseUnavailableError) {
+        // Another owner (or a just-dead process's 90s lease) is not a bridge
+        // failure. Do not overwrite its status detail or wait minutes to retry.
+        this.scheduleStartRetry(row.bridge_id, attempt, true);
+        return;
+      }
+      if (error instanceof PublicPolicyUnavailableError) {
         try {
           await this.sql`UPDATE bridges SET status_detail = ${error.message}, updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
         } catch (bookkeepingError) {
@@ -1064,12 +1070,12 @@ export class BridgeManager {
     this.scheduleStartRetry(row.bridge_id, attempt);
   }
 
-  private scheduleStartRetry(bridgeId: string, attempt: number): void {
+  private scheduleStartRetry(bridgeId: string, attempt: number, leaseContention = false): void {
     if (this.startRetryTimers.has(bridgeId)) return;
     // Full jitter: bridges share relays, so one relay outage puts many
     // bridges into this path at once — identical delays would line them all
     // up on the same retry tick against a host that is already struggling.
-    const cap = Math.min(START_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), START_RETRY_MAX_MS);
+    const cap = leaseContention ? 5_000 : Math.min(START_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), START_RETRY_MAX_MS);
     const delay = cap / 2 + Math.random() * (cap / 2);
     const timer = setTimeout(() => {
       this.startRetryTimers.delete(bridgeId);

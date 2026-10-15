@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type postgres from "postgres";
-import type { BridgeLease } from "@armada-bridge/bridge/src/db/leases";
+import { BridgeLeaseUnavailableError, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
 import type { PortalEnv } from "./env";
 import { BridgeManager } from "./manager";
 
@@ -124,4 +124,39 @@ test("stop closes subscriptions and sockets and writes pause despite release fai
   expect(f.internal.byDiscordChannel.has(f.row.discord_channel_id)).toBe(false);
   expect(f.row.status).toBe("paused");
   expect(f.retries.size).toBe(0);
+});
+
+test("lease contention selects the short retry without writing another owner's detail or failure streak", async () => {
+  const f = fixture();
+  const calls: unknown[][] = [];
+  f.internal.scheduleStartRetry = (...args: unknown[]) => { calls.push(args); };
+  f.internal.start = async () => { throw new BridgeLeaseUnavailableError("other owner"); };
+  await f.internal.startTracked(f.row, 20);
+  expect(calls).toEqual([[f.row.bridge_id, 20, true]]);
+  expect(f.row.status).toBe("active");
+  expect(f.row.options).toEqual({});
+});
+
+test("lease retry stays capped at 2.5–5 seconds regardless of the attempt count", () => {
+  const manager = new BridgeManager({} as postgres.Sql, {} as PortalEnv);
+  const internal = manager as any;
+  const original = globalThis.setTimeout;
+  const delays: number[] = [];
+  globalThis.setTimeout = ((callback: () => void, delay: number) => {
+    delays.push(delay);
+    return original(callback, 60_000);
+  }) as typeof setTimeout;
+  try {
+    internal.scheduleStartRetry("contended", 100, true);
+    internal.scheduleStartRetry("contended", 101, true); // single timer per resource
+    internal.scheduleStartRetry("relay-outage", 0);
+    expect(delays).toHaveLength(2);
+    expect(delays[0]).toBeGreaterThanOrEqual(2_500);
+    expect(delays[0]).toBeLessThanOrEqual(5_000);
+    expect(delays[1]).toBeGreaterThanOrEqual(150_000);
+  } finally {
+    globalThis.setTimeout = original;
+    internal.cancelStartRetry("contended");
+    internal.cancelStartRetry("relay-outage");
+  }
 });
