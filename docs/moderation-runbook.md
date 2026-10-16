@@ -79,3 +79,15 @@ status and retry existing work. Alert on `concord_coop_handoffs_pending` and
 of Coop delivery or its acknowledgement, not a successful case-delivery claim.
 Database failure or failed evidence cleanup still makes the API unready. Worker
 policy readiness remains separate and continues to gate enforcement.
+
+Control-history capacity is not an accepted pilot limit yet. The validator
+memoizes verified cryptographic decoding only within its own bounded process
+cache; every admission still folds the complete installed history and checks
+freshness. Cold starts, newly seen editions and cache eviction still require
+verification. Strfry starts the plugin on a write, so startup work is part of
+that write's external timeout; warming before reading stdin is not an untimed
+startup phase. The existing finite history/load bounds also stop reconciliation
+when exhausted. Before pilot acceptance, select and verify a bounded history/load
+and pre-ceiling lifecycle plan, or an upstream-compatible snapshot/compaction
+design. Do not prune to current heads, raise bounds, or disable the hook as an
+operator workaround: historical authorization and ban state depend on the fold.

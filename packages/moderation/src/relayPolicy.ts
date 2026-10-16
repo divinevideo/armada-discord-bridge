@@ -3,11 +3,13 @@ import type { ParsedEdition } from "@armada-bridge/concord-core";
 import { verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { AdmissionContext, AdmissionResult, CarrierRecord, CommunityPolicy, RoomTarget } from "./contracts";
+import { ControlEditionCache } from "./controlEditionCache";
 
 export const MAX_EVENT_BYTES = 100_000;
 export const HEX_ID = /^[0-9a-f]{64}$/;
 const CHAT_KINDS = new Set([9, 1111, 7, 5, 3302, 1740, 23311]);
 const PUBLIC_KINDS = new Set([0, 10050, 10304, 30030, 33301]);
+const controlEditions = new ControlEditionCache();
 
 function requireThat(condition: unknown): asserts condition {
   if (!condition) throw new Error("policy rejected");
@@ -28,10 +30,9 @@ export function controlState(policy: CommunityPolicy) {
   requireThat(policy.controlEvents.length <= 4096 && policy.controlStreams.length > 0);
   const editions: ParsedEdition[] = [];
   for (const raw of policy.controlEvents) {
-    const event = verifiedEvent(raw);
-    const descriptor = policy.controlStreams.find((s) => s.key.pk === event.pubkey);
+    const descriptor = policy.controlStreams.find((s) => s.key.pk === raw.pubkey);
     requireThat(descriptor && descriptor.plane === "control" && descriptor.communityId === policy.communityId && !("sk" in descriptor.key));
-    editions.push(parseEdition(openWrap(event, descriptor.key)));
+    editions.push(controlEditions.read(raw, descriptor, () => parseEdition(openWrap(verifiedEvent(raw), descriptor.key))));
   }
   return { editions, folded: foldControlState(editions, hex32(policy.communityId), policy.owner) };
 }
