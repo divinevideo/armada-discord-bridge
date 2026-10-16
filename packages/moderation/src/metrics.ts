@@ -12,5 +12,12 @@ export async function collectMetrics(sql: postgres.Sql): Promise<string> {
     count(*) FILTER (WHERE d.state = 'failed') AS failed,
     COALESCE(max(GREATEST(0, extract(epoch FROM clock_timestamp() - c.created_at))) FILTER (WHERE d.state IN ('pending', 'acknowledged')), 0) AS age
     FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)`;
-  return renderMetrics({ policyCount: Number(policy.count), policyRevision: Number(policy.revision), policyAge: Number(policy.age), pending: Number(delivery.pending), failed: Number(delivery.failed), oldestPendingAge: Number(delivery.age) });
+  const [handoff] = await sql`SELECT count(*) AS pending,
+    COALESCE(max(GREATEST(0, extract(epoch FROM clock_timestamp() - c.created_at))), 0) AS age
+    FROM moderation.coop_handoffs h JOIN moderation.cases c USING (case_id)
+    WHERE h.state = 'pending' AND c.expires_at > clock_timestamp()`;
+  const handoffPending = Number(handoff.pending), handoffAge = Number(handoff.age);
+  if (![handoffPending, handoffAge].every((value) => Number.isFinite(value) && value >= 0)) throw new Error('Invalid handoff metric');
+  return renderMetrics({ policyCount: Number(policy.count), policyRevision: Number(policy.revision), policyAge: Number(policy.age), pending: Number(delivery.pending), failed: Number(delivery.failed), oldestPendingAge: Number(delivery.age) })
+    + `# TYPE concord_coop_handoffs_pending gauge\nconcord_coop_handoffs_pending ${handoffPending}\n# TYPE concord_coop_oldest_pending_seconds gauge\nconcord_coop_oldest_pending_seconds ${handoffAge}\n`;
 }

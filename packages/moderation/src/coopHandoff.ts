@@ -34,9 +34,4 @@ export class CoopHandoff {
       return true;
     });
   }
-  async healthy(): Promise<boolean> {
-    const [row] = await this.sql`SELECT count(*)::int AS count FROM moderation.coop_handoffs h JOIN moderation.cases c USING (case_id)
-      WHERE c.org_id = ${this.config.orgId} AND h.state = 'pending' AND c.created_at < clock_timestamp() - interval '1 minute'`;
-    return row.count === 0;
-  }
 }

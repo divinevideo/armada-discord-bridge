@@ -72,3 +72,10 @@ make the scan finish. The synthetic restore fixture does not establish this
 operational prerequisite; rehearse it before pilot acceptance.
 
 Operator metrics contain aggregates only: policy count/revision/age, pending/failed deliveries, oldest pending age, Discord gateway connectivity and relay socket outages. They are internal scrape endpoints, not public portal routes. Never attach report plaintext, credentials, full request payloads or source addresses to monitoring labels or incident comments.
+
+The API remains ready during a Coop handoff backlog so staff can still inspect
+status and retry existing work. Alert on `concord_coop_handoffs_pending` and
+`concord_coop_oldest_pending_seconds`; an increasing age requires investigation
+of Coop delivery or its acknowledgement, not a successful case-delivery claim.
+Database failure or failed evidence cleanup still makes the API unready. Worker
+policy readiness remains separate and continues to gate enforcement.

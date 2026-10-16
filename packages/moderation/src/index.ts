@@ -1,4 +1,5 @@
 import { collectMetrics } from "./metrics";
+import { apiReadiness } from "./apiReadiness";
 import { CoopHandoff } from "./coopHandoff";
 import postgres from "postgres";
 import { rehydrateCommunity } from "@armada-bridge/concord-core";
@@ -58,7 +59,7 @@ async function main() {
       const path = new URL(request.url).pathname;
       if (path === "/healthz") return new Response("ok");
       if (path === "/metrics") { try { return new Response(await collectMetrics(sql), { headers: { "content-type": "text/plain; version=0.0.4", "cache-control": "no-store" } }); } catch { return new Response("unavailable", { status: 503 }); } }
-      if (path === "/readyz") { try { await sql`SELECT 1`; if (cleanupFailed || !await handoff.healthy()) throw new Error(); return new Response("ok"); } catch { return new Response("unavailable", { status: 503 }); } }
+      if (path === "/readyz") return await apiReadiness(sql, cleanupFailed) ? new Response("ok") : new Response("unavailable", { status: 503 });
       try { return await api(request); } catch { return Response.json({ error: "unavailable" }, { status: 503 }); }
     } });
     try { await new Promise<void>((resolve) => { if (stop.signal.aborted) resolve(); else stop.signal.addEventListener("abort", () => resolve(), { once: true }); }); }
