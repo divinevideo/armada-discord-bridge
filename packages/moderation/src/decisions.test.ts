@@ -12,6 +12,7 @@ import { deliverConcord } from "./concordDelivery";
 import { RetryableDeliveryError } from "./discordActions";
 import { PolicyStore } from "./policyStore";
 import { controlState } from "./relayPolicy";
+import { ModerationWorker, type ExecutionContext } from "./worker";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 const org = crypto.randomUUID(), caseId = crypto.randomUUID(), executionId = crypto.randomUUID();
 const actor = { orgId: org, actorId: "synthetic-reviewer", permissions: ["remove_message", "ban_member", "unban_member", "retry"] };
@@ -486,4 +487,98 @@ test("expiry clears uncertain signed bytes but leaves the successor waiting for 
     expect(await h.outbox.claim()).toBeUndefined();
     expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
   } finally { await h.cleanup(); }
+});
+
+function latch() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+// Pause only at completed database operations, keeping the real SQL, row locks,
+// leases and worker code in the test. No production scheduling hook is needed.
+function claimBarrier(client: postgres.Sql, beforeBegin?: () => Promise<void>, afterSelection?: () => Promise<void>): postgres.Sql {
+  return new Proxy(client, {
+    get(target, key) {
+      if (key !== "begin") return Reflect.get(target, key);
+      return async (callback: (tx: postgres.TransactionSql) => Promise<unknown>) => {
+        await beforeBegin?.();
+        return client.begin(async (tx) => callback(new Proxy(tx, {
+          apply(target, receiver, args) {
+            const query = Reflect.apply(target, receiver, args);
+            if (String(args[0][0]).startsWith("SELECT d.*")) return (async () => {
+              const rows = await query;
+              await afterSelection?.();
+              return rows;
+            })();
+            return query;
+          },
+        })));
+      };
+    },
+  });
+}
+
+for (const [olderAction, newerAction] of [["ban_member", "unban_member"], ["unban_member", "ban_member"]] as const) test(`two concurrent claimers cannot apply an older ${olderAction} after the newer ${newerAction}`, async () => {
+  const subject = await memberCase();
+  const first = await decisions.acceptDecision(member(subject, olderAction), actor);
+  await hold(first.decisionId, "divine_relay");
+  const selected = latch(), finishSelection = latch(), secondReady = latch(), startSecond = latch();
+  const applicationName = `member-claim-race-${crypto.randomUUID()}`;
+  const secondSql = postgres(process.env.DATABASE_URL!, { max: 1, connection: { application_name: applicationName }, onnotice: () => {} });
+  const firstOutbox = new Decisions(claimBarrier(sql, undefined, async () => { selected.resolve(); await finishSelection.promise; }), cipher, new Map([["a".repeat(64), org]]));
+  const secondOutbox = new Decisions(claimBarrier(secondSql, async () => { secondReady.resolve(); await startSecond.promise; }), cipher, new Map([["a".repeat(64), org]]));
+  const firstClaim = firstOutbox.claim();
+  let secondClaim: ReturnType<Decisions["claim"]> | undefined;
+  try {
+    await selected.promise; // A has locked the old row but has not written its lease.
+    expect((await sql`SELECT lease_until FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`)[0].lease_until).toBeNull();
+    secondClaim = secondOutbox.claim();
+    await secondReady.promise;
+    // On the broken implementation both supersession sweeps are now complete.
+    // A new decision arrives before B's SKIP LOCKED selection skips the old row.
+    const second = await decisions.acceptDecision(member(subject, newerAction), actor);
+    await hold(second.decisionId, "divine_relay");
+    let secondFinished = false;
+    void secondClaim.then(() => { secondFinished = true; });
+    startSecond.resolve();
+    // Wait for a real scheduling boundary: either B claimed the successor or
+    // Postgres reports B waiting for claim serialization. Elapsed time itself
+    // is never evidence that B waited.
+    let reachedBoundary = false;
+    for (let attempts = 0; attempts < 200; attempts++) {
+      const [backend] = await sql`SELECT wait_event_type FROM pg_stat_activity WHERE application_name = ${applicationName}`;
+      if (secondFinished || backend?.wait_event_type === "Lock") { reachedBoundary = true; break; }
+      await Bun.sleep(5);
+    }
+    expect(reachedBoundary).toBe(true);
+    finishSelection.resolve();
+    const [a, b] = await Promise.all([firstClaim, secondClaim]);
+    expect(a?.decision.decisionId).toBe(first.decisionId);
+    // Exercise the dangerous worker order: B executes before A. The community
+    // lock serializes them, but without claim fencing the old action wins last.
+    const queued = [b, a].filter((claim): claim is NonNullable<typeof claim> => Boolean(claim));
+    const queuedOutbox = new Proxy(decisions, { get(target, key) { return key === "claim" ? async () => queued.shift() : Reflect.get(target, key); } });
+    let banned = olderAction === "unban_member";
+    const context = async (_claim: unknown, assertCurrent: () => Promise<void>): Promise<ExecutionContext> => ({
+      authorize: async () => {}, assertCurrent,
+      setRelayBan: async (decision) => { banned = decision.action === "ban_member"; return true; },
+      removeFromRelay: async () => ({ state: "verified" }),
+      executeConcord: async () => ({ state: "verified", code: "unused" }),
+      discord: { execute: async () => ({ state: "verified", code: "unused" }) },
+    });
+    const reordered = new ModerationWorker(sql, queuedOutbox, context);
+    while (queued.length) await reordered.tick();
+    // A legitimately held older lease may finish first, then ordinary claims
+    // deliver the successor. Already-verified decisions cannot be replayed.
+    const ordinary = new ModerationWorker(sql, decisions, context);
+    while (await ordinary.tick()) {}
+    expect(banned).toBe(newerAction === "ban_member");
+    expect((await decisions.get(second.decisionId, actor)).deliveries.find((delivery) => delivery.target === "divine_relay")?.state).toBe("verified");
+  } finally {
+    startSecond.resolve(); finishSelection.resolve();
+    await Promise.allSettled([firstClaim, ...(secondClaim ? [secondClaim] : [])]);
+    await sql`DELETE FROM moderation.decisions WHERE case_id = ${subject.caseId}`;
+    await secondSql.end();
+  }
 });

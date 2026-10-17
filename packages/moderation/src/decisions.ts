@@ -123,23 +123,28 @@ export class Decisions {
     return this.get(decisionId, actor);
   }
   async claim(): Promise<DeliveryClaim | undefined> {
-    await this.sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'retry_budget_exhausted', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
-      WHERE state IN ('pending', 'acknowledged') AND attempts >= 8 AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
-    // The superseded decision keeps its record; its unsent signed bytes have
-    // no further use. superseded_by is the next decision accepted for the
-    // member, so the chain reads in staff order whenever this sweep runs.
-    await this.sql`UPDATE moderation.deliveries d SET state = 'failed', result_code = 'superseded_by_newer_decision', signed_events = NULL, token = NULL, lease_until = NULL, updated_at = clock_timestamp(),
-        superseded_by = (SELECT n.decision_id FROM moderation.decisions n WHERE ${this.sql.unsafe(newerThan("n", "c"))} ORDER BY n.created_at, n.decision_id LIMIT 1)
-      FROM moderation.decisions c
-      WHERE c.decision_id = d.decision_id AND d.state IN ('pending', 'acknowledged') AND NOT ${this.sql.unsafe(inFlight("d"))}
-        AND EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${this.sql.unsafe(newerThan("n", "c"))})`;
     return this.sql.begin(async (tx) => {
+      // Claiming is a short database-only transaction. Serializing its sweep
+      // and lease write makes every later claimer observe either supersession
+      // or the earlier lease, including a decision accepted between the sweep
+      // and selection. The community execution lock alone cannot order claims
+      // that have already committed. This lock is never taken by acceptance,
+      // Retry or execution, so their member/community locks cannot invert it.
+      await tx`SELECT pg_advisory_xact_lock(483217, 1)`;
+      await tx`UPDATE moderation.deliveries SET state = 'failed', result_code = 'retry_budget_exhausted', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+        WHERE state IN ('pending', 'acknowledged') AND attempts >= 8 AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
+      // The superseded decision keeps its record; its unsent signed bytes have
+      // no further use. superseded_by is the next decision accepted for the
+      // member, so the chain reads in staff order whenever this sweep runs.
+      await tx`UPDATE moderation.deliveries d SET state = 'failed', result_code = 'superseded_by_newer_decision', signed_events = NULL, token = NULL, lease_until = NULL, updated_at = clock_timestamp(),
+          superseded_by = (SELECT n.decision_id FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))} ORDER BY n.created_at, n.decision_id LIMIT 1)
+        FROM moderation.decisions c
+        WHERE c.decision_id = d.decision_id AND d.state IN ('pending', 'acknowledged') AND NOT ${tx.unsafe(inFlight("d"))}
+          AND EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))})`;
       // A membership target waits, without spending attempts, while an older
       // decision's same target is in flight. An older row that a newer decision
       // committed just after the sweep may still be claimed here; it is then the
       // one in flight, and the newer target applies on top once it completes.
-      // Execution is serialized per community (ModerationWorker), so a claim
-      // that loses that lock defers and meets this check again.
       const [job] = await tx`SELECT d.* FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
         WHERE d.state IN ('pending', 'acknowledged') AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
           AND d.attempts < 8 AND c.expires_at > clock_timestamp()
