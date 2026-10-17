@@ -58,6 +58,16 @@ describe.skipIf(!dbUp)("sharedMasterSecret", () => {
     expect(unseal(SEAL_KEY, other)).not.toBe(unseal(SEAL_KEY, one));
   });
 
+  it("uses the provisioned worker puppet root and rejects drift on relink", async () => {
+    const provisioned = { communityId: COMMUNITY, guildId: "100000000000000043", key: "cd".repeat(32) };
+    const manager = new BridgeManager(sql, { ...env, puppetMaster: provisioned });
+    const sealed = await secretFor(manager, COMMUNITY, provisioned.guildId);
+    expect(derivePuppet(unseal(SEAL_KEY, sealed), "200000000000000002").pk).toBe(derivePuppet(provisioned.key, "200000000000000002").pk);
+    const changed = new BridgeManager(sql, { ...env, puppetMaster: { ...provisioned, key: "ef".repeat(32) } });
+    await expect(secretFor(changed, COMMUNITY, provisioned.guildId)).rejects.toThrow();
+    await expect(secretFor(manager, COMMUNITY, "100000000000000044")).rejects.toThrow();
+  });
+
   it("concurrent first activations converge on one secret", async () => {
     const [x, y] = await Promise.all([
       secretFor(mgr, COMMUNITY, "100000000000000042"),
@@ -101,4 +111,34 @@ describe("a down gateway defers, never severs", () => {
       /sealed key material/i,
     );
   });
+});
+
+describe("public policy at manager boundaries", () => {
+  const env = { mode: "public", sealKeyHex: SEAL_KEY } as PortalEnv;
+  const denied = { assertPublicChannel: async () => { throw new Error("test visibility denied"); } };
+  const row = {
+    bridge_id: "public-boundary", community_id: "cd".repeat(32),
+    discord_guild_id: "100000000000000001", discord_channel_id: "100000000000000002",
+    status: "pending_confirm", invite_url_sealed: new Uint8Array([1]),
+    master_secret_sealed: new Uint8Array([1]), primary_sk_sealed: new Uint8Array([1]),
+  };
+  it("checks visibility before decoding keys or opening relay connections on restart", async () => {
+    const manager = new BridgeManager(sql, env, denied);
+    await expect(manager.startImported(row as never)).rejects.toThrow("Public channel visibility could not be verified");
+  });
+  it("checks visibility before minting keys or changing activation state", async () => {
+    const manager = new BridgeManager(sql, env, denied);
+    await expect(manager.activate(row as never)).rejects.toThrow("Public channel visibility could not be verified");
+    await expect(manager.provisionImported(row as never)).rejects.toThrow("Public channel visibility could not be verified");
+  });
+});
+
+it("legacy channel admission accepts multiple guilds without invoking public visibility", async () => {
+  const denied = { assertPublicChannel: async () => { throw new Error("visibility denied"); } };
+  const manager = new BridgeManager({} as never, { mode: "legacy" } as PortalEnv, denied);
+  await manager.assertChannelPolicy("guild-a", "private-a");
+  await manager.assertChannelPolicy("guild-b", "private-b");
+  await expect(manager.assertPublicChannel("guild-a", "private-a")).rejects.toThrow(/visibility/);
+  const publicManager = new BridgeManager({} as never, { mode: "public" } as PortalEnv, denied);
+  await expect(publicManager.assertChannelPolicy("guild-a", "private-a")).rejects.toThrow(/visibility/);
 });

@@ -9,6 +9,9 @@
  * portal cannot bypass it.
  */
 
+import { BridgeLeases, BridgeLeaseUnavailableError, bridgeResource, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
+import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/effectGuard";
+import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
 import { randomBytes } from "node:crypto";
 import {
   Permissions,
@@ -21,6 +24,7 @@ import type { ChannelV2, OpenedChat } from "@armada-bridge/concord-core";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { KlipyClient } from "@armada-bridge/bridge/src/klipy";
 import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/client";
+import { identityRelayPool } from "@armada-bridge/bridge/src/concord/identityPool";
 import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyIntake";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
@@ -61,6 +65,8 @@ export interface BridgeRow {
 }
 
 interface Running {
+  lease: BridgeLease;
+  assertMayForward: () => Promise<void>;
   id: string;
   client: ConcordClient;
   pool: RelayPool;
@@ -138,6 +144,8 @@ export const BRIDGE_COMMANDS = [
   },
 ];
 
+class PublicPolicyUnavailableError extends Error {}
+
 export class BridgeManager {
   private adapter?: DiscordAdapter;
   private readonly running = new Map<string, Running>();
@@ -155,9 +163,32 @@ export class BridgeManager {
   constructor(
     private readonly sql: postgres.Sql,
     private readonly env: PortalEnv,
+    private readonly publicPolicy?: Pick<PublicChannelPolicy, "assertPublicChannel"> & Partial<Pick<PublicChannelPolicy, "assertPublicChannels">>,
   ) {
     this.store = new PostgresMappingStore(sql);
   }
+
+  async assertChannelPolicy(guildId: string, channelId: string): Promise<void> {
+    if (this.env.mode === "public") await this.assertPublicChannel(guildId, channelId);
+  }
+
+  async assertPublicChannel(guildId: string, channelId: string): Promise<void> {
+    const policy = this.publicPolicy ?? (this.env.publicChannels && discordPublicChannelPolicy(this.env.publicChannels, this.env.discordBotToken));
+    if (!policy) throw new PublicPolicyUnavailableError("Public channel policy is not configured");
+    try { await policy.assertPublicChannel(guildId, channelId); }
+    catch { throw new PublicPolicyUnavailableError("Public channel visibility could not be verified"); }
+  }
+
+  async assertPublicChannels(guildId: string, channelIds: readonly string[]): Promise<void> {
+    const policy = this.publicPolicy ?? (this.env.publicChannels && discordPublicChannelPolicy(this.env.publicChannels, this.env.discordBotToken));
+    if (!policy) throw new PublicPolicyUnavailableError("Public channel policy is not configured");
+    try {
+      if (policy.assertPublicChannels) await policy.assertPublicChannels(guildId, channelIds);
+      else for (const id of channelIds) await policy.assertPublicChannel(guildId, id);
+    } catch { throw new PublicPolicyUnavailableError("Public channel visibility could not be verified"); }
+  }
+
+  get discordConnected(): boolean { return this.adapter?.client.isReady() ?? false; }
 
   async init(): Promise<void> {
     if (this.env.discordBotToken) {
@@ -216,6 +247,10 @@ export class BridgeManager {
         const rb = this.activeRouterFor(typing.channelId);
         if (rb) await rb.router!.onDiscordTyping(typing.userId, rb.link);
       },
+    }, async (channelId) => {
+      const running = this.activeRouterFor(channelId);
+      if (!running) throw new Error("No active channel owner");
+      await running.assertMayForward();
     });
   }
 
@@ -336,7 +371,7 @@ export class BridgeManager {
         await client.syncControl();
         return {
           community: { idHex: community.idHex, name: community.name, relays: community.relays },
-          channels: client.channels().map((c) => ({ idHex: c.idHex, name: c.name })),
+          channels: client.channels().filter((c) => this.env.mode !== "public" || !c.isPrivate).map((c) => ({ idHex: c.idHex, name: c.name })),
         };
       } finally {
         await pool.close();
@@ -354,7 +389,9 @@ export class BridgeManager {
    * back the same row.
    */
   private async sharedMasterSecret(communityId: string, guildId: string): Promise<Uint8Array> {
-    const candidate = seal(this.env.sealKeyHex, randomBytes(32).toString("hex"));
+    const master = this.env.puppetMaster;
+    if (master && (master.communityId !== communityId || master.guildId !== guildId)) throw new Error("Provisioned puppet scope mismatch");
+    const candidate = seal(this.env.sealKeyHex, master?.key ?? randomBytes(32).toString("hex"));
     await this.sql`
       INSERT INTO guild_community_secrets (community_id, discord_guild_id, master_secret_sealed)
       VALUES (${communityId}, ${guildId}, ${candidate})
@@ -362,6 +399,7 @@ export class BridgeManager {
     const [row] = await this.sql<{ master_secret_sealed: Uint8Array }[]>`
       SELECT master_secret_sealed FROM guild_community_secrets
       WHERE community_id = ${communityId} AND discord_guild_id = ${guildId}`;
+    if (master && unseal(this.env.sealKeyHex, row.master_secret_sealed) !== master.key) throw new Error("Puppet root differs from provisioned worker identity");
     return row.master_secret_sealed;
   }
 
@@ -370,6 +408,7 @@ export class BridgeManager {
     if (!row.community_id || !row.discord_guild_id) {
       throw new Error("bridge must be linked (community + guild) before activation");
     }
+    await this.assertChannelPolicy(row.discord_guild_id, row.discord_channel_id ?? "");
     const primarySk = generateSecretKey();
     const primary = localIdentity(primarySk);
     const confirmCode = randomBytes(4).toString("hex");
@@ -397,15 +436,14 @@ export class BridgeManager {
   /**
    * Mint the bridge's identity and mark it active, WITHOUT starting it.
    *
-   * Split out from {@link activateImported} because a private channel's key has
-   * to reach this npub before the bridge boots: `start()` takes key delivery
-   * exactly once, at boot (see keyIntake.ts). A bridge started first simply
-   * cannot see the channel, and would sit there mirroring nothing.
+   * Kept separate from {@link activateImported} so import checkpoints can persist
+   * provisioned identity before starting the public-channel bridge.
    */
   async provisionImported(row: BridgeRow): Promise<BridgeRow> {
     if (!row.community_id || !row.discord_guild_id) {
       throw new Error("bridge must be linked (community + guild) before activation");
     }
+    await this.assertChannelPolicy(row.discord_guild_id, row.discord_channel_id ?? "");
     const primarySk = generateSecretKey();
     const primary = localIdentity(primarySk);
     const masterSecretSealed = await this.sharedMasterSecret(row.community_id, row.discord_guild_id);
@@ -435,163 +473,231 @@ export class BridgeManager {
     if (this.running.has(row.bridge_id)) return;
     // An active bridge mirrors in both directions through the shared gateway,
     // so without it there is nothing to attach — defer before doing the relay
-    // work (resolve, fold, key intake) rather than fold a whole community only
+    // work (resolve and fold) rather than fold a whole community only
     // to find nowhere to route it. GatewayUnavailableError is caught in
     // startTracked and never counts toward a sever (see its definition).
     if (row.status === "active" && !this.adapter) throw new GatewayUnavailableError();
     if (!row.invite_url_sealed || !row.master_secret_sealed || !row.primary_sk_sealed) {
       throw new Error("bridge is missing sealed key material");
     }
-    const inviteUrl = unseal(this.env.sealKeyHex, row.invite_url_sealed);
-    const invite = parseInviteLink(inviteUrl);
-    if (!invite) throw new Error("stored invite no longer parses");
-
-    const bootstrap = new RelayPool(
-      await filterPublicRelays(
-        invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS,
-        STOCK_RELAYS,
-      ),
-    );
-    const { community } = await resolveInvite(inviteUrl, bootstrap).finally(() => void bootstrap.close());
-
-    const primarySk = Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, row.primary_sk_sealed), "hex"));
-    const primary = localIdentity(primarySk);
-    // NIP-42 identity: the bridge's own npub, not a throwaway. Relays that gate
-    // kind 1059 serve a giftwrap only to the pubkey it is addressed to, and the
-    // Direct Invites carrying private-channel keys are addressed to this npub.
-    // Under a random identity the bridge could never read its own key
-    // deliveries on relay.ditto.pub or relay.dreamith.to — every private
-    // channel an import admitted it to failed "concord channel not found" on
-    // every start (2026-09-24). The npub is public already (kind 0, guestbook).
-    const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), { authSk: primarySk });
-
-    // Fold the Control Plane first: it reads from the community root the
-    // invite carried, so the roster — and with it, who may vend a channel key
-    // — is knowable before we accept any. The intake refuses anyone else.
-    const preflight = new ConcordClient(community, pool, primary);
-    const folded = await preflight.syncControl();
-
-    // Private-channel keys granted to THIS bridge's npub since it was linked,
-    // delivered as Direct Invites (see keyIntake.ts). Runs before the client
-    // that serves `channels()` is built, so a gated channel is present on the
-    // first pass.
-    const floor = new RelayPool(inviteDeliveryRelays([]), { authSk: primarySk });
-    const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
-      isAuthorizedSender: (pk) =>
-        isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
-    }).finally(() => void floor.close());
-
-    const client =
-      intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
-    if (intake.learned.length > 0) await client.syncControl();
-
-    const channel = row.concord_channel_id ? client.channel(row.concord_channel_id) : undefined;
-    if (!channel) {
-      await pool.close();
-      throw new Error("concord channel not found (deleted, or key not held)");
-    }
-    // Refresh display names each start: renames heal on the next boot, and
-    // rows from before the name columns existed backfill themselves. The two
-    // lookups hit different Discord endpoints and neither reads the other, so
-    // they go together rather than one after the next.
-    const [discordName, guildName] = await Promise.all([
-      row.discord_channel_id
-        ? this.adapter?.channelName(row.discord_channel_id).catch(() => null)
-        : null,
-      row.discord_guild_id ? this.adapter?.guildName(row.discord_guild_id).catch(() => null) : null,
-    ]);
-    // A failed lookup is null, and null used to be written straight over a
-    // name that was already correct — so one rate-limited boot silently
-    // blanked the dashboard for bridges nothing was wrong with. Keep what we
-    // knew unless Discord actually answered; a real rename still heals,
-    // because a rename answers.
-    await this.sql`
-      UPDATE bridges SET concord_channel_name = ${channel.name},
-        discord_channel_name = coalesce(${discordName ?? null}, discord_channel_name),
-        discord_guild_name = coalesce(${guildName ?? null}, discord_guild_name)
-      WHERE bridge_id = ${row.bridge_id}`;
-    // Four announcements the bridge owes the relays, none of which anything
-    // below reads: the join, our giftwrap inbox (so the next key handoff is
-    // delivered to the relays we actually watch rather than the stock interop
-    // floor), the bot's profile, and the command manifest. Awaited in sequence
-    // they cost four publish timeouts — up to ~32s during which the bridge is
-    // fully folded and able to mirror, but routing has not been attached. So
-    // they are fired together and not waited on; each already swallows its own
-    // failure, exactly as announceBridge does.
-    void Promise.all([
-      client.publishJoin().catch(() => {}),
-      client.publishDmRelays(primary, community.relays).catch(() => {}),
-      client
-        .publishProfile(primary, {
-          name: "Discord <-> Armada Bridge Bot",
-          picture: this.adapter?.botAvatarUrl,
-          about:
-            "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
-          bot: true,
-        })
-        .catch(() => {}),
-      client.publishManifest(BRIDGE_COMMANDS).catch(() => {}),
-    ]);
-
-    const link: ChannelLink = {
-      discordGuildId: row.discord_guild_id ?? "",
-      discordChannelId: row.discord_channel_id ?? "",
-      communityId: community.idHex,
-      concordChannelIdHex: channel.idHex,
-      enabled: true,
-    };
-
-    const rb: Running = {
-      id: row.bridge_id,
-      client,
-      pool,
-      channel,
-      link,
-      primary,
-      status: row.status === "active" ? "active" : "pending_confirm",
-      unsubChat: () => {},
-      unsubControl: () => {},
-    };
-
-    rb.unsubChat = client.subscribeChannel(
-      channel,
-      (chat) => {
-        void this.onConcordChat(rb, chat, row.confirm_code ?? "").catch((error) =>
-          console.error(`bridge ${rb.id}: concord handler failed`, error),
-        );
-      },
-      (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
-      (streamPk, wrapAt) => {
-        void this.store.cursorSet(community.idHex, streamPk, wrapAt).catch(() => {});
-      },
-    );
-    // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
-    // ones goes silent while publishes (fresh channel lookup) keep working.
-    // Re-subscribe whenever the fold changes the channel's stream set.
-    rb.unsubControl = client.subscribeControl(() => {
-      this.refreshChatSubscription(rb, row.confirm_code ?? "");
+    await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
+    let starting = true;
+    let lost = false;
+    const lease = await new BridgeLeases(this.sql).acquire(bridgeResource(row.discord_guild_id!, row.discord_channel_id!), () => {
+      lost = true;
+      // Startup owns its partial resources until startOwned has unwound. A
+      // callback there must not race cleanup or leave a dead instance registered.
+      if (!starting) void this.onLeaseLost(row.bridge_id, lease!).catch((error) =>
+        console.error(`bridge ${row.bridge_id}: lease loss cleanup failed`, error));
     });
-
-    if (rb.status === "active") {
-      const liveFromMs = Date.now();
-      this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed), row.options);
-      this.backfillMissed(rb).catch((error) =>
-        console.warn(`bridge ${rb.id}: catch-up backfill failed:`, error),
-      );
-      this.catchUpDiscord(rb, liveFromMs).catch((error) =>
-        console.warn(`bridge ${rb.id}: Discord catch-up failed:`, error),
-      );
-    } else {
-      await client.sendChat(channel, {
-        content:
-          `A Discord bridge requests to link this channel. Bridged messages LEAVE ` +
-          `end-to-end encryption and are mirrored to Discord in plaintext. ` +
-          `A member with Manage Channels can enable it by replying:\n` +
-          `/bridge confirm ${row.confirm_code}`,
-        author: { pk: primary.pk, signer: primary.signer },
-      });
+    if (!lease) throw new BridgeLeaseUnavailableError("Bridge lease is owned by another worker");
+    try {
+      await this.startOwned(row, lease);
+      starting = false;
+      if (lost) {
+        await this.onLeaseLost(row.bridge_id, lease);
+        throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
+      }
+    } catch (error) {
+      starting = false;
+      await lease.release().catch(() => {});
+      if (lost) {
+        this.scheduleStartRetry(row.bridge_id, 0, true);
+        throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
+      }
+      throw error;
     }
-    this.running.set(rb.id, rb);
+  }
+
+  private async startOwned(row: BridgeRow, lease: BridgeLease): Promise<void> {
+    const cleanup: Array<() => void | Promise<void>> = [];
+    try {
+      const inviteUrl = unseal(this.env.sealKeyHex, row.invite_url_sealed!);
+      const invite = parseInviteLink(inviteUrl);
+      if (!invite) throw new Error("stored invite no longer parses");
+
+      const bootstrap = new RelayPool(
+        await filterPublicRelays(
+          invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS,
+          STOCK_RELAYS,
+        ),
+      );
+      const { community } = await resolveInvite(inviteUrl, bootstrap).finally(() => void bootstrap.close());
+
+      const primarySk = Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, row.primary_sk_sealed!), "hex"));
+      const primary = localIdentity(primarySk);
+      // NIP-42 identity: the bridge's own npub, not a throwaway. Relays that gate
+      // kind 1059 serve a giftwrap only to the pubkey it is addressed to, and the
+      // Direct Invites carrying private-channel keys are addressed to this npub.
+      // Under a random identity the bridge could never read its own key
+      // deliveries on relay.ditto.pub or relay.dreamith.to — every private
+      // channel an import admitted it to failed "concord channel not found" on
+      // every start (2026-09-24). The npub is public already (kind 0, guestbook).
+      const pool = identityRelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), primarySk);
+
+      cleanup.push(() => pool.close());
+      // Fold the Control Plane first: it reads from the community root the
+      // invite carried, so the roster — and with it, who may vend a channel key
+      // — is knowable before we accept any. The intake refuses anyone else.
+      const preflight = new ConcordClient(community, pool, primary);
+      const folded = await preflight.syncControl();
+      let rawClient = preflight;
+      if (this.env.mode !== "public") {
+
+        // Private-channel keys granted to THIS bridge's npub since it was linked,
+        // delivered as Direct Invites (see keyIntake.ts). Runs before the client
+        // that serves `channels()` is built, so a gated channel is present on the
+        // first pass.
+        const floor = identityRelayPool(inviteDeliveryRelays([]), primarySk);
+        const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
+          isAuthorizedSender: (pk) =>
+            isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
+        }).finally(() => void floor.close());
+
+        rawClient =
+          intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
+        if (intake.learned.length > 0) await rawClient.syncControl();
+      }
+      const assertMayForward = async () => {
+        await lease.assertCurrent();
+        const [state] = await this.sql`SELECT status FROM bridges WHERE bridge_id = ${row.bridge_id}`;
+        if (!state || !["active", "pending_confirm"].includes(state.status)) throw new Error("Bridge is paused or unlinked");
+        try {
+          await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
+        } catch (error) {
+          await lease.assertCurrent();
+          await this.sql`UPDATE bridges SET status_detail = 'Forwarding blocked: public visibility unavailable', updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
+          throw error;
+        }
+        const current = row.concord_channel_id && rawClient.channel(row.concord_channel_id);
+        if (!current || (this.env.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
+        await lease.assertCurrent();
+        await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
+          AND status_detail = 'Forwarding blocked: public visibility unavailable'`;
+      };
+      const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
+
+      const channel = row.concord_channel_id ? client.channel(row.concord_channel_id) : undefined;
+      if (!channel) {
+        await pool.close();
+        throw new Error("concord channel not found (deleted, or key not held)");
+      }
+      if (this.env.mode === "public" && channel.isPrivate) {
+        await pool.close();
+        throw new Error("Concord channel must be public");
+      }
+      // Refresh display names each start: renames heal on the next boot, and
+      // rows from before the name columns existed backfill themselves. The two
+      // lookups hit different Discord endpoints and neither reads the other, so
+      // they go together rather than one after the next.
+      const [discordName, guildName] = await Promise.all([
+        row.discord_channel_id
+          ? this.adapter?.channelName(row.discord_channel_id).catch(() => null)
+          : null,
+        row.discord_guild_id ? this.adapter?.guildName(row.discord_guild_id).catch(() => null) : null,
+      ]);
+      // A failed lookup is null, and null used to be written straight over a
+      // name that was already correct — so one rate-limited boot silently
+      // blanked the dashboard for bridges nothing was wrong with. Keep what we
+      // knew unless Discord actually answered; a real rename still heals,
+      // because a rename answers.
+      await this.sql`
+        UPDATE bridges SET concord_channel_name = ${channel.name},
+          discord_channel_name = coalesce(${discordName ?? null}, discord_channel_name),
+          discord_guild_name = coalesce(${guildName ?? null}, discord_guild_name)
+        WHERE bridge_id = ${row.bridge_id}`;
+      // Four announcements the bridge owes the relays, none of which anything
+      // below reads: the join, our giftwrap inbox (so the next key handoff is
+      // delivered to the relays we actually watch rather than the stock interop
+      // floor), the bot's profile, and the command manifest. Awaited in sequence
+      // they cost four publish timeouts — up to ~32s during which the bridge is
+      // fully folded and able to mirror, but routing has not been attached. So
+      // they are fired together and not waited on; each already swallows its own
+      // failure, exactly as announceBridge does.
+      void Promise.all([
+        client.publishJoin().catch(() => {}),
+        client.publishDmRelays(primary, community.relays).catch(() => {}),
+        client
+          .publishProfile(primary, {
+            name: "Discord <-> Armada Bridge Bot",
+            picture: this.adapter?.botAvatarUrl,
+            about:
+              "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
+            bot: true,
+          })
+          .catch(() => {}),
+        client.publishManifest(BRIDGE_COMMANDS).catch(() => {}),
+      ]);
+
+      const link: ChannelLink = {
+        discordGuildId: row.discord_guild_id ?? "",
+        discordChannelId: row.discord_channel_id ?? "",
+        communityId: community.idHex,
+        concordChannelIdHex: channel.idHex,
+        enabled: true,
+      };
+
+      const rb: Running = {
+        lease,
+        assertMayForward,
+        id: row.bridge_id,
+        client,
+        pool,
+        channel,
+        link,
+        primary,
+        status: row.status === "active" ? "active" : "pending_confirm",
+        unsubChat: () => {},
+        unsubControl: () => {},
+      };
+
+      cleanup.push(() => { rb.unsubChat(); rb.unsubControl(); });
+      rb.unsubChat = client.subscribeChannel(
+        channel,
+        (chat) => {
+          void this.onConcordChat(rb, chat, row.confirm_code ?? "").catch((error) =>
+            console.error(`bridge ${rb.id}: concord handler failed`, error),
+          );
+        },
+        (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
+        (streamPk, wrapAt) => {
+          void this.store.cursorSet(community.idHex, streamPk, wrapAt).catch(() => {});
+        },
+      );
+      // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
+      // ones goes silent while publishes (fresh channel lookup) keep working.
+      // Re-subscribe whenever the fold changes the channel's stream set.
+      rb.unsubControl = client.subscribeControl(() => {
+        this.refreshChatSubscription(rb, row.confirm_code ?? "");
+      });
+
+      if (rb.status === "active") {
+        const liveFromMs = Date.now();
+        this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
+        this.backfillMissed(rb).catch((error) =>
+          console.warn(`bridge ${rb.id}: catch-up backfill failed:`, error),
+        );
+        this.catchUpDiscord(rb, liveFromMs).catch((error) =>
+          console.warn(`bridge ${rb.id}: Discord catch-up failed:`, error),
+        );
+      } else {
+        await client.sendChat(channel, {
+          content:
+            `A Discord bridge requests to link this channel. Bridged messages LEAVE ` +
+            `end-to-end encryption and are mirrored to Discord in plaintext. ` +
+            `A member with Manage Channels can enable it by replying:\n` +
+            `/bridge confirm ${row.confirm_code}`,
+          author: { pk: primary.pk, signer: primary.signer },
+        });
+      }
+      await lease.assertCurrent();
+      this.running.set(rb.id, rb);
+    } catch (error) {
+      for (const close of cleanup.reverse()) await Promise.resolve().then(close).catch(() => {});
+      const current = this.running.get(row.bridge_id);
+      if (!current || current.lease === lease) this.byDiscordChannel.delete(row.discord_channel_id ?? "");
+      throw error;
+    }
   }
 
   /**
@@ -668,7 +774,10 @@ export class BridgeManager {
     if (!anchor) return;
 
     const { mirrored, capped } = await replayDiscordSince(anchor, liveFromMs, DISCORD_CATCHUP_MAX, {
-      fetchAfter: (afterId) => botChannelMessagesAfter(this.env.discordBotToken, rb.link.discordChannelId, afterId),
+      fetchAfter: async (afterId) => {
+        await rb.assertMayForward();
+        return botChannelMessagesAfter(this.env.discordBotToken, rb.link.discordChannelId, afterId);
+      },
       alreadyMirrored: async (messageId) => {
         const [exists] = await this.sql`
           SELECT 1 FROM messages
@@ -722,6 +831,7 @@ export class BridgeManager {
         isAuthorized(folded.roster, chat.author, rb.client.community.owner, Permissions.MANAGE_CHANNELS);
       if (!authorized) return;
 
+      await rb.assertMayForward();
       const [row] = await this.sql<BridgeRow[]>`
         UPDATE bridges SET status = 'active', status_detail = NULL, updated_at = now()
         WHERE bridge_id = ${rb.id} RETURNING *`;
@@ -778,6 +888,7 @@ export class BridgeManager {
         author: rb.primary,
       })
       .catch(() => {});
+    await rb.assertMayForward();
     await this.adapter
       ?.notice(
         rb.link.discordChannelId,
@@ -803,6 +914,7 @@ export class BridgeManager {
       new Kind0ProfileResolver(rb.pool),
       { applicationId: this.adapter.applicationId, webhookIds: this.adapter.ownWebhookIds },
       {
+        beforeSideEffect: rb.assertMayForward,
         bridgeEdits: options?.edits === true,
         blobs: this.env.blossomServer ? new BlossomStore(this.env.blossomServer) : undefined,
         klipy: this.env.klipyApiKey ? new KlipyClient(this.env.klipyApiKey) : undefined,
@@ -833,21 +945,47 @@ export class BridgeManager {
         author: rb.primary,
       })
       .catch(() => {});
+    await rb.assertMayForward();
     await this.adapter!.send(rb.link, {
       username: "Armada Bridge",
       content: "This channel is now mirrored with an Armada community. /help lists what this bot answers.",
     }).catch(() => {});
   }
 
+  private async closeRunning(rb: Running): Promise<void> {
+    // Remove only this instance, before yielding: a replacement must never be
+    // deleted by an old lease's delayed cleanup. Fencing is still in the DB.
+    if (this.running.get(rb.id) !== rb) return;
+    this.running.delete(rb.id);
+    if (this.byDiscordChannel.get(rb.link.discordChannelId) === rb.id) {
+      this.byDiscordChannel.delete(rb.link.discordChannelId);
+    }
+    rb.router = undefined;
+    try { rb.unsubChat(); } catch {}
+    try { rb.unsubControl(); } catch {}
+    await rb.pool.close().catch(() => {});
+  }
+
+  private async onLeaseLost(bridgeId: string, lease: BridgeLease): Promise<void> {
+    const rb = this.running.get(bridgeId);
+    if (!rb || rb.lease !== lease) return;
+    try {
+      await this.closeRunning(rb);
+    } finally {
+      // This is not an operator pause: preserve durable status and retry even
+      // if storage is still down. retryStart re-reads any subsequent pause.
+      this.scheduleStartRetry(bridgeId, 0, true);
+    }
+  }
+
   async stop(bridgeId: string, status: "paused" | "unlinked", detail?: string): Promise<void> {
     this.cancelStartRetry(bridgeId);
     const rb = this.running.get(bridgeId);
     if (rb) {
-      rb.unsubChat();
-      rb.unsubControl();
-      await rb.pool.close().catch(() => {});
-      this.byDiscordChannel.delete(rb.link.discordChannelId);
-      this.running.delete(bridgeId);
+      // release invalidates the local handle before its DB round trip. Failure
+      // must not keep subscriptions alive or prevent the requested status write.
+      await rb.lease.release().catch((error) => console.warn(`bridge ${bridgeId}: lease release failed`, error));
+      await this.closeRunning(rb);
     }
     if (status === "unlinked") {
       await this.sql`
@@ -865,6 +1003,7 @@ export class BridgeManager {
   async resume(bridgeId: string): Promise<void> {
     const [row] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
     if (!row) throw new Error("no such bridge");
+    await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
     const next = row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
     await this.sql`UPDATE bridges SET status = ${row.status === "paused" ? "active" : next}, updated_at = now() WHERE bridge_id = ${bridgeId}`;
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
@@ -888,6 +1027,22 @@ export class BridgeManager {
     try {
       await this.start(row);
     } catch (error) {
+      if (error instanceof BridgeLeaseUnavailableError) {
+        // Another owner (or a just-dead process's 90s lease) is not a bridge
+        // failure. Do not overwrite its status detail or wait minutes to retry.
+        this.scheduleStartRetry(row.bridge_id, attempt, true);
+        return;
+      }
+      if (error instanceof PublicPolicyUnavailableError) {
+        try {
+          await this.sql`UPDATE bridges SET status_detail = ${error.message}, updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
+        } catch (bookkeepingError) {
+          console.warn(`bridge ${row.bridge_id}: could not record deferred start`, bookkeepingError);
+        } finally {
+          this.scheduleStartRetry(row.bridge_id, attempt);
+        }
+        return;
+      }
       if (error instanceof GatewayUnavailableError) {
         // Not a start failure: the community is fine, the local gateway is
         // down. Retry without touching status_detail or the sever streak, so
@@ -911,6 +1066,7 @@ export class BridgeManager {
     }
     // Started and running: failing to clear the streak marker must not be
     // mistaken for a failed start. The next successful boot clears it.
+    if (!this.running.has(row.bridge_id)) return;
     await this.clearStartFailure(row).catch((error) =>
       console.warn(`bridge ${row.bridge_id}: could not clear start-failure marker:`, error),
     );
@@ -937,12 +1093,12 @@ export class BridgeManager {
     this.scheduleStartRetry(row.bridge_id, attempt);
   }
 
-  private scheduleStartRetry(bridgeId: string, attempt: number): void {
+  private scheduleStartRetry(bridgeId: string, attempt: number, leaseContention = false): void {
     if (this.startRetryTimers.has(bridgeId)) return;
     // Full jitter: bridges share relays, so one relay outage puts many
     // bridges into this path at once — identical delays would line them all
     // up on the same retry tick against a host that is already struggling.
-    const cap = Math.min(START_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), START_RETRY_MAX_MS);
+    const cap = leaseContention ? 5_000 : Math.min(START_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), START_RETRY_MAX_MS);
     const delay = cap / 2 + Math.random() * (cap / 2);
     const timer = setTimeout(() => {
       this.startRetryTimers.delete(bridgeId);
@@ -1051,6 +1207,7 @@ export class BridgeManager {
     command: string,
     rb: Running,
   ): Promise<void> {
+    await rb.assertMayForward();
     if (command === "help") {
       await message.reply(this.helpText());
       return;

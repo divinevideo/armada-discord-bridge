@@ -22,6 +22,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      BRIDGE_MODE: legacy
       DATABASE_URL: postgres://bridge:bridge@postgres/bridge
       # Required to go live; without them the service validates and exits.
       BRIDGE_MASTER_SECRET: ${BRIDGE_MASTER_SECRET:-}
@@ -53,6 +54,7 @@ services:
     ports:
       - "8787:8787"
     environment:
+      BRIDGE_MODE: legacy
       DATABASE_URL: postgres://bridge:bridge@postgres/bridge
       # The container is the boundary here, so the published port needs a
       # bind on every interface. Bare-metal deployments keep the loopback

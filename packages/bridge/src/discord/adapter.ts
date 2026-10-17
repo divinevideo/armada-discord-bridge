@@ -91,6 +91,7 @@ export class DiscordAdapter implements WebhookSender {
   constructor(
     private readonly token: string,
     private readonly handlers: DiscordAdapterHandlers,
+    private readonly beforeEffect: (channelId: string) => Promise<void> = async () => { throw new Error("Bridge effect policy is not configured"); },
   ) {
     this.client = new Client({
       intents: [
@@ -203,6 +204,7 @@ export class DiscordAdapter implements WebhookSender {
   }
 
   private async webhookFor(channelId: string): Promise<Webhook> {
+    await this.beforeEffect(channelId);
     const cached = this.webhookCache.get(channelId);
     if (cached) return cached;
 
@@ -214,9 +216,8 @@ export class DiscordAdapter implements WebhookSender {
     const existing = (await text.fetchWebhooks()).find(
       (wh) => wh.name === BRIDGE_WEBHOOK_NAME && wh.token,
     );
-    const webhook =
-      existing ??
-      (await text.createWebhook({ name: BRIDGE_WEBHOOK_NAME, reason: "Armada bridge persona posts" }));
+    await this.beforeEffect(channelId);
+    const webhook = existing ?? (await text.createWebhook({ name: BRIDGE_WEBHOOK_NAME, reason: "Armada bridge persona posts" }));
     this.webhookCache.set(channelId, webhook);
     this.ownWebhookIds.add(webhook.id);
     return webhook;
@@ -243,6 +244,7 @@ export class DiscordAdapter implements WebhookSender {
       allowedMentions: { parse: [] as [] },
     });
     try {
+      await this.beforeEffect(link.discordChannelId);
       const created = await webhook.send(payload(sanitizeUsername(message.username)));
       return created.id;
     } catch (error) {
@@ -251,6 +253,7 @@ export class DiscordAdapter implements WebhookSender {
       // display name: retry once under a neutral one.
       if (!isUsernameRejection(error)) throw error;
       console.warn(`discord rejected webhook username ${JSON.stringify(message.username)}; retrying as "bridged member"`);
+      await this.beforeEffect(link.discordChannelId);
       const created = await webhook.send(payload("bridged member"));
       return created.id;
     }
@@ -259,6 +262,7 @@ export class DiscordAdapter implements WebhookSender {
   /** WebhookSender: edit a webhook-authored mirror in place. */
   async edit(link: ChannelLink, discordMessageId: string, content: string): Promise<void> {
     const webhook = await this.webhookFor(link.discordChannelId);
+    await this.beforeEffect(link.discordChannelId);
     await webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } });
   }
 
@@ -270,6 +274,7 @@ export class DiscordAdapter implements WebhookSender {
    */
   async notice(channelId: string, content: string): Promise<void> {
     const channel = await this.textChannel(channelId);
+    await this.beforeEffect(channelId);
     await channel.send({ content, allowedMentions: { parse: [] } });
   }
 
@@ -299,9 +304,11 @@ export class DiscordAdapter implements WebhookSender {
   async delete(link: ChannelLink, discordMessageId: string): Promise<void> {
     const webhook = await this.webhookFor(link.discordChannelId);
     try {
+      await this.beforeEffect(link.discordChannelId);
       await webhook.deleteMessage(discordMessageId);
     } catch {
       const channel = await this.textChannel(link.discordChannelId);
+      await this.beforeEffect(link.discordChannelId);
       await channel.messages.delete(discordMessageId);
     }
   }
@@ -309,6 +316,7 @@ export class DiscordAdapter implements WebhookSender {
   /** WebhookSender: show the bot's typing indicator (lasts ~10s or until a send). */
   async sendTyping(link: ChannelLink): Promise<void> {
     const channel = await this.textChannel(link.discordChannelId);
+    await this.beforeEffect(link.discordChannelId);
     await channel.sendTyping();
   }
 
@@ -316,6 +324,7 @@ export class DiscordAdapter implements WebhookSender {
   async react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
     const channel = await this.textChannel(link.discordChannelId);
     const message = await channel.messages.fetch(discordMessageId);
+    await this.beforeEffect(link.discordChannelId);
     await message.react(emoji);
   }
 
@@ -334,6 +343,7 @@ export class DiscordAdapter implements WebhookSender {
     const message = await channel.messages.fetch(discordMessageId);
     const botId = this.client.user?.id;
     if (!botId) return;
+    await this.beforeEffect(link.discordChannelId);
     await message.reactions.resolve(emoji)?.users.remove(botId);
   }
 }

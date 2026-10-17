@@ -1,0 +1,30 @@
+--- a/src/apps/relay/RelayWebsocket.cpp
++++ b/src/apps/relay/RelayWebsocket.cpp
+@@ -262,7 +262,7 @@
+             if (header == "1" || header.starts_with("ffff:")) header = std::string("::") + header;
+ 
+             c->ipAddr = parseIP(header);
+-            if (c->ipAddr.size() == 0) LW << "Couldn't parse IP from header " << cfg().relay__realIpHeader << ": " << header;
++            if (c->ipAddr.size() == 0) LW << "Could not parse configured client address header";
+         }
+ 
+         if (c->ipAddr.size() == 0) c->ipAddr = ws->getAddressBytes();
+@@ -272,7 +272,7 @@
+ 
+         bool compEnabled, compSlidingWindow;
+         ws->getCompressionState(compEnabled, compSlidingWindow);
+-        LI << "[" << connId << "] Connect from " << renderIP(c->ipAddr)
++        LI << "[" << connId << "] Connection opened"
+            << " compression=" << (compEnabled ? 'Y' : 'N')
+            << " sliding=" << (compSlidingWindow ? 'Y' : 'N')
+         ;
+@@ -292,8 +292,7 @@
+         auto upComp = renderPercent(1.0 - (double)c->stats.bytesUpCompressed / c->stats.bytesUp);
+         auto downComp = renderPercent(1.0 - (double)c->stats.bytesDownCompressed / c->stats.bytesDown);
+ 
+-        LI << "[" << connId << "] Disconnect from " << renderIP(c->ipAddr)
+-           << " (" << code << "/" << (message ? std::string_view(message, length) : "-") << ")"
++        LI << "[" << connId << "] Connection closed, code=" << code
+            << " UP: " << renderSize(c->stats.bytesUp) << " (" << upComp << " compressed)"
+            << " DN: " << renderSize(c->stats.bytesDown) << " (" << downComp << " compressed)"
+         ;

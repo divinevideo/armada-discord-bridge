@@ -1,3 +1,5 @@
+import { loadDeploymentMode, type BridgeMode } from "./deploymentMode";
+import type { PublicChannelRules } from "./discord/publicChannelPolicy";
 /**
  * Bridge configuration, read once from the environment at startup.
  *
@@ -8,6 +10,8 @@
  */
 
 export interface BridgeConfig {
+  mode: BridgeMode;
+  publicChannels?: PublicChannelRules;
   /** Postgres connection string. */
   databaseUrl: string;
   /** Discord bot token (empty allowed until the Discord adapter lands). */
@@ -41,6 +45,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error("BRIDGE_MASTER_SECRET must be 64 lowercase hex chars (32 bytes)");
   }
   return {
+    ...loadDeploymentMode(env),
     databaseUrl: required("DATABASE_URL"),
     discordToken: env.DISCORD_TOKEN?.trim() ?? "",
     masterSecretHex,

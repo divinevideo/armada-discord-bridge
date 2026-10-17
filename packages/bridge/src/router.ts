@@ -18,6 +18,7 @@ import type { ConcordClient } from "./concord/client";
 import { hasProxyTag, proxyTag } from "./concord/client";
 import { localIdentity } from "./concord/signer";
 import type { LocalIdentity } from "./concord/signer";
+import { CONCORD_EFFECT_METHODS, guardEffects } from "./effectGuard";
 import { ffmpegAvailable, mp4ToGif } from "./gif";
 import {
   attachmentFilename,
@@ -147,6 +148,8 @@ export interface BlobPort {
 }
 
 export interface RouterOptions {
+  /** Required at runtime: current worker ownership and deployment-specific channel permissions. */
+  beforeSideEffect?: () => Promise<void>;
   /** Kind 3302 is not frozen in the CORDs yet; off by default. */
   bridgeEdits?: boolean;
   /** When set, attachments rehost through Blossom instead of rotting CDN links. */
@@ -408,7 +411,21 @@ export class BridgeRouter {
     private readonly profiles: ProfileResolver,
     private readonly self: { applicationId: string; webhookIds: Set<string> },
     private readonly options: RouterOptions = {},
-  ) {}
+  ) {
+    const before = options.beforeSideEffect ?? (() => this.assertMayForward());
+    this.client = guardEffects(client, before, CONCORD_EFFECT_METHODS);
+    this.webhooks = guardEffects(webhooks, before, new Set(["send", "edit", "delete", "react", "unreact", "sendTyping"]));
+    this.options = {
+      ...options,
+      blobs: options.blobs && guardEffects(options.blobs, before, new Set(["download", "upload"])),
+      klipy: options.klipy && guardEffects(options.klipy, before, new Set(["resolveGif"])),
+    };
+  }
+
+  private async assertMayForward(): Promise<void> {
+    if (!this.options.beforeSideEffect) throw new Error("Bridge effect policy is not configured");
+    await this.options.beforeSideEffect();
+  }
 
   /**
    * Keep the puppet's kind 0 in step with the Discord identity so Armada
@@ -462,6 +479,8 @@ export class BridgeRouter {
     this.lastTyping.set(key, now);
     const puppet = this.puppets.get(userId);
     if (this.client.isBanned(puppet.pk)) return;
+    // Dropped typing must not consume the visibility lane needed by real sends.
+    await this.assertMayForward();
     await this.client.sendTyping(channel, { pk: puppet.pk, signer: localIdentity(puppet.sk).signer });
   }
 
@@ -473,6 +492,7 @@ export class BridgeRouter {
     if (msg.applicationId && msg.applicationId === this.self.applicationId) return undefined;
     // Other bots are configurable later; skipped by default to avoid bot loops.
     if (msg.author.bot) return undefined;
+    await this.assertMayForward();
 
     const channel = this.client.channel(link.concordChannelIdHex);
     if (!channel) return undefined; // deleted or key not held; nothing to do
@@ -489,10 +509,10 @@ export class BridgeRouter {
     const content = discordToConcord({ ...source, attachments });
     if (content.length === 0) return undefined;
 
+    await this.publishPuppetJoin(msg.author.id, identity, msg.timestampMs);
     await this.syncPuppetProfile(msg.author, identity).catch((error) =>
       console.warn(`bridge: puppet profile publish failed for ${msg.author.id}`, error),
     );
-    await this.publishPuppetJoin(msg.author.id, identity, msg.timestampMs);
     if (msg.referencedMessageId) {
       // NIP-C7 inline quote-reply naming the mapped rumor and its author.
       // An unmapped reference (pre-bridge history) degrades to a bare message.
@@ -655,6 +675,7 @@ export class BridgeRouter {
    * puppet cannot (and must not) tombstone someone else's rumor.
    */
   async onDiscordDelete(del: DiscordMessageDelete, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!link.enabled) return undefined;
     const [row] = await this.store.byDiscordId(del.id);
     if (!row || row.origin !== "discord") return undefined;
@@ -677,6 +698,7 @@ export class BridgeRouter {
    * Off unless bridgeEdits: the 3302 payload is not frozen in the CORDs.
    */
   async onDiscordEdit(msg: DiscordInboundMessage, link: ChannelLink): Promise<string | undefined> {
+    await this.assertMayForward();
     if (!this.options.bridgeEdits || !link.enabled) return undefined;
     const [row] = await this.store.byDiscordId(msg.id);
     if (!row || row.origin !== "discord") return undefined;
@@ -704,6 +726,7 @@ export class BridgeRouter {
   async onDiscordReaction(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
+    await this.assertMayForward();
     if (!reaction.emoji.name) return undefined;
     const custom = reaction.emoji.id !== null;
     const content = custom ? `:${reaction.emoji.name}:` : reaction.emoji.name;
@@ -717,6 +740,7 @@ export class BridgeRouter {
 
     const puppet = this.puppets.get(reaction.user.id);
     const identity = { pk: puppet.pk, signer: localIdentity(puppet.sk).signer };
+    await this.publishPuppetJoin(reaction.user.id, identity, Date.now());
     await this.syncPuppetProfile(reaction.user, identity).catch((error) =>
       console.warn(`bridge: puppet profile publish failed for ${reaction.user.id}`, error),
     );
@@ -752,6 +776,7 @@ export class BridgeRouter {
   async onDiscordReactionRemove(reaction: DiscordReactionAdd, link: ChannelLink): Promise<string | undefined> {
     if (!link.enabled) return undefined;
     if (reaction.user.bot) return undefined;
+    await this.assertMayForward();
     if (!reaction.emoji.name) return undefined;
     const emojiKey = reaction.emoji.id ? `${reaction.emoji.name}:${reaction.emoji.id}` : reaction.emoji.name;
 

@@ -23,10 +23,14 @@ import {
   KIND_SEAL_ENCRYPTED,
   KIND_SEAL_PLAINTEXT,
   STOCK_RELAYS,
+  buildDirectInviteRumor,
+  inviteDeliveryRelays,
+  recipientInboxRelays,
+  sealDirectInvite,
+  wrapDirectInvite,
   adminRole,
   buildBundleEvent,
   buildChannelEdition,
-  buildDirectInviteRumor,
   buildGrantEdition,
   buildInviteUrl,
   buildJoinRumor,
@@ -47,20 +51,16 @@ import {
   grantToJSON,
   guestbookGroups,
   hex32,
-  inviteDeliveryRelays,
   mintCommunity,
   mintLinkSigner,
   mintToken,
   parseInviteLink,
   random32,
-  recipientInboxRelays,
   registerStreamKeys,
-  sealDirectInvite,
   sealEdition,
   sealGuestbook,
   withChannelCategory,
   withChannelPosition,
-  wrapDirectInvite,
   wrapSeal,
 } from "@armada-bridge/concord-core";
 import type {
@@ -78,6 +78,8 @@ import type {
  * another project's namespace would collide the day they define it.
  */
 export const DISCORD_IMPORT_METADATA_KEY = "discord.import";
+import { BridgeLeases, BridgeLeaseUnavailableError, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
+import { guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import type { RelayLike } from "@armada-bridge/bridge/src/concord/pool";
@@ -238,6 +240,8 @@ async function rehostEncryptedImage(
 export class Importer {
   /** Imports with a pipeline currently running in this process. */
   private readonly running = new Set<string>();
+  private readonly importGuards = new Map<string, () => Promise<void>>();
+  private readonly retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /** Imports with a pipeline running in this process right now. */
   get activeCount(): number {
@@ -269,7 +273,27 @@ export class Importer {
      * give-up path without sleeping for it.
      */
     private readonly publishRetryMs: number = 1500,
+    private readonly withImportLease: (id: string, work: (lease?: BridgeLease) => Promise<void>) => Promise<void> =
+      (id, work) => new BridgeLeases(sql).withBridgeLease(`import:${id}`, async (lease) => {
+        this.importGuards.set(id, () => lease.assertCurrent());
+        try { await work(lease); } finally { this.importGuards.delete(id); }
+      }),
+    /** Test seam: shorten the capped contention retry without changing lease TTL. */
+    private readonly leaseRetryMs = 5_000,
   ) {}
+
+  private async assertChannelPolicy(guildId: string, channelId: string): Promise<void> {
+    if (this.env.mode === "public") await this.manager.assertPublicChannel(guildId, channelId);
+  }
+
+  private async assertPublicPlan(plan: ImportPlan): Promise<void> {
+    if (this.env.mode !== "public") return;
+    const selected = plan.channels.filter((c) => c.selected);
+    for (const channel of selected) {
+      if (channel.private || channel.discordType !== 0) throw new Error("Only public text channels may be imported");
+    }
+    await this.manager.assertPublicChannels(plan.guild.id, selected.map((c) => c.discordId));
+  }
 
   /** Snapshot the guild and store a previewed plan. */
   async preview(
@@ -285,6 +309,24 @@ export class Importer {
       return { present: false, installUrl: botInstallUrl(this.env.discordClientId, guildId) };
     }
     const plan = buildImportPlan(snapshot);
+    if (this.env.mode === "public") {
+      const publicChannels: PlannedChannel[] = [];
+      for (const channel of plan.channels) {
+        if (channel.private || channel.discordType !== 0) {
+          plan.skipped.push({ kind: "channel", name: channel.name, reason: "only public text channels may be imported" });
+          continue;
+        }
+        try {
+          await this.assertChannelPolicy(guildId, channel.discordId);
+          publicChannels.push(channel);
+        } catch {
+          // Report the exclusion, not Discord errors or policy configuration.
+          plan.skipped.push({ kind: "channel", name: channel.name, reason: "excluded by public channel policy or visibility unavailable" });
+        }
+      }
+      plan.channels = publicChannels;
+      if (!plan.channels.length) throw new Error("No configured public text channels are available");
+    }
     // Pre-flight the bot's Manage Webhooks in every live-bridgeable channel,
     // so the review screen can warn before wiring. Sequential (not a burst)
     // to stay gentle on the rate limiter; the helper waits out any 429.
@@ -368,6 +410,8 @@ export class Importer {
     }
     if (!plan.channels.some((c) => c.selected)) throw new Error("select at least one channel");
 
+    await this.assertPublicPlan(plan);
+
     const requested = (body.relays ?? []).map((r) => r.trim()).filter(Boolean);
     // Scheme AND host: the old check was scheme-only, so `ws://127.0.0.1:6379/`
     // passed and the server opened a socket to it on the caller's behalf.
@@ -393,6 +437,7 @@ export class Importer {
         // Hex, not the raw Buffer: this rides the plan's jsonb column.
         channel.keySealed = seal(this.env.sealKeyHex, bytesToHex(random32())).toString("hex");
       }
+
     }
     for (const role of plan.roles) role.roleIdHex = bytesToHex(random32());
     const token = mintToken();
@@ -537,31 +582,56 @@ export class Importer {
         this.launch(row.import_id);
         continue;
       }
-      await this.sql`
-        UPDATE imports SET status = 'failed',
-          status_detail = 'interrupted by a portal restart; retry to resume from where it stopped',
-          updated_at = now()
-        WHERE import_id = ${row.import_id} AND status IN ('minting', 'publishing', 'wiring', 'history')`;
-      console.warn(`import ${row.import_id}: stranded since ${row.updated_at.toISOString()}; marked failed (retryable)`);
+      this.launchWithLease(row.import_id, async () => {
+        // A stale timestamp is not authority to interrupt a live owner.
+        throw new Error("interrupted by a portal restart; retry to resume from where it stopped");
+      });
     }
   }
 
   private launch(importId: string): void {
-    if (this.running.has(importId)) return;
-    this.running.add(importId);
-    void this.run(importId)
-      .catch(async (error) => {
-        console.error(`import ${importId}: failed:`, error);
-        await this.sql`
-          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
-          WHERE import_id = ${importId}`;
-      })
-      .finally(() => this.running.delete(importId));
+    this.launchWithLease(importId, () => this.runOwned(importId));
   }
 
   // ── The pipeline ───────────────────────────────────────────────────────────
 
-  private async run(importId: string): Promise<void> {
+  private launchWithLease(importId: string, work: () => Promise<void>): void {
+    if (this.running.has(importId) || this.retryTimers.has(importId)) return;
+    this.running.add(importId);
+    void this.withImportLease(importId, async (lease) => {
+      // A retry may find that the other worker has already finished. Do not
+      // replay its pipeline or turn its completed import into a failure.
+      const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
+      if (!row || !["minting", "publishing", "wiring", "history"].includes(row.status)) return;
+      try {
+        await work();
+      } catch (error) {
+        if (error instanceof BridgeLeaseUnavailableError) throw error;
+        // The exception itself proves no ownership. Keep this inside the
+        // acquired lease and fence the UPDATE too: expiry can race the write.
+        const failed = await this.sql`
+          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
+          WHERE import_id = ${importId} AND EXISTS (
+            SELECT 1 FROM bridge_leases WHERE resource = ${`import:${importId}`}
+              AND token = ${lease?.token.toString() ?? null} AND expires_at > clock_timestamp()
+          ) RETURNING import_id`;
+        if (!failed.length) throw new BridgeLeaseUnavailableError("Import lease expired before failure recording");
+        console.error(`import ${importId}: failed:`, error);
+      }
+    }).catch((error) => {
+      console.warn(`import ${importId}: deferred without changing status:`, error);
+      // Contention and terminal lease loss leave the checkpoint/status intact.
+      // One capped, jittered timer per import also bounds DB-outage retries.
+      const timer = setTimeout(() => {
+        this.retryTimers.delete(importId);
+        this.launchWithLease(importId, work);
+      }, this.leaseRetryMs / 2 + Math.random() * this.leaseRetryMs / 2);
+      timer.unref();
+      this.retryTimers.set(importId, timer);
+    }).finally(() => this.running.delete(importId));
+  }
+
+  private async runOwned(importId: string): Promise<void> {
     const { community, opSk, plan } = await this.load(importId);
     await this.publishEditions(importId, community, opSk, plan);
     await this.wireBridges(importId, community, opSk, plan);
@@ -610,7 +680,12 @@ export class Importer {
     const control = currentControlWriteGroup(community);
     const guestbook = currentGuestbookGroup(community);
     registerStreamKeys([...controlGroups(community), ...guestbookGroups(community)], community.relays);
-    const pool = this.poolFactory(community.relays);
+    await this.assertPublicPlan(plan);
+    const beforeEffect = async () => {
+      await this.assertPublicPlan(plan);
+      await this.importGuards.get(importId)?.();
+    };
+    const pool = guardEffects(this.poolFactory(community.relays), beforeEffect, new Set(["publish"]));
     const save = async () => {
       await this.sql`
         UPDATE imports SET plan = ${this.sql.json(plan as never)}, updated_at = now()
@@ -725,7 +800,7 @@ export class Importer {
       // metadata edition that references them. Best effort — an unreachable
       // CDN or blob host costs the images, never the import.
       if (!cp.assetsAt && !cp.metadataPublishedAt) {
-        const blossom = new BlossomStore(this.env.blossomServer || DEFAULT_BLOSSOM);
+        const blossom = guardEffects(new BlossomStore(this.env.blossomServer || DEFAULT_BLOSSOM), beforeEffect, new Set(["download", "upload"]));
         try {
           if (plan.guild.iconUrl) {
             cp.iconPointer = await rehostEncryptedImage(plan.guild.iconUrl, blossom, op);
@@ -979,11 +1054,12 @@ export class Importer {
         // FAILED lookup is not "no list" — delivering to the stock floor would
         // report success while the invite sat somewhere they never read.
         const inbox = await recipientInboxRelays(pool, community.owner);
-        const deliveryPool = this.poolFactory(inviteDeliveryRelays(inbox ?? []));
+        const deliveryPool = guardEffects(this.poolFactory(inviteDeliveryRelays(inbox ?? [])), beforeEffect, new Set(["publish"]));
         try {
           await deliveryPool.publish(wrap);
           cp.ownerChannelKeysSentAt = Date.now();
         } catch (error) {
+          if (error instanceof BridgeLeaseUnavailableError) throw error;
           // Non-fatal: the community is fully published and the channels are
           // gated. What is missing is the owner's copy of the keys, which is
           // recoverable by re-running the import (this step is idempotent —
@@ -1059,35 +1135,24 @@ export class Importer {
 
   /** Backfill-only pipeline for rerunHistory (no re-mint, no re-wire). */
   private launchHistoryOnly(importId: string): void {
-    if (this.running.has(importId)) return;
-    this.running.add(importId);
-    void (async () => {
+    this.launchWithLease(importId, async () => {
       const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
       await this.importHistory(importId, row!.plan);
       await this.sql`
         UPDATE imports SET status = 'done', status_detail = NULL, updated_at = now()
         WHERE import_id = ${importId}`;
-    })()
-      .catch(async (error) => {
-        console.error(`import ${importId}: history re-run failed:`, error);
-        await this.sql`
-          UPDATE imports SET status = 'failed', status_detail = ${String(error)}, updated_at = now()
-          WHERE import_id = ${importId}`;
-      })
-      .finally(() => this.running.delete(importId));
+    });
   }
 
   private async backfillChannel(importId: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> {
+    await this.assertPublicPlan(plan);
     // Re-fold control so the running bridge knows the channels the import
     // just created; without this client.channel() returns undefined and the
     // router silently skips every history message (the invisible-history bug).
     await this.manager.resyncFor(channel.discordId).catch(() => {});
     const running = this.manager.routerFor(channel.discordId);
     if (!running) {
-      console.warn(`import ${importId}: no live bridge for #${channel.name}; history skipped`);
-      channel.historyDoneAt = Date.now();
-      await this.savePlan(importId, plan);
-      return;
+      throw new Error("History bridge is not owned by this worker; retry after it is running");
     }
 
     // Collect the newest cap-worth of messages, stopping at the resume
@@ -1096,6 +1161,8 @@ export class Importer {
     const collected: RestMessage[] = [];
     let before: string | undefined;
     while (collected.length < HISTORY_MESSAGE_CAP) {
+      await this.assertChannelPolicy(plan.guild.id, channel.discordId);
+      await this.importGuards.get(importId)?.();
       const page = await this.historyFetch(channel.discordId, before);
       if (!page || page.length === 0) break;
       let stop = false;
@@ -1115,6 +1182,8 @@ export class Importer {
     let published = channel.historyImported ?? 0;
     let skipped = 0;
     for (const message of collected) {
+      await this.importGuards.get(importId)?.();
+      await this.assertChannelPolicy(plan.guild.id, channel.discordId);
       if (message.type !== 0 && message.type !== 19) continue;
       // Scoped to this community: re-importing the same guild elsewhere left
       // rows for the same discord_message_id, which made every history
@@ -1180,6 +1249,7 @@ export class Importer {
    * re-granted. That is the known bound on this feature, not a failure here.
    */
   private async admitBridgeToPrivateChannel(
+    importId: string,
     community: CommunityV2,
     opSk: Uint8Array,
     plan: ImportPlan,
@@ -1189,7 +1259,7 @@ export class Importer {
     const op = localIdentity(opSk);
     const control = currentControlWriteGroup(community);
     registerStreamKeys(controlGroups(community), community.relays);
-    const pool = this.poolFactory(community.relays);
+    const pool = guardEffects(this.poolFactory(community.relays), async () => { await this.importGuards.get(importId)?.(); }, new Set(["publish"]));
     try {
       const opV1 = {
         actorPubkey: op.pk,
@@ -1246,6 +1316,7 @@ export class Importer {
     opSk: Uint8Array,
     plan: ImportPlan,
   ): Promise<void> {
+    await this.assertPublicPlan(plan);
     await this.sql`
       UPDATE imports SET status = 'wiring', updated_at = now() WHERE import_id = ${importId}`;
     const [row] = await this.sql<ImportRow[]>`SELECT * FROM imports WHERE import_id = ${importId}`;
@@ -1255,6 +1326,8 @@ export class Importer {
     for (const channel of plan.channels) {
       if (!channel.selected || !channel.bridge || !channel.bridgeable || channel.bridgeId) continue;
 
+      await this.assertChannelPolicy(plan.guild.id, channel.discordId);
+      await this.importGuards.get(importId)?.();
       // A channel someone already bridged by hand: one live bridge per Discord
       // channel is a database invariant, so activating a second would throw
       // and take the whole import down with it. Note it and move on — the
@@ -1279,11 +1352,9 @@ export class Importer {
                 ${row.discord_guild_id}, ${channel.discordId}, ${channel.channelIdHex!})
         RETURNING *`;
 
-      // Mint the identity first, so a private channel's key can reach it
-      // before it boots — key intake happens once, at start.
       const provisioned = await this.manager.provisionImported(bridge);
       if (channel.private && channel.keySealed && provisioned.primary_pk) {
-        await this.admitBridgeToPrivateChannel(community, opSk, plan, channel, provisioned.primary_pk);
+        await this.admitBridgeToPrivateChannel(importId, community, opSk, plan, channel, provisioned.primary_pk);
       }
 
       // resolveInvite inside start() races relay propagation of the fresh
