@@ -44,6 +44,13 @@ The first command requires `DATABASE_URL` set securely to the disposable instanc
 
 Failing/stale policy, disconnected control state, missing validator, malformed output and validator timeout/crash reject writes. Do not disable the mandatory write hook to restore availability. A rekey-pending state requires matching recovery material; a missing owner grant cannot be repaired by elevating the workload to owner.
 
+The validator's soft deadline requests cancellation and waits for its database
+admission to settle before writing a decision or accepting another request.
+It does not announce rejection while that transaction can still commit. An
+external relay/process failure is still an uncertain transport outcome, not a
+cross-database atomic commit guarantee; reconcile policy and relay storage
+before treating recovery as complete.
+
 A worker owns the community through a Postgres transaction lock; delivery leases and stable decision IDs survive replacement. Acknowledge/verify is a separate step. Inspect target status before retrying; automatic retries stop at their configured budget and preserve failure. Rate limits are failures to retry, never successes.
 
 When upgrading the publication-attempt schema, stop old moderation workers

@@ -8,7 +8,7 @@ import { HEX_ID, MAX_EVENT_BYTES } from "./relayPolicy";
 export async function runPlugin(
   input: AsyncIterable<Uint8Array>,
   output: (line: string) => void | Promise<void>,
-  admit: (event: NostrEvent) => Promise<AdmissionResult>,
+  admit: (event: NostrEvent, signal: AbortSignal) => Promise<AdmissionResult>,
   options: { timeoutMs?: number; burst?: number } = {},
 ): Promise<void> {
   const limit = MAX_EVENT_BYTES + 4096;
@@ -29,10 +29,17 @@ export async function runPlugin(
       refilledAt = now;
       if (tokens < 1) throw new Error();
       tokens--;
-      result = await Promise.race([
-        admit(request.event),
-        new Promise<AdmissionResult>((resolve) => { timer = setTimeout(() => resolve(reject(id)), options.timeoutMs ?? 2000); }),
+      const abort = new AbortController();
+      const admission = Promise.resolve().then(() => admit(request.event, abort.signal)).catch(() => reject(id));
+      const completed = await Promise.race([
+        admission,
+        new Promise<undefined>((resolve) => { timer = setTimeout(() => { abort.abort(); resolve(undefined); }, options.timeoutMs ?? 2000); }),
       ]);
+      // A timeout is a cancellation request, not proof of rollback. Do not
+      // report rejection (or process the next event) while effects can commit.
+      // The real store checks the signal inside its bounded transaction. If a
+      // callback cannot settle, strfry's external timeout stops this process.
+      result = completed ?? await admission;
       if (result.id !== id || !["accept", "reject"].includes(result.action)) result = reject(id);
       // Only fixed public reasons cross the process boundary.
       result = result.action === "accept" ? { id, action: "accept" } : reject(id);
@@ -63,10 +70,11 @@ if (import.meta.main) {
   const url = process.env.MODERATION_DATABASE_URL;
   if (!url) { process.stderr.write("Moderation database is not configured\n"); process.exit(1); }
   const sql = postgres(url, { max: 1, connect_timeout: 1, idle_timeout: 10, onnotice: () => {} });
+  const store = new PolicyStore(sql);
   try {
     await runPlugin(process.stdin, (line) => new Promise<void>((resolve, reject) => {
       process.stdout.write(line, (error) => error ? reject(error) : resolve());
-    }), (event) => new PolicyStore(sql).admit(event));
+    }), (event, signal) => store.admit(event, signal));
   } catch {
     process.stderr.write("Moderation validator stopped\n");
     process.exitCode = 1;

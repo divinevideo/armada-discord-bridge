@@ -91,16 +91,18 @@ export class PolicyStore {
 
   async getPolicy(communityId: string) { requireId(communityId); return this.load(this.sql, communityId); }
 
-  async admit(event: NostrEvent): Promise<AdmissionResult> {
-    return this.admitEvent(event, false);
+  async admit(event: NostrEvent, signal?: AbortSignal): Promise<AdmissionResult> {
+    return this.admitEvent(event, false, signal);
   }
 
-  private async admitEvent(event: NostrEvent, restoring: boolean): Promise<AdmissionResult> {
+  private async admitEvent(event: NostrEvent, restoring: boolean, signal?: AbortSignal): Promise<AdmissionResult> {
     const id = typeof event?.id === "string" && HEX_ID.test(event.id) ? event.id : "0".repeat(64);
     const rejected: AdmissionResult = { id, action: "reject", msg: "blocked: room policy unavailable or event not permitted" };
     try {
+      signal?.throwIfAborted();
       if (Buffer.byteLength(JSON.stringify(event)) > MAX_EVENT_BYTES || !HEX_ID.test(event.pubkey)) return rejected;
       return await this.sql.begin(async (tx) => {
+        signal?.throwIfAborted();
         await tx.unsafe("SET LOCAL statement_timeout = '1500ms'");
         if (restoring) {
           // A removed public stream has no current scope. Rejecting it is safe
@@ -124,6 +126,7 @@ export class PolicyStore {
         const communityId = candidates[0].community_id as string;
         await policyLock(tx, communityId);
         const policy = await this.load(tx, communityId);
+        signal?.throwIfAborted();
         if (restoring) this.assertRecoveryPolicy(policy);
         const [row] = await tx`SELECT * FROM moderation.streams WHERE pubkey = ${event.pubkey} AND community_id = ${communityId}`;
         const known = await tx`SELECT 1 FROM moderation.observed_members WHERE community_id = ${communityId} AND author = ${event.pubkey}`;
@@ -145,6 +148,7 @@ export class PolicyStore {
           if (references) await tx`UPDATE moderation.carriers SET target_rumor_ids = ${references.ids}, targets_indexed = true
             WHERE event_id = ${references.eventId} AND community_id = ${references.target.communityId} AND channel_id = ${references.target.channelId} AND rumor_id = ${references.target.rumorId}`;
         }
+        signal?.throwIfAborted();
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept") for (const target of removals ?? []) {
           await tx`INSERT INTO moderation.tombstones (community_id, channel_id, rumor_id) VALUES (${communityId}, ${target.channelId}, ${target.rumorId}) ON CONFLICT DO NOTHING`;
@@ -158,6 +162,9 @@ export class PolicyStore {
         }
         if (result.action === "accept" && rekey) await tx`INSERT INTO moderation.rekey_events (event_id, community_id, epoch, event)
           VALUES (${rekey.event.id}, ${rekey.communityId}, ${rekey.epoch}, ${tx.json(rekey.event as never)}) ON CONFLICT DO NOTHING`;
+        // Throwing here rolls all policy/index writes back before admission can
+        // settle. The plugin waits for that settlement before emitting bytes.
+        signal?.throwIfAborted();
         return result;
       });
     } catch (error) { if (restoring) throw error; return rejected; }
