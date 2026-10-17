@@ -46,8 +46,9 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
   assert.equal(response.status, 202);
   const { caseId } = await response.json() as { caseId: string };
   const actor = { orgId: "synthetic", actorId: "synthetic-staff", permissions: ["view", "remove_message", "ban_member", "unban_member"] };
+  let sourceRevision = 0;
   async function decide(action: string) {
-    const body = JSON.stringify({ caseId, executionId: crypto.randomUUID(), action, reason: "Synthetic runtime decision", scope: action === "remove_message" ? "message" : "community", discordGuildConfirmed: false });
+    const body = JSON.stringify({ ...(action === "remove_message" ? {} : { sourceOrder: { version: 1, revision: String(++sourceRevision) } }), caseId, executionId: crypto.randomUUID(), action, reason: "Synthetic runtime decision", scope: action === "remove_message" ? "message" : "community", discordGuildConfirmed: false });
     const reply = await fetch(origin + "/v1/decisions", { method: "POST", headers: signCoopRequest(key, actor, "POST", "/v1/decisions", body), body });
     assert.equal(reply.status, 202);
     const { decisionId } = await reply.json() as { decisionId: string };

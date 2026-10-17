@@ -8,7 +8,7 @@ import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
 export async function migrateModeration(sql: postgres.Sql): Promise<void> {
-  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
+  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}, 1)`;
     for (const body of bodies) await tx.unsafe(body);

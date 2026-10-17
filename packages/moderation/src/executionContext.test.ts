@@ -36,7 +36,7 @@ test("an unban extended by an owner edition verifies the durable outbox and lift
     await store.setBan(f.community.idHex, f.member.pk, true);
     await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
       VALUES (${caseId}, ${orgId}, ${f.community.idHex}, ${f.channelId}, ${f.allowedRumorId}, ${f.member.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
-    const accepted = await decisions.acceptDecision({ caseId, executionId: crypto.randomUUID(), action: "unban_member", reason: "Synthetic unban", scope: "community", discordGuildConfirmed: false }, actor);
+    const accepted = await decisions.acceptDecision({ caseId, executionId: crypto.randomUUID(), sourceOrder: { version: 1, revision: "1" }, action: "unban_member", reason: "Synthetic unban", scope: "community", discordGuildConfirmed: false }, actor);
     await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${accepted.decisionId} AND target <> 'concord'`;
     const claim = (await decisions.claim())!;
     expect(claim.target).toBe("concord");

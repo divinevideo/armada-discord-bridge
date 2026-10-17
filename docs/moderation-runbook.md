@@ -106,3 +106,68 @@ portal database or grant moderation access to its private-channel keys.
 The public IaC configuration must select this mode when adopting an image with
 this compatibility repair. Image publication and deployment need their own
 approval; a local test does not authorize rollout.
+
+## Membership source order and recovery
+
+Every new `ban_member` or `unban_member` POST `/v1/decisions` requires
+`sourceOrder: {"version":1,"revision":"42"}`. Coop allocates that positive,
+canonical PostgreSQL bigint decimal string when it records the staff intent,
+under its per-target counter lock. Publication and retry reuse the original
+execution ID, actor, reason, scope, confirmation and source order. The bridge
+resolves the member from its own case and stores a durable head keyed by
+organization, community and member. Do not allocate order at HTTP delivery time.
+`remove_message` retains its existing unfenced contract.
+
+Status responses add `executionId` and `sourceOrder` (null for legacy rows).
+Signed GET `/v1/decision-executions/:executionId` returns the existing status,
+with the same org/community and action-or-view authorization as decision GET.
+404 is an observation of no visible committed acceptance, not proof an in-flight
+request cannot still commit. Reconcile a lost acceptance response through this
+lookup. Delivery Retry is a separate operation and never allocates source order.
+
+New lower revisions return HTTP 409 with `error: "member_intent_superseded"`,
+`executionId`, `currentRevision` and `supersededByExecutionId`. Equal revision
+with another execution returns `member_intent_order_conflict`; missing ordering
+returns `member_intent_order_required`. No refusal creates deliveries. Exact
+accepted replays are verified by their stored fingerprint generation first and
+return the original record without restarting deliveries, including legacy
+executions after evidence expiry. Changed immutable fields conflict.
+
+Migration 013 adds nullable decision ordering fields and backfills existing
+fingerprints as version 1. New revisioned hashes use version 2. The default
+version 2 also makes an old executable's new unfenced membership INSERT fail
+its database constraint; old unfenced removal hashes retain their replay
+algorithm at either marker. Runtime roles cannot delete heads; an increasing
+revision trigger prevents reset. Bootstrap re-applies these restrictions after
+its earlier broad grants. Heads have no evidence/decision foreign key and must
+survive pruning, restart, expiry, restore and recovery. Worker supersession and
+Retry use source revision (including durable heads), while legacy accepted
+membership precedes the revisioned generation. Existing live-lease and uncertain
+Concord-publication guards still apply.
+
+Cut over with new membership writes paused: deploy the additive bridge schema,
+lookup and fence, reconcile existing Coop pending executions, then enable only
+revision-aware registered-intent publication. Unaccepted ambiguous legacy
+intents require reconciliation or a fresh explicit staff decision; never assign
+them a new revision automatically. Inventory: the API is the production bridge
+acceptance boundary; the runtime scenario in
+`scripts/fixtures/moderation-runtime.ts` and acceptance fixtures in
+`decisions.test.ts` and `executionContext.test.ts` now record explicit revisions.
+Worker/protocol fixtures operating on already-stored decisions do not create
+new acceptance and require no source-order allocation.
+
+Before any revisioned acceptance, stop membership writers and run
+`scripts/moderation-source-order-rollback-preflight.sql` against the intended
+database before considering a schema downgrade. This is a read-only refusal
+check, not a down migration. Once any revisioned row or head exists, keep both
+ledgers, all counters, fingerprint markers and fencing. Disable new writes and
+recovery if necessary; preserve reads/reconciliation and safe existing outbox
+delivery, then roll forward or deploy a compatible build. Never resume an old
+unfenced writer, lower counters or remove ordering from requests. Restore heads
+and accepted execution identities together before enabling writes. There is no
+automatic down migration; eventual retirement needs separate approval.
+
+The bridge cannot know a newer intent that is still wholly inside Coop. The
+fence prevents a delayed older request from undoing a newer revision after the
+bridge accepts it; Coop suppresses automatic older sends after recording the
+newer intent. Do not claim this provides synchronous ordering for unseen work.

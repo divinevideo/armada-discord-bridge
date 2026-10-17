@@ -4,17 +4,18 @@ import type { DeliveryState, DeliveryTarget, RoomTarget } from "./contracts";
 import { EvidenceCipher } from "./evidence";
 export type RoomAction = "remove_message" | "ban_member" | "unban_member";
 export interface VerifiedCoopActor { orgId: string; actorId: string; permissions: string[] }
-export interface ModerationDecision { caseId: string; executionId: string; action: RoomAction; reason: string; scope: "message" | "community"; discordGuildConfirmed: boolean }
+export interface SourceOrder { version: 1; revision: string }
+export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string; executionId: string; action: RoomAction; reason: string; scope: "message" | "community"; discordGuildConfirmed: boolean }
 /** `supersededBy` names the newer ban or unban for the same member that took
  * over this decision's undelivered targets (each reads failed /
  * superseded_by_newer_decision); null when nothing was superseded. */
-export interface DecisionStatus { decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
+export interface DecisionStatus { executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
 export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationAttempted?: boolean }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
-export type DecisionRefusal = "member_decision_superseded";
+export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required";
 export class DecisionRefusedError extends Error {
-  constructor(readonly code: DecisionRefusal, message: string) { super(message); }
+  constructor(readonly code: DecisionRefusal, message: string, readonly details: { executionId?: string; currentRevision?: string; supersededByExecutionId?: string } = {}) { super(message); }
 }
 const membership = (action: string) => action === "ban_member" || action === "unban_member";
 // Bans and unbans for one member must take effect in the order staff decided
@@ -37,11 +38,19 @@ const inFlight = (d: string) => `(((${d}.state IN ('pending', 'acknowledged')) A
   OR (${d}.target = 'concord' AND ${d}.publication_attempted AND ${d}.state NOT IN ('verified', 'not_applicable')
     AND (${d}.signed_events IS NOT NULL OR COALESCE(${d}.result_code = 'concord_recovery_requires_operator', false))))`;
 const sameMember = (other: string, c: string) => `${c}.action IN ('ban_member', 'unban_member') AND ${other}.action IN ('ban_member', 'unban_member')
-  AND ${other}.community_id = ${c}.community_id AND ${other}.author = ${c}.author`;
-// Acceptance order is (created_at, decision_id). The member lock below makes it
-// the commit order too: created_at is stamped after the lock is held.
-const newerThan = (other: string, c: string) => `${sameMember(other, c)} AND (${other}.created_at, ${other}.decision_id) > (${c}.created_at, ${c}.decision_id)`;
-const olderThan = (other: string, c: string) => `${sameMember(other, c)} AND (${other}.created_at, ${other}.decision_id) < (${c}.created_at, ${c}.decision_id)`;
+  AND ${other}.org_id = ${c}.org_id AND ${other}.community_id = ${c}.community_id AND ${other}.author = ${c}.author`;
+// Source revisions define intent order, regardless of HTTP acceptance time.
+// All fenced decisions follow the legacy generation; legacy pairs retain their
+// historical order. Explicit NULL branches keep uncertain legacy sends blocking.
+const orderedAfter = (a: string, b: string) => `((${a}.source_revision IS NOT NULL AND ${b}.source_revision IS NULL)
+  OR (${a}.source_revision IS NOT NULL AND ${b}.source_revision IS NOT NULL AND ${a}.source_revision > ${b}.source_revision)
+  OR (${a}.source_revision IS NULL AND ${b}.source_revision IS NULL AND (${a}.created_at, ${a}.decision_id) > (${b}.created_at, ${b}.decision_id)))`;
+const newerThan = (other: string, c: string) => `${sameMember(other, c)} AND ${orderedAfter(other, c)}`;
+const olderThan = (other: string, c: string) => `${sameMember(other, c)} AND ${orderedAfter(c, other)}`;
+const newerHead = (c: string) => `${c}.action IN ('ban_member', 'unban_member') AND EXISTS (
+  SELECT 1 FROM moderation.member_order_heads h WHERE h.org_id = ${c}.org_id AND h.community_id = ${c}.community_id AND h.author = ${c}.author
+    AND (${c}.source_revision IS NULL OR h.latest_revision > ${c}.source_revision))`;
+const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${alias}.created_at, ${alias}.decision_id`;
 // Acceptance and Retry serialize per member, so a Retry cannot restart a
 // decision that a concurrently accepted newer one supersedes.
 function lockMember(tx: postgres.TransactionSql, communityId: string, author: string) {
@@ -60,22 +69,38 @@ export class Decisions {
   async acceptDecision(input: ModerationDecision, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     const cipher = this.cipher;
     if (!cipher) throw new Error("Decision acceptance disabled for this process");
-    if (!input || Object.keys(input).sort().join(",") !== "action,caseId,discordGuildConfirmed,executionId,reason,scope" || !uuid.test(input.caseId) || !uuid.test(input.executionId) || !actions.has(input.action) || typeof input.reason !== "string" || !input.reason.trim() || input.reason.length > 2048 || typeof input.discordGuildConfirmed !== "boolean" || input.scope !== (input.action === "remove_message" ? "message" : "community")) throw new Error("Invalid decision or scope confirmation");
+    if (!input || Object.keys(input).filter((key) => key !== "sourceOrder").sort().join(",") !== "action,caseId,discordGuildConfirmed,executionId,reason,scope" || !uuid.test(input.caseId) || !uuid.test(input.executionId) || !actions.has(input.action) || typeof input.reason !== "string" || !input.reason.trim() || input.reason.length > 2048 || typeof input.discordGuildConfirmed !== "boolean" || input.scope !== (input.action === "remove_message" ? "message" : "community")) throw new Error("Invalid decision or scope confirmation");
     assertActor(actor, input.action);
     if (input.discordGuildConfirmed) assertActor(actor, "discord_guild_ban");
-    const fingerprint = createHash("sha256").update(JSON.stringify([actor.orgId, actor.actorId, input.caseId, input.executionId, input.action, input.reason, input.scope, input.discordGuildConfirmed])).digest("hex");
+    const order = input.sourceOrder;
+    if ("sourceOrder" in input && (!order || !membership(input.action) || Object.keys(order).sort().join(",") !== "revision,version" || order.version !== 1 || typeof order.revision !== "string" || !/^[1-9][0-9]{0,18}$/.test(order.revision) || BigInt(order.revision) > 9223372036854775807n)) throw new Error("Invalid source order");
+    const fingerprintVersion = order ? 2 : 1;
+    const fingerprintFields: (string | number | boolean)[] = [actor.orgId, actor.actorId, input.caseId, input.executionId, input.action, input.reason, input.scope, input.discordGuildConfirmed];
+    if (order) fingerprintFields.push(order.version, order.revision);
+    const fingerprint = createHash("sha256").update(JSON.stringify(fingerprintFields)).digest("hex");
     const id = await this.sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(${actor.orgId + ":" + input.executionId}, 483213))`;
-      const [prior] = await tx`SELECT decision_id, fingerprint FROM moderation.decisions WHERE org_id = ${actor.orgId} AND execution_id = ${input.executionId}`;
-      if (prior) { if (prior.fingerprint !== fingerprint) throw new Error("Decision replay conflict"); return prior.decision_id as string; }
+      const [prior] = await tx`SELECT decision_id, fingerprint, fingerprint_version FROM moderation.decisions WHERE org_id = ${actor.orgId} AND execution_id = ${input.executionId}`;
+      if (prior) { if ((prior.fingerprint_version !== fingerprintVersion && !(input.action === "remove_message" && !order && prior.fingerprint_version === 2)) || prior.fingerprint !== fingerprint) throw new Error("Decision replay conflict"); return prior.decision_id as string; }
+      if (membership(input.action) && !order) throw new DecisionRefusedError("member_intent_order_required", "Membership source order required", { executionId: input.executionId });
       const [evidence] = await tx`SELECT * FROM moderation.cases WHERE case_id = ${input.caseId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp() FOR SHARE`;
       if (!evidence || this.communities.get(evidence.community_id) !== actor.orgId) throw new Error("Case unavailable");
-      // Never refused for an earlier decision: superseding it happens in the outbox.
-      if (membership(input.action)) await lockMember(tx, evidence.community_id, evidence.author);
+      if (membership(input.action)) {
+        await lockMember(tx, evidence.community_id, evidence.author);
+        const [head] = await tx`SELECT latest_revision::text AS revision, latest_execution_id FROM moderation.member_order_heads
+          WHERE org_id = ${actor.orgId} AND community_id = ${evidence.community_id} AND author = ${evidence.author} FOR UPDATE`;
+        if (head && BigInt(order!.revision) <= BigInt(head.revision)) {
+          throw new DecisionRefusedError(BigInt(order!.revision) < BigInt(head.revision) ? "member_intent_superseded" : "member_intent_order_conflict", "Membership source order refused",
+            { executionId: input.executionId, currentRevision: head.revision, supersededByExecutionId: head.latest_execution_id });
+        }
+        await tx`INSERT INTO moderation.member_order_heads (org_id, community_id, author, latest_revision, latest_execution_id)
+          VALUES (${actor.orgId}, ${evidence.community_id}, ${evidence.author}, ${order!.revision}, ${input.executionId})
+          ON CONFLICT (org_id, community_id, author) DO UPDATE SET latest_revision = EXCLUDED.latest_revision, latest_execution_id = EXCLUDED.latest_execution_id`;
+      }
       const decisionId = crypto.randomUUID();
       const audit = cipher.seal(`${actor.orgId}:${decisionId}`, { actorId: actor.actorId, reason: input.reason });
-      await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, audit, expires_at)
-        VALUES (${decisionId}, ${actor.orgId}, ${input.executionId}, ${fingerprint}, ${input.caseId}, ${evidence.community_id}, ${evidence.channel_id}, ${evidence.rumor_id}, ${evidence.author}, ${input.action}, ${input.discordGuildConfirmed}, ${audit}, ${evidence.expires_at})`;
+      await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, audit, expires_at, fingerprint_version, source_order_version, source_revision)
+        VALUES (${decisionId}, ${actor.orgId}, ${input.executionId}, ${fingerprint}, ${input.caseId}, ${evidence.community_id}, ${evidence.channel_id}, ${evidence.rumor_id}, ${evidence.author}, ${input.action}, ${input.discordGuildConfirmed}, ${audit}, ${evidence.expires_at}, ${fingerprintVersion}, ${order?.version ?? null}, ${order?.revision ?? null})`;
       for (const target of ["divine_relay", "concord", "discord"]) await tx`INSERT INTO moderation.deliveries (decision_id, target) VALUES (${decisionId}, ${target})`;
       return decisionId;
     });
@@ -88,7 +113,14 @@ export class Decisions {
     if (!row || this.communities.get(row.community_id) !== actor.orgId || (!actor.permissions.includes("view") && !actor.permissions.includes(row.action))) throw new Error("Decision unavailable");
     const deliveries = await this.sql`SELECT target, state, attempts, result_code, superseded_by FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
     const supersededBy = deliveries.find((d) => d.superseded_by)?.superseded_by ?? null;
-    return { decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
+    return { executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
+  }
+  async getByExecution(executionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
+    assertActor(actor);
+    if (!uuid.test(executionId)) throw new Error("Decision unavailable");
+    const [row] = await this.sql`SELECT decision_id FROM moderation.decisions WHERE org_id = ${actor.orgId} AND execution_id = ${executionId}`;
+    if (!row) throw new Error("Decision unavailable");
+    return this.get(row.decision_id, actor);
   }
   async forCase(caseId: string, actor: VerifiedCoopActor): Promise<DecisionStatus[]> {
     assertActor(actor, "view");
@@ -110,8 +142,8 @@ export class Decisions {
       if (membership(status.action)) {
         await lockMember(tx, scope.community_id, scope.author);
         // Restarting an older decision would undo the newer one for this member.
-        const [newer] = await tx`SELECT 1 FROM moderation.decisions c, moderation.decisions n
-          WHERE c.decision_id = ${decisionId} AND ${tx.unsafe(newerThan("n", "c"))} LIMIT 1`;
+        const [newer] = await tx`SELECT 1 FROM moderation.decisions c
+          WHERE c.decision_id = ${decisionId} AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) OR ${tx.unsafe(newerHead("c"))}) LIMIT 1`;
         if (newer) throw new DecisionRefusedError("member_decision_superseded", "A newer ban or unban for this member supersedes this decision");
       }
       return tx`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
@@ -137,10 +169,10 @@ export class Decisions {
       // no further use. superseded_by is the next decision accepted for the
       // member, so the chain reads in staff order whenever this sweep runs.
       await tx`UPDATE moderation.deliveries d SET state = 'failed', result_code = 'superseded_by_newer_decision', signed_events = NULL, token = NULL, lease_until = NULL, updated_at = clock_timestamp(),
-          superseded_by = (SELECT n.decision_id FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))} ORDER BY n.created_at, n.decision_id LIMIT 1)
+          superseded_by = (SELECT n.decision_id FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))} ORDER BY ${tx.unsafe(memberOrder("n"))} LIMIT 1)
         FROM moderation.decisions c
         WHERE c.decision_id = d.decision_id AND d.state IN ('pending', 'acknowledged') AND NOT ${tx.unsafe(inFlight("d"))}
-          AND EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))})`;
+          AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) OR ${tx.unsafe(newerHead("c"))})`;
       // A membership target waits, without spending attempts, while an older
       // decision's same target is in flight. An older row that a newer decision
       // committed just after the sweep may still be claimed here; it is then the

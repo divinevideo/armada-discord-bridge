@@ -112,7 +112,7 @@ test("transient failure respects retry delay and can be claimed again", async ()
 });
 test("retrying a guild-scoped decision needs guild authority for its Discord delivery", async () => {
   const admin = { ...actor, permissions: [...actor.permissions, "discord_guild_ban"] };
-  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community", discordGuildConfirmed: true }, admin);
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community", discordGuildConfirmed: true, sourceOrder: { version: 1, revision: "1" } }, admin);
   await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1 WHERE decision_id = ${accepted.decisionId}`;
   const moderator = await decisions.retry(accepted.decisionId, actor);
   expect(moderator.discordGuildConfirmed).toBe(true);
@@ -126,7 +126,7 @@ test("retrying a guild-scoped decision needs guild authority for its Discord del
 });
 
 test("Concord generation replacement and send intent are lease-fenced compare-and-swaps", async () => {
-  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community" }, actor);
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID(), action: "ban_member", scope: "community", sourceOrder: { version: 1, revision: "2" } }, actor);
   await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour'`;
   await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId} AND target = 'concord'`;
   const old = (await decisions.claim())!;
@@ -230,7 +230,13 @@ async function memberCase(author = crypto.randomUUID().replaceAll("-", "").repea
     VALUES (${id}, ${org}, ${"a".repeat(64)}, ${"b".repeat(64)}, ${crypto.randomUUID().replaceAll("-", "").repeat(2)}, ${author}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
   return { caseId: id, author };
 }
-const member = (subject: { caseId: string }, action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ caseId: subject.caseId, executionId, action, reason: `Synthetic ${action}`, scope: "community" as const, discordGuildConfirmed: false });
+const recordedRevisions = new Map<string, string>();
+let nextRevision = 100;
+function recordedOrder(executionId: string) {
+  if (!recordedRevisions.has(executionId)) recordedRevisions.set(executionId, String(++nextRevision));
+  return { version: 1 as const, revision: recordedRevisions.get(executionId)! };
+}
+const member = (subject: { caseId: string }, action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ sourceOrder: recordedOrder(executionId), caseId: subject.caseId, executionId, action, reason: `Synthetic ${action}`, scope: "community" as const, discordGuildConfirmed: false });
 const settle = (decisionId: string, state = "verified") => sql`UPDATE moderation.deliveries SET state = ${state}, attempts = 1 WHERE decision_id = ${decisionId}`;
 /** Holds a decision's deliveries out of the outbox. */
 const hold = (decisionId: string, except?: string) => sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${decisionId} AND target IS DISTINCT FROM ${except ?? null}`;
@@ -246,7 +252,7 @@ async function memberHarness(subject: "member" | "bannedMember") {
   const refresh = async () => { const p = (await store.getPolicy(f.community.idHex))!; return { ...p, controlEvents: [...p.controlEvents, ...published] }; };
   const actions = new ConcordActions(f.community, f.moderator, refresh);
   const relay = { publish: async (event: NostrEvent) => { if (!published.some((e) => e.id === event.id)) published.push(event); }, queryStrict: async (filters: { ids: string[] }[]) => published.filter((event) => filters[0].ids.includes(event.id)) };
-  const request = (action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ caseId: subjectCase, executionId, action, reason: "Synthetic member decision", scope: "community" as const, discordGuildConfirmed: false });
+  const request = (action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ sourceOrder: recordedOrder(executionId), caseId: subjectCase, executionId, action, reason: "Synthetic member decision", scope: "community" as const, discordGuildConfirmed: false });
   const accept = async (action: "ban_member" | "unban_member") => { const status = await outbox.acceptDecision(request(action), staff); await hold(status.decisionId, "concord"); return status; };
   const deliver = async (claim: Awaited<ReturnType<Decisions["claim"]>> & object, through: typeof relay = relay) => {
     expect(claim.target).toBe("concord");
@@ -406,7 +412,7 @@ test("acceptance and Retry for one member serialize on that member, not on other
   }
 });
 
-test("racing opposite decisions for one member all land in acceptance order, and the last one holds", async () => {
+test("racing opposite decisions for one member preserve source order and refuse superseded arrivals", async () => {
   const h = await memberHarness("member");
   try {
     let accepting = true;
@@ -416,12 +422,14 @@ test("racing opposite decisions for one member all land in acceptance order, and
     const results = await Promise.allSettled(Array.from({ length: 12 }, (_, i) => h.accept(i % 2 ? "ban_member" : "unban_member")));
     accepting = false;
     await delivering;
-    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+    expect(results[11].status).toBe("fulfilled");
+    for (const result of results) if (result.status === "rejected") expect(result.reason).toMatchObject({ code: "member_intent_superseded" });
     await h.drain();
-    const ids = results.map((result) => (result as PromiseFulfilledResult<{ decisionId: string }>).value.decisionId);
-    const order = await sql`SELECT decision_id, action FROM moderation.decisions WHERE decision_id IN ${sql(ids)} ORDER BY created_at, decision_id`;
+    const ids = results.filter((result) => result.status === "fulfilled").map((result) => (result as PromiseFulfilledResult<{ decisionId: string }>).value.decisionId);
+    const order = await sql`SELECT decision_id, action FROM moderation.decisions WHERE decision_id IN ${sql(ids)} ORDER BY source_revision`;
     const last = order[order.length - 1];
-    expect(await h.banned()).toBe(last.action === "ban_member");
+    expect(last.action).toBe("ban_member");
+    expect(await h.banned()).toBe(true);
     expect((await concordRow(last.decision_id)).state).toBe("verified");
     // Each earlier decision either landed before the next was accepted or stood down for it.
     for (let i = 0; i + 1 < order.length; i++) {
