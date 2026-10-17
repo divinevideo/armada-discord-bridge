@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
 import { createModerationApi, signCoopRequest } from "./api";
+import { DecisionRefusedError } from "./decisions";
 const secret = randomBytes(32);
 const actor = { orgId: "synthetic-org", actorId: "synthetic-reviewer", permissions: ["remove_message", "view", "retry"] };
-const status = { decisionId: crypto.randomUUID(), target: { communityId: "a".repeat(64), channelId: "b".repeat(64), rumorId: "c".repeat(64) }, action: "remove_message" as const, discordGuildConfirmed: false, deliveries: [] };
+const status = { decisionId: crypto.randomUUID(), target: { communityId: "a".repeat(64), channelId: "b".repeat(64), rumorId: "c".repeat(64) }, action: "remove_message" as const, discordGuildConfirmed: false, supersededBy: null, deliveries: [] };
 let accepted = 0;
 const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error("not called"); } }, decisions: { async acceptDecision() { accepted++; return status; }, async get() { return status; }, async retry() { return status; } } });
 test("staff endpoints require signed actor/org, method and body; acceptance is queued", async () => {
@@ -75,4 +76,19 @@ test("pre-auth body reads cancel slow streams and enforce the byte cap without w
   const stream = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new Uint8Array(65_537)); }, cancel() { canceled = true; return new Promise(() => {}); } });
   expect((await makeApi()(new Request("https://rooms.example/v1/decisions", { method: "POST", body: stream }))).status).toBe(413);
   expect(canceled).toBe(true);
+});
+
+test("a Retry refused because a newer member decision superseded it returns its code as a conflict", async () => {
+  let refusal: Error = new DecisionRefusedError("member_decision_superseded", "superseded");
+  const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error("not called"); } }, decisions: { async acceptDecision() { return status; }, async get() { return status; }, async retry() { throw refusal; } } });
+  const retryPath = `/v1/decisions/${status.decisionId}/retry`;
+  const post = () => api(new Request("https://rooms.example" + retryPath, { method: "POST", body: "", headers: signCoopRequest(secret, actor, "POST", retryPath, "") }));
+  const refused = await post();
+  expect(refused.status).toBe(409);
+  expect(await refused.json()).toEqual({ error: "member_decision_superseded" });
+  // Every other failure keeps the opaque rejection, message text included.
+  refusal = new Error("member_decision_superseded");
+  const other = await post();
+  expect(other.status).toBe(400);
+  expect(await other.json()).toEqual({ error: "decision_not_accepted" });
 });

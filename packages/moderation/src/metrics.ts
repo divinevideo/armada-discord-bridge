@@ -9,7 +9,7 @@ export async function collectMetrics(sql: postgres.Sql): Promise<string> {
   const [policy] = await sql`SELECT count(*) AS count, COALESCE(min(revision), 0) AS revision,
     COALESCE(max(GREATEST(0, extract(epoch FROM clock_timestamp() - updated_at))), 0) AS age FROM moderation.community_policy`;
   const [delivery] = await sql`SELECT count(*) FILTER (WHERE d.state IN ('pending', 'acknowledged')) AS pending,
-    count(*) FILTER (WHERE d.state = 'failed') AS failed,
+    count(*) FILTER (WHERE d.state = 'failed' AND d.result_code IS DISTINCT FROM 'superseded_by_newer_decision') AS failed,
     COALESCE(max(GREATEST(0, extract(epoch FROM clock_timestamp() - c.created_at))) FILTER (WHERE d.state IN ('pending', 'acknowledged')), 0) AS age
     FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)`;
   const [handoff] = await sql`SELECT count(*) AS pending,

@@ -5,6 +5,13 @@ import { migrateModeration } from "./policyStore";
 import { Decisions } from "./decisions";
 import { EvidenceCipher } from "./evidence";
 import { collectMetrics } from "./metrics";
+import type { NostrEvent } from "nostr-tools/pure";
+import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
+import { ConcordActions } from "./concordActions";
+import { deliverConcord } from "./concordDelivery";
+import { RetryableDeliveryError } from "./discordActions";
+import { PolicyStore } from "./policyStore";
+import { controlState } from "./relayPolicy";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 const org = crypto.randomUUID(), caseId = crypto.randomUUID(), executionId = crypto.randomUUID();
 const actor = { orgId: org, actorId: "synthetic-reviewer", permissions: ["remove_message", "ban_member", "unban_member", "retry"] };
@@ -192,9 +199,11 @@ test("the actual API role accepts decisions while retaining case locks and colum
     for (const { column_name } of columns) {
       await expect(api`UPDATE moderation.decisions SET ${api(column_name)} = ${api(column_name)} WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
     }
-    for (const column of ["signed_events", "publication_attempted", "decision_id", "target", "attempts", "result_code"]) {
+    for (const column of ["signed_events", "publication_attempted", "decision_id", "target", "attempts", "result_code", "superseded_by"]) {
       await expect(api`UPDATE moderation.deliveries SET ${api(column)} = ${api(column)} WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
     }
+    await expect(api`INSERT INTO moderation.deliveries (decision_id, target, superseded_by)
+      VALUES (${accepted.decisionId}, 'concord', ${accepted.decisionId}) ON CONFLICT DO NOTHING`.execute()).rejects.toThrow(/permission denied/);
     await expect(api`DELETE FROM moderation.deliveries WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
     await expect(api`DELETE FROM moderation.decisions WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
     await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
@@ -212,4 +221,269 @@ test("pending age survives delivery renewal, rescheduling and manual retry", asy
   expect(Number.isFinite(age)).toBe(true);
   expect(age).toBeGreaterThanOrEqual(3600);
   await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${accepted.decisionId}`;
+});
+
+async function memberCase(author = crypto.randomUUID().replaceAll("-", "").repeat(2)) {
+  const id = crypto.randomUUID();
+  await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
+    VALUES (${id}, ${org}, ${"a".repeat(64)}, ${"b".repeat(64)}, ${crypto.randomUUID().replaceAll("-", "").repeat(2)}, ${author}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
+  return { caseId: id, author };
+}
+const member = (subject: { caseId: string }, action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ caseId: subject.caseId, executionId, action, reason: `Synthetic ${action}`, scope: "community" as const, discordGuildConfirmed: false });
+const settle = (decisionId: string, state = "verified") => sql`UPDATE moderation.deliveries SET state = ${state}, attempts = 1 WHERE decision_id = ${decisionId}`;
+/** Holds a decision's deliveries out of the outbox. */
+const hold = (decisionId: string, except?: string) => sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${decisionId} AND target IS DISTINCT FROM ${except ?? null}`;
+const concordRow = async (decisionId: string) => (await sql`SELECT state, result_code, superseded_by, signed_events, attempts FROM moderation.deliveries WHERE decision_id = ${decisionId} AND target = 'concord'`)[0];
+
+/** A real outbox, real Concord preparation and readback, and a Concord fold
+ * over what the fake local relay has stored. Relay and Discord targets are held. */
+async function memberHarness(subject: "member" | "bannedMember") {
+  const f = await moderationFixture(), who = f[subject], store = new PolicyStore(sql), orgId = crypto.randomUUID(), subjectCase = crypto.randomUUID();
+  const staff = { orgId, actorId: "synthetic-reviewer", permissions: ["ban_member", "unban_member", "view", "retry"] };
+  const outbox = new Decisions(sql, cipher, new Map([[f.community.idHex, orgId]]));
+  const published: NostrEvent[] = [];
+  const refresh = async () => { const p = (await store.getPolicy(f.community.idHex))!; return { ...p, controlEvents: [...p.controlEvents, ...published] }; };
+  const actions = new ConcordActions(f.community, f.moderator, refresh);
+  const relay = { publish: async (event: NostrEvent) => { if (!published.some((e) => e.id === event.id)) published.push(event); }, queryStrict: async (filters: { ids: string[] }[]) => published.filter((event) => filters[0].ids.includes(event.id)) };
+  const request = (action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ caseId: subjectCase, executionId, action, reason: "Synthetic member decision", scope: "community" as const, discordGuildConfirmed: false });
+  const accept = async (action: "ban_member" | "unban_member") => { const status = await outbox.acceptDecision(request(action), staff); await hold(status.decisionId, "concord"); return status; };
+  const deliver = async (claim: Awaited<ReturnType<Decisions["claim"]>> & object, through: typeof relay = relay) => {
+    expect(claim.target).toBe("concord");
+    const result = await deliverConcord(claim, actions, outbox, through as never, async () => {}).catch((error) => {
+      if (error instanceof RetryableDeliveryError) return { state: "pending" as const, code: error.code };
+      throw error;
+    });
+    await outbox.complete(claim, result.state, result.code);
+    return result;
+  };
+  const drain = async () => { for (let claim; (claim = await outbox.claim());) await deliver(claim); };
+  const banned = async () => controlState(await refresh()).folded.banned.has(who.pk);
+  await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+  await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
+    VALUES (${subjectCase}, ${orgId}, ${f.community.idHex}, ${f.channelId}, ${f.allowedRumorId}, ${who.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
+  const cleanup = async () => {
+    await sql`DELETE FROM moderation.decisions WHERE org_id = ${orgId}`;
+    await sql`DELETE FROM moderation.cases WHERE org_id = ${orgId}`;
+    await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.community.idHex}`;
+  };
+  return { f, who, staff, outbox, relay, published, request, accept, deliver, drain, banned, cleanup };
+}
+
+// The outbox claims by available_at and Concord prepares from the fold current
+// at delivery. An older decision that was backing off used to deliver after a
+// newer opposite one and win, with both rows reading verified.
+for (const [older, newer] of [["ban_member", "unban_member"], ["unban_member", "ban_member"]] as const) test(`a ${newer} accepted after a still-delivering ${older} wins`, async () => {
+  const h = await memberHarness(older === "ban_member" ? "member" : "bannedMember");
+  try {
+    const first = await h.accept(older);
+    // The older decision's Concord delivery is backing off after a retryable failure.
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '200 milliseconds' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const second = await h.accept(newer);
+    await Bun.sleep(300);
+    await h.drain();
+    expect(await h.banned()).toBe(newer === "ban_member");
+    expect((await h.outbox.get(second.decisionId, h.staff)).deliveries.find((d) => d.target === "concord")?.state).toBe("verified");
+    const superseded = await h.outbox.get(first.decisionId, h.staff);
+    expect(superseded.supersededBy).toBe(second.decisionId);
+    // Every target of the older decision, held or not, stands down for the newer one.
+    expect(superseded.deliveries.map((d) => [d.state, d.resultCode])).toEqual(Array(3).fill(["failed", "superseded_by_newer_decision"]));
+    expect((await h.outbox.get(second.decisionId, h.staff)).supersededBy).toBeNull();
+  } finally { await h.cleanup(); }
+});
+
+test("superseding keeps the older decision on record and drops its unsent generation", async () => {
+  const subject = await memberCase();
+  const older = await decisions.acceptDecision(member(subject, "ban_member"), actor);
+  await hold(older.decisionId);
+  // An unsent prepared generation: signed but never published.
+  await sql`UPDATE moderation.deliveries SET signed_events = ${sql.json([{ id: "5".repeat(64) }])}, publication_attempted = false WHERE decision_id = ${older.decisionId} AND target = 'concord'`;
+  const failedBefore = Number((await collectMetrics(sql)).match(/^concord_deliveries_failed (\d+)$/m)![1]);
+  const newer = await decisions.acceptDecision(member(subject, "unban_member"), actor);
+  await hold(newer.decisionId);
+  const newest = await decisions.acceptDecision(member(subject, "ban_member"), actor);
+  await hold(newest.decisionId);
+  expect(await decisions.claim()).toBeUndefined();
+  const rows = await sql`SELECT target, state, result_code, superseded_by, signed_events, token, lease_until FROM moderation.deliveries WHERE decision_id = ${older.decisionId} ORDER BY target`;
+  for (const row of rows) expect(row).toEqual({ target: row.target, state: "failed", result_code: "superseded_by_newer_decision", superseded_by: newer.decisionId, signed_events: null, token: null, lease_until: null });
+  const [record] = await sql`SELECT action, author, audit IS NOT NULL AS audited FROM moderation.decisions WHERE decision_id = ${older.decisionId}`;
+  expect(record).toEqual({ action: "ban_member", author: subject.author, audited: true });
+  // Each superseded decision names the one accepted next, even when one sweep marks both.
+  expect((await decisions.forCase(subject.caseId, { ...actor, permissions: ["view"] })).map((d) => [d.decisionId, d.supersededBy])).toEqual([[newest.decisionId, null], [newer.decisionId, newest.decisionId], [older.decisionId, newer.decisionId]]);
+  // Superseded is not a delivery failure to escalate.
+  expect(Number((await collectMetrics(sql)).match(/^concord_deliveries_failed (\d+)$/m)![1])).toBe(failedBefore);
+  await settle(newest.decisionId, "failed");
+});
+
+test("a newer decision waits for an older one mid-send, then applies on top", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    const sending = (await h.outbox.claim())!;
+    expect(sending.decision.decisionId).toBe(first.decisionId);
+    const second = await h.accept("unban_member");
+    // The older attempt holds its lease: it is neither superseded nor overtaken.
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect((await concordRow(first.decisionId)).result_code).toBeNull();
+    expect((await concordRow(second.decisionId)).attempts).toBe(0);
+    expect(await h.deliver(sending)).toEqual({ state: "verified", code: "concord_enforcement_verified" });
+    expect(await h.banned()).toBe(true);
+    await h.drain();
+    expect(await h.banned()).toBe(false);
+    expect((await concordRow(first.decisionId)).state).toBe("verified");
+    expect(await concordRow(second.decisionId)).toMatchObject({ state: "verified", attempts: 1 });
+  } finally { await h.cleanup(); }
+});
+
+test("an older Concord edition whose publication is uncertain settles before a newer one is prepared", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    const limbo: NostrEvent[] = [];
+    // The relay may have stored the edition even though the send reported failure.
+    const lossy = { ...h.relay, publish: async (event: NostrEvent) => { limbo.push(event); throw new Error("socket closed"); } };
+    expect(await h.deliver((await h.outbox.claim())!, lossy)).toEqual({ state: "pending", code: "concord_transport_unavailable" });
+    const second = await h.accept("unban_member");
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    // Superseding it would let a newer edition race one that may already be stored.
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "pending", result_code: "concord_transport_unavailable", superseded_by: null });
+    expect((await concordRow(first.decisionId)).signed_events).toHaveLength(1);
+    h.published.push(...limbo);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const resumed = (await h.outbox.claim())!;
+    expect(resumed.decision.decisionId).toBe(first.decisionId);
+    expect(await h.deliver(resumed)).toEqual({ state: "verified", code: "concord_enforcement_verified" });
+    await h.drain();
+    expect(await h.banned()).toBe(false);
+    expect((await concordRow(second.decisionId)).state).toBe("verified");
+  } finally { await h.cleanup(); }
+});
+
+test("Retry refuses a decision a newer one for that member superseded", async () => {
+  const subject = await memberCase();
+  const older = await decisions.acceptDecision(member(subject, "ban_member"), actor);
+  await settle(older.decisionId, "failed");
+  const newer = await decisions.acceptDecision(member(subject, "unban_member"), actor);
+  await hold(newer.decisionId);
+  const refused = await decisions.retry(older.decisionId, actor).catch((error: unknown) => error);
+  expect(refused).toMatchObject({ code: "member_decision_superseded" });
+  expect((await decisions.get(older.decisionId, actor)).deliveries.every((d) => d.state === "failed")).toBe(true);
+  // A decision the outbox marked superseded is refused the same way.
+  const newest = await decisions.acceptDecision(member(subject, "ban_member"), actor);
+  await hold(newest.decisionId);
+  expect(await decisions.claim()).toBeUndefined();
+  expect((await decisions.get(newer.decisionId, actor)).supersededBy).toBe(newest.decisionId);
+  await expect(decisions.retry(newer.decisionId, actor)).rejects.toMatchObject({ code: "member_decision_superseded" });
+  // The newest decision for the member stays retryable.
+  await settle(newest.decisionId, "failed");
+  expect((await decisions.retry(newest.decisionId, actor)).deliveries.every((d) => d.state === "pending")).toBe(true);
+  await settle(newest.decisionId, "failed");
+});
+
+test("acceptance and Retry for one member serialize on that member, not on others", async () => {
+  const subject = await memberCase(), bystander = await memberCase();
+  const older = await decisions.acceptDecision(member(subject, "ban_member"), actor);
+  await settle(older.decisionId, "failed");
+  const locked = sql.reserve();
+  const conn = await locked;
+  try {
+    await conn`BEGIN`;
+    await conn`SELECT pg_advisory_xact_lock(hashtextextended(${"a".repeat(64) + ":" + subject.author}, 483216))`;
+    let accepted = false, retried = false;
+    const pendingAccept = decisions.acceptDecision(member(subject, "unban_member"), actor).then((s) => { accepted = true; return s; });
+    const pendingRetry = decisions.retry(older.decisionId, actor).then((s) => { retried = true; return s; }, (e) => { retried = true; return e; });
+    await decisions.acceptDecision(member(bystander, "ban_member"), actor).then((s) => hold(s.decisionId));
+    await Bun.sleep(200);
+    expect([accepted, retried]).toEqual([false, false]);
+    await conn`COMMIT`;
+    const newer = await pendingAccept;
+    await pendingRetry;
+  } finally {
+    await conn`ROLLBACK`.catch(() => {});
+    conn.release();
+    await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id IN (SELECT decision_id FROM moderation.decisions WHERE case_id IN (${subject.caseId}, ${bystander.caseId}))`;
+  }
+});
+
+test("racing opposite decisions for one member all land in acceptance order, and the last one holds", async () => {
+  const h = await memberHarness("member");
+  try {
+    let accepting = true;
+    // A relay or Discord row can be claimed before accept() holds it; park it again.
+    const step = async (claim: Awaited<ReturnType<Decisions["claim"]>> & object) => claim.target === "concord" ? h.deliver(claim) : h.outbox.complete(claim, "pending", "held_by_test", 3600);
+    const delivering = (async () => { while (accepting) { const claim = await h.outbox.claim(); if (claim) await step(claim); else await Bun.sleep(5); } })();
+    const results = await Promise.allSettled(Array.from({ length: 12 }, (_, i) => h.accept(i % 2 ? "ban_member" : "unban_member")));
+    accepting = false;
+    await delivering;
+    expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+    await h.drain();
+    const ids = results.map((result) => (result as PromiseFulfilledResult<{ decisionId: string }>).value.decisionId);
+    const order = await sql`SELECT decision_id, action FROM moderation.decisions WHERE decision_id IN ${sql(ids)} ORDER BY created_at, decision_id`;
+    const last = order[order.length - 1];
+    expect(await h.banned()).toBe(last.action === "ban_member");
+    expect((await concordRow(last.decision_id)).state).toBe("verified");
+    // Each earlier decision either landed before the next was accepted or stood down for it.
+    for (let i = 0; i + 1 < order.length; i++) {
+      const row = await concordRow(order[i].decision_id);
+      if (row.state !== "verified") expect(row).toMatchObject({ state: "failed", result_code: "superseded_by_newer_decision", superseded_by: order[i + 1].decision_id });
+    }
+  } finally { await h.cleanup(); }
+});
+
+test("only a newer membership decision for the same member supersedes", async () => {
+  const subject = await memberCase(), bystander = await memberCase();
+  // Removing a message does not change membership, before or after a ban, and another member is a different subject.
+  const remove = () => decisions.acceptDecision({ caseId: subject.caseId, executionId: crypto.randomUUID(), action: "remove_message", reason: "Synthetic removal", scope: "message", discordGuildConfirmed: false }, actor);
+  const earlier = await remove();
+  await hold(earlier.decisionId);
+  const outstanding = await decisions.acceptDecision(member(subject, "ban_member"), actor);
+  await hold(outstanding.decisionId);
+  const removal = await remove();
+  const other = await decisions.acceptDecision(member(bystander, "unban_member"), actor);
+  for (const id of [removal.decisionId, other.decisionId]) await hold(id);
+  expect(await decisions.claim()).toBeUndefined();
+  for (const id of [earlier.decisionId, outstanding.decisionId, removal.decisionId, other.decisionId]) {
+    const status = await decisions.get(id, actor);
+    expect(status.supersededBy).toBeNull();
+    expect(status.deliveries.every((d) => d.state === "pending")).toBe(true);
+  }
+  // A replayed execution is the same decision, not a newer one.
+  const [{ execution_id }] = await sql`SELECT execution_id FROM moderation.decisions WHERE decision_id = ${outstanding.decisionId}`;
+  expect((await decisions.acceptDecision(member(subject, "ban_member", execution_id), actor)).decisionId).toBe(outstanding.decisionId);
+  expect(await decisions.claim()).toBeUndefined();
+  expect((await decisions.get(outstanding.decisionId, actor)).supersededBy).toBeNull();
+  for (const id of [earlier.decisionId, outstanding.decisionId, removal.decisionId, other.decisionId]) await settle(id, "failed");
+});
+
+for (const terminal of ["retry_budget_exhausted", "concord_recovery_requires_operator"] as const) test(`an uncertain older Concord publication still blocks its successor after ${terminal}`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    const lossy = { ...h.relay, publish: async (_event: NostrEvent) => { throw new Error("socket closed"); } };
+    await h.deliver((await h.outbox.claim())!, lossy);
+    if (terminal === "retry_budget_exhausted") {
+      await sql`UPDATE moderation.deliveries SET attempts = 8 WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    } else {
+      await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = ${terminal} WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    }
+    const second = await h.accept("unban_member");
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: terminal, superseded_by: null });
+    expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
+  } finally { await h.cleanup(); }
+});
+
+test("expiry clears uncertain signed bytes but leaves the successor waiting for operator recovery", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    const lossy = { ...h.relay, publish: async (_event: NostrEvent) => { throw new Error("socket closed"); } };
+    await h.deliver((await h.outbox.claim())!, lossy);
+    const second = await h.accept("unban_member");
+    await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`;
+    await h.outbox.expire();
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
+  } finally { await h.cleanup(); }
 });

@@ -1,6 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { authenticateReport, type Reports } from "./reports";
-import type { Decisions, VerifiedCoopActor } from "./decisions";
+import { DecisionRefusedError, type Decisions, type VerifiedCoopActor } from "./decisions";
 const digest = (body: string) => createHash("sha256").update(body).digest("hex");
 const signature = (key: Uint8Array, method: string, path: string, body: string, timestamp: string, actor: string) => createHmac("sha256", key).update(JSON.stringify([method, path, digest(body), timestamp, actor])).digest("hex");
 /** Coop signs its server-derived staff identity after its own permission check. */
@@ -79,7 +79,12 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
       if (decisionRoute && !decisionRoute[2] && request.method === "GET") return response(await options.decisions.get(decisionRoute[1], actor));
       if (decisionRoute?.[2] && request.method === "POST") return response(await options.decisions.retry(decisionRoute[1], actor), 202);
       return response({ error: "method_not_allowed" }, 405);
-    } catch { return response({ error: "decision_not_accepted" }, 400); }
+    } catch (error) {
+      // A refusal staff can resolve (act on the newer decision) names itself.
+      // Everything else stays opaque.
+      if (error instanceof DecisionRefusedError) return response({ error: error.code }, 409);
+      return response({ error: "decision_not_accepted" }, 400);
+    }
   };
   return async (request: Request): Promise<Response> => {
     const origin = request.headers.get("origin");
