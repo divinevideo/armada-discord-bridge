@@ -1,3 +1,4 @@
+import { guildInScope } from "@armada-bridge/bridge/src/deploymentMode";
 /**
  * Portal server: JSON API + static SPA, one Bun process. In dev, run the
  * Vite dev server alongside (`bun run --cwd packages/portal web`) which
@@ -191,6 +192,7 @@ type GuildAuthority = { ok: true; guild: SessionGuild } | { ok: false; status: 4
  * bearer by design and keep their fixture guilds.
  */
 async function guildAuthority(c: Context, session: SessionData, guildId: string): Promise<GuildAuthority> {
+  if (!guildInScope(env, guildId)) return { ok: false, status: 403, error: "guild is outside this deployment" };
   let guilds = session.guilds;
   if (!session.dev && Date.now() - (session.guildsFetchedAt ?? 0) > GUILD_AUTHORITY_TTL_MS) {
     if (!session.accessToken) {
@@ -537,7 +539,7 @@ app.get("/api/me", async (c) => {
   if (!session || !session.user.id) return c.json({ user: null, devLogin: env.devLogin, discordConfigured });
   return c.json({
     user: session.user,
-    guilds: session.guilds.filter((g) => g.canManage),
+    guilds: session.guilds.filter((g) => g.canManage && guildInScope(env, g.id)),
     devLogin: env.devLogin,
     discordConfigured,
   });
@@ -556,7 +558,11 @@ app.get("/api/guilds/:id/channels", async (c) => {
   if (!env.discordBotToken) return c.json({ error: "bot token not configured" }, 501);
   const channels = await botGuildTextChannels(env.discordBotToken, c.req.param("id"));
   if (!channels) return c.json({ present: false, installUrl: botInstallUrl(env.discordClientId, c.req.param("id")) });
-  return c.json({ present: true, channels });
+  const visible = [];
+  for (const channel of channels) {
+    try { await manager.assertChannelPolicy(c.req.param("id"), channel.id); visible.push(channel); } catch {}
+  }
+  return c.json({ present: true, channels: visible });
 });
 
 // ── Server import ────────────────────────────────────────────────────────────
@@ -741,7 +747,7 @@ app.post("/api/bridges/:id/link", async (c) => {
     return c.json({ error: "that channel is not in that guild" }, 403);
   }
   try {
-    await manager.assertPublicChannel(body.guildId, body.channelId);
+    await manager.assertChannelPolicy(body.guildId, body.channelId);
   } catch {
     return c.json({ error: "Channel is excluded, private, or its public visibility could not be verified" }, 403);
   }

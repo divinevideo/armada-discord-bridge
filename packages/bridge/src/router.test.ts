@@ -1334,9 +1334,9 @@ describe("public channel policy at side-effect boundaries", () => {
   });
 });
 
- it("fails closed when a router has no public policy", async () => {
+ it("fails closed when a router has no effect policy", async () => {
    const h = harness({ beforeSideEffect: undefined });
-   await expect(h.router.onDiscordMessage(discordMsg(), h.link)).rejects.toThrow("Public channel policy is not configured");
+   await expect(h.router.onDiscordMessage(discordMsg(), h.link)).rejects.toThrow("Bridge effect policy is not configured");
    expect(h.pool.published).toHaveLength(0);
  });
 

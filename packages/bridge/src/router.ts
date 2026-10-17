@@ -148,7 +148,7 @@ export interface BlobPort {
 }
 
 export interface RouterOptions {
-  /** Required at runtime: fresh public-channel permissions and current worker ownership. */
+  /** Required at runtime: current worker ownership and deployment-specific channel permissions. */
   beforeSideEffect?: () => Promise<void>;
   /** Kind 3302 is not frozen in the CORDs yet; off by default. */
   bridgeEdits?: boolean;
@@ -423,7 +423,7 @@ export class BridgeRouter {
   }
 
   private async assertMayForward(): Promise<void> {
-    if (!this.options.beforeSideEffect) throw new Error("Public channel policy is not configured");
+    if (!this.options.beforeSideEffect) throw new Error("Bridge effect policy is not configured");
     await this.options.beforeSideEffect();
   }
 

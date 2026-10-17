@@ -93,3 +93,16 @@ when exhausted. Before pilot acceptance, select and verify a bounded history/loa
 and pre-ceiling lifecycle plan, or an upstream-compatible snapshot/compaction
 design. Do not prune to current heads, raise bounds, or disable the hook as an
 operator workaround: historical authorization and ban state depend on the fold.
+
+## Separate public deployment
+
+Set `BRIDGE_MODE=public` explicitly on public bridge/portal processes alongside
+`BRIDGE_PUBLIC_CHANNELS`. Missing rules fail startup. Ordinary bridge/portal
+processes remain legacy by default and retain private, multi-community support.
+The moderation worker is already a public-only entrypoint; it does not host
+legacy bridges. Use the dedicated public deployment/database/session and bot
+credentials described in the root README. Never reuse the existing legacy
+portal database or grant moderation access to its private-channel keys.
+The public IaC configuration must select this mode when adopting an image with
+this compatibility repair. Image publication and deployment need their own
+approval; a local test does not authorize rollout.

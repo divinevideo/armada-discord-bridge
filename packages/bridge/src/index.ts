@@ -11,6 +11,9 @@
 
 import {
   STOCK_RELAYS,
+  Permissions,
+  inviteDeliveryRelays,
+  isAuthorized,
   parseInviteLink,
 } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
@@ -20,10 +23,12 @@ import postgres from "postgres";
 
 import { CONCORD_EFFECT_METHODS, guardEffects } from "./effectGuard";
 import { BridgeLeases, bridgeResource } from "./db/leases";
-import { parsePublicChannelRules, discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
+import { discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
 import { BlossomStore } from "./blossom";
 import { KlipyClient } from "./klipy";
 import { ConcordClient, resolveInvite } from "./concord/client";
+import { intakeDirectInviteKeys } from "./concord/keyIntake";
+import { identityRelayPool } from "./concord/identityPool";
 import { RelayPool } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { loadConfig } from "./config";
@@ -56,8 +61,8 @@ if (!inviteUrl || !guildId || !channelId || !config.discordToken) {
   process.exit(0);
 }
 
-const publicPolicy = discordPublicChannelPolicy(parsePublicChannelRules(process.env.BRIDGE_PUBLIC_CHANNELS), config.discordToken);
-await publicPolicy.assertPublicChannel(guildId, channelId);
+const publicPolicy = config.mode === "public" ? discordPublicChannelPolicy(config.publicChannels!, config.discordToken) : undefined;
+await publicPolicy?.assertPublicChannel(guildId, channelId);
 const sql = postgres(config.databaseUrl, { onnotice: () => {} });
 // Register cleanup as resources appear, so loss during startup does not touch
 // bindings that have not initialized yet. A supervisor can then restart us.
@@ -80,9 +85,9 @@ if (!lease) throw new Error("Bridge lease is owned by another worker");
 cleanup.push(() => lease.release());
 const assertMayForward = async () => {
   await lease.assertCurrent();
-  await publicPolicy.assertPublicChannel(guildId, channelId);
+  await publicPolicy?.assertPublicChannel(guildId, channelId);
   const current = rawClient.channel(concordChannelId!);
-  if (!current || current.isPrivate) throw new Error("Concord channel must be public");
+  if (!current || (config.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
   await lease.assertCurrent();
 };
 
@@ -95,23 +100,48 @@ const { community } = await resolveInvite(inviteUrl, bootstrap);
 await bootstrap.close();
 console.log(`bridge: joined material for community ${community.name} (${community.idHex})`);
 
-const pool = new RelayPool(community.relays);
+const primaryKey = primarySk(config.primarySecretKey);
+const primary = localIdentity(primaryKey);
+const pool = identityRelayPool(community.relays, primaryKey);
 cleanup.push(() => pool.close());
-const primary = localIdentity(primarySk(config.primarySecretKey));
 
-// Fold authority from the invite's community root before using its public channels.
-// Public-only production boot does not accept private-channel key bundles.
+// Fold the Control Plane FIRST. It reads from the community root the invite
+// already carried, so it needs no private-channel key — which means the
+// roster, and therefore who is entitled to vend a channel key, is knowable
+// before we accept any. The intake below refuses bundles from anyone else.
 const preflight = new ConcordClient(community, pool, primary);
-await preflight.syncControl();
+const folded = await preflight.syncControl();
+let rawClient = preflight;
+if (config.mode !== "public") {
 
-const rawClient = preflight;
+  // Private-channel keys addressed to us since the last boot. The join bundle
+  // only ever carried what the inviter vended at the time, so a channel we were
+  // granted afterwards is readable only once its Direct Invite is opened — and
+  // this has to run BEFORE the client that serves `channels()` is built, or the
+  // grant is invisible until the next restart. The stock floor is scanned
+  // alongside the community relays because that is where a sender delivers to an
+  // npub with no published inbox (which we were, until the 10050 below).
+  const floor = identityRelayPool(inviteDeliveryRelays([]), primaryKey);
+  const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
+    isAuthorizedSender: (pk) =>
+      isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
+  }).finally(() => void floor.close());
+  if (intake.learned.length > 0) {
+    console.log(`bridge: learned ${intake.learned.length} private-channel key(s) from direct invites`);
+  }
+
+  // Re-fold only when the intake actually changed the key set; otherwise the
+  // preflight client already holds the answer.
+  rawClient = intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
+  if (intake.learned.length > 0) await rawClient.syncControl();
+}
 const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
 
 const concordChannelId =
   process.env.CONCORD_CHANNEL_ID?.trim() || client.channels()[0]?.idHex;
 const channel = concordChannelId ? client.channel(concordChannelId) : undefined;
 if (!channel) throw new Error(`concord channel not found (have: ${client.channels().map((c) => c.idHex).join(", ")})`);
-if (channel.isPrivate) throw new Error("Concord channel must be public");
+if (config.mode === "public" && channel.isPrivate) throw new Error("Concord channel must be public");
 console.log(`bridge: target channel #${channel.name}`);
 
 await client.publishJoin().catch((error) => console.warn("bridge: guestbook join failed", error));

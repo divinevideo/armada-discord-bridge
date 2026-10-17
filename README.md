@@ -101,7 +101,8 @@ Portal:
 | `PORTAL_BASE_URL` | Public origin, used for OAuth redirects and to decide whether cookies are `Secure`. |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | OAuth application credentials. |
 | `DISCORD_TOKEN` | Bot token. Without it, bridges cannot go live. |
-| `BRIDGE_PUBLIC_CHANNELS` | **Required.** JSON object with `guildId`, nonempty `channelIds`, and nonempty `excludedCategoryIds`, each containing Discord IDs. See the public-only compatibility note below. |
+| `BRIDGE_MODE` | `legacy` by default; `public` explicitly enables the separately deployed public-room service. |
+| `BRIDGE_PUBLIC_CHANNELS` | **Required in public mode.** JSON object with `guildId`, nonempty `channelIds`, and nonempty `excludedCategoryIds`, each containing Discord IDs. See the public-only compatibility note below. |
 | `PORTAL_DEV_LOGIN` | `1` enables the fake-session login, which hands any anonymous caller a session. The portal refuses to boot with it set when `PORTAL_BASE_URL` is `https:` or `NODE_ENV=production`. |
 | `BLOSSOM_SERVER` | Attachment re-hosting targets, comma-separated in preference order (e.g. `https://blossom.ditto.pub,https://blossom.primal.net`); each upload falls through to the next on failure. Empty leaves CDN links. |
 | `KLIPY_API_KEY` | Resolves Klipy GIF-picker sends to their real GIF via the Items API. Without it they are transcoded from the embed's mp4 (needs ffmpeg). |
@@ -115,27 +116,42 @@ from env instead — `BRIDGE_MASTER_SECRET`, `BRIDGE_PRIMARY_KEY`,
 `DISCORD_CHANNEL_ID`, `CONCORD_CHANNEL_ID` — and runs with
 `docker compose --profile bridge up`.
 
-### Public-only compatibility boundary
+### Existing bridges and separate public rooms
 
-This branch restricts forwarding and imports to public text channels in one
-configured guild. For example, using synthetic Discord IDs:
+The ordinary portal and standalone bridge retain their existing behavior:
+private Concord channels, authorized Direct Invite key intake, and multiple
+guild/community pairings. Existing deployments need no public-pilot variables.
+Legacy private imports retain their independent keys, scoped access roles,
+owner-only key delivery and explicit per-channel mirroring choices.
+
+Public rooms are an explicit separate deployment using `BRIDGE_MODE=public`.
+It requires `BRIDGE_PUBLIC_CHANNELS`, for example with synthetic Discord IDs:
 
 ```json
 {"guildId":"111111111111111111","channelIds":["222222222222222222"],"excludedCategoryIds":["333333333333333333"]}
 ```
 
-The portal requires this configuration at boot; the standalone bridge requires
-it when going live. Both reject private Concord channels. Channels in configured
-excluded categories, or a category named `tickets` (case-insensitive), remain
-excluded even if the bot can view them. Both ID lists must currently be nonempty.
+Public mode permits only configured public Discord text channels in that guild
+and public Concord targets. Excluded categories and a category named `tickets`
+(case-insensitive) stay excluded even when the bot can see them. Visibility is
+checked again before effects and history reads. Both lists remain nonempty.
+Missing/invalid public settings fail startup; they never select legacy behavior.
+Public-pairing variables without explicit public mode are rejected.
 
-This is not a drop-in upgrade for the multi-guild/private-channel service
-described above. Setting the variable alone does not preserve bridges in other
-guilds. Before upgrading an existing deployment, its owner must choose legacy
-compatibility outside the public pairing or an explicit deployment/tenant
-migration and rollback plan. That cutover is unresolved; do not infer it from
-the public pilot configuration. See [the moderation runbook](docs/moderation-runbook.md)
-for the separately gated public pilot.
+Use `docker compose -p <separate-project> -f docker-compose.public.yml up --build`
+only when deployment is authorized. This file is standalone, not an override of
+the ordinary compose file. It has its own database/volume and requires separate
+public bot/OAuth credentials, seal/session key, port and origin. Do not point a
+public process at the existing bridge database or give it legacy sealed roots.
+The existing Armada popup integration continues using its existing portal;
+OAuth/claim payloads are unchanged. Stopping the separate public deployment is
+its rollback, without cutting over existing bridges.
+
+Optional public `BRIDGE_MASTER_SECRET` and `BRIDGE_COMMUNITY_ID` must be supplied
+together and match the moderation worker's provisioned community/guild pairing.
+Existing legacy puppet identities are preserved; this is not a key rotation.
+Actual deployment, credentials, enrollment and public pilot acceptance remain
+separately authorized operations. See [the moderation runbook](docs/moderation-runbook.md).
 
 ## What the database holds
 

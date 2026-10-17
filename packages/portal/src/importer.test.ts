@@ -54,6 +54,7 @@ import { unseal } from "./seal";
 const SEAL_KEY = "0123456789abcdef".repeat(4);
 
 const env: PortalEnv = {
+  mode: "public",
   databaseUrl: "",
   port: 0,
   host: "127.0.0.1",

@@ -16,6 +16,7 @@ import { randomBytes } from "node:crypto";
 import {
   Permissions,
   STOCK_RELAYS,
+  inviteDeliveryRelays,
   isAuthorized,
   parseInviteLink,
 } from "@armada-bridge/concord-core";
@@ -23,6 +24,8 @@ import type { ChannelV2, OpenedChat } from "@armada-bridge/concord-core";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { KlipyClient } from "@armada-bridge/bridge/src/klipy";
 import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/client";
+import { identityRelayPool } from "@armada-bridge/bridge/src/concord/identityPool";
+import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyIntake";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
@@ -163,6 +166,10 @@ export class BridgeManager {
     private readonly publicPolicy?: Pick<PublicChannelPolicy, "assertPublicChannel"> & Partial<Pick<PublicChannelPolicy, "assertPublicChannels">>,
   ) {
     this.store = new PostgresMappingStore(sql);
+  }
+
+  async assertChannelPolicy(guildId: string, channelId: string): Promise<void> {
+    if (this.env.mode === "public") await this.assertPublicChannel(guildId, channelId);
   }
 
   async assertPublicChannel(guildId: string, channelId: string): Promise<void> {
@@ -364,7 +371,7 @@ export class BridgeManager {
         await client.syncControl();
         return {
           community: { idHex: community.idHex, name: community.name, relays: community.relays },
-          channels: client.channels().filter((c) => !c.isPrivate).map((c) => ({ idHex: c.idHex, name: c.name })),
+          channels: client.channels().filter((c) => this.env.mode !== "public" || !c.isPrivate).map((c) => ({ idHex: c.idHex, name: c.name })),
         };
       } finally {
         await pool.close();
@@ -401,7 +408,7 @@ export class BridgeManager {
     if (!row.community_id || !row.discord_guild_id) {
       throw new Error("bridge must be linked (community + guild) before activation");
     }
-    await this.assertPublicChannel(row.discord_guild_id, row.discord_channel_id ?? "");
+    await this.assertChannelPolicy(row.discord_guild_id, row.discord_channel_id ?? "");
     const primarySk = generateSecretKey();
     const primary = localIdentity(primarySk);
     const confirmCode = randomBytes(4).toString("hex");
@@ -436,7 +443,7 @@ export class BridgeManager {
     if (!row.community_id || !row.discord_guild_id) {
       throw new Error("bridge must be linked (community + guild) before activation");
     }
-    await this.assertPublicChannel(row.discord_guild_id, row.discord_channel_id ?? "");
+    await this.assertChannelPolicy(row.discord_guild_id, row.discord_channel_id ?? "");
     const primarySk = generateSecretKey();
     const primary = localIdentity(primarySk);
     const masterSecretSealed = await this.sharedMasterSecret(row.community_id, row.discord_guild_id);
@@ -473,7 +480,7 @@ export class BridgeManager {
     if (!row.invite_url_sealed || !row.master_secret_sealed || !row.primary_sk_sealed) {
       throw new Error("bridge is missing sealed key material");
     }
-    await this.assertPublicChannel(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
+    await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
     let starting = true;
     let lost = false;
     const lease = await new BridgeLeases(this.sql).acquire(bridgeResource(row.discord_guild_id!, row.discord_channel_id!), () => {
@@ -526,28 +533,44 @@ export class BridgeManager {
       // deliveries on relay.ditto.pub or relay.dreamith.to — every private
       // channel an import admitted it to failed "concord channel not found" on
       // every start (2026-09-24). The npub is public already (kind 0, guestbook).
-      const pool = new RelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), { authSk: primarySk });
+      const pool = identityRelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), primarySk);
 
       cleanup.push(() => pool.close());
-      // Fold authority from the invite's community root first. Public-only boot
-      // does not accept private-channel key bundles.
+      // Fold the Control Plane first: it reads from the community root the
+      // invite carried, so the roster — and with it, who may vend a channel key
+      // — is knowable before we accept any. The intake refuses anyone else.
       const preflight = new ConcordClient(community, pool, primary);
-      await preflight.syncControl();
+      const folded = await preflight.syncControl();
+      let rawClient = preflight;
+      if (this.env.mode !== "public") {
 
-      const rawClient = preflight;
+        // Private-channel keys granted to THIS bridge's npub since it was linked,
+        // delivered as Direct Invites (see keyIntake.ts). Runs before the client
+        // that serves `channels()` is built, so a gated channel is present on the
+        // first pass.
+        const floor = identityRelayPool(inviteDeliveryRelays([]), primarySk);
+        const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
+          isAuthorizedSender: (pk) =>
+            isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
+        }).finally(() => void floor.close());
+
+        rawClient =
+          intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
+        if (intake.learned.length > 0) await rawClient.syncControl();
+      }
       const assertMayForward = async () => {
         await lease.assertCurrent();
         const [state] = await this.sql`SELECT status FROM bridges WHERE bridge_id = ${row.bridge_id}`;
         if (!state || !["active", "pending_confirm"].includes(state.status)) throw new Error("Bridge is paused or unlinked");
         try {
-          await this.assertPublicChannel(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
+          await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
         } catch (error) {
           await lease.assertCurrent();
           await this.sql`UPDATE bridges SET status_detail = 'Forwarding blocked: public visibility unavailable', updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
           throw error;
         }
         const current = row.concord_channel_id && rawClient.channel(row.concord_channel_id);
-        if (!current || current.isPrivate) throw new Error("Concord channel must be public");
+        if (!current || (this.env.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
         await lease.assertCurrent();
         await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
           AND status_detail = 'Forwarding blocked: public visibility unavailable'`;
@@ -559,7 +582,7 @@ export class BridgeManager {
         await pool.close();
         throw new Error("concord channel not found (deleted, or key not held)");
       }
-      if (channel.isPrivate) {
+      if (this.env.mode === "public" && channel.isPrivate) {
         await pool.close();
         throw new Error("Concord channel must be public");
       }
@@ -980,7 +1003,7 @@ export class BridgeManager {
   async resume(bridgeId: string): Promise<void> {
     const [row] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
     if (!row) throw new Error("no such bridge");
-    await this.assertPublicChannel(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
+    await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
     const next = row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
     await this.sql`UPDATE bridges SET status = ${row.status === "paused" ? "active" : next}, updated_at = now() WHERE bridge_id = ${bridgeId}`;
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;

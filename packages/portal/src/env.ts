@@ -1,8 +1,11 @@
 /** Portal environment. Discord OAuth vars are optional in dev (dev login). */
 
-import { parsePublicChannelRules, type PublicChannelRules } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
+import { type PublicChannelRules } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
+
+import { loadDeploymentMode, type BridgeMode } from "@armada-bridge/bridge/src/deploymentMode";
 
 export interface PortalEnv {
+  mode?: BridgeMode;
   /** Provisioned root shared only with the moderation worker for this public pairing. */
   puppetMaster?: { communityId: string; guildId: string; key: string };
   publicChannels?: PublicChannelRules;
@@ -76,12 +79,14 @@ export function loadPortalEnv(): PortalEnv {
       "PORTAL_DEV_LOGIN=1 refused: it grants any anonymous caller a session, and this looks like a production deployment",
     );
   }
-  const master = process.env.BRIDGE_MASTER_SECRET;
-  const communityId = process.env.BRIDGE_COMMUNITY_ID;
-  const publicChannels = parsePublicChannelRules(process.env.BRIDGE_PUBLIC_CHANNELS);
+  const deployment = loadDeploymentMode();
+  const master = deployment.mode === "public" ? process.env.BRIDGE_MASTER_SECRET : undefined;
+  const communityId = deployment.mode === "public" ? process.env.BRIDGE_COMMUNITY_ID : undefined;
+  const { publicChannels } = deployment;
   if (Boolean(master) !== Boolean(communityId) || (master && (!/^[0-9a-f]{64}$/.test(master) || !/^[0-9a-f]{64}$/.test(communityId!)))) throw new Error("Invalid provisioned puppet scope");
   return {
-    puppetMaster: master ? { communityId: communityId!, guildId: publicChannels.guildId, key: master } : undefined,
+    mode: deployment.mode,
+    puppetMaster: master ? { communityId: communityId!, guildId: publicChannels!.guildId, key: master } : undefined,
     databaseUrl: required("DATABASE_URL"),
     publicChannels,
     port,

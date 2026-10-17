@@ -7,7 +7,7 @@ platform=${BUILD_PLATFORM:-linux/amd64}
 : "${IMAGE_PREFIX:=divine-local}"
 for target in portal moderation bridge; do
   image="$IMAGE_PREFIX/$target:$revision"
-  # The final Dockerfile stage is the public default; exercise it without --target.
+  # The final Dockerfile stage is the standalone bridge default; exercise it without --target.
   # Keep the array nonempty: macOS bash 3.2 treats an empty one as unset with -u.
   build_args=(--platform "$platform" --load --build-arg "VCS_REF=$revision" -t "$image")
   if [ "$target" != bridge ]; then build_args+=(--target "$target"); fi

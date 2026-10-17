@@ -91,7 +91,7 @@ export class DiscordAdapter implements WebhookSender {
   constructor(
     private readonly token: string,
     private readonly handlers: DiscordAdapterHandlers,
-    private readonly beforeEffect: (channelId: string) => Promise<void> = async () => { throw new Error("Public channel policy is not configured"); },
+    private readonly beforeEffect: (channelId: string) => Promise<void> = async () => { throw new Error("Bridge effect policy is not configured"); },
   ) {
     this.client = new Client({
       intents: [

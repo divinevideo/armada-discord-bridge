@@ -114,7 +114,7 @@ describe("a down gateway defers, never severs", () => {
 });
 
 describe("public policy at manager boundaries", () => {
-  const env = { sealKeyHex: SEAL_KEY } as PortalEnv;
+  const env = { mode: "public", sealKeyHex: SEAL_KEY } as PortalEnv;
   const denied = { assertPublicChannel: async () => { throw new Error("test visibility denied"); } };
   const row = {
     bridge_id: "public-boundary", community_id: "cd".repeat(32),
@@ -131,4 +131,14 @@ describe("public policy at manager boundaries", () => {
     await expect(manager.activate(row as never)).rejects.toThrow("Public channel visibility could not be verified");
     await expect(manager.provisionImported(row as never)).rejects.toThrow("Public channel visibility could not be verified");
   });
+});
+
+it("legacy channel admission accepts multiple guilds without invoking public visibility", async () => {
+  const denied = { assertPublicChannel: async () => { throw new Error("visibility denied"); } };
+  const manager = new BridgeManager({} as never, { mode: "legacy" } as PortalEnv, denied);
+  await manager.assertChannelPolicy("guild-a", "private-a");
+  await manager.assertChannelPolicy("guild-b", "private-b");
+  await expect(manager.assertPublicChannel("guild-a", "private-a")).rejects.toThrow(/visibility/);
+  const publicManager = new BridgeManager({} as never, { mode: "public" } as PortalEnv, denied);
+  await expect(publicManager.assertChannelPolicy("guild-a", "private-a")).rejects.toThrow(/visibility/);
 });
