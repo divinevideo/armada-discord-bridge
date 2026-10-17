@@ -109,6 +109,12 @@ try {
     const target = [fixture.policy.communityId, fixture.channelId, fixture.allowedRumorId];
     const second = wrapSeal(fixture.allowedSeal, fixture.chatKey);
     assert.equal(await publisher.publish(second), true);
+    const editRumor = buildRumor({ pubkey: fixture.member.pk, kind: 3302, content: "Synthetic edited message", tags: [...channelBindingTags(fixture.channelId, 0n), ["e", fixture.allowedRumorId]], ms: Date.now() });
+    const editSeal = await sealRumor(editRumor, KIND_SEAL_ENCRYPTED, fixture.chatKey, fixture.member.signer);
+    const edit = wrapSeal(editSeal, fixture.chatKey), alternateEdit = wrapSeal(editSeal, fixture.chatKey);
+    const reaction = wrapSeal(await sealRumor(buildRumor({ pubkey: fixture.member.pk, kind: 7, content: "+", tags: [...channelBindingTags(fixture.channelId, 0n), ["e", fixture.allowedRumorId]], ms: Date.now() }), KIND_SEAL_ENCRYPTED, fixture.chatKey, fixture.member.signer), fixture.chatKey);
+    for (const event of [edit, alternateEdit, reaction]) assert.equal(await publisher.publish(event), true);
+    const removedIds = [fixture.allowed.id, second.id, edit.id, alternateEdit.id, reaction.id];
     const unrelatedRumor = buildRumor({ pubkey: fixture.member.pk, kind: 9, content: "synthetic unrelated message", tags: channelBindingTags(fixture.channelId, 0n), ms: Date.now() });
     const unrelated = wrapSeal(await sealRumor(unrelatedRumor, KIND_SEAL_ENCRYPTED, fixture.chatKey, fixture.member.signer), fixture.chatKey);
     assert.equal(await publisher.publish(unrelated), true);
@@ -118,10 +124,12 @@ try {
     const decision = crypto.randomUUID();
     const purge = async (name: string, id: string) => JSON.parse(await docker("exec", name, "bun", "packages/moderation/src/relayPurgeCli.ts", id, ...target));
     assert.equal((await purge(normal.name, decision)).state, "verified");
-    assert.equal((await publisher.query([fixture.allowed.id, second.id])).length, 0);
+    assert.equal((await publisher.query(removedIds)).length, 0);
     assert.equal((await publisher.query([unrelated.id])).length, 1);
     assert.equal(await publisher.publish(fixture.allowed), false);
     assert.equal(await publisher.publish(wrapSeal(fixture.allowedSeal, fixture.chatKey)), false);
+    assert.equal(await publisher.publish(wrapSeal(editSeal, fixture.chatKey)), false);
+    assert.equal(await publisher.publish(reaction), false);
     assert.equal((await purge(normal.name, decision)).state, "verified");
     await docker("restart", normal.name);
     const restartPort = (await docker("port", normal.name, "7777/tcp")).split(":").at(-1);
@@ -131,16 +139,18 @@ try {
       catch { if (Date.now() > restartDeadline) throw new Error("Relay did not restart"); await Bun.sleep(50); }
     }
     const restarted = await connect(`ws://127.0.0.1:${restartPort}`);
-    assert.equal((await restarted.query([fixture.allowed.id, second.id])).length, 0);
+    assert.equal((await restarted.query(removedIds)).length, 0);
     assert.equal(await restarted.publish(wrapSeal(fixture.allowedSeal, fixture.chatKey)), false);
+    assert.equal(await restarted.publish(wrapSeal(editSeal, fixture.chatKey)), false);
     console.log("PASS purge: all wrappers absent after removal/retry/restart, unrelated event remains, exact and alternate replay rejected");
     const [current] = await sql`SELECT revision FROM moderation.community_policy WHERE community_id = ${fixture.policy.communityId}`;
     restoreFloors = { [fixture.policy.communityId]: Number(current.revision) };
     const restoredInstance = await relay("restored");
     const restoredClient = await connect(restoredInstance.url);
-    assert.equal((await restoredClient.query([fixture.allowed.id, second.id])).length, 0);
+    assert.equal((await restoredClient.query(removedIds)).length, 0);
     assert.equal((await restoredClient.query([unrelated.id])).length, 1);
     assert.equal(await restoredClient.publish(wrapSeal(fixture.allowedSeal, fixture.chatKey)), false);
+    assert.equal(await restoredClient.publish(wrapSeal(editSeal, fixture.chatKey)), false);
     console.log("PASS restore: older relay snapshot reconciled before listening, removed carriers absent and unrelated message retained");
 
     // A second isolated community allows a deterministic accepted-but-uncommitted race.

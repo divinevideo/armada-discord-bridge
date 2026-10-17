@@ -63,6 +63,16 @@ there is no successful-authorization cache shared between effects.
 Before restoring an older relay snapshot: stop the public listener, restore current moderation state independently, supply explicit minimum policy revisions, run `offlineRelayRestore.ts` against the offline relay volume, and require success before bringing the listener back. Never roll moderation policy/tombstones back to the relay snapshot. Restore into an isolated namespace first. A failed reconciliation leaves the public listener stopped. Keep community read material, evidence keys and bot keys in the restricted secret store; keep the owner backup separate and audit logged.
 
 The offline target cannot also be the only source of fresh control policy.
+For upgrades adding carrier-reference indexing, stop public admission and run
+verified offline reconciliation before trusting removals or edited evidence.
+Existing edit/reaction rows are deliberately marked unreconciled by migration;
+no SQL guess assigns their encrypted contents to a message. A channel containing
+such rows blocks purge/evidence rather than reporting partial success. Replay
+the actual signed carriers with their required read streams to reindex them,
+including carriers now rejected because their author or target was removed.
+Missing historical read material remains an operator recovery blocker; do not
+mark unknown references as indexed or discard unrelated edits to force success.
+
 Keep an independently current control source available to `PolicyWatcher` while
 reconciling the separate offline volume. The bundled worker reads the loopback
 `MODERATION_LOCAL_RELAY_URL`; that source must remain available independently of

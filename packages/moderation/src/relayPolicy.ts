@@ -37,9 +37,10 @@ export function controlState(policy: CommunityPolicy) {
   return { editions, folded: foldControlState(editions, hex32(policy.communityId), policy.owner) };
 }
 
-export async function inspectRelayEvent(input: NostrEvent, context: AdmissionContext): Promise<{ result: AdmissionResult; carrier?: CarrierRecord; observedAuthor?: string; control?: NostrEvent; removals?: RoomTarget[]; rekey?: { communityId: string; epoch: string; event: NostrEvent } }> {
+export async function inspectRelayEvent(input: NostrEvent, context: AdmissionContext): Promise<{ result: AdmissionResult; carrier?: CarrierRecord; references?: { target: RoomTarget; eventId: string; ids: string[] }; observedAuthor?: string; control?: NostrEvent; removals?: RoomTarget[]; rekey?: { communityId: string; epoch: string; event: NostrEvent } }> {
   const id = typeof input?.id === "string" && HEX_ID.test(input.id) ? input.id : "0".repeat(64);
   const reject: AdmissionResult = { id, action: "reject", msg: "blocked: room policy unavailable or event not permitted" };
+  let references: { target: RoomTarget; eventId: string; ids: string[] } | undefined;
   try {
     const event = verifiedEvent(input);
     const policy = context.policy;
@@ -64,6 +65,14 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
     requireThat(descriptor && descriptor.communityId === policy.communityId && descriptor.key.pk === event.pubkey && !("sk" in descriptor.key));
     requireThat(descriptor.key.convKey.length === 32 && /^(0|[1-9][0-9]*)$/.test(descriptor.epoch));
     const opened = openWrap(event, descriptor.key);
+    if (descriptor.plane === "chat" && descriptor.channelId && [3302, 7].includes(opened.kind) && opened.sealKind === KIND_SEAL_ENCRYPTED && event.kind === 1059) {
+      checkChannelBinding(opened, descriptor.channelId, BigInt(descriptor.epoch));
+      // Verified recovery metadata is independent of current author admission:
+      // a banned author's already stored edits must still be discoverable.
+      const referenced = opened.tags.find((tag) => tag[0] === "e")?.[1];
+      references = { target: { communityId: policy.communityId, channelId: descriptor.channelId, rumorId: opened.rumorId }, eventId: event.id,
+        ids: referenced && HEX_ID.test(referenced) ? [referenced] : [] };
+    }
     if (descriptor.plane !== "chat") requireThat(!event.tags.some((tag) => tag[0] === "expiration") && !opened.tags.some((tag) => tag[0] === "expiration"));
     if (descriptor.plane === "control") {
       requireThat(event.kind === 1059 && opened.sealKind === KIND_SEAL_PLAINTEXT && opened.kind === 3308);
@@ -107,7 +116,11 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
     requireThat(descriptor.retiredAt === undefined || opened.createdAt <= descriptor.retiredAt);
     requireThat((opened.kind === 23311) === (event.kind === 21059));
     const target: RoomTarget = { communityId: policy.communityId, channelId: descriptor.channelId, rumorId: opened.rumorId };
+    const targetRumorIds = references?.ids ?? [];
+    // Recovery may need to reindex an already stored edit even when its target
+    // is now removed. These are verified references, never an admission grant.
     requireThat(!(await context.isRemoved(target)));
+    for (const rumorId of targetRumorIds) requireThat(!(await context.isRemoved({ ...target, rumorId })));
     if (opened.kind === 5 || opened.kind === 3302) {
       const targets = opened.tags.filter((tag) => tag[0] === "e").map((tag) => tag[1]);
       requireThat(targets.length > 0 && targets.length <= 100 && targets.every((value) => HEX_ID.test(value)));
@@ -124,9 +137,9 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
     const expiresAt = expiration.length ? Number(expiration[0][1]) * 1000 : undefined;
     if (expiration.length) requireThat(/^[0-9]+$/.test(expiration[0][1]) && Number.isSafeInteger(expiresAt) && expiresAt! > context.now());
     requireThat(context.now() < policy.validUntil);
-    return { result: accept, observedAuthor: opened.author, removals: opened.kind === 5 ? opened.tags.filter((tag) => tag[0] === "e").map((tag) => ({ ...target, rumorId: tag[1] })) : undefined, carrier: { ...target, eventId: event.id, author: opened.author, kind: opened.kind, expiresAt, policyRevision: policy.revision } };
+    return { result: accept, references, observedAuthor: opened.author, removals: opened.kind === 5 ? opened.tags.filter((tag) => tag[0] === "e").map((tag) => ({ ...target, rumorId: tag[1] })) : undefined, carrier: { ...target, eventId: event.id, author: opened.author, kind: opened.kind, expiresAt, policyRevision: policy.revision, targetRumorIds } };
   } catch {
-    return { result: reject };
+    return { result: reject, references };
   }
 }
 

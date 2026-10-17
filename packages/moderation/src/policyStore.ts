@@ -8,7 +8,7 @@ import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
 export async function migrateModeration(sql: postgres.Sql): Promise<void> {
-  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
+  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql", "014_carrier_references.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}, 1)`;
     for (const body of bodies) await tx.unsafe(body);
@@ -134,7 +134,7 @@ export class PolicyStore {
           try { return await read(); }
           catch (error) { lookupFailures.push(error); throw error; }
         };
-        const { result, carrier, rekey, observedAuthor, control, removals } = await inspectRelayEvent(event, {
+        const { result, carrier, references, rekey, observedAuthor, control, removals } = await inspectRelayEvent(event, {
           policy, stream: row && streamOf(row), now: Date.now, publicAuthorKnown: known.length > 0,
           isRemoved: (target) => lookup(async () => (await tx`SELECT 1 FROM moderation.tombstones WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId}`).length > 0),
           authorOf: (target) => lookup(async () => (await tx`SELECT author FROM moderation.carriers WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} LIMIT 1`)[0]?.author as string | undefined),
@@ -142,6 +142,8 @@ export class PolicyStore {
         if (restoring) {
           if (lookupFailures.length) throw lookupFailures[0];
           this.assertRecoveryPolicy(policy);
+          if (references) await tx`UPDATE moderation.carriers SET target_rumor_ids = ${references.ids}, targets_indexed = true
+            WHERE event_id = ${references.eventId} AND community_id = ${references.target.communityId} AND channel_id = ${references.target.channelId} AND rumor_id = ${references.target.rumorId}`;
         }
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept") for (const target of removals ?? []) {
@@ -150,8 +152,9 @@ export class PolicyStore {
         }
         if (result.action === "accept" && observedAuthor) await tx`INSERT INTO moderation.observed_members (community_id, author) VALUES (${communityId}, ${observedAuthor}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept" && carrier) {
-          await tx`INSERT INTO moderation.carriers (community_id, channel_id, rumor_id, event_id, author, kind, policy_revision, expires_at)
-            VALUES (${carrier.communityId}, ${carrier.channelId}, ${carrier.rumorId}, ${carrier.eventId}, ${carrier.author}, ${carrier.kind}, ${carrier.policyRevision}, ${carrier.expiresAt ? new Date(carrier.expiresAt) : null}) ON CONFLICT (event_id) DO NOTHING`;
+          await tx`INSERT INTO moderation.carriers (community_id, channel_id, rumor_id, event_id, author, kind, policy_revision, expires_at, target_rumor_ids, targets_indexed)
+            VALUES (${carrier.communityId}, ${carrier.channelId}, ${carrier.rumorId}, ${carrier.eventId}, ${carrier.author}, ${carrier.kind}, ${carrier.policyRevision}, ${carrier.expiresAt ? new Date(carrier.expiresAt) : null}, ${carrier.targetRumorIds ?? []}, true)
+            ON CONFLICT (event_id) DO UPDATE SET target_rumor_ids = EXCLUDED.target_rumor_ids, targets_indexed = true`;
         }
         if (result.action === "accept" && rekey) await tx`INSERT INTO moderation.rekey_events (event_id, community_id, epoch, event)
           VALUES (${rekey.event.id}, ${rekey.communityId}, ${rekey.epoch}, ${tx.json(rekey.event as never)}) ON CONFLICT DO NOTHING`;

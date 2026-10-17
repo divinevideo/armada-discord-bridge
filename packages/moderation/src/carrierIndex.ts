@@ -37,8 +37,11 @@ export class CarrierIndex implements RemovalIndex {
         const index: RemovalIndex = {
           start: () => { throw new Error("Tombstone must precede barrier"); },
           ids: async (target) => {
+            const legacy = await run(session`SELECT 1 FROM moderation.carriers WHERE community_id = ${target.communityId}
+              AND channel_id = ${target.channelId} AND kind IN (3302, 7) AND NOT targets_indexed LIMIT 1`);
+            if (legacy.length) throw new Error("Carrier references require verified reindexing");
             const rows = await run(session`SELECT event_id FROM moderation.carriers WHERE community_id = ${target.communityId}
-              AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} ORDER BY event_id LIMIT ${MAX_CARRIERS + 1}`);
+              AND channel_id = ${target.channelId} AND (rumor_id = ${target.rumorId} OR target_rumor_ids @> ARRAY[${target.rumorId}]::text[]) ORDER BY event_id LIMIT ${MAX_CARRIERS + 1}`);
             if (rows.length > MAX_CARRIERS) throw new Error("Carrier index overflow");
             return rows.map((row) => row.event_id as string);
           },
@@ -81,8 +84,11 @@ export class CarrierIndex implements RemovalIndex {
     });
   }
   async ids(target: RoomTarget): Promise<string[]> {
+    const legacy = await this.sql`SELECT 1 FROM moderation.carriers WHERE community_id = ${target.communityId}
+      AND channel_id = ${target.channelId} AND kind IN (3302, 7) AND NOT targets_indexed LIMIT 1`;
+    if (legacy.length) throw new Error("Carrier references require verified reindexing");
     const rows = await this.sql`SELECT event_id FROM moderation.carriers WHERE community_id = ${target.communityId}
-      AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} ORDER BY event_id`;
+      AND channel_id = ${target.channelId} AND (rumor_id = ${target.rumorId} OR target_rumor_ids @> ARRAY[${target.rumorId}]::text[]) ORDER BY event_id`;
     return rows.map((row) => row.event_id as string);
   }
   async finish(decisionId: string, state: "verified" | "failed"): Promise<void> {

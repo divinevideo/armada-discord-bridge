@@ -47,4 +47,5 @@ export interface CarrierRecord extends RoomTarget {
   kind: number;
   expiresAt?: number;
   policyRevision: number;
+  targetRumorIds?: string[];
 }
