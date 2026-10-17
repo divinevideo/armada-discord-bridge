@@ -19,7 +19,9 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
   // The API's background handoff must not contact an ambient/external service.
   // A fresh test CA and mock live only in this owned relay container.
   const tlsKey = join(directory, "synthetic-coop-key.pem"), tlsCert = join(directory, "synthetic-coop-cert.pem");
-  const certificate = Bun.spawn(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tlsKey, "-out", tlsCert, "-days", "1", "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"], { stdout: "ignore", stderr: "pipe" });
+  const tlsConfig = join(directory, "synthetic-coop.cnf");
+  await writeFile(tlsConfig, "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=extensions\n[dn]\nCN=127.0.0.1\n[extensions]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,digitalSignature,keyEncipherment,keyCertSign\n");
+  const certificate = Bun.spawn(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", tlsKey, "-out", tlsCert, "-days", "1", "-config", tlsConfig], { stdout: "ignore", stderr: "pipe" });
   await new Response(certificate.stderr).text();
   assert.equal(await certificate.exited, 0, "Synthetic Coop TLS provisioning failed");
   await docker("cp", tlsKey, `${instance.name}:/data/synthetic-coop-key.pem`);
