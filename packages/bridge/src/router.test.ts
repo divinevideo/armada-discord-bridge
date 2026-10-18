@@ -118,7 +118,7 @@ function harness(options?: RouterOptions) {
   };
   const router = new BridgeRouter(client, puppets, store, webhooks, {
     resolve: async (pk: string) => fallbackProfile(pk),
-  }, { applicationId: "app1", webhookIds: new Set(["wh1"]) }, { beforeSideEffect: async () => {}, ...options });
+  }, { applicationId: "app1", webhookIds: new Set(["wh1"]) }, { beforeSideEffect: async () => {}, mediaProbe: async () => undefined, ...options });
 
   return { community, channel, pool, client, puppets, store, webhooks, link, router };
 }
@@ -252,7 +252,8 @@ describe("BridgeRouter: Discord -> Concord", () => {
     // `x` and `size` would be lies (the bytes are never downloaded) and a
     // guessed `m` is worse than none: Armada renders a file card for an imeta
     // whose MIME is neither image, video nor audio.
-    const { router, pool, channel, link } = harness();
+    const probed: string[] = [];
+    const { router, pool, channel, link } = harness({ mediaProbe: async (url) => { probed.push(url); return undefined; } });
     await router.onDiscordMessage(
       discordMsg({
         content: "https://example.com/page",
@@ -265,6 +266,7 @@ describe("BridgeRouter: Discord -> Concord", () => {
       channel.current.group,
     );
     expect(opened.content).toBe("https://example.com/media");
+    expect(probed).toEqual(["https://example.com/page.gif"]);
     expect(opened.tags.some((t) => t[0] === "imeta")).toBe(false);
   });
 

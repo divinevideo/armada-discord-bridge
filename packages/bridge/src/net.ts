@@ -40,6 +40,8 @@ const MAX_REDIRECTS = 3;
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
+export type HostResolver = (hostname: string) => Promise<readonly { address: string }[]>;
+const systemResolver: HostResolver = (hostname) => lookup(hostname, { all: true });
 
 /**
  * The eight 16-bit groups of an IPv6 literal, or undefined if it does not
@@ -166,18 +168,18 @@ export function isPrivateAddress(ip: string): boolean {
  * friends resolve per-host, are exactly the container-network shape this
  * guards, and never legitimately name a media origin or a public relay.
  */
-export async function resolvePublicHost(hostname: string): Promise<string | undefined> {
+export async function resolvePublicHost(hostname: string, resolver: HostResolver = systemResolver): Promise<string | undefined> {
   const bare = hostname.replace(/^\[|\]$/g, "");
   if (isIP(bare)) return isPrivateAddress(bare) ? undefined : bare;
   if (!hostname.includes(".")) return undefined;
-  let addresses: Array<{ address: string }>;
+  let addresses: readonly { address: string }[];
   try {
-    addresses = await lookup(hostname, { all: true });
+    addresses = await resolver(hostname);
   } catch {
     return undefined;
   }
   if (addresses.length === 0) return undefined;
-  if (addresses.some((a) => isPrivateAddress(a.address))) return undefined;
+  if (addresses.some((a) => !isIP(a.address) || isPrivateAddress(a.address))) return undefined;
   return addresses[0].address;
 }
 
@@ -198,12 +200,12 @@ export async function hostIsPublic(hostname: string): Promise<boolean> {
  * rather than returning a flag: every caller here treats a rejected URL as a
  * hard skip, and a silent falsy return is how one of these gets forgotten.
  */
-export async function assertSafeHttpUrl(raw: string): Promise<URL> {
-  return (await vetHttpUrl(raw)).url;
+export async function assertSafeHttpUrl(raw: string, resolver?: HostResolver): Promise<URL> {
+  return (await vetHttpUrl(raw, resolver)).url;
 }
 
 /** {@link assertSafeHttpUrl}, keeping the address the verdict was made about. */
-async function vetHttpUrl(raw: string): Promise<{ url: URL; address: string }> {
+async function vetHttpUrl(raw: string, resolver?: HostResolver): Promise<{ url: URL; address: string }> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -213,7 +215,7 @@ async function vetHttpUrl(raw: string): Promise<{ url: URL; address: string }> {
   if (!ALLOWED_PROTOCOLS.has(url.protocol)) {
     throw new Error(`refusing to fetch ${url.protocol} URL`);
   }
-  const address = await resolvePublicHost(url.hostname);
+  const address = await resolvePublicHost(url.hostname, resolver);
   if (!address) {
     throw new Error(`refusing to fetch non-public host ${url.hostname}`);
   }

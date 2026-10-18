@@ -156,6 +156,8 @@ export interface RouterOptions {
   blobs?: BlobPort;
   /** Resolves Klipy GIF-picker sends to their real GIF (KLIPY_API_KEY). */
   klipy?: Pick<KlipyClient, "resolveGif">;
+  /** Trusted transport seam for owned tests; production defaults to safeProbe. */
+  mediaProbe?: typeof safeProbe;
 }
 
 /** Attachment ceiling both ways (webhook upload limit for standard guilds). */
@@ -503,7 +505,7 @@ export class BridgeRouter {
     const tags = [proxyTag(msg.guildId, msg.channelId, msg.id), ...customEmojiTags(msg.content)];
     let source =
       (await this.klipyGif(msg, identity, tags)) ??
-      (await this.transcodedGifFallback(await upgradeGifEmbed(msg), identity, tags));
+      (await this.transcodedGifFallback(await upgradeGifEmbed(msg, this.options.mediaProbe), identity, tags));
     this.tagEmbedMedia(source, tags);
     const attachments = await this.rehostAttachments(source, identity, tags);
     const content = discordToConcord({ ...source, attachments });
