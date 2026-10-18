@@ -11,7 +11,7 @@ export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string;
  * superseded_by_newer_decision); null when nothing was superseded. */
 export interface DecisionStatus { executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
-export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean }
+export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
 export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required";
 export class DecisionRefusedError extends Error {
@@ -36,7 +36,7 @@ const membership = (action: string) => action === "ban_member" || action === "un
 // NULL-safe on purpose: these are negated, and a NULL lease must read "not in flight".
 const inFlight = (d: string) => `(((${d}.state IN ('pending', 'acknowledged')) AND COALESCE(${d}.lease_until > clock_timestamp(), false))
   OR (${d}.target = 'concord' AND ${d}.publication_attempted AND ${d}.state NOT IN ('verified', 'not_applicable')
-    AND (${d}.signed_events IS NOT NULL OR COALESCE(${d}.result_code = 'concord_recovery_requires_operator', false))))`;
+    AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL OR COALESCE(${d}.result_code = 'concord_recovery_requires_operator', false))))`;
 const sameMember = (other: string, c: string) => `${c}.action IN ('ban_member', 'unban_member') AND ${other}.action IN ('ban_member', 'unban_member')
   AND ${other}.org_id = ${c}.org_id AND ${other}.community_id = ${c}.community_id AND ${other}.author = ${c}.author`;
 // Source revisions define intent order, regardless of HTTP acceptance time.
@@ -52,7 +52,7 @@ const newerHead = (c: string) => `${c}.action IN ('ban_member', 'unban_member') 
     AND (${c}.source_revision IS NULL OR h.latest_revision > ${c}.source_revision))`;
 const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${alias}.created_at, ${alias}.decision_id`;
 const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.state = 'failed' AND ${d}.publication_attempted
-  AND ${d}.signed_events IS NOT NULL AND ${c}.action IN ('ban_member', 'unban_member')
+  AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL) AND ${c}.action IN ('ban_member', 'unban_member')
   AND EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
     WHERE ${newerThan("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
       AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
@@ -210,7 +210,7 @@ export class Decisions {
         result_code = CASE WHEN result_code = 'concord_waiting_on_prior_publication' THEN NULL ELSE result_code END
         WHERE decision_id = ${job.decision_id} AND target = ${job.target}`;
       const [row] = await tx`SELECT * FROM moderation.decisions WHERE decision_id = ${job.decision_id}`;
-      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only) };
+      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationEventIds: job.publication_event_ids, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only) };
     });
   }
   async defer(claim: DeliveryClaim): Promise<void> {
@@ -226,33 +226,41 @@ export class Decisions {
   async saveEvents(claim: DeliveryClaim, events: unknown[]): Promise<unknown[]> {
     const rows = await this.sql`UPDATE moderation.deliveries SET signed_events = COALESCE(signed_events, ${this.sql.json(events as never)}),
       publication_attempted = CASE WHEN signed_events IS NULL THEN false ELSE publication_attempted END
-      WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING signed_events, publication_attempted`;
+      WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp()
+        AND NOT (signed_events IS NULL AND publication_event_ids IS NOT NULL) RETURNING signed_events, publication_attempted, publication_event_ids`;
     if (!rows.length) throw new Error("Delivery lease lost");
     claim.signedEvents = rows[0].signed_events;
     claim.publicationAttempted = rows[0].publication_attempted;
+    claim.publicationEventIds = rows[0].publication_event_ids;
     return rows[0].signed_events;
   }
   async replaceUnattemptedEvents(claim: DeliveryClaim, previous: unknown[], events: unknown[]): Promise<unknown[]> {
     // Only the exact generation proved never sent may be replaced. A stale
     // lease or a publisher that won this CAS must leave its signed bytes intact.
-    const rows = await this.sql`UPDATE moderation.deliveries SET signed_events = ${this.sql.json(events as never)}, updated_at = clock_timestamp()
+    const rows = await this.sql`UPDATE moderation.deliveries SET signed_events = ${this.sql.json(events as never)}, publication_event_ids = NULL, updated_at = clock_timestamp()
       WHERE decision_id = ${claim.decision.decisionId} AND target = 'concord' AND target = ${claim.target}
         AND token = ${claim.token} AND lease_until > clock_timestamp() AND publication_attempted = false
         AND signed_events = ${this.sql.json(previous as never)} RETURNING signed_events`;
     if (!rows.length) throw new Error("Delivery lease or unattempted generation lost");
     claim.signedEvents = rows[0].signed_events;
     claim.publicationAttempted = false;
+    claim.publicationEventIds = null;
     return rows[0].signed_events;
   }
   async markPublicationAttempted(claim: DeliveryClaim, events: unknown[]): Promise<void> {
     // Commit this BEFORE network I/O: a crash or timeout is not proof that a
     // relay did not receive the edition. Such generations remain replay-only.
-    const rows = await this.sql`UPDATE moderation.deliveries SET publication_attempted = true, updated_at = clock_timestamp()
+    const member = membership(claim.decision.action);
+    const id = (events[0] as { id?: unknown } | undefined)?.id;
+    if (member && (events.length !== 1 || typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id))) throw new Error("Invalid publication identity");
+    const ids = member ? [id as string] : null;
+    const rows = await this.sql`UPDATE moderation.deliveries SET publication_attempted = true, publication_event_ids = ${ids}, updated_at = clock_timestamp()
       WHERE decision_id = ${claim.decision.decisionId} AND target = 'concord' AND target = ${claim.target}
         AND token = ${claim.token} AND lease_until > clock_timestamp()
         AND signed_events = ${this.sql.json(events as never)} RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease or generation lost");
     claim.publicationAttempted = true;
+    claim.publicationEventIds = ids;
   }
   async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0): Promise<void> {
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0 || !/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
@@ -265,7 +273,7 @@ export class Decisions {
   async expire(): Promise<void> {
     await this.sql.begin(async (tx) => {
       await tx`UPDATE moderation.deliveries SET state = 'failed',
-        result_code = CASE WHEN target = 'concord' AND signed_events IS NOT NULL AND publication_attempted
+        result_code = CASE WHEN target = 'concord' AND (signed_events IS NOT NULL OR publication_event_ids IS NOT NULL) AND publication_attempted
           AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE action IN ('ban_member', 'unban_member'))
           THEN 'concord_recovery_requires_operator' ELSE 'decision_expired' END,
         signed_events = NULL, token = NULL, lease_until = NULL

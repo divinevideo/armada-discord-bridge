@@ -482,18 +482,81 @@ for (const terminal of ["retry_budget_exhausted", "concord_recovery_requires_ope
   } finally { await h.cleanup(); }
 });
 
-test("expiry clears uncertain signed bytes but leaves the successor waiting for operator recovery", async () => {
+for (const [older, newer] of [["ban_member", "unban_member"], ["unban_member", "ban_member"]] as const) test(`expiry erases ${older} payloads without erasing the receipt needed by ${newer}`, async () => {
+  const h = await memberHarness(older === "ban_member" ? "member" : "bannedMember");
+  try {
+    const first = await h.accept(older), limbo: NostrEvent[] = [];
+    const lossy = { ...h.relay, publish: async (event: NostrEvent) => { limbo.push(event); throw new Error("socket closed"); } };
+    await h.deliver((await h.outbox.claim())!, lossy);
+    const next = h.request(newer), oldCase = next.caseId;
+    next.caseId = crypto.randomUUID();
+    await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
+      VALUES (${next.caseId}, ${h.staff.orgId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.who.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic newer report")}, clock_timestamp() + interval '1 hour')`;
+    const second = await h.outbox.acceptDecision(next, h.staff);
+    await hold(second.decisionId, "concord");
+    await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`;
+    await h.outbox.expire();
+    await sql`DELETE FROM moderation.cases WHERE case_id = ${oldCase}`;
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const receipt = (await h.outbox.claim())!;
+    expect(receipt).toMatchObject({ reconcileOnly: true, signedEvents: null });
+    expect(receipt.publicationEventIds).toHaveLength(1);
+    // Absence does not settle it, even after payload erasure.
+    expect(await h.deliver(receipt)).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+    expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
+    // Delayed publication becomes readable after both the case and saved
+    // payload have gone. The opaque ID still binds the fetched signed bytes.
+    h.published.push(...limbo);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async () => { throw new Error("No expired-intent replay"); } })).toMatchObject({ state: "not_applicable", code: "concord_superseded_publication_settled" });
+    await h.drain();
+    expect(await h.banned()).toBe(newer === "ban_member");
+    expect((await concordRow(second.decisionId)).state).toBe("verified");
+    const [expired] = await sql`SELECT c.audit, d.signed_events, d.publication_event_ids FROM moderation.decisions c JOIN moderation.deliveries d USING (decision_id) WHERE c.decision_id = ${first.decisionId} AND d.target = 'concord'`;
+    expect(expired.audit).toBeNull(); expect(expired.signed_events).toBeNull(); expect(expired.publication_event_ids).toEqual([limbo[0].id]);
+  } finally { await h.cleanup(); }
+});
+
+test("publication ID migration copies only readable outer IDs and keeps receipts worker-owned", async () => {
   const h = await memberHarness("member");
   try {
     const first = await h.accept("ban_member");
-    const lossy = { ...h.relay, publish: async (_event: NostrEvent) => { throw new Error("socket closed"); } };
-    await h.deliver((await h.outbox.claim())!, lossy);
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async () => { throw new Error("uncertain send"); } });
+    const [saved] = await sql`SELECT signed_events FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await sql`UPDATE moderation.deliveries SET publication_event_ids = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await migrateModeration(sql);
+    expect((await sql`SELECT publication_event_ids FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`)[0].publication_event_ids).toEqual([saved.signed_events[0].id]);
+    await expect(sql.begin(async (tx) => {
+      await tx.unsafe("SET LOCAL ROLE moderation_api");
+      await tx`UPDATE moderation.deliveries SET publication_event_ids = ARRAY[${"f".repeat(64)}] WHERE decision_id = ${first.decisionId}`;
+    })).rejects.toThrow(/permission denied/);
+    await sql`UPDATE moderation.deliveries SET publication_event_ids = NULL, signed_events = '{"not":"an event array"}'::jsonb WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await migrateModeration(sql);
+    expect((await sql`SELECT publication_event_ids FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`)[0].publication_event_ids).toBeNull();
+  } finally { await h.cleanup(); }
+});
+
+for (const attempted of [false, true]) test(`legacy erased expiry is ${attempted ? "unknown, not proven unsent" : "safe when durably proved unattempted"}`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const request = h.request("ban_member"), legacy = crypto.randomUUID();
+    await sql`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, fingerprint_version, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, expires_at)
+      VALUES (${legacy}, ${h.staff.orgId}, ${request.executionId}, ${crypto.randomUUID()}, 1, ${request.caseId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.who.pk}, 'ban_member', false, clock_timestamp() - interval '1 second')`;
+    await sql`INSERT INTO moderation.deliveries (decision_id, target, state, result_code, publication_attempted)
+      VALUES (${legacy}, 'concord', 'failed', 'decision_expired', ${attempted})`;
+    await migrateModeration(sql);
     const second = await h.accept("unban_member");
-    await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`;
-    await h.outbox.expire();
-    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
-    expect(await h.outbox.claim()).toBeUndefined();
-    expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
+    if (attempted) {
+      expect(await concordRow(legacy)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
+      expect(await h.outbox.claim()).toBeUndefined();
+      expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0, result_code: "concord_waiting_on_prior_publication" });
+    } else {
+      expect((await concordRow(legacy)).result_code).toBe("decision_expired");
+      const claim = (await h.outbox.claim())!;
+      expect(claim.decision.decisionId).toBe(second.decisionId);
+      await h.deliver(claim);
+    }
   } finally { await h.cleanup(); }
 });
 

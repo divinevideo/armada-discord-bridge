@@ -19,19 +19,26 @@ resume only that exact generation under its original current-authority and
 expiry checks; its relay and Discord targets stay stopped. This is publication
 settlement, not permission to reissue the old staff intent.
 
-When a newer Concord target is waiting behind a terminal older publication with
-retained bytes, the worker also checks receipts without publishing. Exact relay
-readback plus canonical hash ancestry marks the old target
+When a newer Concord target is waiting behind a terminal older publication, the
+worker also checks receipts without publishing. Opaque public-event IDs remain
+with the durable delivery record; expiry still clears signed pending payloads,
+case plaintext and audit material. A fetched event must match its recorded ID,
+verify cryptographically and appear in the fresh canonical history. That marks the old target
 `concord_superseded_publication_settled` / not applicable, then lets the newer
 target proceed. This read-only check does not reset or spend the send budget and
 can settle an expired action without executing it. Missing, invalid, noncanonical
-or erased proof never releases the successor: the old target records
+or unavailable proof never releases the successor: the old target records
 `concord_recovery_awaiting_proof`, and waiting targets report
 `concord_waiting_on_prior_publication`. A missing-proof/expired-generation
-operator release procedure and its proof-retention policy remain part of the
+operator release procedure (including legacy rows whose identities were already
+erased before this migration) and its broader proof-retention policy remain part of the
 unresolved case/audit lifecycle contract; do not clear markers or guess a
 successful outcome in SQL. Read-only recovery uses the existing maximum retry
 backoff, not a tight loop.
+
+Legacy unfenced expired rows with a conservative send marker but no surviving
+identity are quarantined as operator recovery, not guessed to be unsent. A
+durable unattempted marker is different and does not create that blocker.
 
 Only a persisted generation proved unattempted may be rebuilt against a newer
 banlist. `concord_recovery_requires_operator` is not an ordinary Retry action:

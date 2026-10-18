@@ -7,14 +7,16 @@ import { verifiedEvent } from "./relayPolicy";
 export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActions, decisions: Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted">, relay: Pick<RelayPool, "publish" | "queryStrict">, assertCurrent: () => Promise<void>): Promise<DeliveryAttempt> {
   if (claim.reconcileOnly) {
     const waiting: DeliveryAttempt = { state: "failed", code: "concord_recovery_awaiting_proof", retryAfterSeconds: 300 };
-    const events = claim.signedEvents as NostrEvent[] | null;
-    if (events?.length !== 1 || claim.publicationAttempted !== true) return waiting;
+    if (claim.publicationAttempted !== true) return waiting;
     await assertCurrent();
     let settled = false;
     try {
-      const fetched = await relay.queryStrict([{ ids: events.map((event) => verifiedEvent(event).id) }]);
-      const found = new Set(fetched.map((event) => verifiedEvent(event).id));
-      if (events.every((event) => found.has(event.id))) settled = await actions.publicationInCurrentHistory(claim.decision, events);
+      const legacy = claim.signedEvents;
+      const ids = claim.publicationEventIds ?? (Array.isArray(legacy) && legacy.length === 1 ? [verifiedEvent(legacy[0] as NostrEvent).id] : undefined);
+      if (ids?.length === 1 && /^[0-9a-f]{64}$/.test(ids[0])) {
+        const fetched = (await relay.queryStrict([{ ids }])).map(verifiedEvent).filter((event) => event.id === ids[0]);
+        if (fetched.length) settled = await actions.publicationInCurrentHistory(claim.decision, [fetched[0]]);
+      }
     } catch { /* Missing/invalid proof or unavailable policy cannot release a successor. */ }
     await assertCurrent();
     // No publish, replacement, old-action authorization or relay/Discord effect.
@@ -35,6 +37,10 @@ export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActio
     await assertCurrent();
     await actions.authorize(claim.decision);
     await decisions.markPublicationAttempted(claim, events);
+    // Persisting intent is an await, not an authority or lease guarantee for
+    // the following network effect. Recheck after the durable write settles.
+    await actions.authorize(claim.decision);
+    await assertCurrent();
     try { await relay.publish(event); } catch { throw new RetryableDeliveryError("concord_transport_unavailable"); }
   }
   const fetched = await relay.queryStrict([{ ids: events.map((event) => event.id) }]).catch(() => { throw new RetryableDeliveryError("concord_readback_unavailable"); });

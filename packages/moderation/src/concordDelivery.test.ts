@@ -169,6 +169,16 @@ test("failure to persist publication intent prevents network publication", async
   await expect(deliverConcord(claim, actions, store, { publish: async () => { published = true; }, queryStrict: async () => [] }, async () => {})).rejects.toThrow(/lease/);
   expect(published).toBe(false);
 });
+test("lease loss or revoked policy during the send-marker write prevents publication", async () => {
+  for (const revokedPolicy of [false, true]) {
+    const { f, actions, claim } = await preparedBan();
+    let lost = false, published = false;
+    const store = memoryDecisions();
+    store.markPublicationAttempted = async () => { claim.publicationAttempted = true; if (revokedPolicy) f.policy.complete = false; else lost = true; };
+    await expect(deliverConcord(claim, actions, store, { publish: async () => { published = true; }, queryStrict: async () => [] }, async () => { if (lost) throw new Error("Delivery lease lost"); })).rejects.toThrow();
+    expect(published).toBe(false);
+  }
+});
 test("a competing edit discovered after publication preserves the uncertain generation for an operator", async () => {
   const { actions, claim, events, compete } = await preparedBan();
   const calls: string[] = [];
