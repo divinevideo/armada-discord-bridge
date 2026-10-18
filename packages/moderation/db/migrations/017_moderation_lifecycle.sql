@@ -66,17 +66,40 @@ BEGIN
   END IF;
   RETURN OLD;
 END $$;
-CREATE OR REPLACE FUNCTION moderation.bind_lifecycle_case() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+-- Every reference names one original case, including after its evidence is gone.
+CREATE OR REPLACE FUNCTION moderation.resolve_lifecycle_case(org text, explicit_case uuid, decision uuid, hold uuid) RETURNS uuid
+LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE bound_case uuid := explicit_case; referenced_case uuid;
 BEGIN
-  IF NEW.case_id IS NOT NULL THEN
-    PERFORM pg_advisory_xact_lock(hashtextextended(format('[%s,%s]', to_json(NEW.org_id), to_json(NEW.case_id::text)), 483217));
-    PERFORM 1 FROM moderation.cases WHERE org_id = NEW.org_id AND case_id = NEW.case_id FOR UPDATE;
-    IF NOT FOUND THEN
-      IF TG_TABLE_NAME = 'evidence_holds' THEN RAISE EXCEPTION 'Lifecycle case unavailable'; END IF;
-      IF NEW.decision_id IS NULL THEN RAISE EXCEPTION 'Lifecycle case unavailable'; END IF;
-    END IF;
-    IF EXISTS (SELECT 1 FROM moderation.cases WHERE case_id = NEW.case_id AND org_id <> NEW.org_id) THEN RAISE EXCEPTION 'Lifecycle case organization mismatch'; END IF;
+  IF decision IS NOT NULL THEN
+    SELECT case_id INTO referenced_case FROM moderation.decisions WHERE org_id = org AND decision_id = decision;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Lifecycle reference violates same-organization foreign key'; END IF;
+    IF bound_case IS NOT NULL AND bound_case <> referenced_case THEN RAISE EXCEPTION 'Lifecycle case reference mismatch'; END IF;
+    bound_case := referenced_case;
   END IF;
+  IF hold IS NOT NULL THEN
+    SELECT case_id INTO referenced_case FROM moderation.evidence_holds WHERE org_id = org AND hold_id = hold;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Lifecycle reference violates same-organization foreign key'; END IF;
+    IF bound_case IS NOT NULL AND bound_case <> referenced_case THEN RAISE EXCEPTION 'Lifecycle case reference mismatch'; END IF;
+    bound_case := referenced_case;
+  END IF;
+  IF bound_case IS NULL THEN RAISE EXCEPTION 'Lifecycle case unavailable'; END IF;
+  RETURN bound_case;
+END $$;
+CREATE OR REPLACE FUNCTION moderation.bind_lifecycle_case() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE case_exists boolean;
+BEGIN
+  IF TG_TABLE_NAME = 'lifecycle_events' THEN
+    NEW.case_id := moderation.resolve_lifecycle_case(NEW.org_id, NEW.case_id, NEW.decision_id, NEW.hold_id);
+  END IF;
+  PERFORM pg_advisory_xact_lock(hashtextextended(format('[%s,%s]', to_json(NEW.org_id), to_json(NEW.case_id::text)), 483217));
+  PERFORM 1 FROM moderation.cases WHERE org_id = NEW.org_id AND case_id = NEW.case_id FOR UPDATE;
+  case_exists := FOUND;
+  IF NOT case_exists THEN
+    IF TG_TABLE_NAME = 'evidence_holds' THEN RAISE EXCEPTION 'Lifecycle case unavailable'; END IF;
+    IF NEW.decision_id IS NULL AND NEW.hold_id IS NULL THEN RAISE EXCEPTION 'Lifecycle case unavailable'; END IF;
+  END IF;
+  IF EXISTS (SELECT 1 FROM moderation.cases WHERE case_id = NEW.case_id AND org_id <> NEW.org_id) THEN RAISE EXCEPTION 'Lifecycle case organization mismatch'; END IF;
   RETURN NEW;
 END $$;
 -- Keep acceptance immutable even if a future bootstrap accidentally widens grants.
@@ -85,6 +108,21 @@ BEGIN
   IF (to_jsonb(NEW) - ARRAY['audit','lifecycle_closed_at','audit_delete_after','audit_retention_seconds','appeal_state'])
     IS DISTINCT FROM (to_jsonb(OLD) - ARRAY['audit','lifecycle_closed_at','audit_delete_after','audit_retention_seconds','appeal_state']) THEN
     RAISE EXCEPTION 'Decision acceptance is immutable';
+  END IF;
+  IF OLD.lifecycle_closed_at IS NOT NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtextextended(format('[%s,%s]', to_json(OLD.org_id), to_json(OLD.case_id::text)), 483217));
+    IF NEW.lifecycle_closed_at IS NULL THEN
+      -- Reopening explicitly drops the deadline, without purging audit or
+      -- substituting a new policy snapshot in the same transition.
+      IF NEW.audit_delete_after IS NOT NULL OR NEW.audit IS DISTINCT FROM OLD.audit
+        OR (NEW.audit_retention_seconds IS NOT NULL AND NEW.audit_retention_seconds IS DISTINCT FROM OLD.audit_retention_seconds) THEN
+        RAISE EXCEPTION 'Invalid lifecycle reopening retention transition';
+      END IF;
+    ELSE
+      IF NEW.lifecycle_closed_at IS DISTINCT FROM OLD.lifecycle_closed_at THEN RAISE EXCEPTION 'Lifecycle closure is immutable until reopened'; END IF;
+      IF NEW.audit_retention_seconds IS DISTINCT FROM OLD.audit_retention_seconds THEN RAISE EXCEPTION 'Closed lifecycle retention snapshot is immutable'; END IF;
+      IF OLD.audit_delete_after IS NOT NULL AND (NEW.audit_delete_after IS NULL OR NEW.audit_delete_after < OLD.audit_delete_after) THEN RAISE EXCEPTION 'Decision audit deadline cannot shorten'; END IF;
+    END IF;
   END IF;
   IF NEW.audit IS DISTINCT FROM OLD.audit THEN
     IF NEW.audit IS NOT NULL THEN RAISE EXCEPTION 'Decision audit is immutable'; END IF;
@@ -114,9 +152,8 @@ BEGIN
     RETURN NEW;
   END IF;
   bound_case := OLD.case_id;
-  IF TG_TABLE_NAME = 'lifecycle_events' AND bound_case IS NULL THEN
-    IF OLD.decision_id IS NOT NULL THEN SELECT case_id INTO bound_case FROM moderation.decisions WHERE org_id = OLD.org_id AND decision_id = OLD.decision_id; END IF;
-    IF bound_case IS NULL AND OLD.hold_id IS NOT NULL THEN SELECT case_id INTO bound_case FROM moderation.evidence_holds WHERE org_id = OLD.org_id AND hold_id = OLD.hold_id; END IF;
+  IF TG_TABLE_NAME = 'lifecycle_events' THEN
+    bound_case := moderation.resolve_lifecycle_case(OLD.org_id, OLD.case_id, OLD.decision_id, OLD.hold_id);
   END IF;
   PERFORM pg_advisory_xact_lock(hashtextextended(format('[%s,%s]', to_json(OLD.org_id), to_json(bound_case::text)), 483217));
   IF OLD.audit_delete_after IS NULL OR OLD.audit_delete_after > clock_timestamp() THEN RAISE EXCEPTION 'Lifecycle audit retention required'; END IF;
@@ -155,3 +192,6 @@ GRANT SELECT ON moderation.discord_member_bindings TO moderation_api, moderation
 GRANT INSERT, UPDATE ON moderation.discord_member_bindings TO moderation_operator;
 
 GRANT UPDATE (audit_delete_after) ON moderation.lifecycle_events TO moderation_operator;
+
+REVOKE ALL ON FUNCTION moderation.resolve_lifecycle_case(text, uuid, uuid, uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION moderation.resolve_lifecycle_case(text, uuid, uuid, uuid) TO moderation_api, moderation_operator;

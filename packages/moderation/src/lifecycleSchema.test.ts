@@ -88,3 +88,58 @@ test("cross-organization lifecycle references and unfenced generation3 are refus
   await expect(Promise.resolve(sql`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, expires_at, fingerprint_version, reverses_decision_id)
     VALUES (${crypto.randomUUID()}, ${org}, ${crypto.randomUUID()}, ${crypto.randomUUID()}, ${caseId}, ${community}, ${"b".repeat(64)}, ${"c".repeat(64)}, ${"d".repeat(64)}, 'unban_member', false, clock_timestamp() + interval '1 hour', 3, ${openId})`)).rejects.toThrow(/check constraint/i);
 });
+
+for (const role of ["moderation_api", "moderation_operator"]) {
+  test(`${role} cannot shorten a closed decision deadline or replace its policy snapshot before cleanup`, async () => {
+    const id = crypto.randomUUID(); await insertDecision(id, Buffer.from("synthetic-future-deadline-audit"));
+    await sql`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '2 hours', audit_retention_seconds = 86400, audit_delete_after = clock_timestamp() + interval '22 hours' WHERE decision_id = ${id}`;
+    await expect(sql.begin(async tx => {
+      await tx.unsafe(`SET LOCAL ROLE ${role}`);
+      await tx`UPDATE moderation.decisions SET audit_delete_after = clock_timestamp() - interval '1 hour' WHERE decision_id = ${id}`;
+    })).rejects.toThrow(/deadline|retention|snapshot/i);
+    await expect(sql.begin(async tx => { await tx.unsafe(`SET LOCAL ROLE ${role}`); await tx`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${id}`; })).rejects.toThrow(/audit/i);
+    await expect(sql.begin(async tx => { await tx.unsafe(`SET LOCAL ROLE ${role}`); await tx`UPDATE moderation.decisions SET audit_retention_seconds = 1 WHERE decision_id = ${id}`; })).rejects.toThrow(/snapshot|retention/i);
+    await expect(sql.begin(async tx => { await tx.unsafe(`SET LOCAL ROLE ${role}`); await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '3 hours' WHERE decision_id = ${id}`; })).rejects.toThrow(/closure|immutable/i);
+    const [row] = await sql`SELECT audit, audit_retention_seconds::text AS retention FROM moderation.decisions WHERE decision_id = ${id}`;
+    expect(Buffer.from(row.audit).toString()).toBe("synthetic-future-deadline-audit"); expect(row.retention).toBe("86400");
+    await sql.begin(async tx => { await tx.unsafe(`SET LOCAL ROLE ${role}`); await tx`UPDATE moderation.decisions SET lifecycle_closed_at = NULL, audit_delete_after = NULL, appeal_state = 'open' WHERE decision_id = ${id}`; });
+    expect((await sql`SELECT lifecycle_closed_at, audit_delete_after, appeal_state FROM moderation.decisions WHERE decision_id = ${id}`)[0]).toMatchObject({ lifecycle_closed_at: null, audit_delete_after: null, appeal_state: "open" });
+    await expect(sql.begin(async tx => { await tx.unsafe(`SET LOCAL ROLE ${role}`); await tx`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${id}`; })).rejects.toThrow(/audit/i);
+  });
+}
+test("lifecycle events cannot mix explicit, hold and decision case identities", async () => {
+  const a = crypto.randomUUID(), b = crypto.randomUUID(), holdId = crypto.randomUUID();
+  for (const id of [a, b]) await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
+    VALUES (${id}, ${org}, ${community}, ${"b".repeat(64)}, ${"c".repeat(64)}, ${"d".repeat(64)}, ${crypto.randomUUID()}, ${Buffer.from("synthetic-reference-evidence")}, clock_timestamp() - interval '1 hour')`;
+  await sql`INSERT INTO moderation.evidence_holds (hold_id, org_id, case_id, hold_until, encrypted_audit) VALUES (${holdId}, ${org}, ${a}, clock_timestamp() + interval '1 hour', ${Buffer.from("synthetic-reference-hold")})`;
+  await expect(sql.begin(async tx => {
+    await tx`SET LOCAL ROLE moderation_api`;
+    await tx`INSERT INTO moderation.lifecycle_events (event_id, org_id, case_id, hold_id, kind, encrypted_audit, recorded_at, audit_delete_after)
+      VALUES (${crypto.randomUUID()}, ${org}, ${b}, ${holdId}, 'held_evidence_access', ${Buffer.from("synthetic-mismatched-event")}, clock_timestamp() - interval '2 hours', clock_timestamp() - interval '1 hour')`;
+  })).rejects.toThrow(/case.*mismatch|inconsistent/i);
+  await expect(sql.begin(async tx => {
+    await tx`SET LOCAL ROLE moderation_api`;
+    await tx`INSERT INTO moderation.lifecycle_events (event_id, org_id, decision_id, hold_id, kind, encrypted_audit)
+      VALUES (${crypto.randomUUID()}, ${org}, ${openId}, ${holdId}, 'held_evidence_access', ${Buffer.from("synthetic-mismatched-event")})`;
+  })).rejects.toThrow(/case.*mismatch|inconsistent/i);
+  await expect(sql.begin(async tx => {
+    await tx`SET LOCAL ROLE moderation_api`;
+    await tx`INSERT INTO moderation.lifecycle_events (event_id, org_id, case_id, decision_id, kind, encrypted_audit)
+      VALUES (${crypto.randomUUID()}, ${org}, ${b}, ${openId}, 'appeal_opened', ${Buffer.from("synthetic-mismatched-decision-event")})`;
+  })).rejects.toThrow(/case.*mismatch|inconsistent/i);
+  // Model an inconsistent row written before this guard was installed. Only
+  // fixture setup bypasses triggers; deletion runs under the real runtime role.
+  const legacyEventId = crypto.randomUUID();
+  await sql.begin(async tx => {
+    await tx`SET LOCAL session_replication_role = replica`;
+    await tx`INSERT INTO moderation.lifecycle_events (event_id, org_id, case_id, hold_id, kind, encrypted_audit, recorded_at, audit_delete_after)
+      VALUES (${legacyEventId}, ${org}, ${b}, ${holdId}, 'held_evidence_access', ${Buffer.from("synthetic-inconsistent-legacy-event")}, clock_timestamp() - interval '2 hours', clock_timestamp() - interval '1 hour')`;
+  });
+  await expect(sql.begin(async tx => { await tx`SET LOCAL ROLE moderation_operator`; await tx`DELETE FROM moderation.lifecycle_events WHERE event_id = ${legacyEventId}`; })).rejects.toThrow(/case.*mismatch|inconsistent/i);
+  const eventId = crypto.randomUUID();
+  await sql`INSERT INTO moderation.lifecycle_events (event_id, org_id, hold_id, kind, encrypted_audit, recorded_at, audit_delete_after)
+    VALUES (${eventId}, ${org}, ${holdId}, 'held_evidence_access', ${Buffer.from("synthetic-reference-event")}, clock_timestamp() - interval '2 hours', clock_timestamp() - interval '1 hour')`;
+  await expect(sql.begin(async tx => { await tx`SET LOCAL ROLE moderation_operator`; await tx`DELETE FROM moderation.lifecycle_events WHERE event_id = ${eventId}`; })).rejects.toThrow(/retention|hold/i);
+  expect((await sql`SELECT case_id FROM moderation.lifecycle_events WHERE event_id = ${eventId}`)[0].case_id).toBe(a);
+  expect((await sql`SELECT event_id FROM moderation.lifecycle_events WHERE event_id = ${legacyEventId}`).length).toBe(1);
+});
