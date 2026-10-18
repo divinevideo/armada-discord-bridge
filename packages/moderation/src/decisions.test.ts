@@ -273,7 +273,7 @@ async function memberHarness(subject: "member" | "bannedMember") {
     await sql`DELETE FROM moderation.cases WHERE org_id = ${orgId}`;
     await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.community.idHex}`;
   };
-  return { f, who, staff, outbox, relay, published, request, accept, deliver, drain, banned, cleanup };
+  return { f, who, staff, outbox, relay, actions, published, request, accept, deliver, drain, banned, cleanup };
 }
 
 // The outbox claims by available_at and Concord prepares from the fold current
@@ -494,6 +494,71 @@ test("expiry clears uncertain signed bytes but leaves the successor waiting for 
     expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
     expect(await h.outbox.claim()).toBeUndefined();
     expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
+  } finally { await h.cleanup(); }
+});
+
+for (const [older, newer] of [["ban_member", "unban_member"], ["unban_member", "ban_member"]] as const) test(`a retained ${older} publication receipt releases ${newer} without replaying expired intent`, async () => {
+  const h = await memberHarness(older === "ban_member" ? "member" : "bannedMember");
+  try {
+    const first = await h.accept(older);
+    const lossy = { ...h.relay, publish: async (event: NostrEvent) => { h.published.push(event); throw new Error("lost acknowledgement"); } };
+    await h.deliver((await h.outbox.claim())!, lossy);
+    const second = await h.accept(newer);
+    await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 8, available_at = clock_timestamp(), result_code = 'retry_budget_exhausted' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`;
+    let publishes = 0, authorizations = 0, otherEffects = 0;
+    const forbidden = async (): Promise<never> => { otherEffects++; throw new Error("Read-only recovery must not execute an old action"); };
+    const worker = new ModerationWorker(sql, h.outbox, async (claim, assertCurrent) => ({
+      reconcileOnly: claim.reconcileOnly,
+      authorize: async () => { authorizations++; throw new Error("Expired action must not be reauthorized"); }, assertCurrent,
+      executeConcord: () => deliverConcord(claim, h.actions, h.outbox, { ...h.relay, publish: async () => { publishes++; throw new Error("No recovery publish"); } }, assertCurrent),
+      setRelayBan: forbidden, removeFromRelay: forbidden, discord: { execute: forbidden },
+    }));
+    expect(await worker.tick()).toBe(true);
+    expect([publishes, authorizations, otherEffects]).toEqual([0, 0, 0]);
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "not_applicable", result_code: "concord_superseded_publication_settled", attempts: 8 });
+    await h.drain();
+    expect(await h.banned()).toBe(newer === "ban_member");
+    expect((await concordRow(second.decisionId)).state).toBe("verified");
+  } finally { await h.cleanup(); }
+});
+
+test("missing publication proof keeps the successor visibly blocked without spending send attempts", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member"), limbo: NostrEvent[] = [];
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async (event) => { limbo.push(event); throw new Error("uncertain transport"); } });
+    const second = await h.accept("unban_member");
+    await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 8, available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const recovery = (await h.outbox.claim())!;
+    expect(recovery).toMatchObject({ reconcileOnly: true, attempts: 8 });
+    expect(await h.deliver(recovery, { ...h.relay, publish: async () => { throw new Error("Read-only recovery cannot publish"); } })).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+    expect(await concordRow(first.decisionId)).toMatchObject({ attempts: 8, signed_events: limbo });
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending", result_code: "concord_waiting_on_prior_publication" });
+    h.published.push(...limbo);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await h.deliver((await h.outbox.claim())!);
+    await h.drain();
+    expect(await h.banned()).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
+test("Retry of superseded live uncertainty resumes only its exact attempted Concord generation", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async () => { throw new Error("uncertain transport"); } });
+    const before = (await concordRow(first.decisionId)).signed_events;
+    await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'current_authority_or_delivery_unavailable' WHERE decision_id = ${first.decisionId}`;
+    await h.accept("unban_member");
+    const resumed = await h.outbox.retry(first.decisionId, h.staff);
+    expect(resumed.deliveries.filter((row) => row.target !== "concord").every((row) => row.state === "failed")).toBe(true);
+    const claim = (await h.outbox.claim())!;
+    expect(claim).toMatchObject({ reconcileOnly: false, publicationAttempted: true, signedEvents: before });
+    await h.deliver(claim);
+    expect(h.published[0].id).toBe(before[0].id);
+    await h.drain();
+    expect(await h.banned()).toBe(false);
   } finally { await h.cleanup(); }
 });
 

@@ -1,10 +1,23 @@
 import { banlistLocator, buildBanlistEdition, buildRumor, bytesToHex, canActOnMember, checkChannelBinding, channelBindingTags, channelsView, citationFromTags, citationSatisfied, citationToTag, currentControlWriteGroup, foldControlState, grantLocator, hex32, KIND_SEAL_ENCRYPTED, openWrap, parseEdition, Permissions, sealEdition, sealRumor, wrapSeal } from "@armada-bridge/concord-core";
-import type { CommunityV2, StreamSigner } from "@armada-bridge/concord-core";
+import type { CommunityV2, StreamSigner, ParsedEdition } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { CommunityPolicy } from "./contracts";
 import type { StoredDecision } from "./decisions";
 import { controlState, verifiedEvent } from "./relayPolicy";
 export class StalePreparedBanlistError extends Error {}
+function canonicalIncludes(edition: ParsedEdition, { editions, folded }: ReturnType<typeof controlState>): boolean {
+  const entity = bytesToHex(edition.entityId);
+  const current = folded.heads.get(entity);
+  const history = new Map(editions.filter((candidate) => bytesToHex(candidate.entityId) === entity).map((candidate) => [bytesToHex(candidate.selfHash), candidate]));
+  let ancestor = current && history.get(bytesToHex(current.hash));
+  while (ancestor) {
+    if (bytesToHex(ancestor.selfHash) === bytesToHex(edition.selfHash)) return true;
+    const previous = ancestor.prevHash && history.get(bytesToHex(ancestor.prevHash));
+    if (!previous || previous.version >= ancestor.version) break;
+    ancestor = previous;
+  }
+  return false;
+}
 export class ConcordActions {
   constructor(readonly community: CommunityV2, readonly identity: { pk: string; signer: StreamSigner }, private readonly refresh: () => Promise<CommunityPolicy>) {
     if (identity.pk === community.owner) throw new Error("Moderation workload must not use the owner identity");
@@ -45,6 +58,21 @@ export class ConcordActions {
     await this.validatePrepared(decision, [event]);
     return [event];
   }
+  /** Read-only publication receipt, not permission to execute an expired or
+   * superseded action. Only exact canonical ancestry settles uncertainty. */
+  async publicationInCurrentHistory(decision: StoredDecision, events: NostrEvent[]): Promise<boolean> {
+    const policy = await this.refresh();
+    if (decision.action === "remove_message" || events.length !== 1 || decision.target.communityId !== this.community.idHex || policy.communityId !== this.community.idHex || !policy.complete || policy.rekeyPending || policy.validUntil <= Date.now()) return false;
+    const state = controlState(policy);
+    if (state.folded.incomplete.length) return false;
+    const event = verifiedEvent(events[0]);
+    if (event.kind !== 1059) return false;
+    const stream = policy.controlStreams.find((entry) => entry.key.pk === event.pubkey && entry.plane === "control" && entry.communityId === policy.communityId);
+    if (!stream || "sk" in stream.key) return false;
+    const edition = parseEdition(openWrap(event, stream.key));
+    if (bytesToHex(edition.entityId) !== bytesToHex(banlistLocator(this.community.id))) return false;
+    return canonicalIncludes(edition, state) && policy.validUntil > Date.now();
+  }
   async validatePrepared(decision: StoredDecision, events: NostrEvent[]): Promise<void> {
     const { editions, folded } = await this.authorize(decision);
     if (events.length !== 1) throw new Error("Unexpected moderation event set");
@@ -65,14 +93,7 @@ export class ConcordActions {
       // Readback may arrive after another valid edition extends ours. Follow
       // the canonical head's actual hashes, not just its current member set:
       // matching intent alone would credit an unrelated moderator's edit.
-      const history = new Map(editions.filter((candidate) => bytesToHex(candidate.entityId) === bytesToHex(edition.entityId)).map((candidate) => [bytesToHex(candidate.selfHash), candidate]));
-      let ancestor = current && history.get(bytesToHex(current.hash));
-      while (ancestor) {
-        if (bytesToHex(ancestor.selfHash) === bytesToHex(edition.selfHash)) return;
-        const previous = ancestor.prevHash && history.get(bytesToHex(ancestor.prevHash));
-        if (!previous || previous.version >= ancestor.version) break;
-        ancestor = previous;
-      }
+      if (canonicalIncludes(edition, { editions, folded })) return;
       if (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash)))) throw new StalePreparedBanlistError("Prepared banlist would overwrite a concurrent edit");
       const next = foldControlState([...editions, edition], this.community.id, this.community.owner, folded.heads);
       const head = next.headEditions.get(bytesToHex(edition.entityId));

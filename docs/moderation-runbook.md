@@ -13,6 +13,26 @@ Use Retry for a failed, unexpired, authorized action with attempts remaining. Ke
 For one member, the newest ban or unban wins. Accepting one supersedes any earlier ban or unban for that member whose deliveries have not gone out: those rows read failed with `superseded_by_newer_decision`, the status names the newer decision in `supersededBy`, and the earlier decision stays on record. A delivery already in progress for the earlier decision (a send underway, or a Concord edition whose publication was attempted and is still being read back) finishes first, and the newer decision then applies on top. An exhausted or failed Concord publication with an uncertain outcome still holds the newer Concord delivery for operator recovery. Expiry clears its signed bytes as before and records `concord_recovery_requires_operator`; it does not establish that publication failed. Superseded rows are not counted as failed deliveries. Retry refuses an older ban or unban once a newer one exists for that member (`member_decision_superseded`); act on the newer decision instead.
 
 Concord retries preserve signed event bytes once publication may have begun.
+An older, superseded action is never prepared again by Retry. A live failed
+Concord target with retained attempted bytes and send attempts remaining may
+resume only that exact generation under its original current-authority and
+expiry checks; its relay and Discord targets stay stopped. This is publication
+settlement, not permission to reissue the old staff intent.
+
+When a newer Concord target is waiting behind a terminal older publication with
+retained bytes, the worker also checks receipts without publishing. Exact relay
+readback plus canonical hash ancestry marks the old target
+`concord_superseded_publication_settled` / not applicable, then lets the newer
+target proceed. This read-only check does not reset or spend the send budget and
+can settle an expired action without executing it. Missing, invalid, noncanonical
+or erased proof never releases the successor: the old target records
+`concord_recovery_awaiting_proof`, and waiting targets report
+`concord_waiting_on_prior_publication`. A missing-proof/expired-generation
+operator release procedure and its proof-retention policy remain part of the
+unresolved case/audit lifecycle contract; do not clear markers or guess a
+successful outcome in SQL. Read-only recovery uses the existing maximum retry
+backoff, not a tight loop.
+
 Only a persisted generation proved unattempted may be rebuilt against a newer
 banlist. `concord_recovery_requires_operator` is not an ordinary Retry action:
 keep that delivery failed and inspect the current canonical banlist and original

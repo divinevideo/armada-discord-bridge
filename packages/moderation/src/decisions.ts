@@ -11,7 +11,7 @@ export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string;
  * superseded_by_newer_decision); null when nothing was superseded. */
 export interface DecisionStatus { executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
-export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationAttempted?: boolean }
+export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
 export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required";
 export class DecisionRefusedError extends Error {
@@ -51,6 +51,12 @@ const newerHead = (c: string) => `${c}.action IN ('ban_member', 'unban_member') 
   SELECT 1 FROM moderation.member_order_heads h WHERE h.org_id = ${c}.org_id AND h.community_id = ${c}.community_id AND h.author = ${c}.author
     AND (${c}.source_revision IS NULL OR h.latest_revision > ${c}.source_revision))`;
 const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${alias}.created_at, ${alias}.decision_id`;
+const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.state = 'failed' AND ${d}.publication_attempted
+  AND ${d}.signed_events IS NOT NULL AND ${c}.action IN ('ban_member', 'unban_member')
+  AND EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
+    WHERE ${newerThan("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
+      AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
+      AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp()))`;
 // Acceptance and Retry serialize per member, so a Retry cannot restart a
 // decision that a concurrently accepted newer one supersedes.
 function lockMember(tx: postgres.TransactionSql, communityId: string, author: string) {
@@ -144,7 +150,17 @@ export class Decisions {
         // Restarting an older decision would undo the newer one for this member.
         const [newer] = await tx`SELECT 1 FROM moderation.decisions c
           WHERE c.decision_id = ${decisionId} AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) OR ${tx.unsafe(newerHead("c"))}) LIMIT 1`;
-        if (newer) throw new DecisionRefusedError("member_decision_superseded", "A newer ban or unban for this member supersedes this decision");
+        if (newer) {
+          // This can only resume the exact attempted Concord generation while
+          // its original authority/expiry and send budget still permit replay.
+          // It must never restart the older relay/Discord action or mint bytes.
+          const recoverable = await tx`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+            WHERE decision_id = ${decisionId} AND target = 'concord' AND state = 'failed' AND publication_attempted AND signed_events IS NOT NULL AND attempts < 8
+              AND result_code IS DISTINCT FROM 'concord_recovery_requires_operator'
+              AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
+          if (recoverable.length) return recoverable;
+          throw new DecisionRefusedError("member_decision_superseded", "A newer ban or unban for this member supersedes this decision");
+        }
       }
       return tx`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
         WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8 AND (${guildRetryAllowed} OR target <> 'discord')
@@ -173,26 +189,32 @@ export class Decisions {
         FROM moderation.decisions c
         WHERE c.decision_id = d.decision_id AND d.state IN ('pending', 'acknowledged') AND NOT ${tx.unsafe(inFlight("d"))}
           AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) OR ${tx.unsafe(newerHead("c"))})`;
+      await tx`UPDATE moderation.deliveries d SET result_code = 'concord_waiting_on_prior_publication'
+        FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.target = 'concord' AND d.state = 'pending'
+          AND d.result_code IS NULL AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
+          AND EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
+            WHERE ${tx.unsafe(olderThan("o", "c"))} AND od.target = 'concord' AND ${tx.unsafe(inFlight("od"))})`;
       // A membership target waits, without spending attempts, while an older
       // decision's same target is in flight. An older row that a newer decision
       // committed just after the sweep may still be claimed here; it is then the
       // one in flight, and the newer target applies on top once it completes.
-      const [job] = await tx`SELECT d.* FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
-        WHERE d.state IN ('pending', 'acknowledged') AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
-          AND d.attempts < 8 AND c.expires_at > clock_timestamp()
+      const [job] = await tx`SELECT d.*, (${tx.unsafe(publicationRecovery("d", "c"))}) AS reconcile_only FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
+        WHERE ((d.state IN ('pending', 'acknowledged') AND d.attempts < 8 AND c.expires_at > clock_timestamp()) OR (${tx.unsafe(publicationRecovery("d", "c"))}))
+          AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
           AND NOT EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
             WHERE ${tx.unsafe(olderThan("o", "c"))} AND od.target = d.target AND ${tx.unsafe(inFlight("od"))})
         ORDER BY d.available_at, d.decision_id, d.target FOR UPDATE OF d SKIP LOCKED LIMIT 1`;
       if (!job) return undefined;
       const token = crypto.randomUUID();
-      await tx`UPDATE moderation.deliveries SET token = ${token}, attempts = attempts + 1, lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp()
+      await tx`UPDATE moderation.deliveries SET token = ${token}, attempts = attempts + ${job.reconcile_only ? 0 : 1}, lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp(),
+        result_code = CASE WHEN result_code = 'concord_waiting_on_prior_publication' THEN NULL ELSE result_code END
         WHERE decision_id = ${job.decision_id} AND target = ${job.target}`;
       const [row] = await tx`SELECT * FROM moderation.decisions WHERE decision_id = ${job.decision_id}`;
-      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + 1, signedEvents: job.signed_events, publicationAttempted: job.publication_attempted };
+      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only) };
     });
   }
   async defer(claim: DeliveryClaim): Promise<void> {
-    const rows = await this.sql`UPDATE moderation.deliveries SET state = 'pending', attempts = attempts - 1, token = NULL, lease_until = NULL, available_at = clock_timestamp() + interval '1 second'
+    const rows = await this.sql`UPDATE moderation.deliveries SET state = ${claim.reconcileOnly ? "failed" : "pending"}, attempts = attempts - ${claim.reconcileOnly ? 0 : 1}, token = NULL, lease_until = NULL, available_at = clock_timestamp() + interval '1 second'
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease lost");
   }

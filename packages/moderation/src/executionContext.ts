@@ -9,6 +9,7 @@ import type { ExecutionContext } from "./worker";
 import { deliverConcord } from "./concordDelivery";
 export function createExecutionContext(options: { sql: postgres.Sql; store: PolicyStore; actions: ConcordActions; claim: DeliveryClaim; assertCurrent(): Promise<void>; decisions: Decisions; relay: Pick<RelayPool, "publish" | "queryStrict">; discord: Pick<DiscordActions, "execute">; purger: RelayPurger; driver: Pick<PurgeDriver, "barrier"> }): ExecutionContext {
   return {
+    reconcileOnly: options.claim.reconcileOnly,
     authorize: (decision) => options.actions.authorize(decision),
     assertCurrent: options.assertCurrent,
     discord: options.discord,

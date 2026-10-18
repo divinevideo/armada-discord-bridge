@@ -3,6 +3,7 @@ import type { DeliveryTarget, RoomTarget } from "./contracts";
 import type { Decisions, DeliveryClaim, StoredDecision } from "./decisions";
 import { RetryableDeliveryError, type DiscordActions, type DeliveryAttempt } from "./discordActions";
 export interface ExecutionContext {
+  reconcileOnly?: boolean;
   authorize(decision: StoredDecision): Promise<unknown>;
   assertCurrent(): Promise<void>;
   removeFromRelay(target: RoomTarget, decisionId: string): Promise<{ state: string }>;
@@ -12,6 +13,11 @@ export interface ExecutionContext {
 }
 export async function executeDelivery(decision: StoredDecision, target: DeliveryTarget, context: ExecutionContext): Promise<DeliveryAttempt> {
   try {
+    if (context.reconcileOnly) {
+      await context.assertCurrent();
+      if (target !== "concord") throw new Error("Only Concord publication receipts are reconciled");
+      return context.executeConcord(decision);
+    }
     await context.authorize(decision);
     await context.assertCurrent();
     if (target === "discord") return context.discord.execute(decision);
@@ -43,7 +49,7 @@ export class ModerationWorker {
           if (renewalFailed) throw new Error("Delivery ownership lost");
           await tx`SELECT 1`;
           await this.decisions.renew(claim);
-          if (renewalFailed || claim.decision.expiresAt.getTime() <= Date.now()) throw new Error("Delivery ownership or evidence expired");
+          if (renewalFailed || (!claim.reconcileOnly && claim.decision.expiresAt.getTime() <= Date.now())) throw new Error("Delivery ownership or evidence expired");
         };
         const context = await this.context(claim, assertCurrent);
         const result = await executeDelivery(claim.decision, claim.target, context);

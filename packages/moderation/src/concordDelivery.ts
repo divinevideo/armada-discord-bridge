@@ -5,6 +5,21 @@ import type { Decisions, DeliveryClaim } from "./decisions";
 import { RetryableDeliveryError, type DeliveryAttempt } from "./discordActions";
 import { verifiedEvent } from "./relayPolicy";
 export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActions, decisions: Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted">, relay: Pick<RelayPool, "publish" | "queryStrict">, assertCurrent: () => Promise<void>): Promise<DeliveryAttempt> {
+  if (claim.reconcileOnly) {
+    const waiting: DeliveryAttempt = { state: "failed", code: "concord_recovery_awaiting_proof", retryAfterSeconds: 300 };
+    const events = claim.signedEvents as NostrEvent[] | null;
+    if (events?.length !== 1 || claim.publicationAttempted !== true) return waiting;
+    await assertCurrent();
+    let settled = false;
+    try {
+      const fetched = await relay.queryStrict([{ ids: events.map((event) => verifiedEvent(event).id) }]);
+      const found = new Set(fetched.map((event) => verifiedEvent(event).id));
+      if (events.every((event) => found.has(event.id))) settled = await actions.publicationInCurrentHistory(claim.decision, events);
+    } catch { /* Missing/invalid proof or unavailable policy cannot release a successor. */ }
+    await assertCurrent();
+    // No publish, replacement, old-action authorization or relay/Discord effect.
+    return settled ? { state: "not_applicable", code: "concord_superseded_publication_settled" } : waiting;
+  }
   let events = (claim.signedEvents ?? await decisions.saveEvents(claim, await actions.prepare(claim.decision))) as NostrEvent[];
   try { await actions.validatePrepared(claim.decision, events); } catch (error) {
     if (!(error instanceof StalePreparedBanlistError)) throw error;
