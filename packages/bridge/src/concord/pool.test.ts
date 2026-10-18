@@ -2,9 +2,13 @@ import { expect, test } from "bun:test";
 import { RelayPool } from "./pool";
 test("strict moderation reads reject an unavailable relay instead of treating it as empty state", async () => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request, server) { if (server.upgrade(request)) return; return new Response("no"); }, websocket: { message(ws, value) { const frame = JSON.parse(String(value)); if (frame[0] === "REQ") ws.send(JSON.stringify(["EOSE", frame[1]])); } } });
-  const pool = new RelayPool([`ws://127.0.0.1:${server.port}`, "ws://127.0.0.1:1"]);
+  // A fixed "unavailable" localhost port can belong to another workspace.
+  // Hold our own port and deliberately refuse the WebSocket handshake instead.
+  const unavailable = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("unavailable", { status: 503 }) });
+  console.info("OWNED_TEST_SERVER", JSON.stringify({ pid: process.pid, ports: [server.port, unavailable.port] }));
+  const pool = new RelayPool([`ws://127.0.0.1:${server.port}`, `ws://127.0.0.1:${unavailable.port}`]);
   try { await expect(pool.queryStrict([{ kinds: [1059] }], { signal: AbortSignal.timeout(100) })).rejects.toThrow(); }
-  finally { await pool.close(); server.stop(true); }
+  finally { await pool.close(); server.stop(true); unavailable.stop(true); }
 });
 test("an aborted publish cannot escape a delayed connection after authority is lost", async () => {
   const { finalizeEvent, generateSecretKey } = await import("nostr-tools/pure");
@@ -12,6 +16,7 @@ test("an aborted publish cannot escape a delayed connection after authority is l
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const received: unknown[] = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request, server) { await gate; if (server.upgrade(request)) return; return new Response("no"); }, websocket: { message(_ws, value) { received.push(JSON.parse(String(value))); } } });
+  console.info("OWNED_TEST_SERVER", JSON.stringify({ pid: process.pid, ports: [server.port] }));
   const pool = new RelayPool([`ws://127.0.0.1:${server.port}`]);
   try {
     const event = finalizeEvent({ kind: 1, content: "synthetic", tags: [], created_at: Math.floor(Date.now()/1000) }, generateSecretKey());
@@ -32,6 +37,7 @@ test("live publications acknowledge once and never replay automatically after AU
     if (frame[0] === "EVENT") { events.push(frame[1].id); ws.send(JSON.stringify(["OK", frame[1].id, frame[1].content === "accepted", "auth-required: synthetic"])); }
     if (frame[0] === "AUTH") ws.send(JSON.stringify(["OK", frame[1].id, true, ""]));
   } } });
+  console.info("OWNED_TEST_SERVER", JSON.stringify({ pid: process.pid, ports: [server.port] }));
   const pool = new RelayPool([`ws://127.0.0.1:${server.port}`]);
   try {
     await pool.queryStrict([{ kinds: [1] }]);

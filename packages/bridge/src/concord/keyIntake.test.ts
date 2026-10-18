@@ -298,6 +298,7 @@ it("restart recovers private keys only by authenticating the bridge identity to 
       },
     },
   });
+  console.info("OWNED_TEST_SERVER", JSON.stringify({ pid: process.pid, ports: [server.port] }));
   try {
     // Fresh pools model both the initial boot and a restart; no keys survive in memory.
     for (let boot = 0; boot < 2; boot++) {
