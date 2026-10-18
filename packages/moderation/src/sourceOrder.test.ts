@@ -100,7 +100,8 @@ test("delivery supersession and Retry use source revisions despite inverted acce
  const target = await evidence("5".repeat(64));
  const a = await decisions.acceptDecision(request("1", "ban_member", target), actor);
  const b = await decisions.acceptDecision(request("2", "unban_member", target), actor);
- await sql`UPDATE moderation.decisions SET created_at = clock_timestamp() + interval '1 day' WHERE decision_id = ${a.decisionId}`;
+ // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
+ await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET created_at = clock_timestamp() + interval '1 day' WHERE decision_id = ${a.decisionId}`; });
  await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1 WHERE decision_id = ${a.decisionId}`;
  await expect(decisions.retry(a.decisionId, actor)).rejects.toThrow(/supersedes/);
  await sql`UPDATE moderation.deliveries SET state = 'pending' WHERE decision_id = ${a.decisionId}`;
@@ -196,7 +197,8 @@ test("legacy uncertain Concord publication blocks its revisioned successor until
  await sql`UPDATE moderation.deliveries SET state = 'verified', result_code = 'synthetic_reconciled' WHERE decision_id = ${legacyId}`;
  const released = await decisions.claim(); expect(released?.decision.decisionId).toBe(next.decisionId);
  await decisions.complete(released!, "verified", "synthetic_settled");
- await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${next.decisionId}`;
+ // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
+ await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${next.decisionId}`; });
  await decisions.expire();
  await expect(decisions.acceptDecision(request("1", "ban_member", target), actor)).rejects.toMatchObject({ code: "member_intent_order_conflict" });
 });

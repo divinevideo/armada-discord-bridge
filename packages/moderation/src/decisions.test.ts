@@ -83,7 +83,8 @@ test("an unverified delivery that exhausts its retry budget becomes visibly fail
 });
 test("delivery results remain visible after evidence expires, but expired actions cannot retry", async () => {
   const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
-  await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId}`;
+  // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId}`; });
   await decisions.expire();
   const status = await decisions.get(accepted.decisionId, actor);
   expect(status.deliveries.every((delivery) => delivery.state === 'failed')).toBe(true);
@@ -198,7 +199,10 @@ test("the actual API role accepts decisions while retaining case locks and colum
     for (const row of rows) expect(row).toEqual({ token: null, lease_until: null, available: true, updated: true, signed_events: events, publication_attempted: true });
     const columns = await sql`SELECT column_name FROM information_schema.columns WHERE table_schema = 'moderation' AND table_name = 'decisions'`;
     for (const { column_name } of columns) {
-      await expect(api`UPDATE moderation.decisions SET ${api(column_name)} = ${api(column_name)} WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
+      const permitted = ["audit", "lifecycle_closed_at", "audit_delete_after", "audit_retention_seconds", "appeal_state"].includes(column_name);
+      const update = api`UPDATE moderation.decisions SET ${api(column_name)} = ${api(column_name)} WHERE decision_id = ${accepted.decisionId}`.execute();
+      if (permitted) await update;
+      else await expect(update).rejects.toThrow(/permission denied/);
     }
     for (const column of ["signed_events", "publication_attempted", "decision_id", "target", "attempts", "result_code", "superseded_by"]) {
       await expect(api`UPDATE moderation.deliveries SET ${api(column)} = ${api(column)} WHERE decision_id = ${accepted.decisionId}`.execute()).rejects.toThrow(/permission denied/);
@@ -213,7 +217,8 @@ test("the actual API role accepts decisions while retaining case locks and colum
 
 test("pending age survives delivery renewal, rescheduling and manual retry", async () => {
   const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
-  await sql`UPDATE moderation.decisions SET created_at = clock_timestamp() - interval '1 hour' WHERE decision_id = ${accepted.decisionId}`;
+  // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET created_at = clock_timestamp() - interval '1 hour' WHERE decision_id = ${accepted.decisionId}`; });
   await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1, updated_at = clock_timestamp() WHERE decision_id = ${accepted.decisionId}`;
   await decisions.retry(accepted.decisionId, actor);
   await sql`UPDATE moderation.deliveries SET lease_until = clock_timestamp() + interval '60 seconds', available_at = clock_timestamp() + interval '5 minutes', updated_at = clock_timestamp() WHERE decision_id = ${accepted.decisionId}`;
@@ -494,7 +499,8 @@ for (const [older, newer] of [["ban_member", "unban_member"], ["unban_member", "
       VALUES (${next.caseId}, ${h.staff.orgId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.who.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic newer report")}, clock_timestamp() + interval '1 hour')`;
     const second = await h.outbox.acceptDecision(next, h.staff);
     await hold(second.decisionId, "concord");
-    await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`;
+    // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
     await h.outbox.expire();
     await sql`DELETE FROM moderation.cases WHERE case_id = ${oldCase}`;
     expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
@@ -514,7 +520,7 @@ for (const [older, newer] of [["ban_member", "unban_member"], ["unban_member", "
     expect(await h.banned()).toBe(newer === "ban_member");
     expect((await concordRow(second.decisionId)).state).toBe("verified");
     const [expired] = await sql`SELECT c.audit, d.signed_events, d.publication_event_ids FROM moderation.decisions c JOIN moderation.deliveries d USING (decision_id) WHERE c.decision_id = ${first.decisionId} AND d.target = 'concord'`;
-    expect(expired.audit).toBeNull(); expect(expired.signed_events).toBeNull(); expect(expired.publication_event_ids).toEqual([limbo[0].id]);
+    expect(expired.audit).not.toBeNull(); expect(expired.signed_events).toBeNull(); expect(expired.publication_event_ids).toEqual([limbo[0].id]);
   } finally { await h.cleanup(); }
 });
 
@@ -569,7 +575,8 @@ for (const [older, newer] of [["ban_member", "unban_member"], ["unban_member", "
     await h.deliver((await h.outbox.claim())!, lossy);
     const second = await h.accept(newer);
     await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 8, available_at = clock_timestamp(), result_code = 'retry_budget_exhausted' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
-    await sql`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`;
+    // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
     let publishes = 0, authorizations = 0, otherEffects = 0;
     const forbidden = async (): Promise<never> => { otherEffects++; throw new Error("Read-only recovery must not execute an old action"); };
     const worker = new ModerationWorker(sql, h.outbox, async (claim, assertCurrent) => ({

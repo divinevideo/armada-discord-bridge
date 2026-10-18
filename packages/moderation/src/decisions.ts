@@ -304,7 +304,7 @@ export class Decisions {
           THEN 'concord_recovery_requires_operator' ELSE 'decision_expired' END,
         signed_events = NULL, token = NULL, lease_until = NULL
         WHERE decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at <= clock_timestamp()) AND state IN ('pending', 'acknowledged')`;
-      await tx`UPDATE moderation.decisions SET audit = NULL WHERE expires_at <= clock_timestamp() AND audit IS NOT NULL`;
+      // Action audit has an independent lifecycle; execution expiry only clears delivery material.
     });
   }
 }
