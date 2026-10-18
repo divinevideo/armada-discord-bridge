@@ -22,5 +22,5 @@ UPDATE moderation.deliveries d SET publication_event_ids = ARRAY[d.signed_events
 UPDATE moderation.deliveries d SET result_code = 'concord_recovery_requires_operator'
   FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND c.source_revision IS NULL
     AND c.action IN ('ban_member', 'unban_member') AND d.target = 'concord' AND d.state = 'failed'
-    AND d.result_code = 'decision_expired' AND d.publication_attempted
+    AND d.result_code = 'decision_expired' AND d.publication_attempted AND d.attempts > 0
     AND d.signed_events IS NULL AND d.publication_event_ids IS NULL;

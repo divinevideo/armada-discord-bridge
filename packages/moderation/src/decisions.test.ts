@@ -537,17 +537,18 @@ test("publication ID migration copies only readable outer IDs and keeps receipts
   } finally { await h.cleanup(); }
 });
 
-for (const attempted of [false, true]) test(`legacy erased expiry is ${attempted ? "unknown, not proven unsent" : "safe when durably proved unattempted"}`, async () => {
+for (const [attempted, attempts] of [[false, 0], [false, 1], [true, 0], [true, 1]] as const) test(`legacy erased expiry with marker ${attempted} and ${attempts} attempts preserves known send history`, async () => {
   const h = await memberHarness("member");
   try {
     const request = h.request("ban_member"), legacy = crypto.randomUUID();
     await sql`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, fingerprint_version, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, expires_at)
       VALUES (${legacy}, ${h.staff.orgId}, ${request.executionId}, ${crypto.randomUUID()}, 1, ${request.caseId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.who.pk}, 'ban_member', false, clock_timestamp() - interval '1 second')`;
-    await sql`INSERT INTO moderation.deliveries (decision_id, target, state, result_code, publication_attempted)
-      VALUES (${legacy}, 'concord', 'failed', 'decision_expired', ${attempted})`;
+    await sql`INSERT INTO moderation.deliveries (decision_id, target, state, result_code, publication_attempted, attempts)
+      VALUES (${legacy}, 'concord', 'failed', 'decision_expired', ${attempted}, ${attempts})`;
     await migrateModeration(sql);
     const second = await h.accept("unban_member");
-    if (attempted) {
+    await migrateModeration(sql); // Restart must not invent a send for an unclaimed row.
+    if (attempted && attempts > 0) {
       expect(await concordRow(legacy)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", signed_events: null });
       expect(await h.outbox.claim()).toBeUndefined();
       expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0, result_code: "concord_waiting_on_prior_publication" });

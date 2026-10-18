@@ -37,8 +37,11 @@ successful outcome in SQL. Read-only recovery uses the existing maximum retry
 backoff, not a tight loop.
 
 Legacy unfenced expired rows with a conservative send marker but no surviving
-identity are quarantined as operator recovery, not guessed to be unsent. A
-durable unattempted marker is different and does not create that blocker.
+identity are quarantined as operator recovery only if they were claimed, not
+guessed to be unsent. Zero attempts proves no send through the supported worker
+path; a durable unattempted marker is also different. Neither creates that
+blocker when migrations run again on restart. Never reset attempt counters in
+SQL to manufacture that proof.
 
 Only a persisted generation proved unattempted may be rebuilt against a newer
 banlist. `concord_recovery_requires_operator` is not an ordinary Retry action:
