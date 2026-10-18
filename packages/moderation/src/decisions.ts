@@ -13,7 +13,7 @@ export interface DecisionStatus { executionId: string; sourceOrder: SourceOrder 
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
 export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
-export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required";
+export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required" | "guild_scope_order_requires_operator";
 export class DecisionRefusedError extends Error {
   constructor(readonly code: DecisionRefusal, message: string, readonly details: { executionId?: string; currentRevision?: string; supersededByExecutionId?: string } = {}) { super(message); }
 }
@@ -47,9 +47,20 @@ const orderedAfter = (a: string, b: string) => `((${a}.source_revision IS NOT NU
   OR (${a}.source_revision IS NULL AND ${b}.source_revision IS NULL AND (${a}.created_at, ${a}.decision_id) > (${b}.created_at, ${b}.decision_id)))`;
 const newerThan = (other: string, c: string) => `${sameMember(other, c)} AND ${orderedAfter(other, c)}`;
 const olderThan = (other: string, c: string) => `${sameMember(other, c)} AND ${orderedAfter(c, other)}`;
-const newerHead = (c: string) => `${c}.action IN ('ban_member', 'unban_member') AND EXISTS (
+// Community intent can replace community effects, but only another explicitly
+// confirmed Guild action can replace a Guild effect. A no-op Discord row has
+// no external effect to preserve or wait behind.
+const newerForTarget = (other: string, c: string, d: string) => `${newerThan(other, c)}
+  AND (${d}.target <> 'discord' OR NOT ${c}.discord_guild_confirmed OR ${other}.discord_guild_confirmed)`;
+const olderForTarget = (other: string, c: string, d: string) => `${olderThan(other, c)}
+  AND (${d}.target <> 'discord' OR (${c}.discord_guild_confirmed AND ${other}.discord_guild_confirmed))`;
+const newerHead = (c: string, d?: string) => `${c}.action IN ('ban_member', 'unban_member') AND EXISTS (
   SELECT 1 FROM moderation.member_order_heads h WHERE h.org_id = ${c}.org_id AND h.community_id = ${c}.community_id AND h.author = ${c}.author
-    AND (${c}.source_revision IS NULL OR h.latest_revision > ${c}.source_revision))`;
+    AND (${d ? `CASE WHEN ${d}.target = 'discord' AND ${c}.discord_guild_confirmed THEN h.latest_guild_revision ELSE h.latest_revision END` : "h.latest_revision"} > COALESCE(${c}.source_revision, 0)))`;
+const unknownGuildOrder = (c: string) => `${c}.action IN ('ban_member', 'unban_member') AND ${c}.discord_guild_confirmed
+  AND (${c}.source_revision IS NULL OR EXISTS (SELECT 1 FROM moderation.member_order_heads h
+    WHERE h.org_id = ${c}.org_id AND h.community_id = ${c}.community_id AND h.author = ${c}.author AND h.guild_scope_known_after > ${c}.source_revision
+      AND (h.latest_guild_revision IS NULL OR h.latest_guild_revision <= ${c}.source_revision)))`;
 const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${alias}.created_at, ${alias}.decision_id`;
 const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.state = 'failed' AND ${d}.publication_attempted
   AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL) AND ${c}.action IN ('ban_member', 'unban_member')
@@ -99,9 +110,10 @@ export class Decisions {
           throw new DecisionRefusedError(BigInt(order!.revision) < BigInt(head.revision) ? "member_intent_superseded" : "member_intent_order_conflict", "Membership source order refused",
             { executionId: input.executionId, currentRevision: head.revision, supersededByExecutionId: head.latest_execution_id });
         }
-        await tx`INSERT INTO moderation.member_order_heads (org_id, community_id, author, latest_revision, latest_execution_id)
-          VALUES (${actor.orgId}, ${evidence.community_id}, ${evidence.author}, ${order!.revision}, ${input.executionId})
-          ON CONFLICT (org_id, community_id, author) DO UPDATE SET latest_revision = EXCLUDED.latest_revision, latest_execution_id = EXCLUDED.latest_execution_id`;
+        await tx`INSERT INTO moderation.member_order_heads (org_id, community_id, author, latest_revision, latest_execution_id, latest_guild_revision)
+          VALUES (${actor.orgId}, ${evidence.community_id}, ${evidence.author}, ${order!.revision}, ${input.executionId}, ${input.discordGuildConfirmed ? order!.revision : null})
+          ON CONFLICT (org_id, community_id, author) DO UPDATE SET latest_revision = EXCLUDED.latest_revision, latest_execution_id = EXCLUDED.latest_execution_id,
+            latest_guild_revision = COALESCE(EXCLUDED.latest_guild_revision, moderation.member_order_heads.latest_guild_revision)`;
       }
       const decisionId = crypto.randomUUID();
       const audit = cipher.seal(`${actor.orgId}:${decisionId}`, { actorId: actor.actorId, reason: input.reason });
@@ -153,21 +165,30 @@ export class Decisions {
         if (newer) {
           // This can only resume the exact attempted Concord generation while
           // its original authority/expiry and send budget still permit replay.
-          // It must never restart the older relay/Discord action or mint bytes.
-          const recoverable = await tx`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
-            WHERE decision_id = ${decisionId} AND target = 'concord' AND state = 'failed' AND publication_attempted AND signed_events IS NOT NULL AND attempts < 8
-              AND result_code IS DISTINCT FROM 'concord_recovery_requires_operator'
-              AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
+          // An independently surviving Guild target can also retry, with the
+          // original Guild authority; this never restarts superseded community work.
+          const recoverable = await tx`UPDATE moderation.deliveries d SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+            FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.decision_id = ${decisionId} AND d.state = 'failed' AND d.attempts < 8
+              AND d.result_code IS DISTINCT FROM 'concord_recovery_requires_operator' AND c.expires_at > clock_timestamp()
+              AND ((d.target = 'concord' AND d.publication_attempted AND d.signed_events IS NOT NULL)
+                OR (d.target = 'discord' AND c.discord_guild_confirmed AND ${guildRetryAllowed} AND NOT (${tx.unsafe(unknownGuildOrder("c"))})
+                  AND NOT EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerForTarget("n", "c", "d"))}) AND NOT (${tx.unsafe(newerHead("c", "d"))}))) RETURNING d.target`;
           if (recoverable.length) return recoverable;
+          const [unknown] = await tx`SELECT 1 FROM moderation.decisions c WHERE c.decision_id = ${decisionId} AND ${tx.unsafe(unknownGuildOrder("c"))}`;
+          if (unknown) throw new DecisionRefusedError("guild_scope_order_requires_operator", "Historical Guild intent requires reconciliation or a new staff decision");
           throw new DecisionRefusedError("member_decision_superseded", "A newer ban or unban for this member supersedes this decision");
         }
       }
-      return tx`UPDATE moderation.deliveries SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
-        WHERE decision_id = ${decisionId} AND state = 'failed' AND attempts < 8 AND (${guildRetryAllowed} OR target <> 'discord')
-          AND result_code IS DISTINCT FROM 'concord_recovery_requires_operator'
-          AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at > clock_timestamp()) RETURNING target`;
+      return tx`UPDATE moderation.deliveries d SET state = 'pending', available_at = clock_timestamp(), token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+        FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.decision_id = ${decisionId} AND d.state = 'failed' AND d.attempts < 8 AND (${guildRetryAllowed} OR d.target <> 'discord')
+          AND d.result_code IS DISTINCT FROM 'concord_recovery_requires_operator'
+          AND (d.target <> 'discord' OR NOT (${tx.unsafe(unknownGuildOrder("c"))})) AND c.expires_at > clock_timestamp() RETURNING d.target`;
     });
-    if (!retried.length) throw new Error("No retryable delivery; escalate expired or exhausted decisions");
+    if (!retried.length) {
+      const [unknown] = await this.sql`SELECT 1 FROM moderation.decisions c WHERE c.decision_id = ${decisionId} AND ${this.sql.unsafe(unknownGuildOrder("c"))}`;
+      if (unknown) throw new DecisionRefusedError("guild_scope_order_requires_operator", "Historical Guild intent requires reconciliation or a new staff decision");
+      throw new Error("No retryable delivery; escalate expired or exhausted decisions");
+    }
     return this.get(decisionId, actor);
   }
   async claim(): Promise<DeliveryClaim | undefined> {
@@ -185,10 +206,15 @@ export class Decisions {
       // no further use. superseded_by is the next decision accepted for the
       // member, so the chain reads in staff order whenever this sweep runs.
       await tx`UPDATE moderation.deliveries d SET state = 'failed', result_code = 'superseded_by_newer_decision', signed_events = NULL, token = NULL, lease_until = NULL, updated_at = clock_timestamp(),
-          superseded_by = (SELECT n.decision_id FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))} ORDER BY ${tx.unsafe(memberOrder("n"))} LIMIT 1)
+          superseded_by = (SELECT n.decision_id FROM moderation.decisions n WHERE ${tx.unsafe(newerForTarget("n", "c", "d"))} ORDER BY ${tx.unsafe(memberOrder("n"))} LIMIT 1)
         FROM moderation.decisions c
         WHERE c.decision_id = d.decision_id AND d.state IN ('pending', 'acknowledged') AND NOT ${tx.unsafe(inFlight("d"))}
-          AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) OR ${tx.unsafe(newerHead("c"))})`;
+          AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerForTarget("n", "c", "d"))}) OR ${tx.unsafe(newerHead("c", "d"))})`;
+      // An old global head cannot reveal a pruned decision's Guild scope.
+      // Preserve that uncertainty explicitly rather than cancel or send old intent.
+      await tx`UPDATE moderation.deliveries d SET state = 'failed', result_code = 'guild_scope_order_requires_operator', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+        FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.target = 'discord' AND d.state IN ('pending', 'acknowledged')
+          AND NOT ${tx.unsafe(inFlight("d"))} AND ${tx.unsafe(unknownGuildOrder("c"))}`;
       await tx`UPDATE moderation.deliveries d SET result_code = 'concord_waiting_on_prior_publication'
         FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.target = 'concord' AND d.state = 'pending'
           AND d.result_code IS NULL AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
@@ -202,7 +228,7 @@ export class Decisions {
         WHERE ((d.state IN ('pending', 'acknowledged') AND d.attempts < 8 AND c.expires_at > clock_timestamp()) OR (${tx.unsafe(publicationRecovery("d", "c"))}))
           AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
           AND NOT EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
-            WHERE ${tx.unsafe(olderThan("o", "c"))} AND od.target = d.target AND ${tx.unsafe(inFlight("od"))})
+            WHERE ${tx.unsafe(olderForTarget("o", "c", "d"))} AND od.target = d.target AND ${tx.unsafe(inFlight("od"))})
         ORDER BY d.available_at, d.decision_id, d.target FOR UPDATE OF d SKIP LOCKED LIMIT 1`;
       if (!job) return undefined;
       const token = crypto.randomUUID();
