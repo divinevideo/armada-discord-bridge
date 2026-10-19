@@ -32,9 +32,15 @@ never bridged without its community's consent.
 - **Server import**: mint a whole Armada community from a Discord server —
   channels, roles, and grants, with genesis signed by the owner's own key in
   their browser — then backfill history.
-Not yet: severance detection (ban, refounding, dissolution) is partial, and
-Discord-side commands are parsed from message text rather than registered as
-slash commands.
+- **Severance detection**: the bridge notices when its community is banned,
+  refounded, or dissolved, stops forwarding, and says why on the dashboard.
+  Each case is read from the protocol's own folds — the control-plane
+  Banlist, the base-rekey window, and the owner-signed dissolution tombstone —
+  never from a relay refusing a publish, which an outage can fake.
+- **Slash commands**: Discord-side commands are registered as application
+  commands and dispatched through the same handler the message-text path
+  used. Message-text parsing stays as a fallback so commands are answered
+  rather than mirrored into Armada as puppet messages.
 
 ## Layout
 
@@ -87,6 +93,19 @@ bunx tsc -p packages/portal/tsconfig.json --noEmit  # portal, separately
 
 Suites that need Postgres skip themselves when `DATABASE_URL` is unreachable,
 so a bare `bun test` is still meaningful.
+
+`scripts/test-integration.sh` is the whole gate — typechecks, `vite build`,
+the suites, and `scripts/assert-no-skipped-tests.sh`. Run that before you
+trust a green `bun test`: two suites covering the built SPA skip themselves
+when `web/dist` is absent, and the skip gate (correctly) refuses to pass on
+them, so a bare `bun test` followed by the gate looks like a failure whose
+message is nonetheless right.
+
+`scripts/test-bridge-runtime.sh` runs the bridge container's own entrypoint
+and needs GNU `timeout` (coreutils) on macOS.
+
+Run one `bun test` at a time against a shared `DATABASE_URL` — concurrent
+runs contend over `moderation.deliveries` and invent failures.
 
 ### Configuration
 
