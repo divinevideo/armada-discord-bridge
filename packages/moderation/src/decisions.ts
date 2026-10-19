@@ -4,6 +4,8 @@ import type { DeliveryState, DeliveryTarget, RoomTarget } from "./contracts";
 import { EvidenceCipher } from "./evidence";
 import { Lifecycle, lockLifecycleCase, lockLifecycleDecision } from "./lifecycle";
 import type { LifecyclePolicyConfig } from "./apiReadiness";
+import { reversalContext, validateReversalInput } from "./decisionReversals";
+import type { ReversalInput, ReversalContext } from "./lifecycleContracts";
 import type { DiscordRestriction } from "./lifecycleContracts";
 export type RoomAction = "remove_message" | "ban_member" | "unban_member";
 export interface VerifiedCoopActor { orgId: string; actorId: string; permissions: string[] }
@@ -16,7 +18,7 @@ export interface DecisionStatus { auditAvailable?: boolean; discordRestriction?:
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
 export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean; publicationProofOnly?: boolean }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
-export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required" | "guild_scope_order_requires_operator";
+export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required" | "guild_scope_order_requires_operator" | "decision_source_unavailable";
 export class DecisionRefusedError extends Error {
   constructor(readonly code: DecisionRefusal, message: string, readonly details: { executionId?: string; currentRevision?: string; supersededByExecutionId?: string } = {}) { super(message); }
 }
@@ -106,9 +108,15 @@ export class Decisions {
       await lockLifecycleCase(tx, actor.orgId, input.caseId);
       if (membership(input.action) && !order) throw new DecisionRefusedError("member_intent_order_required", "Membership source order required", { executionId: input.executionId });
       const [evidence] = await tx`SELECT * FROM moderation.cases WHERE case_id = ${input.caseId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp() FOR UPDATE`;
-      if (!evidence || this.communities.get(evidence.community_id) !== actor.orgId) throw new Error("Case unavailable");
+      if (!evidence || this.communities.get(evidence.community_id) !== actor.orgId) throw new DecisionRefusedError("decision_source_unavailable", "Decision source unavailable", { executionId: input.executionId });
+      return this.enqueueAcceptedDecision(tx, input, actor, evidence, fingerprint, fingerprintVersion);
+    });
+    return this.get(id, actor);
+  }
+  private async enqueueAcceptedDecision(tx: postgres.TransactionSql, input: ModerationDecision, actor: VerifiedCoopActor, evidence: any, fingerprint: string, fingerprintVersion: number, reversesDecisionId: string | null = null): Promise<string> {
       if (membership(input.action)) {
         await lockMember(tx, evidence.community_id, evidence.author);
+        const order = input.sourceOrder;
         const [head] = await tx`SELECT latest_revision::text AS revision, latest_execution_id FROM moderation.member_order_heads
           WHERE org_id = ${actor.orgId} AND community_id = ${evidence.community_id} AND author = ${evidence.author} FOR UPDATE`;
         if (head && BigInt(order!.revision) <= BigInt(head.revision)) {
@@ -121,13 +129,42 @@ export class Decisions {
             latest_guild_revision = COALESCE(EXCLUDED.latest_guild_revision, moderation.member_order_heads.latest_guild_revision)`;
       }
       const decisionId = crypto.randomUUID();
-      const audit = cipher.seal(`${actor.orgId}:${decisionId}`, { actorId: actor.actorId, reason: input.reason });
-      await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, audit, expires_at, fingerprint_version, source_order_version, source_revision)
-        VALUES (${decisionId}, ${actor.orgId}, ${input.executionId}, ${fingerprint}, ${input.caseId}, ${evidence.community_id}, ${evidence.channel_id}, ${evidence.rumor_id}, ${evidence.author}, ${input.action}, ${input.discordGuildConfirmed}, ${audit}, ${evidence.expires_at}, ${fingerprintVersion}, ${order?.version ?? null}, ${order?.revision ?? null})`;
+      const audit = this.cipher!.seal(`${actor.orgId}:${decisionId}`, { actorId: actor.actorId, reason: input.reason });
+      await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, audit, expires_at, fingerprint_version, source_order_version, source_revision, reverses_decision_id)
+        VALUES (${decisionId}, ${actor.orgId}, ${input.executionId}, ${fingerprint}, ${input.caseId}, ${evidence.community_id}, ${evidence.channel_id}, ${evidence.rumor_id}, ${evidence.author}, ${input.action}, ${input.discordGuildConfirmed}, ${audit}, ${evidence.expires_at}, ${fingerprintVersion}, ${input.sourceOrder?.version ?? null}, ${input.sourceOrder?.revision ?? null}, ${reversesDecisionId})`;
       for (const target of ["divine_relay", "concord", "discord"]) await tx`INSERT INTO moderation.deliveries (decision_id, target) VALUES (${decisionId}, ${target})`;
       return decisionId;
+  }
+  async getReversalContext(decisionId: string, actor: VerifiedCoopActor): Promise<ReversalContext> {
+    assertActor(actor, "unban_member");
+    if (!uuid.test(decisionId)) throw new Error("Decision unavailable");
+    const [row] = await this.sql`SELECT * FROM moderation.decisions WHERE org_id = ${actor.orgId} AND decision_id = ${decisionId}`;
+    const deliveries = await this.sql`SELECT target, state FROM moderation.deliveries WHERE decision_id = ${decisionId}`;
+    const context = reversalContext(row, deliveries, this.communities);
+    if (!context) throw new Error("Decision unavailable");
+    return context;
+  }
+  async acceptReversal(priorDecisionId: string, input: ReversalInput, actor: VerifiedCoopActor): Promise<DecisionStatus> {
+    validateReversalInput(input); assertActor(actor, "unban_member");
+    if (!uuid.test(priorDecisionId)) throw new Error("Invalid prior decision");
+    if (input.discordGuildConfirmed) assertActor(actor, "discord_guild_ban");
+    if (!this.cipher) throw new Error("Decision acceptance disabled for this process");
+    const fingerprint = createHash("sha256").update(JSON.stringify([actor.orgId, actor.actorId, priorDecisionId, input.executionId, input.action, input.reason, input.scope, input.discordGuildConfirmed, input.sourceOrder.version, input.sourceOrder.revision])).digest("hex");
+    const id = await this.sql.begin(async tx => {
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${actor.orgId + ":" + input.executionId}, 483213))`;
+      const [accepted] = await tx`SELECT decision_id, fingerprint, fingerprint_version FROM moderation.decisions WHERE org_id = ${actor.orgId} AND execution_id = ${input.executionId}`;
+      if (accepted) { if (accepted.fingerprint_version !== 3 || accepted.fingerprint !== fingerprint) throw new Error("Decision replay conflict"); return accepted.decision_id as string; }
+      this.lifecycle.requirePolicy();
+      const [scope] = await tx`SELECT case_id FROM moderation.decisions WHERE org_id = ${actor.orgId} AND decision_id = ${priorDecisionId}`;
+      const unavailable = () => new DecisionRefusedError("decision_source_unavailable", "Decision source unavailable", { executionId: input.executionId });
+      if (!scope) throw unavailable();
+      const { decision, deliveries } = await lockLifecycleDecision(tx, actor.orgId, priorDecisionId);
+      const context = reversalContext(decision, deliveries, this.communities);
+      if (!context) throw unavailable();
+      const source = { ...decision, expires_at: new Date(Date.now() + this.cipher!.retentionSeconds * 1000) };
+      return this.enqueueAcceptedDecision(tx, { ...input, caseId: context.caseId }, actor, source, fingerprint, 3, priorDecisionId);
     });
-    return this.get(id, actor);
+    return this.get(id as string, actor);
   }
   async get(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor);

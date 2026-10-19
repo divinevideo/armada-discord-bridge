@@ -40,7 +40,7 @@ async function boundedBody(request: Request): Promise<string> {
   } finally { clearTimeout(timer); reader.releaseLock(); }
   return Buffer.concat(chunks).toString("utf8");
 }
-export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase" | "getByExecution" | "refreshPublicationProof">>; lifecycle?: Pick<Lifecycle, "placeEvidenceHold" | "releaseEvidenceHold" | "readHeldEvidence" | "setAppeal" | "closeLifecycle"> }) {
+export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase" | "getByExecution" | "refreshPublicationProof" | "getReversalContext" | "acceptReversal">>; lifecycle?: Pick<Lifecycle, "placeEvidenceHold" | "releaseEvidenceHold" | "readHeldEvidence" | "setAppeal" | "closeLifecycle"> }) {
   if (options.coopSecret.length < 32) throw new Error("Staff service credential required");
   const capacity = () => {
     let remaining = 100, window = Date.now();
@@ -53,11 +53,12 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
   const response = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url), path = url.pathname;
+    const reversalRoute = /^\/v1\/decisions\/([0-9a-f-]{36})\/(reversal-context|reversals)$/.exec(path);
     const lifecycleRoute = /^\/v1\/(cases|holds|decisions)\/([0-9a-f-]{36})\/(holds|release|held-evidence|appeal|close|publication-refresh)$/.exec(path);
     const executionRoute = /^\/v1\/decision-executions\/([0-9a-f-]{36})$/.exec(path);
     const caseRoute = /^\/v1\/cases\/([0-9a-f-]{36})$/.exec(path);
     const decisionRoute = /^\/v1\/decisions\/([0-9a-f-]{36})(\/retry)?$/.exec(path);
-    if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute && !caseRoute && !executionRoute && !lifecycleRoute) return response({ error: "not_found" }, 404);
+    if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute && !caseRoute && !executionRoute && !lifecycleRoute && !reversalRoute) return response({ error: "not_found" }, 404);
     // Neither public reports nor forged staff headers spend authenticated staff
     // capacity. Keep the existing 100/s cap independently for each trust domain.
     if (path === "/v1/reports" && !reportCapacity()) return response({ error: "rate_limited" }, 429);
@@ -74,6 +75,8 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
     try { actor = authenticateCoop(request, body, options.coopSecret, options.orgs); } catch { return response({ error: "staff_authorization_required" }, 403); }
     if (!staffCapacity()) return response({ error: "rate_limited" }, 429);
     try {
+      if (reversalRoute?.[2] === "reversal-context" && request.method === "GET" && options.decisions.getReversalContext) return response(await options.decisions.getReversalContext(reversalRoute[1], actor));
+      if (reversalRoute?.[2] === "reversals" && request.method === "POST" && options.decisions.acceptReversal) return response(await options.decisions.acceptReversal(reversalRoute[1], JSON.parse(body), actor), 202);
       if (lifecycleRoute && request.method === "POST") {
         const [, resource, id, operation] = lifecycleRoute;
         const input = JSON.parse(body);
