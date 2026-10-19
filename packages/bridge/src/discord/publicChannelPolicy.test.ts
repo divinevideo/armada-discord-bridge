@@ -162,3 +162,11 @@ describe("fresh batch authorization", () => {
     await expect(policy.assertPublicChannels(GUILD, [CHANNEL])).resolves.toBeUndefined();
   });
 });
+
+it("selected exclusion IDs remain effective across category rename and channel moves", async () => {
+ const h = harness(); h.move(TICKETS); h.rename("Renamed support archive");
+ await expect(h.policy.assertPublicChannel(GUILD, CHANNEL)).rejects.toThrow("excluded category");
+ h.move(CATEGORY); await expect(h.policy.assertPublicChannel(GUILD, CHANNEL)).resolves.toBeUndefined();
+ h.move(TICKETS); await expect(h.policy.assertPublicChannel(GUILD, CHANNEL)).rejects.toThrow("excluded category");
+ expect(() => parsePublicChannelRules(JSON.stringify({ ...rules, excludedCategoryIds: [] }))).toThrow();
+});

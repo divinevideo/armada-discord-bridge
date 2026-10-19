@@ -94,3 +94,19 @@ test("capacity insertion skips held expiry and never returns an expired held rep
     await sql`DELETE FROM moderation.report_auth WHERE reporter = ${reporter.pubkey}`;
   }
 });
+
+test("selected report contract keeps reporter cases, original reason/expiry and per-org capacity independent", async () => {
+ const orgs = [crypto.randomUUID(), crypto.randomUUID()], reporters = Array.from({ length: 3 }, () => randomBytes(32).toString("hex"));
+ const instances = orgs.map(org => new Reports(sql, cipher, new RelayEvidenceResolver(sql, async () => [f.allowed]), new Map([[f.policy.communityId, org]]), 2));
+ const report = (index: number, who: number, reason: string) => instances[index].submitReport({ target, reason }, { pubkey: reporters[who], authEventId: randomBytes(32).toString("hex") });
+ try {
+  const first = await report(0, 0, "original synthetic reason"), second = await report(0, 1, "independent reporter"); expect(second.caseId).not.toBe(first.caseId);
+  const staff = { orgId: orgs[0], actorId: "synthetic-reader", permissions: ["view"] }, original = await instances[0].getCase(first.caseId, staff);
+  expect(await report(0, 0, "changed duplicate reason")).toEqual(first);
+  expect(await instances[0].getCase(first.caseId, staff)).toMatchObject({ reason: "original synthetic reason", expiresAt: original.expiresAt });
+  await expect(report(0, 2, "at capacity")).rejects.toThrow(/capacity/);
+  expect((await report(1, 2, "other organization")).caseId).not.toBe(first.caseId);
+  await sql`UPDATE moderation.cases SET expires_at = clock_timestamp() - interval '1 second' WHERE case_id = ${first.caseId}`;
+  expect((await report(0, 2, "capacity after expiry")).caseId).not.toBe(first.caseId);
+ } finally { await sql`DELETE FROM moderation.cases WHERE org_id IN ${sql(orgs)}`; await sql`DELETE FROM moderation.report_auth WHERE reporter IN ${sql(reporters)}`; }
+});
