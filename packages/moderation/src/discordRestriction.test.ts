@@ -92,3 +92,39 @@ test("verified binding survives original mapping deletion and refuses a changed 
  expect(await resolver.member(source)).toEqual(member);
  expect(await new BridgeMappingResolver(sql, tenant, member.guildId, randomBytes(32).toString("hex")).member(source)).toBeUndefined();
 });
+
+test("native settled reversal closes after evidence deletion using the production resolver and scheduled worker observation", async () => {
+ await migrate(process.env.DATABASE_URL!);
+ const g = await moderationFixture();
+ await new PolicyStore(sql).install(g.policy,[g.chatStream,g.controlStream,g.guestbookStream],0);
+ const nativeOrg = `synthetic-native-${crypto.randomUUID()}`, scope = new Map([[g.community.idHex, nativeOrg]]), ban = crypto.randomUUID(), unban = crypto.randomUUID(), caseId = crypto.randomUUID(), executionId = crypto.randomUUID();
+ try {
+   await sql.begin(async tx => {
+     await tx`SET LOCAL session_replication_role = replica`;
+     for (const [id, action, revision, execution] of [[ban, "ban_member", 1, crypto.randomUUID()], [unban, "unban_member", 2, executionId]] as const) {
+       await tx`INSERT INTO moderation.decisions(decision_id,org_id,case_id,execution_id,fingerprint,fingerprint_version,source_order_version,source_revision,community_id,channel_id,rumor_id,author,action,discord_guild_confirmed,audit,expires_at) VALUES(${id},${nativeOrg},${caseId},${execution},${crypto.randomUUID()},2,1,${revision},${g.community.idHex},${g.channelId},${g.allowedRumorId},${g.member.pk},${action},false,${cipher.seal(`${nativeOrg}:${id}`, {actorId:"synthetic-admin",reason:"synthetic native action"})},clock_timestamp()-interval '1 second')`;
+       for (const target of ["concord","divine_relay","discord"]) await tx`INSERT INTO moderation.deliveries(decision_id,target,state,available_at) VALUES(${id},${target},${target === "discord" ? "not_applicable" : "verified"},clock_timestamp())`;
+     }
+     await tx`INSERT INTO moderation.member_order_heads(org_id,community_id,author,latest_revision,latest_execution_id) VALUES(${nativeOrg},${g.community.idHex},${g.member.pk},2,${executionId})`;
+   });
+   const actor = { orgId:nativeOrg,actorId:"synthetic-admin",permissions:["view","manage_moderation_records"] };
+   const observer = new DiscordRestrictionObserver(operatorSql,new BridgeMappingResolver(sql,"default",member.guildId,randomBytes(32).toString("hex")),policy,async()=>{throw Error("Native observation must not contact Discord");},scope);
+   await new Decisions(apiSql,cipher,scope).refreshDiscordRestriction(ban,actor);
+   await observer.tick(); await observer.tick();
+   expect((await new Decisions(apiSql,cipher,scope).get(ban,actor)).discordRestriction).toMatchObject({state:"not_applicable"});
+   const lifecycle = new Lifecycle(apiSql,cipher,scope,{auditRetentionSeconds:60,holdMaxSeconds:3600});
+   expect((await sql`SELECT publication_attempted FROM moderation.deliveries WHERE decision_id=${ban} AND target='discord'`)[0].publication_attempted).toBe(true);
+   await sql`UPDATE moderation.deliveries SET state='not_applicable', result_code='operator_unknown' WHERE decision_id=${ban} AND target='concord'`;
+   await expect(lifecycle.closeLifecycle({decisionId:ban,reason:"Unknown Concord publication must remain open"},actor)).rejects.toThrow();
+   await sql`UPDATE moderation.deliveries SET state='verified', result_code='concord_enforcement_verified' WHERE decision_id=${ban} AND target='concord'`;
+   expect((await lifecycle.closeLifecycle({decisionId:ban,reason:"Settled native reversal"},actor)).closedAt).toBeString();
+   const cleanup = new Lifecycle(operatorSql,undefined,scope,{}); await cleanup.expireAudit();
+   expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id=${ban}`)[0].audit).not.toBeNull();
+   await sql.begin(async tx=>{await tx`SET LOCAL session_replication_role=replica`;await tx`UPDATE moderation.decisions SET lifecycle_closed_at=clock_timestamp()-interval '2 minutes', audit_delete_after=clock_timestamp()-interval '1 minute' WHERE decision_id=${ban}`;await tx`UPDATE moderation.lifecycle_events SET recorded_at=clock_timestamp()-interval '2 minutes' WHERE decision_id=${ban}`;});
+   await sql`UPDATE moderation.deliveries SET state='not_applicable',result_code='operator_unknown' WHERE decision_id=${ban} AND target='concord'`;
+   await expect(Promise.resolve(apiSql`UPDATE moderation.decisions SET audit=NULL WHERE decision_id=${ban}`)).rejects.toThrow(/audit/i);
+   await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id=${ban}`)[0].audit).not.toBeNull();
+   await sql`UPDATE moderation.deliveries SET state='verified',result_code='concord_enforcement_verified' WHERE decision_id=${ban} AND target='concord'`;
+   await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id=${ban}`)[0].audit).toBeNull();
+ } finally { await sql.begin(async tx=>{await tx`SET LOCAL session_replication_role = replica`;await tx`DELETE FROM moderation.lifecycle_events WHERE org_id=${nativeOrg}`;await tx`DELETE FROM moderation.decisions WHERE org_id=${nativeOrg}`;await tx`DELETE FROM moderation.member_order_heads WHERE org_id=${nativeOrg}`;await tx`DELETE FROM moderation.community_policy WHERE community_id=${g.community.idHex}`;}); }
+});

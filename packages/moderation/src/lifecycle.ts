@@ -101,7 +101,7 @@ export class Lifecycle {
     }) as Promise<LifecycleStatus>;
   }
   private async eligible(tx: postgres.TransactionSql, decision: any, deliveries: any[]) {
-    if (decision.appeal_state === "open" || deliveries.map(d => d.target).sort().join(",") !== "concord,discord,divine_relay" || deliveries.some(d => !["verified", "not_applicable"].includes(d.state) || d.lease_until?.getTime() > Date.now() || (d.publication_attempted && d.state !== "verified" && !["concord_superseded_publication_settled", "concord_publication_settled"].includes(d.result_code)) || d.discord_restriction_state === "present" || (d.target === "discord" && decision.discord_guild_confirmed && d.discord_restriction_state === "unknown"))) return false;
+    if (decision.appeal_state === "open" || deliveries.map(d => d.target).sort().join(",") !== "concord,discord,divine_relay" || deliveries.some(d => !["verified", "not_applicable"].includes(d.state) || d.lease_until?.getTime() > Date.now() || (d.target === "concord" && d.publication_attempted && d.state !== "verified" && !["concord_superseded_publication_settled", "concord_publication_settled"].includes(d.result_code)) || d.discord_restriction_state === "present" || (d.target === "discord" && decision.discord_guild_confirmed && d.discord_restriction_state === "unknown"))) return false;
     const [held] = await tx`SELECT 1 FROM moderation.evidence_holds WHERE org_id = ${decision.org_id} AND case_id = ${decision.case_id} AND released_at IS NULL AND hold_until > clock_timestamp()`;
     if (held) return false;
     if (decision.action === "remove_message") return true;

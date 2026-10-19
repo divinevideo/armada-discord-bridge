@@ -150,7 +150,7 @@ BEGIN
             AND NOT EXISTS (SELECT 1 FROM moderation.member_order_heads h WHERE h.org_id = OLD.org_id AND h.community_id = OLD.community_id AND h.author = OLD.author AND (h.latest_guild_revision IS NOT NULL OR h.guild_scope_known_after > 0)))))))
       OR EXISTS (SELECT 1 FROM moderation.evidence_holds h WHERE h.org_id = OLD.org_id AND h.case_id = OLD.case_id AND h.released_at IS NULL AND h.hold_until > clock_timestamp())
       OR EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = OLD.decision_id AND (d.state NOT IN ('verified','not_applicable') OR d.lease_until > clock_timestamp()
-        OR (d.publication_attempted AND d.state <> 'verified') OR d.discord_restriction_state = 'present' OR (d.target = 'discord' AND OLD.discord_guild_confirmed AND d.discord_restriction_state = 'unknown'))) THEN
+        OR (d.target = 'concord' AND d.publication_attempted AND d.state <> 'verified') OR d.discord_restriction_state = 'present' OR (d.target = 'discord' AND OLD.discord_guild_confirmed AND d.discord_restriction_state = 'unknown'))) THEN
       RAISE EXCEPTION 'Decision audit is not eligible for cleanup';
     END IF;
   END IF;
