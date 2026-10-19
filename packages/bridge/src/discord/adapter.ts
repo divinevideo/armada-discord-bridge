@@ -16,6 +16,7 @@ import {
   GatewayIntentBits,
   Options,
   Partials,
+  type ChatInputCommandInteraction,
   type Message,
   type MessageReaction,
   type PartialMessageReaction,
@@ -32,6 +33,11 @@ import type {
   DiscordReactionAdd,
   WebhookSender,
 } from "../router";
+import {
+  SLASH_COMMAND_NAMES,
+  interactionToCommandText,
+  slashCommandRegistration,
+} from "./commands";
 
 export const BRIDGE_WEBHOOK_NAME = "armada-bridge";
 
@@ -80,6 +86,26 @@ export interface DiscordAdapterHandlers {
 export function parseBotCommand(content: string): string | undefined {
   const match = /^\/([a-z][a-z0-9-]*)\b/i.exec(content.trim());
   return match?.[1].toLowerCase();
+}
+
+/**
+ * Present a slash interaction as the command message the text path would have
+ * delivered. The host handler reads exactly `content`, `channelId`, `author.bot`,
+ * `webhookId`, and `reply(text)`; this object is the whole of that contract. The
+ * cast to `Message` is the seam: it keeps one handler signature across both
+ * transports instead of teaching the host a second, near-identical one.
+ */
+function commandMessageFor(interaction: ChatInputCommandInteraction, content: string): Message {
+  return {
+    content,
+    channelId: interaction.channelId,
+    author: { bot: false },
+    webhookId: undefined,
+    reply: async (payload: string | { content?: string }) => {
+      const text = typeof payload === "string" ? payload : (payload.content ?? "");
+      await interaction.reply({ content: text });
+    },
+  } as unknown as Message;
 }
 
 export class DiscordAdapter implements WebhookSender {
@@ -180,6 +206,12 @@ export class DiscordAdapter implements WebhookSender {
         })
         .catch((error) => console.error("bridge: onTyping failed", error));
     });
+    this.client.on("interactionCreate", (interaction) => {
+      if (!interaction.isChatInputCommand()) return;
+      void this.handleSlashInteraction(interaction).catch((error) =>
+        console.error("bridge: slash command failed", error),
+      );
+    });
   }
 
   get applicationId(): string {
@@ -197,6 +229,63 @@ export class DiscordAdapter implements WebhookSender {
       if (this.client.isReady()) return resolve();
       this.client.once("clientReady", () => resolve());
     });
+    // Register the slash commands once the gateway is up. Fired and not waited
+    // on: a REST hiccup here must not take the gateway down (a down gateway is
+    // what turns a blip into a mass sever), and `set` is a full replace, so the
+    // next boot heals a partial registration. Global scope covers every guild
+    // the bot joins now or later — per-guild would need a restart to reach a
+    // new guild, and the command surface is identical everywhere.
+    void this.registerSlashCommands().catch((error) =>
+      console.error("bridge: slash command registration failed", error),
+    );
+  }
+
+  /**
+   * Register (or replace) the bot's application commands. `guildId` scopes the
+   * registration to one guild for instant visibility during development; omit
+   * it for the global registration that is the default.
+   */
+  async registerSlashCommands(guildId?: string): Promise<void> {
+    const application = this.client.application;
+    if (!application) throw new Error("Discord application not ready");
+    const payload = slashCommandRegistration();
+    if (guildId) await application.commands.set(payload, guildId);
+    else await application.commands.set(payload);
+  }
+
+  /**
+   * Dispatch a slash-command interaction to the same handler the message-text
+   * path uses (`onBotCommand`), by presenting the interaction as the equivalent
+   * command message. A dedicated interaction handler would be the obvious
+   * design, but the host (the portal manager) owns the command behaviour —
+   * which channels count as live bridges, the effect gate, the reply text —
+   * behind `onBotCommand`; a new hook would need the host to change. Routing
+   * both transports through one handler keeps that behaviour (and its
+   * permission checks) in exactly one place and byte-identical across them.
+   */
+  async handleSlashInteraction(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!SLASH_COMMAND_NAMES.has(interaction.commandName)) return;
+    const options = interaction.options.data
+      .filter((o) => o.value !== undefined)
+      .map((o) => ({ name: o.name, value: String(o.value) }));
+    const content = interactionToCommandText(interaction.commandName, options);
+    const handler = this.handlers.onBotCommand;
+    if (!handler) {
+      await interaction.reply({ ephemeral: true, content: "Commands are not configured for this bridge." });
+      return;
+    }
+    const handled = await handler(commandMessageFor(interaction, content));
+    // The text path can simply not answer a channel it does not own (another
+    // bot may answer there). A slash command cannot: Discord requires an
+    // acknowledgement within three seconds, and our command is namespaced to
+    // this application so "another bot" cannot own it. An ephemeral note is the
+    // closest thing to the text path's silence — only the invoker sees it.
+    if (!handled && !interaction.replied) {
+      await interaction.reply({
+        ephemeral: true,
+        content: "This channel is not a live bridge to an Armada community.",
+      });
+    }
   }
 
   async stop(): Promise<void> {
