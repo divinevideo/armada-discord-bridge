@@ -340,6 +340,14 @@ export class Decisions {
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease lost");
   }
+  async refreshDiscordRestriction(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
+    await this.get(decisionId, actor);
+    await this.sql.begin(async tx => {
+      await lockLifecycleDecision(tx, actor.orgId, decisionId);
+      await tx`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${decisionId} AND target = 'discord' AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
+    });
+    return this.get(decisionId, actor);
+  }
   async refreshPublicationProof(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     await this.get(decisionId, actor);
     await this.sql.begin(async tx => {

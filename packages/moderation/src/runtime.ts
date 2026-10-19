@@ -6,6 +6,7 @@ import type { LocalIdentity } from "../../bridge/src/concord/signer";
 import { RelayPool } from "../../bridge/src/concord/pool";
 import { discordPublicChannelPolicy, type PublicChannelRules } from "../../bridge/src/discord/publicChannelPolicy";
 import { CarrierIndex } from "./carrierIndex";
+import { DiscordRestrictionObserver } from "./discordRestriction";
 import { ConcordActions } from "./concordActions";
 import type { Decisions } from "./decisions";
 import type { Lifecycle } from "./lifecycle";
@@ -47,6 +48,7 @@ export async function runModerationWorker(options: { sql: postgres.Sql; decision
   const actions = new ConcordActions(community, identity, refresh);
   const mappings = new BridgeMappingResolver(sql, options.bridgeTenantId, options.publicChannels.guildId, options.puppetMaster);
   const publicPolicy = discordPublicChannelPolicy(options.publicChannels, options.discordToken);
+  const restrictions = new DiscordRestrictionObserver(sql, mappings, publicPolicy, discordRequest(options.discordToken), options.communities);
   let unsubscribe = () => {};
   try {
     // The transaction owns the controller for its full lifetime. A failed DB
@@ -78,6 +80,7 @@ export async function runModerationWorker(options: { sql: postgres.Sql; decision
             if (result.state !== "verified") { health.ready = false; health.code = "delivery_unavailable"; }
           }
           await worker.tick();
+          await restrictions.tick();
           await expireModerationRecords(options.decisions, options.lifecycle);
         } catch { health.ready = false; health.code = "policy_unavailable"; await watcher!.disconnected(); }
         await delay(1000, undefined, { signal: options.signal }).catch(() => {});
