@@ -43,7 +43,11 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
   await writeFile(envPath, Object.entries(config).map(([name, value]) => `${name}='${value}'`).join("\n"), { mode: 0o600 });
   await docker("cp", envPath, `${instance.name}:/data/moderation.env`);
   await docker("exec", "--user", "0", instance.name, "chown", "10001:10001", "/data/moderation.env", "/data/community.json");
-  for (const [mode, port] of [["worker", "8081"], ["api", "8080"]]) await docker("exec", "-d", "-e", `MODERATION_MODE=${mode}`, "-e", `MODERATION_PORT=${port}`, "-e", "NODE_EXTRA_CA_CERTS=/data/synthetic-coop-cert.pem", instance.name, "bun", "--env-file=/data/moderation.env", "packages/moderation/src/index.ts");
+  const workerLauncher = `import { runModerationService } from "/opt/divine/packages/moderation/src/index.ts"; const data = await Bun.file("/data/calibration.json").json(); console.error("CALIBRATION synthetic worker dependency injection; no launch proof"); await runModerationService({capacity:{communities:new Map(data.communities),contract:data.contract}});`;
+  for (const [mode, port] of [["worker", "8081"], ["api", "8080"]]) {
+    const command = mode === "worker" ? ["-e", workerLauncher] : ["packages/moderation/src/index.ts"];
+    await docker("exec", "-d", "-e", `MODERATION_MODE=${mode}`, "-e", `MODERATION_PORT=${port}`, "-e", "NODE_EXTRA_CA_CERTS=/data/synthetic-coop-cert.pem", instance.name, "bun", "--env-file=/data/moderation.env", ...command);
+  }
   const apiPort = (await docker("port", instance.name, "8080/tcp")).split(":").at(-1);
   const workerPort = (await docker("port", instance.name, "8081/tcp")).split(":").at(-1);
   const origin = `http://127.0.0.1:${apiPort}`;
