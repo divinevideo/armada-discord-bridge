@@ -20,7 +20,7 @@ test("report authentication binds signer, URL, method, body and time", async () 
 import { afterAll, beforeAll } from "bun:test";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
-import { relayFixture } from "../../../scripts/fixtures/relay-events";
+import { refreshPolicy, relayFixture } from "../../../scripts/fixtures/relay-events";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { EvidenceCipher, RelayEvidenceResolver } from "./evidence";
 import { Reports } from "./reports";
@@ -30,7 +30,7 @@ const target = { communityId: f.policy.communityId, channelId: f.channelId, rumo
 const cipher = new EvidenceCipher(randomBytes(32), 3600, 200_000);
 const reports = new Reports(sql, cipher, new RelayEvidenceResolver(sql, async () => [f.allowed]), new Map([[f.policy.communityId, org]]), 10);
 const reporter = { pubkey: f.member.pk, authEventId: "1".repeat(64) };
-beforeAll(async () => { await migrateModeration(sql); const store = new PolicyStore(sql); await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0); await store.admit(f.allowed); });
+beforeAll(async () => { await migrateModeration(sql); const store = new PolicyStore(sql); await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0); await store.admit(f.allowed); });
 afterAll(async () => { await sql`DELETE FROM moderation.cases WHERE org_id = ${org}`; await sql`DELETE FROM moderation.report_auth WHERE reporter = ${reporter.pubkey}`; await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`; await sql.end(); });
 test("reports resolve verified message data, reject replay and deduplicate fresh authentication", async () => {
   const first = await reports.submitReport({ target, reason: "synthetic report" }, reporter);

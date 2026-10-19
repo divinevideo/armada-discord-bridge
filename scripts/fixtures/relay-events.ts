@@ -8,6 +8,14 @@ function identity() {
   const pk = getPublicKey(sk);
   return { pk, signer: { signEvent: async (event: EventTemplate) => finalizeEvent(event, sk) } };
 }
+const POLICY_WINDOW_MS = 60_000;
+/** Re-stamp the freshness window at the point of use. The fixture stamps it at
+ * build time, but every consumer (install, prepare, authorize) checks it
+ * against wall clock when it runs, and under parallel suite load a harness can
+ * wait longer than the window to get there — the window is spent before it is
+ * ever read. Lengthening the fixture window is the wrong fix: the gap is
+ * unbounded, so a wider window only defers the same failure. */
+export const refreshPolicy = <P extends CommunityPolicy>(policy: P): P => ({ ...policy, validUntil: Date.now() + POLICY_WINDOW_MS });
 export async function relayFixture() {
   const owner = identity(), member = identity(), bannedMember = identity();
   const { community } = mintCommunity("Synthetic relay test", owner.pk, ["wss://relay.example"]);
@@ -24,7 +32,7 @@ export async function relayFixture() {
   const allowedSeal = await chat(member);
   const policy: CommunityPolicy = {
     communityId: community.idHex, owner: owner.pk, ownerSalt: bytesToHex(community.ownerSalt),
-    revision: 1, complete: true, validUntil: Date.now() + 60_000,
+    revision: 1, complete: true, validUntil: Date.now() + POLICY_WINDOW_MS,
     controlStreams: [controlStream], controlEvents: [controlEvent], banned: [bannedMember.pk],
     publicAuthors: [owner.pk, member.pk], snapshotAuthorities: [],
   };

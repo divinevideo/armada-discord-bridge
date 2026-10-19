@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
 import { wrapSeal } from "@armada-bridge/concord-core";
-import { relayFixture } from "../../../scripts/fixtures/relay-events";
+import { refreshPolicy, relayFixture } from "../../../scripts/fixtures/relay-events";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { CarrierIndex } from "./carrierIndex";
 import { RelayPurger, type PurgeDriver } from "./relayPurge";
@@ -10,7 +10,7 @@ const f = await relayFixture();
 const store = new PolicyStore(sql);
 const target = { communityId: f.policy.communityId, channelId: f.channelId, rumorId: f.allowedRumorId };
 const decision = crypto.randomUUID();
-beforeAll(async () => { await migrateModeration(sql); await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0); });
+beforeAll(async () => { await migrateModeration(sql); await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0); });
 afterAll(async () => { await sql`DELETE FROM moderation.community_policy WHERE community_id = ${target.communityId}`; await sql.end(); });
 test("indexes every wrapper and persists removal through restart and retry", async () => {
   const second = wrapSeal(f.allowedSeal, f.chatKey);

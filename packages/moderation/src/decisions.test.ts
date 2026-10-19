@@ -7,6 +7,7 @@ import { EvidenceCipher } from "./evidence";
 import { collectMetrics } from "./metrics";
 import type { NostrEvent } from "nostr-tools/pure";
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
+import { refreshPolicy } from "../../../scripts/fixtures/relay-events";
 import { ConcordActions } from "./concordActions";
 import { deliverConcord } from "./concordDelivery";
 import { RetryableDeliveryError } from "./discordActions";
@@ -254,7 +255,7 @@ async function memberHarness(subject: "member" | "bannedMember") {
   const staff = { orgId, actorId: "synthetic-reviewer", permissions: ["ban_member", "unban_member", "view", "retry"] };
   const outbox = new Decisions(sql, cipher, new Map([[f.community.idHex, orgId]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
   const published: NostrEvent[] = [];
-  const refresh = async () => { const p = (await store.getPolicy(f.community.idHex))!; return { ...p, controlEvents: [...p.controlEvents, ...published] }; };
+  const refresh = async () => { const p = (await store.getPolicy(f.community.idHex))!; return refreshPolicy({ ...p, controlEvents: [...p.controlEvents, ...published] }); };
   const actions = new ConcordActions(f.community, f.moderator, refresh);
   const relay = { publish: async (event: NostrEvent) => { if (!published.some((e) => e.id === event.id)) published.push(event); }, queryStrict: async (filters: { ids: string[] }[]) => published.filter((event) => filters[0].ids.includes(event.id)) };
   const request = (action: "ban_member" | "unban_member", executionId: string = crypto.randomUUID()) => ({ sourceOrder: recordedOrder(executionId), caseId: subjectCase, executionId, action, reason: "Synthetic member decision", scope: "community" as const, discordGuildConfirmed: false });
@@ -270,7 +271,7 @@ async function memberHarness(subject: "member" | "bannedMember") {
   };
   const drain = async () => { for (let claim; (claim = await outbox.claim());) await deliver(claim); };
   const banned = async () => controlState(await refresh()).folded.banned.has(who.pk);
-  await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+  await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
   await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
     VALUES (${subjectCase}, ${orgId}, ${f.community.idHex}, ${f.channelId}, ${f.allowedRumorId}, ${who.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
   const cleanup = async () => {

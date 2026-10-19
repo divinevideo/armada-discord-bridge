@@ -1,6 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import postgres from "postgres";
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
+import { refreshPolicy } from "../../../scripts/fixtures/relay-events";
 import { migrateModeration, PolicyStore } from "./policyStore";
 import { createExecutionContext } from "./executionContext";
 import { ConcordActions } from "./concordActions";
@@ -14,7 +15,7 @@ test("relay bans commit before draining writers and unban waits for verified Con
   await migrateModeration(sql);
   const f = await moderationFixture(), store = new PolicyStore(sql);
   try {
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     let barriers = 0;
     const context = createExecutionContext({ sql, store, actions: new ConcordActions(f.community, f.moderator, async () => (await store.getPolicy(f.community.idHex))!), claim: { decision: { ...f.decision, action: "ban_member" }, target: "divine_relay", attempts: 1, token: crypto.randomUUID(), signedEvents: null }, assertCurrent: async () => {}, decisions: {} as any, relay: {} as any, discord: {} as any, purger: {} as any, driver: { barrier: async <T>(work: () => Promise<T>) => { barriers++; expect((await store.admit(f.allowed)).action).toBe("reject"); return work(); } } });
     expect(await context.setRelayBan({ ...f.decision, action: "ban_member" })).toBe(true);
@@ -32,7 +33,7 @@ test("an unban extended by an owner edition verifies the durable outbox and lift
   try {
     const original = parseEdition(openWrap(f.policy.controlEvents.at(-1)!, f.controlStream.key));
     f.policy.controlEvents.push(await sealEdition(buildBanlistEdition(f.community.id, [f.member.pk, f.bannedMember.pk], { actorPubkey: f.owner.pk, version: original.version + 1n, prevHash: original.selfHash }), currentControlWriteGroup(f.community), f.owner.signer));
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     await store.setBan(f.community.idHex, f.member.pk, true);
     await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
       VALUES (${caseId}, ${orgId}, ${f.community.idHex}, ${f.channelId}, ${f.allowedRumorId}, ${f.member.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
@@ -47,7 +48,7 @@ test("an unban extended by an owner edition verifies the durable outbox and lift
           const edition = parseEdition(openWrap(event, f.controlStream.key));
           const successor = await sealEdition(buildBanlistEdition(f.community.id, [f.bannedMember.pk, "ef".repeat(32)], { actorPubkey: f.owner.pk, version: edition.version + 1n, prevHash: edition.selfHash }), currentControlWriteGroup(f.community), f.owner.signer);
           const policy = (await store.getPolicy(f.community.idHex))!;
-          await store.install({ ...policy, revision: policy.revision + 1, controlEvents: [...policy.controlEvents, event, successor] }, [f.chatStream, f.controlStream, f.guestbookStream], policy.revision);
+          await store.install(refreshPolicy({ ...policy, revision: policy.revision + 1, controlEvents: [...policy.controlEvents, event, successor] }), [f.chatStream, f.controlStream, f.guestbookStream], policy.revision);
         }, queryStrict: async () => claim.signedEvents as any[],
       }, discord: {} as any, purger: {} as any, driver: { barrier: (work) => work() },
     });

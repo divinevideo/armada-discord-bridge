@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
 import { buildRumor, channelBindingTags, sealRumor, wrapSeal, KIND_SEAL_ENCRYPTED } from "@armada-bridge/concord-core";
-import { relayFixture } from "../../../scripts/fixtures/relay-events";
+import { refreshPolicy, relayFixture } from "../../../scripts/fixtures/relay-events";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { CarrierIndex } from "./carrierIndex";
 import { RelayPurger } from "./relayPurge";
@@ -13,7 +13,7 @@ afterAll(async () => { for (const id of communities) await sql`DELETE FROM moder
 async function setup() {
   const f = await relayFixture(), store = new PolicyStore(sql);
   communities.push(f.policy.communityId);
-  await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+  await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
   expect((await store.admit(f.allowed)).action).toBe("accept");
   const target = { communityId: f.policy.communityId, channelId: f.channelId, rumorId: f.allowedRumorId };
   const related = async (kind: number, content: string, ms: number, id = target.rumorId) => {

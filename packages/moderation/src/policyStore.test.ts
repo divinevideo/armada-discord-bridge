@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
-import { relayFixture } from "../../../scripts/fixtures/relay-events";
+import { refreshPolicy, relayFixture } from "../../../scripts/fixtures/relay-events";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { reconcileRestore } from "./relayRestore";
 const sql = postgres(process.env.DATABASE_URL!, { max: 4, onnotice: () => {} });
@@ -13,7 +13,7 @@ afterAll(async () => {
 });
 
 test("persists policy and minimum carrier index before accepting", async () => {
-  await store.install(fixture.policy, [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 0);
+  await store.install(refreshPolicy(fixture.policy), [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 0);
   expect((await store.admit(fixture.allowed)).action).toBe("accept");
   const rows = await sql`SELECT * FROM moderation.carriers WHERE event_id = ${fixture.allowed.id}`;
   expect(rows).toHaveLength(1);
@@ -26,13 +26,13 @@ test("durable bans survive new store instances and reject stale installations", 
   const revision = await store.setBan(fixture.policy.communityId, fixture.member.pk, true);
   expect(revision).toBe(2);
   expect((await new PolicyStore(sql).admit(fixture.allowed)).action).toBe("reject");
-  await expect(store.install(fixture.policy, [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 0)).rejects.toThrow(/revision/i);
+  await expect(store.install(refreshPolicy(fixture.policy), [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 0)).rejects.toThrow(/revision/i);
   expect((await store.admit(fixture.allowed)).action).toBe("reject");
   await expect(store.setBan(fixture.policy.communityId, fixture.owner.pk, true)).rejects.toThrow(/owner/i);
 });
 
 test("control refresh cannot discard a relay ban awaiting protocol delivery", async () => {
-  await store.install({ ...fixture.policy, revision: 3, banned: [] }, [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 2);
+  await store.install(refreshPolicy({ ...fixture.policy, revision: 3, banned: [] }), [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 2);
   expect((await store.admit(fixture.allowed)).action).toBe("reject");
 });
 
@@ -63,12 +63,12 @@ test("validator role can index admissions but cannot change policy", async () =>
 test("control disconnect immediately invalidates admissions across processes", async () => {
   const f = await relayFixture();
   try {
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     expect((await store.admit(f.allowed)).action).toBe("accept");
     expect(await store.invalidate(f.policy.communityId)).toBe(2);
     expect((await new PolicyStore(sql).admit(f.allowed)).action).toBe("reject");
-    await expect(store.install({ ...f.policy, revision: 2 }, [f.chatStream, f.controlStream, f.guestbookStream], 1)).rejects.toThrow(/revision/i);
-    await store.install({ ...f.policy, revision: 3 }, [f.chatStream, f.controlStream, f.guestbookStream], 2);
+    await expect(store.install(refreshPolicy({ ...f.policy, revision: 2 }), [f.chatStream, f.controlStream, f.guestbookStream], 1)).rejects.toThrow(/revision/i);
+    await store.install(refreshPolicy({ ...f.policy, revision: 3 }), [f.chatStream, f.controlStream, f.guestbookStream], 2);
     expect((await store.admit(f.allowed)).action).toBe("accept");
   } finally {
     await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.policy.communityId}`;
@@ -79,7 +79,7 @@ test("validator database role performs a full admission and carrier insert", asy
   const f = await relayFixture();
   const validator = postgres(process.env.DATABASE_URL!, { max: 1, connection: { options: "-c role=moderation_validator" }, onnotice: () => {} });
   try {
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     expect((await new PolicyStore(validator).admit(f.allowed)).action).toBe("accept");
     expect((await sql`SELECT event_id FROM moderation.carriers WHERE event_id = ${f.allowed.id}`).length).toBe(1);
   } finally {
@@ -101,7 +101,7 @@ test("restore aborts without deleting when policy expires after its initial read
   const deleted: string[] = [];
   let scanned = false;
   try {
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     const rows = await sql`SELECT community_id, revision FROM moderation.community_policy`;
     const floors = Object.fromEntries(rows.map((row) => [row.community_id, Number(row.revision)]));
     await expect(reconcileRestore(store, {
@@ -137,7 +137,7 @@ test("restore propagates an admission lookup failure instead of deleting the car
     },
   });
   try {
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     const rows = await sql`SELECT community_id, revision FROM moderation.community_policy`;
     const floors = Object.fromEntries(rows.map((row) => [row.community_id, Number(row.revision)]));
     await expect(reconcileRestore(new PolicyStore(unavailable), {
@@ -156,13 +156,13 @@ test("restore deletes an old public carrier after its channel is deleted or made
   for (const deleted of [false, true]) {
     const f = await relayFixture();
     try {
-      await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+      await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
       expect((await store.admit(f.allowed)).action).toBe("accept");
       const head = parseEdition(openWrap(f.controlEvent, f.controlStream.key));
       const options = { actorPubkey: f.owner.pk, version: 2n, prevHash: head.selfHash };
       const rumor = buildChannelEdition(hex32(f.channelId), { name: "general", private: !deleted, ...(deleted ? { deleted: true } : {}) }, options);
       const event = await sealEdition(rumor, currentControlWriteGroup(f.community), f.owner.signer);
-      await store.install({ ...f.policy, revision: 2, controlEvents: [...f.policy.controlEvents, event] }, [f.controlStream, f.guestbookStream], 1);
+      await store.install(refreshPolicy({ ...f.policy, revision: 2, controlEvents: [...f.policy.controlEvents, event] }), [f.controlStream, f.guestbookStream], 1);
       expect((await store.admit(f.allowed)).action).toBe("reject");
       const rows = await sql`SELECT community_id, revision FROM moderation.community_policy`;
       const floors = Object.fromEntries(rows.map((row) => [row.community_id, Number(row.revision)]));
@@ -184,7 +184,7 @@ test("a verified public guestbook join permits profile bootstrap without grantin
   const signer = { signEvent: async (template: any) => nostr.finalizeEvent(template, newcomer) };
   const profile = await signer.signEvent({ kind: 0, created_at: Math.floor(Date.now() / 1000), tags: [], content: "{}" });
   try {
-    await store.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+    await store.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
     expect((await store.admit(profile)).action).toBe("reject");
     const joined = await core.sealGuestbook(core.buildJoinRumor(pk, Date.now()), core.currentGuestbookGroup(f.community), signer);
     expect((await store.admit(joined)).action).toBe("accept");

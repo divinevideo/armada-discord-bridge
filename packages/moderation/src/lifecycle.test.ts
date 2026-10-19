@@ -3,6 +3,7 @@ import postgres from "postgres";
 import { randomBytes } from "node:crypto";
 import { migrateModeration, PolicyStore } from "./policyStore";
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
+import { refreshPolicy } from "../../../scripts/fixtures/relay-events";
 import { EvidenceCipher } from "./evidence";
 import { Lifecycle } from "./lifecycle";
 import { Reports } from "./reports";
@@ -14,7 +15,7 @@ const cipher = new EvidenceCipher(randomBytes(32), 3600, 200000), communities = 
 const actor = { orgId: org, actorId: "synthetic-admin", permissions: ["view", "manage_moderation_records", "view_held_evidence"] };
 const lifecycle = new Lifecycle(sql, cipher, communities, { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
 const reports = new Reports(sql, cipher, { resolve: async () => { throw new Error("unused"); } }, communities, 10, lifecycle);
-beforeAll(async () => { await migrateModeration(sql); await new PolicyStore(sql).install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0); });
+beforeAll(async () => { await migrateModeration(sql); await new PolicyStore(sql).install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0); });
 afterAll(async () => {
   await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`DELETE FROM moderation.lifecycle_events WHERE org_id = ${org}`; await tx`DELETE FROM moderation.evidence_holds WHERE org_id = ${org}`; await tx`DELETE FROM moderation.decisions WHERE org_id = ${org}`; await tx`DELETE FROM moderation.cases WHERE org_id = ${org}`; await tx`DELETE FROM moderation.member_order_heads WHERE org_id = ${org}`; await tx`DELETE FROM moderation.community_policy WHERE community_id = ${community}`; }); await sql.end();
 });

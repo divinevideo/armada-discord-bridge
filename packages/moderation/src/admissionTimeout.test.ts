@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
-import { relayFixture } from "../../../scripts/fixtures/relay-events";
+import { refreshPolicy, relayFixture } from "../../../scripts/fixtures/relay-events";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { runPlugin } from "./strfryPlugin";
 const sql = postgres(process.env.DATABASE_URL!, { max: 4, onnotice: () => {} });
@@ -29,7 +29,7 @@ test("canceled database admission rolls back control and carrier writes before t
       },
     });
     try {
-      await initial.install(f.policy, [f.chatStream, f.controlStream, f.guestbookStream], 0);
+      await initial.install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0);
       const event = control ? f.controlEvent : f.allowed;
       const output: string[] = [];
       async function* input() { yield Buffer.from(JSON.stringify({ type: "new", event }) + "\n"); }
