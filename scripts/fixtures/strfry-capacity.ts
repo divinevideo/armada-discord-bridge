@@ -170,7 +170,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     report.resourceEnvelope.database += `;localImageId=${pgId};platform=${pgPlatform}`;
     if (pgLimits.Memory !== matrix.databaseMemoryBytes || pgLimits.NanoCpus !== matrix.databaseCpu * 1e9) throw new Error("PostgreSQL resource limits differ from matrix");
     for (let attempt = 0; ; attempt++) {
-      try { await docker("exec", dbName, "pg_isready", "-U", "bridge"); break; }
+      try { await docker("exec", dbName, "pg_isready", "-h", "127.0.0.1", "-U", "bridge"); break; }
       catch { if (attempt > 200) throw new Error("Capacity PostgreSQL unavailable"); await Bun.sleep(100); }
     }
     const pgPort = (await docker("port", dbName, "5432/tcp")).split(":").at(-1), url = `postgres://bridge@127.0.0.1:${pgPort}/bridge`;
