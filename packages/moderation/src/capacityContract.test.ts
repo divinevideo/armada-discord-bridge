@@ -49,6 +49,10 @@ describe("measured capacity contract", () => {
       expect(() => validateCapacityContract(value, identity)).toThrow();
     }
   });
+  it("requires reserve and in-flight overshoot strictly below the measured history ceiling", () => {
+    const value = fixture(); value.thresholds.urgentReserve = value.maxima.historyCount - value.thresholds.pauseHistoryCount - value.maxima.inFlight;
+    expect(() => validateCapacityContract(value, identity)).toThrow(/reserve/);
+  });
   it("rejects changed hard deadlines and a ceiling at an observed failure", () => {
     const changed = fixture(); changed.deadlines.externalMs = 6000;
     expect(() => validateCapacityContract(changed, identity)).toThrow();

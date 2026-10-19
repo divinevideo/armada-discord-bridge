@@ -8,6 +8,9 @@ import type { NostrEvent } from "nostr-tools/pure";
 import { relayFixture } from "./relay-events";
 import { moderationFixture } from "./moderation-events";
 import { exerciseModerationRuntime } from "./moderation-runtime";
+import { capacityCalibrationLauncher } from "./strfry-capacity";
+import { PublicCapacityStore } from "../../packages/moderation/src/publicCapacity";
+import type { PublicCapacityContract } from "../../packages/moderation/src/capacityContract";
 import { PolicyStore, migrateModeration } from "../../packages/moderation/src/policyStore";
 
 const label = `divine-relay-policy-${process.pid}`;
@@ -17,6 +20,14 @@ const sockets: WebSocket[] = [];
 let snapshotImage: string | undefined;
 let restoreFloors: Record<string, number> | undefined;
 let sql: postgres.Sql | undefined;
+// Explicit synthetic library input, deliberately invalid as deployed launch evidence.
+const calibrationContract = { maxima: { historyCount: 4095, historyBytes: 10000000, rekeyCount: 256, streamCount: 1024, inFlight: 4, innerAdmissionMs: 1499 }, thresholds: { warningHistoryCount: 3000, pauseHistoryCount: 4000, urgentReserve: 16 }, maxSampleAgeMs: 120000 } as PublicCapacityContract;
+const calibration = { contract: calibrationContract, communities: [] as Array<[string, string]> };
+async function addCalibrationCommunity(communityId: string) {
+  calibration.communities.push([communityId, "synthetic"]);
+  await writeFile(join(directory, "calibration.json"), JSON.stringify(calibration), { mode: 0o644 });
+  await new PublicCapacityStore(sql!, calibrationContract).observeCurrent("synthetic", communityId);
+}
 async function docker(...args: string[]): Promise<string> {
   const child = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
   const [out, err, exit] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
@@ -57,14 +68,18 @@ async function connect(url: string) {
 }
 async function relay(mode: string) {
   const name = `${label}-${mode}`;
-  const plugin = ["normal", "restored"].includes(mode) ? "/usr/local/bin/relay-policy" : mode === "missing" ? "" : "/data/fault.sh";
+  const strict = mode.startsWith("strict-");
+  const plugin = strict ? "/usr/local/bin/relay-policy" : ["normal", "restored"].includes(mode) ? "/data/calibration-policy.sh" : mode === "missing" ? "" : "/data/fault.sh";
   const config = `db = "/data/db/"\nrelay { nofiles = 0 bind = "0.0.0.0" port = 7777 auth { enabled = true serviceUrl = "wss://relay.example" } writePolicy { plugin = "${plugin}" timeoutSeconds = 3 } logging { dumpInAll = false dumpInEvents = false dumpInReqs = false invalidEvents = false } }\n`;
   const configPath = join(directory, `${mode}.conf`);
   await writeFile(configPath, config, { mode: 0o644 });
   const args = ["run", "-d", "--ulimit", "nofile=65536:65536", "--name", name, "--network", label, "-p", "127.0.0.1::7777", "-p", "127.0.0.1::8080", "-p", "127.0.0.1::8081", "-e", "MODERATION_DATABASE_URL=postgres://bridge@pg/bridge", "-v", `${configPath}:/data/strfry.conf:ro`];
-  if (!["normal", "restored"].includes(mode)) {
+  for (const file of ["calibration.json", "calibration-launcher.ts", "calibration-policy.sh", "invalid-capacity.json"]) args.push("-v", `${join(directory, file)}:/data/${file}:ro`);
+  args.push("-e", `MODERATION_COMMUNITY_ORGS=${JSON.stringify(Object.fromEntries(calibration.communities))}`);
+  if (mode === "strict-invalid") args.push("-e", "MODERATION_CAPACITY_CONTRACT_FILE=/data/invalid-capacity.json");
+  if (!strict && !["normal", "restored"].includes(mode)) {
     const fault = join(directory, `${mode}.sh`);
-    const body = mode === "race" ? 'while IFS= read -r request; do response="$(printf "%s\\n" "$request" | /usr/local/bin/relay-policy)"; touch /data/admitted; while [ ! -f /data/release ]; do sleep 0.02; done; printf "%s\\n" "$response"; done' : mode === "timeout" ? "sleep 10" : mode === "malformed" ? 'IFS= read -r request\nprintf "invalid %s\\n" "$request"' : "exit 1";
+    const body = mode === "race" ? 'while IFS= read -r request; do response="$(printf "%s\\n" "$request" | /data/calibration-policy.sh)"; touch /data/admitted; while [ ! -f /data/release ]; do sleep 0.02; done; printf "%s\\n" "$response"; done' : mode === "timeout" ? "sleep 10" : mode === "malformed" ? 'IFS= read -r request\nprintf "invalid %s\\n" "$request"' : "exit 1";
     await writeFile(fault, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
     args.push("-v", `${fault}:/data/fault.sh:ro`);
   }
@@ -97,6 +112,22 @@ try {
   const fixture = await moderationFixture();
   const store = new PolicyStore(sql);
   await store.install(fixture.policy, [fixture.chatStream, fixture.controlStream, fixture.guestbookStream], 0);
+  await addCalibrationCommunity(fixture.community.idHex);
+  await writeFile(join(directory, "calibration-launcher.ts"), capacityCalibrationLauncher("/data/calibration.json"), { mode: 0o644 });
+  await writeFile(join(directory, "calibration-policy.sh"), "#!/bin/sh\nexec bun /data/calibration-launcher.ts\n", { mode: 0o755 });
+  await writeFile(join(directory, "invalid-capacity.json"), JSON.stringify({ version: 1, synthetic: true }), { mode: 0o644 });
+  for (const mode of ["strict-missing", "strict-invalid"]) {
+    const instance = await relay(mode), writer = await connect(instance.url), reader = await connect(instance.url);
+    reader.ws.send(JSON.stringify(["REQ", "strict-live", { authors: [fixture.chatKey.pk] }]));
+    await waitFor(() => reader.messages.some(m => m[0] === "EOSE") ? true : undefined);
+    const event = wrapSeal(fixture.allowedSeal, fixture.chatKey);
+    assert.equal(await writer.publish(event), false);
+    assert.equal((await writer.query([event.id])).length, 0);
+    assert.equal(reader.messages.some(m => m[0] === "EVENT" && m[2].id === event.id), false);
+    assert.equal((await sql`SELECT 1 FROM moderation.carriers WHERE event_id = ${event.id}`).length, 0);
+    console.log(`PASS deployed entrypoint ${mode}: no acceptance, storage, fanout or admission database mutation`);
+  }
+  console.log("CALIBRATION synthetic library input only; positive runtime checks are not a measured launch contract");
   const normal = await relay("normal");
   const publisher = await connect(normal.url), subscriber = await connect(normal.url);
   subscriber.ws.send(JSON.stringify(["REQ", "live", { authors: [fixture.chatKey.pk] }]));
@@ -156,6 +187,7 @@ try {
     // A second isolated community allows a deterministic accepted-but-uncommitted race.
     const racing = await relayFixture();
     await store.install(racing.policy, [racing.chatStream, racing.controlStream, racing.guestbookStream], 0);
+    await addCalibrationCommunity(racing.community.idHex);
     const instance = await relay("race");
     const racer = await connect(instance.url);
     const publishing = racer.publish(racing.allowed);

@@ -50,7 +50,7 @@ export function validateCapacityContract(value: unknown, buildIdentity: { source
   need(integer(c.maxSampleAgeMs, true) && integer(c.measuredAt, true), "sample freshness required");
   const { warningHistoryCount: warning, pauseHistoryCount: pause, urgentReserve: reserve } = c.thresholds;
   need(integer(warning) && integer(pause, true) && integer(reserve, true) && warning < pause && pause < 4096, "unordered history thresholds");
-  need(pause + reserve + c.maxima.inFlight <= c.maxima.historyCount && c.maxima.historyCount < 4096, "pause lacks measured overshoot/rekey reserve");
+  need(pause + reserve + c.maxima.inFlight < c.maxima.historyCount && c.maxima.historyCount < 4096, "pause lacks measured overshoot/rekey reserve");
   const report = c.measurement;
   need(object(report) && report.version === 1 && report.certified === false, "raw measurement report required");
   need(report.sourceSha === c.sourceSha && report.harnessSha === c.harnessSha && report.imageId === c.imageId && report.platform === c.platform, "measurement identity mismatch");
