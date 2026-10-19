@@ -32,7 +32,7 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
   const config = {
     MODERATION_DATABASE_URL: "postgres://bridge@pg/bridge", MODERATION_PUBLIC_ORIGIN: "https://moderation.example",
     MODERATION_COMMUNITY_ORGS: JSON.stringify({ [f.community.idHex]: "synthetic" }), MODERATION_COOP_HMAC_KEY: key.toString("hex"), MODERATION_EVIDENCE_KEY: randomBytes(32).toString("hex"),
-    MODERATION_EVIDENCE_RETENTION_SECONDS: "3600", MODERATION_EVIDENCE_MAX_BYTES: "100000", MODERATION_EVIDENCE_MAX_CASES: "100", MODERATION_REPORT_ORIGINS: "[]",
+    MODERATION_AUDIT_RETENTION_SECONDS: "60", MODERATION_HOLD_MAX_SECONDS: "3600", MODERATION_EVIDENCE_RETENTION_SECONDS: "3600", MODERATION_EVIDENCE_MAX_BYTES: "100000", MODERATION_EVIDENCE_MAX_CASES: "100", MODERATION_REPORT_ORIGINS: "[]",
     MODERATION_COOP_ORIGIN: "https://127.0.0.1:8182", MODERATION_COOP_API_KEY: "synthetic-api-key", MODERATION_COOP_ORG_ID: "synthetic", NODE_EXTRA_CA_CERTS: "/data/synthetic-coop-cert.pem",
     MODERATION_LOCAL_RELAY_URL: "ws://127.0.0.1:7777", MODERATION_COMMUNITY_ENTRY_FILE: "/data/community.json", MODERATION_MEMBER_KEY: Buffer.from(f.moderatorKey).toString("hex"),
     MODERATION_PUBLIC_AUTHORS: JSON.stringify([f.member.pk]), MODERATION_BRIDGE_TENANT_ID: "default", BRIDGE_MASTER_SECRET: randomBytes(32).toString("hex"), DISCORD_TOKEN: "synthetic-unused",
@@ -57,13 +57,13 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
   const auth = await f.member.signer.signEvent({ kind: 27235, content: "", tags: [["u", "https://moderation.example/v1/reports"], ["method", "POST"], ["payload", createHash("sha256").update(body).digest("hex")]], created_at: Math.floor(Date.now() / 1000) });
   const response = await fetch(origin + "/v1/reports", { method: "POST", headers: { authorization: `Nostr ${Buffer.from(JSON.stringify(auth)).toString("base64")}` }, body });
   assert.equal(response.status, 202);
-  const { caseId } = await response.json() as { caseId: string };
+  let { caseId } = await response.json() as { caseId: string };
   const handoffDeadline = Date.now() + 15_000;
   while (!(await sql`SELECT 1 FROM moderation.coop_handoffs WHERE case_id = ${caseId} AND state = 'queued'`).length) {
     if (Date.now() > handoffDeadline) throw new Error("Owned Coop mock did not acknowledge the case");
     await Bun.sleep(100);
   }
-  const actor = { orgId: "synthetic", actorId: "synthetic-staff", permissions: ["view", "remove_message", "ban_member", "unban_member"] };
+  const actor = { orgId: "synthetic", actorId: "synthetic-staff", permissions: ["view", "remove_message", "ban_member", "unban_member", "manage_moderation_records", "view_held_evidence"] };
   let sourceRevision = 0;
   async function decide(action: string) {
     const body = JSON.stringify({ ...(action === "remove_message" ? {} : { sourceOrder: { version: 1, revision: String(++sourceRevision) } }), caseId, executionId: crypto.randomUUID(), action, reason: "Synthetic runtime decision", scope: action === "remove_message" ? "message" : "community", discordGuildConfirmed: false });
@@ -81,10 +81,48 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
       if (Date.now() > until) throw new Error("Runtime delivery did not finish");
       await Bun.sleep(100);
     }
+    return decisionId;
   }
-  await decide("ban_member");
+  const banId = await decide("ban_member");
   assert.equal(await publisher.publish(wrapSeal(f.allowedSeal, f.chatKey)), false);
-  await decide("unban_member");
+  const signed = async (path: string, input?: unknown) => {
+    const body = input === undefined ? "" : JSON.stringify(input), method = input === undefined ? "GET" : "POST";
+    const reply = await fetch(origin + path, { method, headers: signCoopRequest(key, actor, method, path, body), ...(input === undefined ? {} : { body }) });
+    assert.equal(reply.headers.get("cache-control"), "no-store"); return reply;
+  };
+  assert.equal((await fetch(origin + "/write-readyz")).status, 200);
+  const holdResponse = await signed(`/v1/cases/${caseId}/holds`, { reason: "Synthetic runtime hold", holdUntil: new Date(Date.now() + 120000).toISOString() });
+  assert.equal(holdResponse.status, 201); const held = await holdResponse.json() as { holdId: string };
+  await sql`UPDATE moderation.cases SET expires_at = clock_timestamp() - interval '1 second' WHERE case_id = ${caseId}`;
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${banId}`; });
+  assert.equal((await (await signed(`/v1/cases/${caseId}`)).json() as { evidenceAvailable: boolean }).evidenceAvailable, false);
+  const heldView = await signed(`/v1/cases/${caseId}/held-evidence`, { reason: "Synthetic audited runtime access" }); assert.equal(heldView.status, 200);
+  assert.equal(typeof (await heldView.json() as { content: string }).content, "string");
+  const context = await signed(`/v1/decisions/${banId}/reversal-context`); assert.equal(context.status, 200);
+  const reverse = await signed(`/v1/decisions/${banId}/reversals`, { executionId: crypto.randomUUID(), action: "unban_member", reason: "Synthetic fresh runtime reversal", scope: "community", discordGuildConfirmed: false, sourceOrder: { version: 1, revision: String(++sourceRevision) } });
+  assert.equal(reverse.status, 202); const reversal = await reverse.json() as { decisionId: string };
+  const reversalDeadline = Date.now() + 30000;
+  while (true) {
+    const status = await (await signed(`/v1/decisions/${reversal.decisionId}`)).json() as { deliveries: { state: string }[] };
+    assert.equal(status.deliveries.some(d => d.state === "failed"), false);
+    if (status.deliveries.every(d => ["verified", "not_applicable"].includes(d.state))) break;
+    if (Date.now() > reversalDeadline) throw new Error("Fresh runtime reversal did not settle"); await Bun.sleep(100);
+  }
+  assert.equal((await signed(`/v1/holds/${held.holdId}/release`, { reason: "Synthetic runtime release" })).status, 200);
+  assert.equal((await sql`SELECT 1 FROM moderation.cases WHERE case_id = ${caseId}`).length, 0);
+  assert.equal((await signed(`/v1/decisions/${banId}/restriction-refresh`, {})).status, 202);
+  const closeDeadline = Date.now() + 15000;
+  while (true) {
+    const reply = await signed(`/v1/decisions/${banId}/close`, { reason: "Synthetic settled native sanction" });
+    if (reply.status === 200) break;
+    if (Date.now() > closeDeadline) throw new Error("Verified native sanction could not close"); await Bun.sleep(100);
+  }
+  // A new report for removal is distinct from the expired source. Its evidence
+  // resolves from the surviving publication; no old case bytes are restored.
+  const freshBody = JSON.stringify({ target: f.decision.target, reason: "Synthetic runtime removal report" });
+  const freshAuth = await f.member.signer.signEvent({ kind: 27235, content: "", tags: [["u", "https://moderation.example/v1/reports"], ["method", "POST"], ["payload", createHash("sha256").update(freshBody).digest("hex")]], created_at: Math.floor(Date.now() / 1000) });
+  const freshReport = await fetch(origin + "/v1/reports", { method: "POST", headers: { authorization: `Nostr ${Buffer.from(JSON.stringify(freshAuth)).toString("base64")}` }, body: freshBody });
+  assert.equal(freshReport.status, 202); caseId = (await freshReport.json() as { caseId: string }).caseId;
   const alternative = wrapSeal(f.allowedSeal, f.chatKey);
   assert.equal(await publisher.publish(alternative), true);
   await decide("remove_message");
@@ -92,5 +130,5 @@ export async function exerciseModerationRuntime(options: { docker(...args: strin
   assert.equal(await publisher.publish(wrapSeal(f.allowedSeal, f.chatKey)), false);
   const [count] = await sql`SELECT count(*)::int AS n FROM moderation.decisions`;
   assert.equal(count.n, 3);
-  console.log("PASS runtime: authenticated report → staff ban/unban/removal → independent verified relay/Concord results, no guessed Discord mapping, raw replay rejected");
+  console.log("PASS runtime: authenticated report → timed hold/audited access → expired-source fresh reversal → explicit settled audit closure → new-report removal; independent relay/Concord proof, no guessed Discord mapping, raw replay rejected");
 }
