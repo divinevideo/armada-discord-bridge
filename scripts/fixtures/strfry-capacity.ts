@@ -131,11 +131,12 @@ export function summarizeCapacity(report: CapacityMeasurementReport, urgentReser
   const pass = (sample: CapacitySample) => sample.expectedAccept && sample.accepted && sample.okReceived && !sample.unsafeEffect && !sample.lateDatabaseWrite && sample.wallMs < 3000 && sample.innerAdmissionMs !== null && sample.innerAdmissionMs < 1500;
   const passing = ordinary.flatMap(entry => entry.samples.filter(pass));
   const failures = ordinary.flatMap(entry => entry.samples.filter(sample => sample.expectedAccept && !pass(sample)));
-  const earliestFailure = Math.min(4096, ...failures.map(sample => sample.historyCount));
+  const earliestFailure = failures.length ? Math.min(...failures.map(sample => sample.historyCount)) : null;
+  const comparisonBound = earliestFailure ?? 4096;
   const measuredInFlight = Math.max(0, ...passing.map(sample => sample.inFlight));
   const allMeasured = report.cases.every(entry => entry.status === "measured") && ordinary.every(entry => entry.samples.some(pass));
   const testedCeiling = allMeasured ? Math.min(...ordinary.map(entry => Math.max(...entry.samples.filter(pass).map(sample => sample.historyCount)))) : 0;
-  const pause = urgentReserve !== undefined && Number.isSafeInteger(urgentReserve) && urgentReserve > 0 && allMeasured ? Math.min(testedCeiling, earliestFailure - 1, 4095) - urgentReserve - measuredInFlight : null;
+  const pause = urgentReserve !== undefined && Number.isSafeInteger(urgentReserve) && urgentReserve > 0 && allMeasured ? Math.min(testedCeiling, comparisonBound - 1, 4095) - urgentReserve - measuredInFlight : null;
   return { certified: false, earliestFailureHistoryCount: earliestFailure, measuredInFlight, testedCeiling,
     candidatePauseHistoryCount: pause !== null && pause > 0 ? pause : null,
     candidateReason: pause !== null && pause > 0 ? "Review candidate only; destination/controller/intervention/rekey assumptions and final entrypoint replay remain required." : "No complete measured envelope/reserve; no supported ceiling inferred.",
