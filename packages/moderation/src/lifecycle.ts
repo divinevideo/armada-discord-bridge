@@ -2,6 +2,9 @@ import type postgres from "postgres";
 import type { VerifiedCoopActor } from "./decisions";
 import { EvidenceCipher } from "./evidence";
 import { requireLifecyclePolicy, type LifecyclePolicyConfig } from "./apiReadiness";
+import { restrictionProofKey, hasGuildHistory } from "./discordRestriction";
+import { PolicyStore } from "./policyStore";
+import { controlState } from "./relayPolicy";
 import type { HoldStatus, LifecycleStatus } from "./lifecycleContracts";
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Case identity survives evidence expiry, and precedes member/decision locks. */
@@ -98,10 +101,25 @@ export class Lifecycle {
     }) as Promise<LifecycleStatus>;
   }
   private async eligible(tx: postgres.TransactionSql, decision: any, deliveries: any[]) {
-    // B3/B4 supply sanction recovery. Supersession never erases a surviving Guild effect.
-    if (decision.action !== "remove_message" || decision.appeal_state === "open" || deliveries.map(d => d.target).sort().join(",") !== "concord,discord,divine_relay" || deliveries.some(d => !["verified", "not_applicable"].includes(d.state) || d.lease_until?.getTime() > Date.now() || (d.publication_attempted && d.state !== "verified" && !["concord_superseded_publication_settled", "concord_publication_settled"].includes(d.result_code)) || d.discord_restriction_state === "present" || (d.target === "discord" && decision.discord_guild_confirmed && d.discord_restriction_state === "unknown"))) return false;
+    if (decision.appeal_state === "open" || deliveries.map(d => d.target).sort().join(",") !== "concord,discord,divine_relay" || deliveries.some(d => !["verified", "not_applicable"].includes(d.state) || d.lease_until?.getTime() > Date.now() || (d.publication_attempted && d.state !== "verified" && !["concord_superseded_publication_settled", "concord_publication_settled"].includes(d.result_code)) || d.discord_restriction_state === "present" || (d.target === "discord" && decision.discord_guild_confirmed && d.discord_restriction_state === "unknown"))) return false;
     const [held] = await tx`SELECT 1 FROM moderation.evidence_holds WHERE org_id = ${decision.org_id} AND case_id = ${decision.case_id} AND released_at IS NULL AND hold_until > clock_timestamp()`;
-    return !held;
+    if (held) return false;
+    if (decision.action === "remove_message") return true;
+    const key = await restrictionProofKey(tx, decision), discord = deliveries.find(d => d.target === "discord");
+    if (!key || discord.discord_restriction_proof_key !== key || !discord.discord_restriction_checked_at || discord.discord_restriction_checked_at < discord.available_at) return false;
+    const guildHistory = await hasGuildHistory(tx, decision);
+    if (discord.discord_restriction_state !== "absent" && !(discord.discord_restriction_state === "not_applicable" && !guildHistory)) return false;
+    const [unban] = await tx`SELECT n.decision_id FROM moderation.member_order_heads h JOIN moderation.decisions n ON n.org_id = h.org_id AND n.community_id = h.community_id AND n.author = h.author AND n.source_revision = h.latest_revision AND n.execution_id = h.latest_execution_id::text
+      WHERE h.org_id = ${decision.org_id} AND h.community_id = ${decision.community_id} AND h.author = ${decision.author} AND n.action = 'unban_member'
+        AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'concord' AND d.state = 'verified')
+        AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'divine_relay' AND d.state = 'verified')`;
+    if (!unban) return false;
+    const policy = await new PolicyStore(tx as unknown as postgres.Sql).getPolicy(decision.community_id);
+    if (!policy || policy.banned.includes(decision.author) || controlState(policy).folded.banned.has(decision.author)) return false;
+    const [blocked] = await tx`SELECT 1 FROM moderation.member_bans WHERE community_id = ${decision.community_id} AND author = ${decision.author} AND blocked`;
+    const [unresolved] = await tx`SELECT 1 FROM moderation.decisions c JOIN moderation.deliveries d USING (decision_id) WHERE c.org_id = ${decision.org_id} AND c.community_id = ${decision.community_id} AND c.author = ${decision.author}
+      AND (d.lease_until > clock_timestamp() OR (d.state NOT IN ('verified','not_applicable') AND NOT (d.state = 'failed' AND d.result_code = 'superseded_by_newer_decision' AND NOT d.publication_attempted))) LIMIT 1`;
+    return !blocked && !unresolved;
   }
   async closeLifecycle(input: { decisionId: string; reason: string }, actor: VerifiedCoopActor): Promise<LifecycleStatus> {
     this.authorize(actor, "manage_moderation_records", input.decisionId, input.reason); const policy = this.requirePolicy();

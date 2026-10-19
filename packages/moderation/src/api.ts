@@ -40,7 +40,7 @@ async function boundedBody(request: Request): Promise<string> {
   } finally { clearTimeout(timer); reader.releaseLock(); }
   return Buffer.concat(chunks).toString("utf8");
 }
-export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase" | "getByExecution" | "refreshPublicationProof" | "getReversalContext" | "acceptReversal">>; lifecycle?: Pick<Lifecycle, "placeEvidenceHold" | "releaseEvidenceHold" | "readHeldEvidence" | "setAppeal" | "closeLifecycle"> }) {
+export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase" | "getByExecution" | "refreshPublicationProof" | "getReversalContext" | "acceptReversal" | "refreshDiscordRestriction">>; lifecycle?: Pick<Lifecycle, "placeEvidenceHold" | "releaseEvidenceHold" | "readHeldEvidence" | "setAppeal" | "closeLifecycle"> }) {
   if (options.coopSecret.length < 32) throw new Error("Staff service credential required");
   const capacity = () => {
     let remaining = 100, window = Date.now();
@@ -54,7 +54,7 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url), path = url.pathname;
     const reversalRoute = /^\/v1\/decisions\/([0-9a-f-]{36})\/(reversal-context|reversals)$/.exec(path);
-    const lifecycleRoute = /^\/v1\/(cases|holds|decisions)\/([0-9a-f-]{36})\/(holds|release|held-evidence|appeal|close|publication-refresh)$/.exec(path);
+    const lifecycleRoute = /^\/v1\/(cases|holds|decisions)\/([0-9a-f-]{36})\/(holds|release|held-evidence|appeal|close|publication-refresh|restriction-refresh)$/.exec(path);
     const executionRoute = /^\/v1\/decision-executions\/([0-9a-f-]{36})$/.exec(path);
     const caseRoute = /^\/v1\/cases\/([0-9a-f-]{36})$/.exec(path);
     const decisionRoute = /^\/v1\/decisions\/([0-9a-f-]{36})(\/retry)?$/.exec(path);
@@ -80,8 +80,9 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
       if (lifecycleRoute && request.method === "POST") {
         const [, resource, id, operation] = lifecycleRoute;
         const input = JSON.parse(body);
-        const expected = operation === "holds" ? "holdUntil,reason" : operation === "appeal" ? "reason,state" : operation === "publication-refresh" ? "" : "reason";
+        const expected = operation === "holds" ? "holdUntil,reason" : operation === "appeal" ? "reason,state" : ["publication-refresh", "restriction-refresh"].includes(operation) ? "" : "reason";
         if (!input || Array.isArray(input) || Object.keys(input).sort().join(",") !== expected) throw new Error("Invalid lifecycle request");
+        if (resource === "decisions" && operation === "restriction-refresh" && options.decisions.refreshDiscordRestriction) return response(await options.decisions.refreshDiscordRestriction(id, actor), 202);
         if (resource === "decisions" && operation === "publication-refresh" && options.decisions.refreshPublicationProof) return response(await options.decisions.refreshPublicationProof(id, actor), 202);
         if (options.lifecycle) {
           if (resource === "cases" && operation === "holds") return response(await options.lifecycle.placeEvidenceHold({ ...input, caseId: id }, actor), 201);

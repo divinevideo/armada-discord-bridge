@@ -22,8 +22,16 @@ export class BridgeMappingResolver implements VerifiedDiscordMappings {
       AND community_id = ${decision.target.communityId} AND concord_channel_id = ${decision.target.channelId} AND concord_rumor_id = ${decision.target.rumorId} AND origin = 'discord'`;
     for (const row of rows) {
       if (!/^[0-9]{17,20}$/.test(row.author_ref)) continue;
-      if (derivePuppet(this.puppetMaster, row.author_ref).pk === decision.author) return { guildId: this.guildId, channelId: row.discord_channel_id, userId: row.author_ref };
+      if (derivePuppet(this.puppetMaster, row.author_ref).pk === decision.author) {
+        await this.sql`INSERT INTO moderation.discord_member_bindings (org_id, community_id, author, guild_id, channel_id, user_id, verified_at, provenance_decision_id)
+          VALUES (${decision.orgId}, ${decision.target.communityId}, ${decision.author}, ${this.guildId}, ${row.discord_channel_id}, ${row.author_ref}, clock_timestamp(), ${decision.decisionId})
+          ON CONFLICT (org_id, community_id, author) DO UPDATE SET guild_id = EXCLUDED.guild_id, channel_id = EXCLUDED.channel_id, user_id = EXCLUDED.user_id, verified_at = EXCLUDED.verified_at, provenance_decision_id = EXCLUDED.provenance_decision_id`;
+        return { guildId: this.guildId, channelId: row.discord_channel_id, userId: row.author_ref };
+      }
     }
+    const [binding] = await this.sql`SELECT b.* FROM moderation.discord_member_bindings b JOIN moderation.decisions p ON p.org_id = b.org_id AND p.decision_id = b.provenance_decision_id
+      WHERE b.org_id = ${decision.orgId} AND b.community_id = ${decision.target.communityId} AND b.author = ${decision.author} AND b.guild_id = ${this.guildId} AND p.community_id = b.community_id AND p.author = b.author`;
+    if (binding && derivePuppet(this.puppetMaster, binding.user_id).pk === decision.author) return { guildId: binding.guild_id, channelId: binding.channel_id, userId: binding.user_id };
     return undefined;
   }
 }
@@ -31,7 +39,7 @@ export interface DeliveryAttempt { state: DeliveryState; code: string; retryAfte
 export class RetryableDeliveryError extends Error {
   constructor(readonly code: string, readonly retryAfterSeconds?: number) { super(code); }
 }
-async function providerRequest(request: (method: string, path: string) => Promise<Response>, method: string, path: string): Promise<Response> {
+export async function providerRequest(request: (method: string, path: string) => Promise<Response>, method: string, path: string): Promise<Response> {
   let response: Response;
   try { response = await request(method, path); }
   catch { throw new RetryableDeliveryError("discord_transport_unavailable"); }
