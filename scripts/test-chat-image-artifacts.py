@@ -2,6 +2,7 @@
 """Artifact tests use synthetic saved Docker images; no daemon or credentials."""
 import copy
 import hashlib
+import gzip
 import importlib.util
 import io
 import json
@@ -76,6 +77,7 @@ class Artifacts(unittest.TestCase):
             add(tar, 'layer.tar', layer)
             add(tar, 'manifest.json', json.dumps([{'Config': config_name, 'RepoTags': [entry['local_tag']], 'Layers': ['layer.tar']}]).encode())
         entry['config_digest'] = 'sha256:' + hashlib.sha256(config).hexdigest()
+        entry['local_image_id'] = entry['config_digest']
         entry['archive_sha256'] = a.file_hash(path)
 
     def write(self):
@@ -85,6 +87,95 @@ class Artifacts(unittest.TestCase):
 
     def verify(self):
         return a.verify(self.root, SHA, HARNESS, self.write(), self.contract)
+
+    def test_containerd_index_id_and_gzip_layers(self):
+        self.containerd_archives()
+
+    def test_containerd_publication_tags_the_daemon_index_handle(self):
+        self.containerd_archives()
+        self.publication_readback(False)
+
+    def containerd_archives(self):
+        for entry in self.manifest['images']:
+            path = self.root / entry['archive']
+            with tarfile.open(path) as tar:
+                parts = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+            saved = json.loads(parts['manifest.json'])[0]
+            config = parts[saved['Config']]
+            layer = gzip.compress(parts['layer.tar'], mtime=0)
+            def descriptor(data, media, **extra):
+                digest = 'sha256:' + hashlib.sha256(data).hexdigest()
+                parts['blobs/sha256/' + digest.split(':')[1]] = data
+                return {'digest': digest, 'size': len(data), 'mediaType': media, **extra}
+            config_desc = descriptor(config, 'application/vnd.oci.image.config.v1+json')
+            layer_desc = descriptor(layer, 'application/vnd.oci.image.layer.v1.tar+gzip')
+            runtime = json.dumps({'schemaVersion': 2, 'config': config_desc, 'layers': [layer_desc]}).encode()
+            runtime_desc = descriptor(runtime, 'application/vnd.oci.image.manifest.v1+json', platform={'os': 'linux', 'architecture': 'amd64'})
+            index = json.dumps({'schemaVersion': 2, 'manifests': [runtime_desc]}).encode()
+            index_desc = descriptor(index, 'application/vnd.oci.image.index.v1+json')
+            parts['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [index_desc]}).encode()
+            saved['Config'] = 'blobs/sha256/' + config_desc['digest'].split(':')[1]
+            saved['Layers'] = ['blobs/sha256/' + layer_desc['digest'].split(':')[1]]
+            parts['manifest.json'] = json.dumps([saved]).encode()
+            with tarfile.open(path, 'w') as tar:
+                for name, data in parts.items():
+                    add(tar, name, data)
+            entry['local_image_id'] = index_desc['digest']
+            entry['archive_sha256'] = a.file_hash(path)
+            self.assertNotEqual(entry['local_image_id'], entry['config_digest'])
+        self.verify()
+
+    def test_registry_index_resolves_the_exact_runtime_config(self):
+        runtime = json.dumps({'config': {'digest': self.manifest['images'][0]['config_digest']}}).encode()
+        digest = 'sha256:' + hashlib.sha256(runtime).hexdigest()
+        index = {'manifests': [{'digest': digest, 'size': len(runtime), 'platform': {'os': 'linux', 'architecture': 'amd64'}}]}
+        def stub(args, **kwargs):
+            return runtime if '@sha256:' in args[-1] else json.dumps(index).encode()
+        with patch.object(a, 'run', side_effect=stub):
+            self.assertEqual(a.remote_config(self.manifest['images'][0]['tag']), self.manifest['images'][0]['config_digest'])
+
+    def test_client_deletions_are_not_served_assets(self):
+        if a.KIND != 'coop':
+            return
+        entry = self.manifest['images'][-1]
+        path = self.root / entry['archive']
+        with tarfile.open(path) as tar:
+            parts = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+        saved = json.loads(parts['manifest.json'])[0]
+        config = json.loads(parts[saved['Config']])
+        for name, files in [('base.tar', {'usr/share/nginx/html/50x.html': b'old base page'}), ('remove.tar', {'usr/share/nginx/html/.wh.50x.html': b''})]:
+            layer = io.BytesIO()
+            with tarfile.open(fileobj=layer, mode='w') as tar:
+                for file, data in files.items():
+                    add(tar, file, data)
+            parts[name] = layer.getvalue()
+            config['rootfs']['diff_ids'].append('sha256:' + hashlib.sha256(parts[name]).hexdigest())
+            saved['Layers'].append(name)
+        data = json.dumps(config).encode()
+        config_name = hashlib.sha256(data).hexdigest() + '.json'
+        parts[config_name] = data; saved['Config'] = config_name
+        parts['manifest.json'] = json.dumps([saved]).encode()
+        with tarfile.open(path, 'w') as tar:
+            for name, data in parts.items():
+                add(tar, name, data)
+        entry['config_digest'] = entry['local_image_id'] = 'sha256:' + config_name[:-5]
+        entry['archive_sha256'] = a.file_hash(path)
+        self.verify()
+
+    def test_compressed_layer_descriptor_hash_checked(self):
+        self.containerd_archives()
+        entry = self.manifest['images'][0]
+        path = self.root / entry['archive']
+        with tarfile.open(path) as tar:
+            parts = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+        name = json.loads(parts['manifest.json'])[0]['Layers'][0]
+        parts[name] += b'altered compressed bytes'
+        with tarfile.open(path, 'w') as tar:
+            for name, data in parts.items():
+                add(tar, name, data)
+        entry['archive_sha256'] = a.file_hash(path)
+        with self.assertRaises(ValueError):
+            self.verify()
 
     def test_complete_set(self):
         self.assertEqual(len(self.verify()['images']), len(a.TARGETS))
@@ -199,16 +290,21 @@ class Artifacts(unittest.TestCase):
             if args[1:3] == ['buildx', 'imagetools']:
                 if '--raw' in args:
                     tag = args[-1]
-                    if tag not in published:
+                    if tag not in published and '@sha256:' not in tag:
                         raise a.subprocess.CalledProcessError(1, args, stderr=b'manifest unknown')
-                    image = next(x for x in self.manifest['images'] if x['tag'] == tag)
+                    image = next(x for x in self.manifest['images'] if x['tag'] == tag or tag.startswith(x['repository'] + '@'))
                     return json.dumps({'config': {'digest': image['config_digest']}}).encode()
-                return json.dumps({'digest': 'sha256:' + 'a' * 64}).encode()
+                image = next(x for x in self.manifest['images'] if x['tag'] == args[4])
+                raw = json.dumps({'config': {'digest': image['config_digest']}}).encode()
+                return json.dumps({'digest': 'sha256:' + hashlib.sha256(raw).hexdigest()}).encode()
+            if args[1] == 'tag':
+                image = next(x for x in self.manifest['images'] if x['tag'] == args[3])
+                self.assertEqual(args[2], image['local_image_id'])
             if args[1] == 'push':
                 published.add(args[2])
             if args[1:3] == ['image', 'inspect']:
                 image = next(x for x in self.manifest['images'] if args[3].startswith(x['repository'] + '@'))
-                return json.dumps([{'Id': image['config_digest'], 'Architecture': 'amd64', 'Os': 'linux', 'Config': {
+                return json.dumps([{'Id': image['local_image_id'], 'Architecture': 'amd64', 'Os': 'linux', 'Config': {
                     'Entrypoint': image['entrypoint'], 'Cmd': image['command'], 'Labels': {
                         'org.opencontainers.image.source': a.SOURCE, 'org.opencontainers.image.revision': SHA}}}]).encode()
             return b''
@@ -218,7 +314,8 @@ class Artifacts(unittest.TestCase):
         self.assertEqual(sum(call[1] == 'push' for call in calls), 0 if existing else len(a.TARGETS))
         self.assertFalse(any('run' in call or 'login' in call or 'build' in call for call in calls))
         result = json.loads((self.root / 'published-digests.json').read_text())
-        self.assertEqual(result['images'][0]['digest'], 'sha256:' + 'a' * 64)
+        expected_digest = 'sha256:' + hashlib.sha256(json.dumps({'config': {'digest': self.manifest['images'][0]['config_digest']}}).encode()).hexdigest()
+        self.assertEqual(result['images'][0]['digest'], expected_digest)
         self.assertNotEqual(result['images'][0]['digest'], self.manifest['images'][0]['config_digest'])
 
     def test_registry_error_is_not_treated_as_absent(self):
