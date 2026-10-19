@@ -9,6 +9,7 @@
  */
 
 import {
+  CHANNEL_REKEY_LOOKAHEAD,
   KIND_BOT_MANIFEST,
   KIND_DM_RELAYS,
   KIND_INVITE_BUNDLE,
@@ -18,6 +19,7 @@ import {
   KIND_WRAP,
   KIND_WRAP_EPHEMERAL,
   Permissions,
+  baseRekeyGroupKey,
   buildJoinRumor,
   buildRumor,
   bundleToEntry,
@@ -25,6 +27,7 @@ import {
   channelsView,
   controlGroups,
   currentGuestbookGroup,
+  dissolvedGroupKey,
   foldControlState,
   guestbookGroups,
   inviteRefOf,
@@ -48,6 +51,7 @@ import type {
   InviteBundle,
   OpenedChat,
   Rumor,
+  StreamKeyView,
 } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
 
@@ -71,6 +75,40 @@ export function proxyTag(guildId: string, channelId: string, messageId: string):
 /** True when a rumor was published by any bridge (ours or a peer's). */
 export function hasProxyTag(rumor: { tags: string[][] }): boolean {
   return rumor.tags.some((tag) => tag[0] === TAG_PROXY);
+}
+
+/**
+ * Every base-rekey address a Refounding minted FROM the root this community
+ * holds could publish at (CORD-06 §1: the rotation's address derives from the
+ * PRIOR secret and the new epoch). Only rotations chained off a held root are
+ * derivable at all — a second consecutive rotation needs the root the first
+ * one minted — so this window is what a member left on a superseded epoch
+ * still sees, and the wrap it finds there is the whole of severance case 2.
+ * The window depth reuses CHANNEL_REKEY_LOOKAHEAD's rationale (a rotation at
+ * an epoch beyond the watch silently strands); base epochs conventionally
+ * advance one at a time, so the depth only covers stepped `newepoch` tags.
+ */
+export function baseRekeyWatchKeys(community: CommunityV2): StreamKeyView[] {
+  const out: StreamKeyView[] = [];
+  for (let step = 1n; step <= BigInt(CHANNEL_REKEY_LOOKAHEAD); step++) {
+    out.push(baseRekeyGroupKey(community.root, community.id, community.rootEpoch + step));
+  }
+  return out;
+}
+
+/**
+ * The stream addresses severance evidence arrives on: the community's dissolved
+ * plane (an owner's dissolution tombstone, CORD-02 §9) plus the base-rekey
+ * window above. Both planes are kind-1059 traffic, so NIP-42-gated relays
+ * (ditto-relay's AUTH_KINDS=4,1059) serve REQs naming these authors only to a
+ * socket authenticated AS them — hence the registration below, beside the
+ * control and guestbook groups (the moderation policyWatcher registers its
+ * rekey descriptors for the same reason). Without it, every severance probe at
+ * such a relay answers with an empty EOSE and the bridge reads a banned,
+ * refounded or dissolved community as healthy.
+ */
+export function severanceStreamKeys(community: CommunityV2): StreamKeyView[] {
+  return [dissolvedGroupKey(community.id), ...baseRekeyWatchKeys(community)];
 }
 
 export interface JoinResult {
@@ -137,9 +175,10 @@ export class ConcordClient {
     private readonly primary: LocalIdentity,
   ) {
     // NIP-42-gated relays require AUTH as every queried stream author; the
-    // pool signs challenges with whatever is registered here (streamAuth).
+    // pool signs challenges with whatever is registered here (streamAuth). The
+    // severance planes ride along: their probes must reach a gated relay too.
     registerStreamKeys(
-      [...controlGroups(community), ...guestbookGroups(community)],
+      [...controlGroups(community), ...guestbookGroups(community), ...severanceStreamKeys(community)],
       community.relays,
     );
   }
