@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import postgres from "postgres";
@@ -258,6 +258,25 @@ try {
   }
   console.log(`PASS tested image ${process.env.STRFRY_TEST_IMAGE}`);
   }
+} catch (error) {
+  // Persist synthetic, non-content diagnostics before disposable resource cleanup.
+  const evidence = process.env.TEST_RUNTIME_EVIDENCE_DIR ?? join(tmpdir(), label + "-evidence");
+  await mkdir(evidence, { recursive: true });
+  for (const name of containers) await writeFile(join(evidence, name + ".log"), await docker("logs", name).catch(() => "logs unavailable"));
+  if (sql) {
+    const state = await Promise.all([
+      sql`SELECT action,source_revision,discord_guild_confirmed,expires_at,lifecycle_closed_at,appeal_state FROM moderation.decisions ORDER BY created_at`,
+      sql`SELECT c.action,c.source_revision,d.target,d.state,d.result_code,d.attempts,d.publication_attempted,d.lease_until,d.available_at,d.discord_restriction_state,d.discord_restriction_code,d.discord_restriction_checked_at,d.discord_restriction_proof_key FROM moderation.deliveries d JOIN moderation.decisions c USING(decision_id) ORDER BY c.created_at,d.target`,
+      sql`SELECT latest_revision,latest_guild_revision,guild_scope_known_after FROM moderation.member_order_heads`,
+      sql`SELECT revision,payload->>'complete' AS complete,payload->>'validUntil' AS valid_until,payload->>'rekeyPending' AS rekey_pending FROM moderation.community_policy`,
+      sql`SELECT blocked FROM moderation.member_bans`,
+      sql`SELECT hold_until,released_at FROM moderation.evidence_holds`,
+      sql`SELECT state,contract_hash,reason_code,history_count,history_bytes,observed_at FROM moderation.public_capacity_state`,
+    ]).catch(() => ["state unavailable"]);
+    await writeFile(join(evidence, "state.json"), JSON.stringify(state, null, 2));
+  }
+  console.error(`Synthetic runtime failure evidence: ${evidence}`);
+  throw error;
 } finally {
   for (const ws of sockets) ws.close();
   if (sql) await sql.end();
