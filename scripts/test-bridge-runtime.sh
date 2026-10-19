@@ -35,7 +35,7 @@ for mode in legacy public; do
   if [ "$mode" = public ]; then
     mode_args+=(-e 'BRIDGE_PUBLIC_CHANNELS={"guildId":"100000000000000001","channelIds":["100000000000000002"],"excludedCategoryIds":["100000000000000003"]}')
   fi
-  if ! timeout 90s docker run --rm --name "$name" --network "$network" \
+  if ! python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], timeout=90).returncode)' docker run --rm --name "$name" --network "$network" \
     "${mode_args[@]}" \
     -e "DATABASE_URL=postgres://bridge@$database:5432/bridge" \
     -e BRIDGE_MASTER_SECRET=0000000000000000000000000000000000000000000000000000000000000001 \
