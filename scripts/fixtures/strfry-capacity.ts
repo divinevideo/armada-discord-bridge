@@ -115,6 +115,16 @@ export function capacityCalibrationLauncher(configPath = "/capacity/calibration.
   return `import { readFileSync } from 'node:fs';\nimport postgres from '/opt/divine/node_modules/postgres/src/index.js';\nimport { runPlugin } from '/opt/divine/packages/moderation/src/strfryPlugin.ts';\nimport { PolicyStore } from '/opt/divine/packages/moderation/src/policyStore.ts';\nconst sql=postgres(process.env.MODERATION_DATABASE_URL,{max:1,onnotice:()=>{}});\nconsole.error(JSON.stringify({type:'capacity_calibration_launcher',pid:process.pid,synthetic:true}));\ntry{await runPlugin(process.stdin,line=>new Promise((resolve,reject)=>process.stdout.write(line,e=>e?reject(e):resolve())),(event,signal)=>{const data=JSON.parse(readFileSync(${JSON.stringify(configPath)},'utf8'));const store=new PolicyStore(sql,{capacity:{communities:new Map(data.communities),contract:data.contract},onAdmissionTiming:timing=>console.error(JSON.stringify({type:'moderation_admission_timing',eventId:event.id,...timing}))});return store.admit(event,signal);});}finally{await sql.end({timeout:1});}\n`;
 }
 
+export function expectedCapacityAcceptance(id: CapacityCaseId, historyCount: number): boolean {
+  return !["plugin_failure", "external_timeout", "sql_timeout"].includes(id) && (historyCount > 0 || id === "append" || id === "rekey");
+}
+
+export function serializeCapacityReport(report: CapacityMeasurementReport): { json: string; hash: string } {
+  const json = JSON.stringify(report, null, 2) + "\n";
+  // External contracts contain JSON: hash the same values the consumer reads.
+  return { json, hash: capacityReportHash(JSON.parse(json)) };
+}
+
 export function summarizeCapacity(report: CapacityMeasurementReport, urgentReserve?: number) {
   const distribution = (values: number[]) => { const sorted = [...values].sort((a, b) => a - b); return sorted.length ? { count: sorted.length, p50: sorted[Math.floor((sorted.length - 1) * 0.5)], p95: sorted[Math.ceil((sorted.length - 1) * 0.95)], max: sorted.at(-1)! } : null; };
   const ordinary = report.cases.filter(entry => !["plugin_failure", "sql_timeout", "external_timeout"].includes(entry.id));
@@ -254,7 +264,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           for (let rep = 0; rep < matrix.repetitions; rep++) {
             if (entry.id === "cold" && rep > 0) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await docker("rm", "-f", instance.name); instance = await start(entry.id); }
             const event = entry.id === "append" ? f.append() : entry.id === "rekey" ? f.rekey(sequence++) : f.message(sequence++);
-            const fault = ["plugin_failure", "external_timeout", "sql_timeout"].includes(entry.id), expected = count > 0 && !fault;
+            const expected = expectedCapacityAcceptance(entry.id, count);
             let release: Promise<unknown> | undefined;
             if (entry.id === "lock_contention" || entry.id === "sql_timeout") {
               await locker`SELECT pg_advisory_lock(hashtextextended(${f.policy.communityId},483210))`;
@@ -284,9 +294,10 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     }
   } finally {
     report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
-    await writeFile(join(output, "measurement-report.json"), JSON.stringify(report, null, 2) + "\n");
+    const artifact = serializeCapacityReport(report);
+    await writeFile(join(output, "measurement-report.json"), artifact.json);
     await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
-    await writeFile(join(output, "report.sha256"), capacityReportHash(report) + "\n");
+    await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
     await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
     for (const ws of sockets) ws.close(); await sql?.end({ timeout: 2 }); await locker?.end({ timeout: 2 });
     for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
