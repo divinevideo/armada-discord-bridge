@@ -58,7 +58,7 @@ test("reversal authorization, definitive source refusal and source order remain 
 
 test("new revision supersedes an older unsent reversal without reviving the old ban", async () => {
  const old = await prior(), first = await decisions.acceptReversal(old.id, request("1"), actor), next = await decisions.acceptReversal(old.id, request("2"), actor);
- await decisions.claim();
+ await new Decisions(sql, undefined, communities).claim();
  expect((await decisions.get(first.decisionId, actor)).deliveries.every(d => d.resultCode === "superseded_by_newer_decision")).toBe(true);
  expect((await decisions.get(first.decisionId, actor)).supersededBy).toBe(next.decisionId);
  expect((await decisions.get(old.id, actor)).deliveries.every(d => d.state === "verified")).toBe(true);
