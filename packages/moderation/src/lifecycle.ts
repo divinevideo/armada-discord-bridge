@@ -100,7 +100,7 @@ export class Lifecycle {
       const [row] = await tx`UPDATE moderation.decisions SET appeal_state = ${input.state}, lifecycle_closed_at = CASE WHEN ${input.state} = 'open' THEN NULL ELSE lifecycle_closed_at END, audit_delete_after = CASE WHEN ${input.state} = 'open' THEN NULL ELSE audit_delete_after END WHERE decision_id = ${input.decisionId} RETURNING *`; return status(row);
     }) as Promise<LifecycleStatus>;
   }
-  private async eligible(tx: postgres.TransactionSql, decision: any, deliveries: any[]) {
+  private async eligible(tx: postgres.TransactionSql, decision: any, deliveries: any[], erasingAudit = false) {
     if (decision.appeal_state === "open" || deliveries.map(d => d.target).sort().join(",") !== "concord,discord,divine_relay" || deliveries.some(d => !["verified", "not_applicable"].includes(d.state) || d.lease_until?.getTime() > Date.now() || (d.target === "concord" && d.publication_attempted && d.state !== "verified" && !["concord_superseded_publication_settled", "concord_publication_settled"].includes(d.result_code)) || d.discord_restriction_state === "present" || (d.target === "discord" && decision.discord_guild_confirmed && d.discord_restriction_state === "unknown"))) return false;
     const [held] = await tx`SELECT 1 FROM moderation.evidence_holds WHERE org_id = ${decision.org_id} AND case_id = ${decision.case_id} AND released_at IS NULL AND hold_until > clock_timestamp()`;
     if (held) return false;
@@ -108,6 +108,10 @@ export class Lifecycle {
     const key = await restrictionProofKey(tx, decision), discord = deliveries.find(d => d.target === "discord");
     if (!key || discord.discord_restriction_proof_key !== key || !discord.discord_restriction_checked_at || discord.discord_restriction_checked_at < discord.available_at) return false;
     const guildHistory = await hasGuildHistory(tx, decision);
+    // Discord bans can change independently of our source/control identity.
+    // The closure-time observation cannot authorize erasure after retention;
+    // the existing worker observer refreshes due records before cleanup.
+    if (erasingAudit && guildHistory && discord.discord_restriction_checked_at < decision.audit_delete_after) return false;
     if (discord.discord_restriction_state !== "absent" && !(discord.discord_restriction_state === "not_applicable" && !guildHistory)) return false;
     const [unban] = await tx`SELECT n.decision_id FROM moderation.member_order_heads h JOIN moderation.decisions n ON n.org_id = h.org_id AND n.community_id = h.community_id AND n.author = h.author AND n.source_revision = h.latest_revision AND n.execution_id = h.latest_execution_id::text
       WHERE h.org_id = ${decision.org_id} AND h.community_id = ${decision.community_id} AND h.author = ${decision.author} AND n.action = 'unban_member'
@@ -145,7 +149,7 @@ export class Lifecycle {
     const rows = await this.sql`SELECT org_id, decision_id FROM moderation.decisions WHERE audit IS NOT NULL AND audit_delete_after <= clock_timestamp() ORDER BY org_id, case_id, decision_id`;
     for (const row of rows) await this.sql.begin(async tx => {
       const { decision, deliveries } = await lockLifecycleDecision(tx, row.org_id, row.decision_id);
-      if (decision.lifecycle_closed_at && decision.audit_delete_after?.getTime() <= Date.now() && await this.eligible(tx, decision, deliveries)) await tx`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${decision.decision_id}`;
+      if (decision.lifecycle_closed_at && decision.audit_delete_after?.getTime() <= Date.now() && await this.eligible(tx, decision, deliveries, true)) await tx`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${decision.decision_id}`;
     });
     const cases = await this.sql`SELECT DISTINCT org_id, case_id FROM moderation.evidence_holds UNION SELECT DISTINCT org_id, case_id FROM moderation.lifecycle_events`;
     for (const row of cases) await this.sql.begin(async tx => {

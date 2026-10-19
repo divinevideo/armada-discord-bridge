@@ -57,6 +57,14 @@ test("fresh absent observation permits settled ban audit closure; source changes
  await expect(lifecycle.closeLifecycle({ decisionId: ban, reason: "stale source" }, staff)).rejects.toThrow();
  await absent.refresh(ban); await lifecycle.closeLifecycle({ decisionId: ban, reason: "fresh source proof" }, staff);
  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '2 minutes', audit_delete_after = clock_timestamp() - interval '1 minute' WHERE decision_id = ${ban}`; await tx`UPDATE moderation.lifecycle_events SET recorded_at = clock_timestamp() - interval '2 minutes' WHERE decision_id = ${ban}`; });
+ // A Guild restriction can change without changing Concord's control history.
+ // Proof taken before the retention deadline cannot authorize later erasure.
+ await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '3 minutes', discord_restriction_checked_at = clock_timestamp() - interval '2 minutes' WHERE decision_id = ${ban} AND target = 'discord'`;
+ await expect(Promise.resolve(operatorSql`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban}`)).rejects.toThrow(/audit/i);
+ await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban}`)[0].audit).not.toBeNull();
+ await observer.refresh(ban);
+ await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban}`)[0].audit).not.toBeNull();
+ await absent.refresh(ban);
  await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban}`)[0].audit).toBeNull();
 });
 
