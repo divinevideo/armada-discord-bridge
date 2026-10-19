@@ -68,6 +68,21 @@ test("fresh absent observation permits settled ban audit closure; source changes
  await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban}`)[0].audit).toBeNull();
 });
 
+test("a retained Guild restriction cannot starve other due audit observations", async () => {
+ await sql`UPDATE moderation.deliveries SET discord_restriction_checked_at = clock_timestamp(), available_at = clock_timestamp() - interval '1 minute' WHERE decision_id IN (SELECT decision_id FROM moderation.decisions WHERE org_id = ${org}) AND target = 'discord'`;
+ const first = await stored("ban_member", "4", true), second = await stored("unban_member", "5", false);
+ await sql.begin(async tx => {
+   await tx`SET LOCAL session_replication_role = replica`;
+   await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '4 minutes', audit_retention_seconds = 60, audit_delete_after = clock_timestamp() - interval '3 minutes' WHERE decision_id IN (${first}, ${second})`;
+ });
+ await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '5 minutes', discord_restriction_checked_at = clock_timestamp() - interval '4 minutes' WHERE decision_id = ${first} AND target = 'discord'`;
+ await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() - interval '4 minutes', discord_restriction_checked_at = clock_timestamp() - interval '3 minutes' WHERE decision_id = ${second} AND target = 'discord'`;
+ const observer = new DiscordRestrictionObserver(operatorSql, mappings, policy, async () => Response.json({ user: { id: member.userId } }), communities);
+ await observer.tick(); await observer.tick();
+ const rows = await sql`SELECT discord_restriction_state FROM moderation.deliveries WHERE decision_id IN (${first}, ${second}) AND target = 'discord'`;
+ expect(rows.map(row => row.discord_restriction_state)).toEqual(["present", "present"]);
+});
+
 test("a concurrent source change discards observation; unchanged policy polling preserves its identity", async () => {
  const [row] = await sql`SELECT decision_id FROM moderation.decisions WHERE org_id = ${org} ORDER BY decision_id LIMIT 1`;
  const before = (await sql`SELECT discord_restriction_state, discord_restriction_proof_key, discord_restriction_checked_at FROM moderation.deliveries WHERE decision_id = ${row.decision_id} AND target = 'discord'`)[0];

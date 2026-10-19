@@ -60,9 +60,12 @@ export class DiscordRestrictionObserver {
     }) as Promise<boolean>;
   }
   async tick(): Promise<void> {
+    // A present/unknown restriction keeps expired audit due. Rotate by the last
+    // observation so that record cannot monopolize the worker indefinitely.
     const [row] = await this.sql`SELECT c.decision_id FROM moderation.decisions c JOIN moderation.deliveries d USING (decision_id)
       WHERE c.community_id IN ${this.sql([...this.communities.keys()])} AND c.action IN ('ban_member','unban_member') AND d.target = 'discord' AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
-        AND (d.discord_restriction_checked_at IS NULL OR d.available_at > d.discord_restriction_checked_at OR (c.audit IS NOT NULL AND c.audit_delete_after <= clock_timestamp())) ORDER BY d.available_at, c.decision_id LIMIT 1`;
+        AND (d.discord_restriction_checked_at IS NULL OR d.available_at > d.discord_restriction_checked_at OR (c.audit IS NOT NULL AND c.audit_delete_after <= clock_timestamp()))
+      ORDER BY d.discord_restriction_checked_at NULLS FIRST, d.available_at, c.decision_id LIMIT 1`;
     if (row) await this.refresh(row.decision_id);
   }
 }
