@@ -683,6 +683,7 @@ export class Importer {
     await this.assertPublicPlan(plan);
     const beforeEffect = async () => {
       await this.assertPublicPlan(plan);
+      if (this.env.mode === "public") await this.manager.assertPublicCapacity(community.idHex);
       await this.importGuards.get(importId)?.();
     };
     const pool = guardEffects(this.poolFactory(community.relays), beforeEffect, new Set(["publish"]));

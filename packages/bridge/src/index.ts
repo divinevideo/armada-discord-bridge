@@ -21,6 +21,7 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
 
+import { PublicCapacityGuard } from "../../moderation/src/publicCapacity";
 import { CONCORD_EFFECT_METHODS, guardEffects } from "./effectGuard";
 import { BridgeLeases, bridgeResource } from "./db/leases";
 import { discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
@@ -64,6 +65,7 @@ if (!inviteUrl || !guildId || !channelId || !config.discordToken) {
 const publicPolicy = config.mode === "public" ? discordPublicChannelPolicy(config.publicChannels!, config.discordToken) : undefined;
 await publicPolicy?.assertPublicChannel(guildId, channelId);
 const sql = postgres(config.databaseUrl, { onnotice: () => {} });
+const capacity = new PublicCapacityGuard(sql);
 // Register cleanup as resources appear, so loss during startup does not touch
 // bindings that have not initialized yet. A supervisor can then restart us.
 const cleanup: Array<() => void | Promise<void>> = [() => sql.end()];
@@ -88,6 +90,7 @@ const assertMayForward = async () => {
   await publicPolicy?.assertPublicChannel(guildId, channelId);
   const current = rawClient.channel(concordChannelId!);
   if (!current || (config.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
+  if (config.mode === "public") await capacity.assertPublicProducer(community.idHex);
   await lease.assertCurrent();
 };
 

@@ -18,6 +18,16 @@ export async function collectMetrics(sql: postgres.Sql): Promise<string> {
     WHERE h.state = 'pending' AND c.expires_at > clock_timestamp()`;
   const handoffPending = Number(handoff.pending), handoffAge = Number(handoff.age);
   if (![handoffPending, handoffAge].every((value) => Number.isFinite(value) && value >= 0)) throw new Error('Invalid handoff metric');
-  return renderMetrics({ policyCount: Number(policy.count), policyRevision: Number(policy.revision), policyAge: Number(policy.age), pending: Number(delivery.pending), failed: Number(delivery.failed), oldestPendingAge: Number(delivery.age) })
+  const [capacity] = await sql`SELECT count(*) FILTER (WHERE state = 'paused') AS paused, count(*) FILTER (WHERE state = 'unknown') AS unknown,
+    count(*) FILTER (WHERE state = 'warning') AS warning, COALESCE(sum(history_count), 0) AS history_count,
+    COALESCE(sum(history_bytes), 0) AS history_bytes, COALESCE(sum(rekey_count), 0) AS rekey_count,
+    COALESCE(sum(stream_count), 0) AS stream_count, COALESCE(max(gate_elapsed_ms), 0) AS gate_elapsed_ms,
+    count(gate_elapsed_ms) AS gate_elapsed_known, COALESCE(max(GREATEST(0, extract(epoch FROM clock_timestamp() - observed_at))), 0) AS sample_age_seconds
+    FROM moderation.public_capacity_state`;
+  const capacityMetrics = Object.entries({ ...capacity, full_admission_latency_known: 0 }).map(([name, raw]) => {
+    const value = Number(raw); if (!Number.isFinite(value) || value < 0) throw new Error('Invalid capacity metric');
+    return `# TYPE concord_public_capacity_${name} gauge\nconcord_public_capacity_${name} ${value}\n`;
+  }).join('');
+  return capacityMetrics + renderMetrics({ policyCount: Number(policy.count), policyRevision: Number(policy.revision), policyAge: Number(policy.age), pending: Number(delivery.pending), failed: Number(delivery.failed), oldestPendingAge: Number(delivery.age) })
     + `# TYPE concord_coop_handoffs_pending gauge\nconcord_coop_handoffs_pending ${handoffPending}\n# TYPE concord_coop_oldest_pending_seconds gauge\nconcord_coop_oldest_pending_seconds ${handoffAge}\n`;
 }

@@ -17,6 +17,7 @@
 import { BridgeLeases, BridgeLeaseUnavailableError, bridgeResource, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
 import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
+import { PublicCapacityGuard } from "../../moderation/src/publicCapacity";
 import { randomBytes } from "node:crypto";
 import {
   KIND_WRAP,
@@ -188,6 +189,7 @@ export class BridgeManager {
   private readonly byDiscordChannel = new Map<string, string>();
   /** One shared store: mapping rows for every router, plus catch-up cursors. */
   private readonly store: PostgresMappingStore;
+  private readonly capacity: PublicCapacityGuard;
   /** Pending start-retry timers by bridge id; cancelled by stop(). */
   private readonly startRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Pending gateway reconnect timer, if the last login attempt failed. */
@@ -202,6 +204,11 @@ export class BridgeManager {
     private readonly publicPolicy?: Pick<PublicChannelPolicy, "assertPublicChannel"> & Partial<Pick<PublicChannelPolicy, "assertPublicChannels">>,
   ) {
     this.store = new PostgresMappingStore(sql);
+    this.capacity = new PublicCapacityGuard(sql);
+  }
+
+  async assertPublicCapacity(communityId: string): Promise<void> {
+    if (this.env.mode === "public") await this.capacity.assertPublicProducer(communityId);
   }
 
   async assertChannelPolicy(guildId: string, channelId: string): Promise<void> {
@@ -607,6 +614,7 @@ export class BridgeManager {
         }
         const current = row.concord_channel_id && rawClient.channel(row.concord_channel_id);
         if (!current || (this.env.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
+        await this.assertPublicCapacity(community.idHex);
         await lease.assertCurrent();
         await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
           AND status_detail = 'Forwarding blocked: public visibility unavailable'`;

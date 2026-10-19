@@ -1,3 +1,4 @@
+import { loadPublicCapacity } from "./publicCapacity";
 import { collectMetrics } from "./metrics";
 import { apiReadiness, lifecycleWriteReadinessResponse } from "./apiReadiness";
 import { CoopHandoff } from "./coopHandoff";
@@ -14,7 +15,7 @@ import { Reports } from "./reports";
 import { Lifecycle } from "./lifecycle";
 import { migrateModeration } from "./policyStore";
 import { runModerationWorker, type WorkerHealth } from "./runtime";
-async function main() {
+export async function runModerationService(options: { capacity?: ReturnType<typeof loadPublicCapacity> } = {}) {
   const required = (name: string) => { const value = process.env[name]; if (!value) throw new Error(`Missing ${name}`); return value; };
   const sql = postgres(required("MODERATION_DATABASE_URL"), { max: 10, connect_timeout: 5, idle_timeout: 30, onnotice: () => {} });
   const mode = required("MODERATION_MODE");
@@ -44,7 +45,7 @@ async function main() {
       if (path !== "/readyz") return new Response(null, { status: 404 });
       return Response.json({ code: health.code }, { status: health.ready && Date.now() - health.checkedAt < 30_000 ? 200 : 503, headers: { "cache-control": "no-store" } });
     } });
-    try { await runModerationWorker({ sql, decisions, lifecycle, community, identity: localIdentity(Buffer.from(key, "hex")), communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
+    try { await runModerationWorker({ sql, decisions, lifecycle, ...(options.capacity ? { capacity: options.capacity } : {}), community, identity: localIdentity(Buffer.from(key, "hex")), communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
     finally { await server.stop(true); await sql.end(); }
   } else {
     const config = loadModerationConfig(process.env);
@@ -71,4 +72,4 @@ async function main() {
     finally { clearInterval(dispatch); clearInterval(cleanup); await server.stop(true); await pool.close(); await sql.end(); }
   }
 }
-if (import.meta.main) await main().catch(() => { console.error("moderation: service startup or ownership failed; check configuration and readiness"); process.exit(1); });
+if (import.meta.main) await runModerationService().catch(() => { console.error("moderation: service startup or ownership failed; check configuration and readiness"); process.exit(1); });

@@ -1,5 +1,8 @@
 import { readFile } from "node:fs/promises";
 import type postgres from "postgres";
+import { PublicCapacityStore } from "./publicCapacity";
+import type { PublicCapacityContract } from "./capacityContract";
+import { openWrap, parseEdition, banlistLocator, hex32, isAuthorized, Permissions, citationFromTags, citationSatisfied } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
 import { bytesToHex } from "@armada-bridge/concord-core";
 import type { AdmissionResult, CommunityPolicy, RoomTarget, StreamDescriptor } from "./contracts";
@@ -8,7 +11,7 @@ import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
 export async function migrateModeration(sql: postgres.Sql): Promise<void> {
-  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql", "014_carrier_references.sql", "015_publication_receipt_ids.sql", "016_guild_scope_order.sql", "017_moderation_lifecycle.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
+  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql", "014_carrier_references.sql", "015_publication_receipt_ids.sql", "016_guild_scope_order.sql", "017_moderation_lifecycle.sql", "018_public_capacity.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}, 1)`;
     for (const body of bodies) await tx.unsafe(body);
@@ -24,8 +27,10 @@ function streamOf(row: Record<string, any>): StreamDescriptor {
   return { communityId: row.community_id, channelId: row.channel_id ?? undefined, plane: row.plane, epoch: String(row.epoch), retiredAt: row.retired_at == null ? undefined : Number(row.retired_at), previousEpoch: row.previous_epoch == null ? undefined : String(row.previous_epoch), previousCommit: row.previous_commit ?? undefined, key: { pk: row.pubkey, convKey: new Uint8Array(row.read_key), restricted: row.restricted } };
 }
 
+export interface PolicyStoreOptions { capacity?: { communities: ReadonlyMap<string, string>; contract: PublicCapacityContract | undefined }; onAdmissionTiming?: (sample: { innerAdmissionMs: number; action: "accept" | "reject" }) => void }
 export class PolicyStore {
-  constructor(private readonly sql: postgres.Sql) {}
+  private readonly capacity: PublicCapacityStore | undefined;
+  constructor(private readonly sql: postgres.Sql, private readonly options: PolicyStoreOptions = {}) { if (options.capacity) this.capacity = new PublicCapacityStore(sql, options.capacity.contract); }
 
   async install(policy: CommunityPolicy, streams: StreamDescriptor[], expectedRevision: number): Promise<void> {
     if (policy.revision !== expectedRevision + 1 || !Number.isSafeInteger(policy.revision)) throw new Error("Policy revision conflict");
@@ -92,10 +97,14 @@ export class PolicyStore {
   async getPolicy(communityId: string) { requireId(communityId); return this.load(this.sql, communityId); }
 
   async admit(event: NostrEvent, signal?: AbortSignal): Promise<AdmissionResult> {
-    return this.admitEvent(event, false, signal);
+    const start = performance.now();
+    const result = await this.admitEvent(event, false, signal);
+    try { this.options.onAdmissionTiming?.({ innerAdmissionMs: performance.now() - start, action: result.action }); } catch { /* Telemetry cannot reverse a settled database result. */ }
+    return result;
   }
 
   private async admitEvent(event: NostrEvent, restoring: boolean, signal?: AbortSignal): Promise<AdmissionResult> {
+    const admissionStart = performance.now();
     const id = typeof event?.id === "string" && HEX_ID.test(event.id) ? event.id : "0".repeat(64);
     const rejected: AdmissionResult = { id, action: "reject", msg: "blocked: room policy unavailable or event not permitted" };
     try {
@@ -149,6 +158,16 @@ export class PolicyStore {
             WHERE event_id = ${references.eventId} AND community_id = ${references.target.communityId} AND channel_id = ${references.target.channelId} AND rumor_id = ${references.target.rumorId}`;
         }
         signal?.throwIfAborted();
+        if (!restoring && result.action === "accept" && this.capacity) {
+          const org = this.options.capacity!.communities.get(communityId); if (!org) return rejected;
+          let urgent = Boolean(rekey);
+          if (row) {
+            const opened = openWrap(event, streamOf(row).key), state = controlState(policy!);
+            if (control) urgent = bytesToHex(parseEdition(opened).entityId) === bytesToHex(banlistLocator(hex32(communityId)));
+            else if (opened.kind === 5 || opened.kind === 3309) urgent = isAuthorized(state.folded.roster, opened.author, policy!.owner, opened.kind === 5 ? Permissions.MANAGE_MESSAGES : Permissions.KICK) && citationSatisfied(state.folded, hex32(communityId), opened.author, citationFromTags(opened.tags));
+          }
+          await this.capacity.assertAdmission(tx, policy!, org, urgent, { control: control?.id, rekey: rekey?.event.id, bytes: Buffer.byteLength(JSON.stringify(event)) }, performance.now() - admissionStart);
+        }
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept") for (const target of removals ?? []) {
           await tx`INSERT INTO moderation.tombstones (community_id, channel_id, rumor_id) VALUES (${communityId}, ${target.channelId}, ${target.rumorId}) ON CONFLICT DO NOTHING`;

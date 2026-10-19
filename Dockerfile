@@ -16,6 +16,7 @@ RUN rm -rf node_modules && bun install --ignore-scripts --frozen-lockfile --prod
 
 FROM oven/bun:1.3.10-slim@sha256:5d5863f35ad9b3acceee8dc134fb2b89f07831129eaeec81af2b19a23dabe3e0 AS runtime
 ARG VCS_REF
+ENV MODERATION_SOURCE_SHA=$VCS_REF
 LABEL org.opencontainers.image.source="https://github.com/divinevideo/armada-discord-bridge" \
       org.opencontainers.image.revision=$VCS_REF \
       org.opencontainers.image.licenses="AGPL-3.0-only"
