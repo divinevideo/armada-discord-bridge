@@ -74,3 +74,65 @@ describe("measured capacity contract", () => {
     }
   });
 });
+
+import { capacityFixture, validateMatrix } from "../../../scripts/fixtures/strfry-capacity";
+import matrix from "../../../scripts/fixtures/capacity-matrix.json";
+import { controlState, verifiedEvent } from "./relayPolicy";
+import { bytesToHex, openWrap, parseEdition } from "@armada-bridge/concord-core";
+
+describe("capacity measurement fixtures", () => {
+  it("counts deterministic distinct valid signed editions with monotonic valid chains", () => {
+    for (const count of [0, 1, 16]) {
+      const first = capacityFixture(count, { roots: 3, channels: 4 }), second = capacityFixture(count, { roots: 3, channels: 4 });
+      expect(first.fixtureHash).toBe(second.fixtureHash);
+      expect(new Set(first.policy.controlEvents.map(e => e.id)).size).toBe(count);
+      expect(first.policy.controlEvents.map(verifiedEvent).length).toBe(count);
+      expect(controlState(first.policy).folded.incomplete).toHaveLength(0);
+      expect(first.verifyChain()).toBe(true);
+    }
+  });
+  it("grows actual control bytes and verifies the appended owner edition", () => {
+    const small = capacityFixture(16), large = capacityFixture(16, { large: true });
+    expect(large.historyBytes).toBeGreaterThan(small.historyBytes * 5);
+    const appended = verifiedEvent(small.append());
+    const stream = small.policy.controlStreams.find(s => s.key.pk === appended.pubkey)!;
+    const edition = parseEdition(openWrap(appended, stream.key));
+    expect(edition.version).toBe(17n);
+    small.policy.controlEvents.push(appended);
+    expect(controlState(small.policy).folded.incomplete).toHaveLength(0);
+    expect(controlState(small.policy).folded.headEditions.get(bytesToHex(edition.entityId))?.version).toBe(17n);
+  });
+  it("requires every scenario, finite resources and a post-rejection observation horizon", () => {
+    expect(validateMatrix(matrix).cases).toHaveLength(14);
+    for (const change of [{ historyPoints: [1, 1] }, { historyPoints: [4096] }, { cases: ["cold"] }, { cpu: Infinity }, { lateObservationMs: 100 }, { observationTimeoutMs: 3000 }]) {
+      expect(() => validateMatrix({ ...matrix, ...change })).toThrow();
+    }
+  });
+  it("distinguishes no inner transaction in an injected process failure from unknown timings", () => {
+    const value = fixture(), fault = value.measurement.cases.find(c => c.id === "plugin_failure")!.samples[0];
+    Object.assign(fault, { innerAdmissionMs: null, innerNotStarted: true });
+    expect(validateCapacityContract(resign(value), identity)).toBe(value);
+    fault.innerNotStarted = false;
+    expect(() => validateCapacityContract(resign(value), identity)).toThrow();
+  });
+});
+
+import { capacityCalibrationLauncher, summarizeCapacity } from "../../../scripts/fixtures/strfry-capacity";
+it("exports a disposable library launcher without an entrypoint bypass", () => {
+  const launcher = capacityCalibrationLauncher("/data/synthetic-test.json");
+  expect(launcher).toContain('"/data/synthetic-test.json"');
+  expect(launcher).toContain("new PolicyStore(sql,{capacity:");
+  expect(launcher).toContain("runPlugin(process.stdin");
+  expect(launcher).toContain("eventId:event.id");
+  expect(launcher).not.toContain("process.env.MODERATION_CAPACITY_CONTRACT_FILE");
+});
+it("derives only a conservative review candidate with measured overshoot and explicit reserve", () => {
+  const report = fixture().measurement;
+  expect(summarizeCapacity(report).candidatePauseHistoryCount).toBeNull();
+  expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBe(52);
+  const boundary = report.cases[0].samples[0];
+  report.cases[0].samples.push({ ...boundary, historyCount: 40, accepted: false, persisted: false, fanout: false });
+  expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBe(27);
+  report.cases[1].status = "unsupported";
+  expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBeNull();
+});

@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "historyPoints": [0, 1, 16, 64, 256, 1024, 4095],
+  "repetitions": 2,
+  "concurrency": 4,
+  "cpu": 1,
+  "memoryBytes": 1073741824,
+  "databaseCpu": 1,
+  "databaseMemoryBytes": 536870912,
+  "lateObservationMs": 3500,
+  "observationTimeoutMs": 6000,
+  "cases": ["cold", "warm", "restart", "append", "cache_entries", "cache_bytes", "rekey", "held_roots", "stream_growth", "lock_contention", "concurrency", "plugin_failure", "sql_timeout", "external_timeout"],
+  "cacheEntryWorkingSet": 4096,
+  "cacheByteWorkingSet": 16777216,
+  "heldRoots": 3,
+  "channels": 16
+}

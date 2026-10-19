@@ -6,7 +6,7 @@ export interface CapacityResources { cpus: number; memoryBytes: number; database
 export interface CapacitySample {
   caseId: CapacityCaseId; historyCount: number; historyBytes: number; rekeyCount: number; streamCount: number; inFlight: number;
   wallMs: number; innerAdmissionMs: number | null; expectedAccept: boolean; accepted: boolean; okReceived: boolean;
-  persisted: boolean; fanout: boolean; lateDatabaseWrite: boolean; unsafeEffect: boolean; error?: string;
+  persisted: boolean; fanout: boolean; lateDatabaseWrite: boolean; unsafeEffect: boolean; innerNotStarted?: boolean; error?: string;
 }
 export interface CapacityMeasurementReport {
   version: 1; sourceSha: string; harnessSha: string; imageId: string; platform: string; resourceEnvelope: CapacityResources;
@@ -69,7 +69,7 @@ export function validateCapacityContract(value: unknown, buildIdentity: { source
     for (const sample of entry.samples) {
       need(object(sample) && sample.caseId === id, "sample scenario mismatch");
       for (const key of ["historyCount", "historyBytes", "rekeyCount", "streamCount", "inFlight"] as const) need(integer(sample[key], key === "inFlight"), `invalid sample ${key}`);
-      need(finite(sample.wallMs) && finite(sample.innerAdmissionMs), "unmeasured inner/external time");
+      need(finite(sample.wallMs) && (finite(sample.innerAdmissionMs) || (FAILURE_CASES.has(id) && sample.innerNotStarted === true && sample.innerAdmissionMs === null && !sample.accepted)), "unmeasured inner/external time");
       need([sample.expectedAccept, sample.accepted, sample.okReceived, sample.persisted, sample.fanout, sample.lateDatabaseWrite, sample.unsafeEffect].every((flag) => typeof flag === "boolean"), "sample outcomes required");
       need(sample.okReceived && !sample.lateDatabaseWrite && !sample.unsafeEffect, "unsafe/uncertain external outcome");
       need(sample.persisted === sample.accepted && sample.fanout === sample.accepted, "relay persistence/fanout mismatch");
