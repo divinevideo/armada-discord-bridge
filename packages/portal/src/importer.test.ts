@@ -298,9 +298,11 @@ describe("importer pipeline", () => {
     const wire: NostrEvent[] = [];
     const activated: BridgeRow[] = [];
     const routed: Array<{ channelId: string; id: string; timestampMs?: number }> = [];
+    const capacityChecks: string[] = [];
     const manager = {
       assertPublicChannel: async () => {},
       assertPublicChannels: async () => {},
+      assertPublicCapacity: async (communityId: string) => { capacityChecks.push(communityId); },
       activateImported: async (row: BridgeRow) => void activated.push(row),
       // The wiring step provisions the identity, admits the bridge to any
       // private channel, then starts it — so the stub hands back a row with a
@@ -526,6 +528,8 @@ describe("importer pipeline", () => {
     );
 
     // Idempotency: a re-run from checkpoints publishes nothing new.
+    expect(capacityChecks.length).toBeGreaterThan(0);
+    expect(new Set(capacityChecks).size).toBe(1);
     const wireLen = wire.length;
     await (importer as unknown as { runOwned: (id: string) => Promise<void> }).runOwned("imp1");
     expect(wire.length).toBe(wireLen);
@@ -545,6 +549,7 @@ describe("importer pipeline", () => {
     const manager = {
       assertPublicChannel: async () => {},
       assertPublicChannels: async () => {},
+      assertPublicCapacity: async () => {},
       activateImported: async () => {},
       provisionImported: async (row: BridgeRow) => ({ ...row, primary_pk: `pk-${row.bridge_id}` }),
       startImported: async () => {},

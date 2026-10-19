@@ -1,6 +1,7 @@
 import postgres from "postgres";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { AdmissionResult } from "./contracts";
+import { loadPublicCapacity } from "./publicCapacity";
 import { PolicyStore } from "./policyStore";
 import { HEX_ID, MAX_EVENT_BYTES } from "./relayPolicy";
 
@@ -70,7 +71,7 @@ if (import.meta.main) {
   const url = process.env.MODERATION_DATABASE_URL;
   if (!url) { process.stderr.write("Moderation database is not configured\n"); process.exit(1); }
   const sql = postgres(url, { max: 1, connect_timeout: 1, idle_timeout: 10, onnotice: () => {} });
-  const store = new PolicyStore(sql);
+  const store = new PolicyStore(sql, { capacity: loadPublicCapacity(), ...(process.env.MODERATION_CAPACITY_TIMING === "1" ? { onAdmissionTiming: (sample: { innerAdmissionMs: number; action: "accept" | "reject" }) => { process.stderr.write(JSON.stringify({ type: "moderation_admission_timing", ...sample }) + "\n"); } } : {}) });
   try {
     await runPlugin(process.stdin, (line) => new Promise<void>((resolve, reject) => {
       process.stdout.write(line, (error) => error ? reject(error) : resolve());

@@ -14,6 +14,7 @@ import { BridgeMappingResolver, DiscordActions, discordRequest } from "./discord
 import { createExecutionContext } from "./executionContext";
 import { LocalRelayDriver } from "./localRelayDriver";
 import { PolicyStore } from "./policyStore";
+import { PublicCapacityStore, loadPublicCapacity } from "./publicCapacity";
 import { PolicyWatcher } from "./policyWatcher";
 import { RelayPurger } from "./relayPurge";
 import { controlState } from "./relayPolicy";
@@ -27,10 +28,17 @@ export async function expireModerationRecords(decisions: Pick<Decisions, "expire
   await lifecycle.expireEvidence();
   await lifecycle.expireAudit();
 }
+/** Operator observation uses durable policy/counts; full settled admission time stays unknown. */
+export async function observeWorkerCapacity(sql: postgres.Sql, capacity: ReturnType<typeof loadPublicCapacity>, communityId: string): Promise<void> {
+  const orgId = capacity.communities.get(communityId);
+  if (!orgId) throw new Error("Capacity community scope unavailable");
+  await new PublicCapacityStore(sql, capacity.contract).observeCurrent(orgId, communityId);
+}
 export interface WorkerHealth { ready: boolean; code: "starting" | "ready" | "policy_unavailable" | "rekey_recovery_required" | "delivery_unavailable" | "stopped"; checkedAt: number }
-export async function runModerationWorker(options: { sql: postgres.Sql; decisions: Decisions; lifecycle: Pick<Lifecycle, "expireEvidence" | "expireAudit">; community: CommunityV2; identity: LocalIdentity; communities: ReadonlyMap<string, string>; relayUrl: string; bridgeTenantId: string; puppetMaster: string; discordToken: string; publicChannels: PublicChannelRules; publicAuthors: string[]; signal: AbortSignal; health: WorkerHealth }): Promise<void> {
+export async function runModerationWorker(options: { capacity?: ReturnType<typeof loadPublicCapacity>; sql: postgres.Sql; decisions: Decisions; lifecycle: Pick<Lifecycle, "expireEvidence" | "expireAudit">; community: CommunityV2; identity: LocalIdentity; communities: ReadonlyMap<string, string>; relayUrl: string; bridgeTenantId: string; puppetMaster: string; discordToken: string; publicChannels: PublicChannelRules; publicAuthors: string[]; signal: AbortSignal; health: WorkerHealth }): Promise<void> {
   validateWorkerCommunity(options.community, options.identity.pk, options.communities);
   const { sql, community, identity, health } = options;
+  const capacity = options.capacity ?? loadPublicCapacity();
   const store = new PolicyStore(sql), driver = new LocalRelayDriver(options.relayUrl);
   const purger = new RelayPurger(new CarrierIndex(sql), driver);
   let watcher: PolicyWatcher | undefined;
@@ -38,6 +46,7 @@ export async function runModerationWorker(options: { sql: postgres.Sql; decision
   watcher = new PolicyWatcher(community, store, pool, [...options.publicAuthors, identity.pk], identity);
   const refresh = async () => {
     const policy = await watcher!.refresh();
+    await observeWorkerCapacity(sql, capacity, community.idHex);
     registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
     health.checkedAt = Date.now();
     health.ready = !policy.rekeyPending;

@@ -9,6 +9,7 @@ RUN mkdir -p /source && git ls-files --recurse-submodules -z | tar --null -T - -
 FROM oven/bun:1.3.10-slim@sha256:5d5863f35ad9b3acceee8dc134fb2b89f07831129eaeec81af2b19a23dabe3e0 AS bun
 FROM ubuntu:22.04@sha256:5ec03bb3441e8b0bf3b4f9cd4629a1ae763010dc3035bb8da3ae6cf026486401 AS relay
 ARG VCS_REF
+ENV MODERATION_SOURCE_SHA=$VCS_REF
 LABEL org.opencontainers.image.source="https://github.com/divinevideo/armada-discord-bridge" \
       org.opencontainers.image.revision=$VCS_REF \
       org.opencontainers.image.licenses="AGPL-3.0-only AND GPL-3.0-only"
