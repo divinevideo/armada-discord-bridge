@@ -4,6 +4,11 @@
  * client. Drives the lifecycle: draft -> pending_confirm (in-channel code)
  * -> active (routing attached) -> paused/severed/unlinked.
  *
+ * `severed` is the community cutting the bridge off — banned by the control
+ * plane, refounded past its keys, or dissolved — detected live (see
+ * ./severance.ts) and recorded like any operator stop. `paused`/`unlinked`
+ * remain operator actions only.
+ *
  * The in-channel confirm is the Armada side's consent gate: only a member
  * holding MANAGE_CHANNELS (or the owner) can flip a bridge live, and the
  * portal cannot bypass it.
@@ -14,16 +19,17 @@ import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/
 import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
 import { randomBytes } from "node:crypto";
 import {
+  KIND_WRAP,
   Permissions,
   STOCK_RELAYS,
   inviteDeliveryRelays,
   isAuthorized,
   parseInviteLink,
 } from "@armada-bridge/concord-core";
-import type { ChannelV2, OpenedChat } from "@armada-bridge/concord-core";
+import type { ChannelV2, CommunityV2, FoldedControl, OpenedChat } from "@armada-bridge/concord-core";
 import { BlossomStore } from "@armada-bridge/bridge/src/blossom";
 import { KlipyClient } from "@armada-bridge/bridge/src/klipy";
-import { ConcordClient, resolveInvite } from "@armada-bridge/bridge/src/concord/client";
+import { ConcordClient, resolveInvite, severanceStreamKeys } from "@armada-bridge/bridge/src/concord/client";
 import { identityRelayPool } from "@armada-bridge/bridge/src/concord/identityPool";
 import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyIntake";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
@@ -36,6 +42,7 @@ import { BridgeRouter } from "@armada-bridge/bridge/src/router";
 import type { ChannelLink, DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { generateSecretKey } from "nostr-tools/pure";
+import type { NostrEvent } from "nostr-tools/pure";
 import type postgres from "postgres";
 
 import { replayDiscordSince } from "./catchup";
@@ -43,6 +50,7 @@ import { botChannelMessagesAfter, restToInbound } from "./discordRest";
 import type { PortalEnv } from "./env";
 import { filterPublicRelays } from "./relayGuard";
 import { seal, unseal } from "./seal";
+import { detectSeverance, severanceDetail, type SeveranceVerdict } from "./severance";
 
 export interface BridgeRow {
   bridge_id: string;
@@ -62,6 +70,8 @@ export interface BridgeRow {
   options: Record<string, unknown> | null;
   announced_at: string | null;
   perm_alerted_at: string | null;
+  /** Postgres hands timestampz back as a Date; accepted as either. */
+  created_at: Date | string;
 }
 
 interface Running {
@@ -77,6 +87,8 @@ interface Running {
   status: "pending_confirm" | "active";
   unsubChat: () => void;
   unsubControl: () => void;
+  /** The dissolved-plane + base-rekey standing REQ (severance watchers). */
+  unsubSeverance: () => void;
 }
 
 export const CONFIRM_RE = /^\/bridge confirm ([0-9a-f]{8})$/i;
@@ -118,6 +130,21 @@ class GatewayUnavailableError extends Error {
   }
 }
 
+/**
+ * Raised when severance detection cuts a bridge off DURING its own start (the
+ * boot probe found the ban / Refounding / tombstone). Its own error type for
+ * the mirror-image reason as GatewayUnavailableError: this one is about the
+ * COMMUNITY and must never be retried or counted as a start failure — the
+ * detection path has already written 'severed' with the real reason, and a
+ * seven-day failure streak would overwrite that detail and fight the record.
+ */
+class SeveredError extends Error {
+  constructor(readonly verdict: SeveranceVerdict) {
+    super(severanceDetail(verdict));
+    this.name = "SeveredError";
+  }
+}
+
 /** How many bridges may be starting at once during boot; see startAll(). */
 const START_CONCURRENCY = 12;
 
@@ -127,6 +154,15 @@ const START_CONCURRENCY = 12;
  * to a burst the channel can absorb.
  */
 const DISCORD_CATCHUP_MAX = 500;
+
+/**
+ * How many severance-plane wraps one live bridge accumulates before the oldest
+ * are evicted. A Refounding is a handful of chunks and a dissolution is one
+ * event, so this is many multiples of any honest need; under a flood the
+ * eviction drops chunks, and a rotation missing a chunk reads as no verdict —
+ * a missed severance heals at the next boot probe, a false one would not.
+ */
+const SEVERANCE_WRAP_CAP = 256;
 
 /** The kind 10304 command manifest every bridge primary advertises. */
 export const BRIDGE_COMMANDS = [
@@ -586,6 +622,13 @@ export class BridgeManager {
         await pool.close();
         throw new Error("Concord channel must be public");
       }
+      // Severance, checked BEFORE anything is announced or attached: a banned,
+      // refounded or dissolved community must never earn one more mirrored
+      // message or one more welcome. One bounded query across the severance
+      // planes plus the fold we already hold decides it (see ./severance.ts for
+      // the three cases); a throw below lands in startTracked as a SeveredError
+      // and is not retried.
+      await this.detectSeveranceAtBoot(row, community, pool, rawClient.folded, primary);
       // Refresh display names each start: renames heal on the next boot, and
       // rows from before the name columns existed backfill themselves. The two
       // lookups hit different Discord endpoints and neither reads the other, so
@@ -649,9 +692,10 @@ export class BridgeManager {
         status: row.status === "active" ? "active" : "pending_confirm",
         unsubChat: () => {},
         unsubControl: () => {},
+        unsubSeverance: () => {},
       };
 
-      cleanup.push(() => { rb.unsubChat(); rb.unsubControl(); });
+      cleanup.push(() => { rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance(); });
       rb.unsubChat = client.subscribeChannel(
         channel,
         (chat) => {
@@ -666,10 +710,48 @@ export class BridgeManager {
       );
       // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
       // ones goes silent while publishes (fresh channel lookup) keep working.
-      // Re-subscribe whenever the fold changes the channel's stream set.
-      rb.unsubControl = client.subscribeControl(() => {
+      // Re-subscribe whenever the fold changes the channel's stream set. The
+      // same fold carries the Banlist — severance case 1 — so that check rides
+      // along here instead of waiting for sends to fail one at a time.
+      const joinedAtMs =
+        row.created_at instanceof Date ? row.created_at.getTime() : Date.parse(String(row.created_at));
+      const severanceWraps = new Map<string, NostrEvent>();
+      const checkSeverance = (folded: FoldedControl | undefined) => {
+        const verdict = detectSeverance({
+          wraps: [...severanceWraps.values()],
+          community,
+          me: primary.pk,
+          folded,
+          joinedAtMs,
+        });
+        if (!verdict) return;
+        void this.applySeverance(rb.id, verdict, community).catch((error) =>
+          console.error(`bridge ${rb.id}: severance handling failed`, error),
+        );
+      };
+      rb.unsubControl = client.subscribeControl((folded) => {
         this.refreshChatSubscription(rb, row.confirm_code ?? "");
+        checkSeverance(folded);
       });
+      // Severance cases 2-3 arrive on their own planes: the dissolved tombstone
+      // and the base-rekey window (see severanceStreamKeys). Wraps accumulate
+      // because a Refounding publishes as several chunks and only a COMPLETE
+      // rotation says anything — and eviction is safe in the only direction
+      // that matters: a rotation missing a chunk reads as NO verdict (never a
+      // false sever), so a flood's failure mode is missing one until the next
+      // boot's probe, not inventing one.
+      rb.unsubSeverance = pool.subscribe(
+        [{ kinds: [KIND_WRAP], authors: severanceStreamKeys(community).map((k) => k.pk) }],
+        {
+          onEvent: (wrap) => {
+            severanceWraps.set(wrap.id, wrap);
+            while (severanceWraps.size > SEVERANCE_WRAP_CAP) {
+              severanceWraps.delete(severanceWraps.keys().next().value as string);
+            }
+            checkSeverance(rb.client.folded);
+          },
+        },
+      );
 
       if (rb.status === "active") {
         const liveFromMs = Date.now();
@@ -804,7 +886,10 @@ export class BridgeManager {
   /** Tear down and rebuild the chat REQ when the channel's stream set changes. */
   private refreshChatSubscription(rb: Running, confirmCode: string): void {
     const fresh = rb.client.channel(rb.link.concordChannelIdHex);
-    if (!fresh) return; // channel left the fold; severance detection is separate work
+    // A channel vanishing from the fold is its own (local) condition — deleted,
+    // or privatized past our keys — not community severance; the community
+    // going away is the watchers in detectSeveranceAtBoot/checkSeverance.
+    if (!fresh) return;
     const keys = (c: ChannelV2) => c.streams.map((s) => s.group.pk).join(",");
     if (keys(fresh) === keys(rb.channel)) return;
     rb.unsubChat();
@@ -963,6 +1048,7 @@ export class BridgeManager {
     rb.router = undefined;
     try { rb.unsubChat(); } catch {}
     try { rb.unsubControl(); } catch {}
+    try { rb.unsubSeverance(); } catch {}
     await rb.pool.close().catch(() => {});
   }
 
@@ -1053,6 +1139,14 @@ export class BridgeManager {
         this.scheduleStartRetry(row.bridge_id, attempt);
         return;
       }
+      if (error instanceof SeveredError) {
+        // The community cut this bridge off during its own start. Detection
+        // already tore it down and wrote 'severed' with the real reason; the
+        // start-failure path would overwrite that detail with the throw text
+        // and arm a seven-day retry streak against a banned, refounded or
+        // dissolved community. Severed rows wait for an operator (resume).
+        return;
+      }
       // The bookkeeping is best-effort; the retry is not. This runs from a
       // bare timer and from startAll's workers, so a throw here was an
       // unhandled rejection that killed the process — 2026-09-24, a postgres
@@ -1065,10 +1159,16 @@ export class BridgeManager {
       return;
     }
     // Started and running: failing to clear the streak marker must not be
-    // mistaken for a failed start. The next successful boot clears it.
+    // mistaken for a failed start. The next successful boot clears it. Both
+    // clears are gated on the bridge still being up: a severance that landed
+    // between start() and here must keep its record, not have the reason
+    // wiped by the very boot it cut off.
     if (!this.running.has(row.bridge_id)) return;
     await this.clearStartFailure(row).catch((error) =>
       console.warn(`bridge ${row.bridge_id}: could not clear start-failure marker:`, error),
+    );
+    await this.clearSeveredReason(row).catch((error) =>
+      console.warn(`bridge ${row.bridge_id}: could not clear severed_reason:`, error),
     );
   }
 
@@ -1147,6 +1247,94 @@ export class BridgeManager {
       UPDATE bridges SET status = 'severed', status_detail = ${detail},
         options = options - 'startFailedAt', updated_at = now()
       WHERE bridge_id = ${bridgeId}`;
+  }
+
+  /**
+   * The severance ACTION (./severance.ts decides THAT it fired; this decides
+   * what the bridge does about it). Three things, the same three the operator
+   * pause/unlink path does: stop forwarding (tear the running instance down
+   * exactly as stop() does), surface it (bridges.status 'severed' +
+   * status_detail via markSevered — the dashboard's resume button already
+   * speaks 'severed'), and durably record WHY (schema.sql's
+   * communities.severed_reason — the 'banned' | 'refounded' | 'dissolved'
+   * column nothing wrote until now). A second verdict for an already-torn-down
+   * bridge only refreshes that record.
+   */
+  private async applySeverance(
+    bridgeId: string,
+    verdict: SeveranceVerdict,
+    community: { idHex: string; relays?: string[]; name?: string },
+  ): Promise<void> {
+    const rb = this.running.get(bridgeId);
+    if (rb) {
+      // Same teardown as stop(): release invalidates the local handle before
+      // its DB round trip, then subscriptions and pool close. A teardown
+      // failure must not prevent the durable record below.
+      await rb.lease.release().catch((error) => console.warn(`bridge ${bridgeId}: lease release failed`, error));
+      await this.closeRunning(rb);
+    }
+    await this.markSevered(bridgeId, severanceDetail(verdict));
+    // Best-effort, like every secondary bookkeeping write here: the bridges
+    // row is the dashboard's surface and already stands; this row is the
+    // durable per-community reason, worth recording but not worth failing the
+    // action for.
+    await this.sql`
+      INSERT INTO communities (tenant_id, community_id, relays, name, severed_reason)
+      VALUES ('default', ${community.idHex}, ${community.relays ?? []}, ${community.name ?? null}, ${verdict.reason})
+      ON CONFLICT (tenant_id, community_id)
+      DO UPDATE SET severed_reason = EXCLUDED.severed_reason`.catch((error) =>
+      console.warn(`bridge ${bridgeId}: could not record severed_reason:`, error),
+    );
+  }
+
+  /**
+   * Boot-time severance: one bounded query across the severance planes (the
+   * dissolved tombstone and the base-rekey window travel as the same kind
+   * 1059, routed by stream address) plus the control fold this start already
+   * holds. A failed read is NOT severance — relays give no tombstones (see
+   * START_FAILURE_SEVER_AFTER_MS on exactly this indistinguishability) — so a
+   * probe that could not run leaves the bridge up for the standing watchers to
+   * catch: the failure mode is a late sever, never a false one.
+   */
+  private async detectSeveranceAtBoot(
+    row: BridgeRow,
+    community: CommunityV2,
+    pool: RelayPool,
+    folded: FoldedControl | undefined,
+    primary: ReturnType<typeof localIdentity>,
+  ): Promise<void> {
+    const wraps = await pool
+      .query([
+        { kinds: [KIND_WRAP], authors: severanceStreamKeys(community).map((k) => k.pk), limit: SEVERANCE_WRAP_CAP },
+      ])
+      .catch((error: unknown) => {
+        console.warn(`bridge ${row.bridge_id}: severance probe failed:`, error);
+        return [] as NostrEvent[];
+      });
+    const verdict = detectSeverance({
+      wraps,
+      community,
+      me: primary.pk,
+      folded,
+      joinedAtMs: row.created_at instanceof Date ? row.created_at.getTime() : Date.parse(String(row.created_at)),
+    });
+    if (!verdict) return;
+    await this.applySeverance(row.bridge_id, verdict, community);
+    throw new SeveredError(verdict);
+  }
+
+  /**
+   * A bridge that started clean is not cut off. Separate from
+   * clearStartFailure: the streak marker is transient bookkeeping, this is the
+   * severance record — cleared only so a resumed bridge's row stops
+   * advertising why it was severed the moment it is back.
+   */
+  private async clearSeveredReason(row: BridgeRow): Promise<void> {
+    if (!row.community_id) return;
+    await this.sql`
+      UPDATE communities SET severed_reason = NULL
+      WHERE tenant_id = 'default' AND community_id = ${row.community_id}
+        AND severed_reason IS NOT NULL`;
   }
 
   /** How many bridges are running in this process. */
