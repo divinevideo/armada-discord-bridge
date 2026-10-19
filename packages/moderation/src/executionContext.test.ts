@@ -28,7 +28,7 @@ test("an unban extended by an owner edition verifies the durable outbox and lift
   await migrateModeration(sql);
   const f = await moderationFixture(), store = new PolicyStore(sql), orgId = crypto.randomUUID(), caseId = crypto.randomUUID();
   const actor = { orgId, actorId: "synthetic-reviewer", permissions: ["unban_member", "view"] };
-  const decisions = new Decisions(sql, new EvidenceCipher(randomBytes(32), 3600, 100_000), new Map([[f.community.idHex, orgId]]));
+  const decisions = new Decisions(sql, new EvidenceCipher(randomBytes(32), 3600, 100_000), new Map([[f.community.idHex, orgId]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
   try {
     const original = parseEdition(openWrap(f.policy.controlEvents.at(-1)!, f.controlStream.key));
     f.policy.controlEvents.push(await sealEdition(buildBanlistEdition(f.community.id, [f.member.pk, f.bannedMember.pk], { actorPubkey: f.owner.pk, version: original.version + 1n, prevHash: original.selfHash }), currentControlWriteGroup(f.community), f.owner.signer));

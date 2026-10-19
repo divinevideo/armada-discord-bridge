@@ -23,7 +23,7 @@ beforeAll(async () => {
   await migrateModeration(sql);
   await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
     VALUES (${caseId}, ${org}, ${"a".repeat(64)}, ${"b".repeat(64)}, ${"c".repeat(64)}, ${"d".repeat(64)}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
-  decisions = new Decisions(sql, cipher, new Map([["a".repeat(64), org]]));
+  decisions = new Decisions(sql, cipher, new Map([["a".repeat(64), org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
 });
 afterAll(async () => { await sql`DELETE FROM moderation.decisions WHERE org_id = ${org}`; await sql`DELETE FROM moderation.cases WHERE org_id = ${org}`; await sql.end(); });
 test("acceptance atomically queues three independent deliveries and immutable replay", async () => {
@@ -170,7 +170,7 @@ test("the actual API role accepts decisions while retaining case locks and colum
       has_column_privilege(current_user, 'moderation.cases', 'evidence', 'UPDATE') AS can_edit_evidence,
       has_column_privilege(current_user, 'moderation.cases', 'expires_at', 'UPDATE') AS can_edit_expiry`;
     expect(identity).toEqual({ role: "moderation_api", can_lock: true, can_edit_evidence: false, can_edit_expiry: false });
-    const apiDecisions = new Decisions(api, cipher, new Map([["a".repeat(64), org]]));
+    const apiDecisions = new Decisions(api, cipher, new Map([["a".repeat(64), org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
     const request = { ...input, executionId: crypto.randomUUID() };
     const accepted = await apiDecisions.acceptDecision(request, actor);
     expect(accepted.deliveries.map((delivery) => delivery.state)).toEqual(["pending", "pending", "pending"]);
@@ -252,7 +252,7 @@ const concordRow = async (decisionId: string) => (await sql`SELECT state, result
 async function memberHarness(subject: "member" | "bannedMember") {
   const f = await moderationFixture(), who = f[subject], store = new PolicyStore(sql), orgId = crypto.randomUUID(), subjectCase = crypto.randomUUID();
   const staff = { orgId, actorId: "synthetic-reviewer", permissions: ["ban_member", "unban_member", "view", "retry"] };
-  const outbox = new Decisions(sql, cipher, new Map([[f.community.idHex, orgId]]));
+  const outbox = new Decisions(sql, cipher, new Map([[f.community.idHex, orgId]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
   const published: NostrEvent[] = [];
   const refresh = async () => { const p = (await store.getPolicy(f.community.idHex))!; return { ...p, controlEvents: [...p.controlEvents, ...published] }; };
   const actions = new ConcordActions(f.community, f.moderator, refresh);
@@ -670,8 +670,8 @@ for (const [olderAction, newerAction] of [["ban_member", "unban_member"], ["unba
   const selected = latch(), finishSelection = latch(), secondReady = latch(), startSecond = latch();
   const applicationName = `member-claim-race-${crypto.randomUUID()}`;
   const secondSql = postgres(process.env.DATABASE_URL!, { max: 1, connection: { application_name: applicationName }, onnotice: () => {} });
-  const firstOutbox = new Decisions(claimBarrier(sql, undefined, async () => { selected.resolve(); await finishSelection.promise; }), cipher, new Map([["a".repeat(64), org]]));
-  const secondOutbox = new Decisions(claimBarrier(secondSql, async () => { secondReady.resolve(); await startSecond.promise; }), cipher, new Map([["a".repeat(64), org]]));
+  const firstOutbox = new Decisions(claimBarrier(sql, undefined, async () => { selected.resolve(); await finishSelection.promise; }), cipher, new Map([["a".repeat(64), org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+  const secondOutbox = new Decisions(claimBarrier(secondSql, async () => { secondReady.resolve(); await startSecond.promise; }), cipher, new Map([["a".repeat(64), org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
   const firstClaim = firstOutbox.claim();
   let secondClaim: ReturnType<Decisions["claim"]> | undefined;
   try {
@@ -725,4 +725,92 @@ for (const [olderAction, newerAction] of [["ban_member", "unban_member"], ["unba
     await sql`DELETE FROM moderation.decisions WHERE case_id = ${subject.caseId}`;
     await secondSql.end();
   }
+});
+
+test("publication refresh schedules a lone expired receipt under the restricted API without replay", async () => {
+  const h = await memberHarness("member");
+  const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice: () => {} });
+  try {
+    const first = await h.accept("ban_member");
+    const lost: NostrEvent[] = [];
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { lost.push(event); throw new Error("synthetic lost ack"); } });
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
+    await h.outbox.expire();
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const api = new Decisions(apiSql, cipher, new Map([[h.f.community.idHex, h.staff.orgId]]));
+    const lease = crypto.randomUUID();
+    await sql`UPDATE moderation.deliveries SET token = ${lease}, lease_until = clock_timestamp() + interval '1 minute' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const [leased] = await sql`SELECT * FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await api.refreshPublicationProof(first.decisionId, h.staff);
+    expect((await sql`SELECT * FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`)[0]).toEqual(leased);
+    await expect(Promise.resolve(apiSql`UPDATE moderation.deliveries SET result_code = 'concord_publication_settled' WHERE FALSE`)).rejects.toThrow(/permission denied/);
+    await sql`UPDATE moderation.deliveries SET token = NULL, lease_until = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const before = await concordRow(first.decisionId);
+    const refreshed = await api.refreshPublicationProof(first.decisionId, h.staff);
+    expect(refreshed.deliveries.find(d => d.target === "concord")?.state).toBe("failed");
+    expect(await concordRow(first.decisionId)).toEqual(before);
+    const missing = await h.outbox.claim(); expect(missing).toBeDefined();
+    expect(missing).toMatchObject({ reconcileOnly: true, signedEvents: null, publicationAttempted: true });
+    expect(await h.deliver(missing!, { ...h.relay, queryStrict: async () => lost, publish: async () => { throw new Error("No proof-refresh resend"); } })).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+    h.published.push(...lost);
+    await api.refreshPublicationProof(first.decisionId, h.staff);
+    const operatorSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice: () => {} });
+    let effects = 0;
+    const forbidden = async (): Promise<never> => { effects++; throw new Error("No expired action execution"); };
+    try {
+      const operator = new Decisions(operatorSql, undefined, new Map([[h.f.community.idHex, h.staff.orgId]]));
+      const worker = new ModerationWorker(operatorSql, operator, async (claim, assertCurrent) => {
+        expect(claim).toMatchObject({ reconcileOnly: true, publicationProofOnly: true, signedEvents: null });
+        return { reconcileOnly: claim.reconcileOnly, authorize: forbidden, assertCurrent,
+          executeConcord: () => deliverConcord(claim, h.actions, operator, { ...h.relay, publish: forbidden }, assertCurrent),
+          setRelayBan: forbidden, removeFromRelay: forbidden, discord: { execute: forbidden } };
+      });
+      expect(await worker.tick()).toBe(true);
+      expect(await concordRow(first.decisionId)).toMatchObject({ state: "not_applicable", result_code: "concord_publication_settled" });
+      expect(effects).toBe(0);
+    } finally { await operatorSql.end(); }
+    expect((await sql`SELECT decision_id FROM moderation.decisions WHERE org_id = ${h.staff.orgId}`).length).toBe(1);
+    expect((await concordRow(first.decisionId)).attempts).toBe(before.attempts);
+    await expect(api.retry(first.decisionId, h.staff)).rejects.toThrow();
+  } finally { await apiSql.end(); await h.cleanup(); }
+});
+
+test("missing lifecycle policy refuses new allocation but preserves exact accepted replay", async () => {
+  const subject = await memberCase(), request = { ...input, caseId: subject.caseId, executionId: crypto.randomUUID() };
+  const missing = new Decisions(sql, cipher, new Map([["a".repeat(64), org]]));
+  await expect(missing.acceptDecision(request, actor)).rejects.toThrow(/configuration required/);
+  expect((await sql`SELECT decision_id FROM moderation.decisions WHERE execution_id = ${request.executionId}`).length).toBe(0);
+  const accepted = await decisions.acceptDecision(request, actor);
+  expect((await missing.acceptDecision(request, actor)).decisionId).toBe(accepted.decisionId);
+  await settle(accepted.decisionId);
+});
+
+test("signed bytes expire in terminal states while independent actor/reason and receipt facts survive", async () => {
+  const subject = await memberCase(), request = { ...input, caseId: subject.caseId, executionId: crypto.randomUUID() };
+  const accepted = await decisions.acceptDecision(request, actor), eventId = "f".repeat(64), token = crypto.randomUUID();
+  await sql`UPDATE moderation.deliveries SET state = 'verified', signed_events = ${sql.json([{ id: eventId }])}, publication_attempted = true, publication_event_ids = ARRAY[${eventId}] WHERE decision_id = ${accepted.decisionId}`;
+  await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'synthetic_failure', token = ${token}, lease_until = clock_timestamp() + interval '1 minute' WHERE decision_id = ${accepted.decisionId} AND target = 'concord'`;
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${accepted.decisionId}`; });
+  await decisions.expire();
+  const rows = await sql`SELECT target, state, signed_events, publication_event_ids, publication_attempted, result_code, token FROM moderation.deliveries WHERE decision_id = ${accepted.decisionId}`;
+  expect(rows.every(row => row.signed_events === null)).toBe(true);
+  expect(rows.every(row => row.publication_attempted && row.publication_event_ids[0] === eventId)).toBe(true);
+  expect(rows.find(row => row.target === 'concord')).toMatchObject({ state: 'failed', result_code: 'synthetic_failure', token });
+  const [row] = await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${accepted.decisionId}`;
+  expect(cipher.open(`${org}:${accepted.decisionId}`, row.audit)).toEqual({ actorId: actor.actorId, reason: request.reason });
+});
+
+test("erasing a legacy failed publication without receipt IDs keeps its successor fenced", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async () => { throw new Error("synthetic uncertain legacy send"); } });
+    await sql`UPDATE moderation.deliveries SET state = 'failed', publication_event_ids = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
+    await h.outbox.expire();
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: 'failed', signed_events: null, result_code: 'concord_recovery_requires_operator' });
+    const successor = await h.accept("unban_member");
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(successor.decisionId)).toMatchObject({ state: 'pending', attempts: 0, result_code: 'concord_waiting_on_prior_publication' });
+  } finally { await h.cleanup(); }
 });

@@ -9,7 +9,7 @@ const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
 const org = crypto.randomUUID(), community = "8".repeat(64), author = "9".repeat(64);
 const actor = { orgId: org, actorId: "synthetic-ordering-staff", permissions: ["view", "ban_member", "unban_member", "remove_message", "retry"] };
 const cipher = new EvidenceCipher(randomBytes(32), 3600, 100_000);
-const decisions = new Decisions(sql, cipher, new Map([[community, org]]));
+const decisions = new Decisions(sql, cipher, new Map([[community, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
 const secret = randomBytes(32);
 const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([org, "other-org"]), reports: { async submitReport() { throw Error("unused"); } }, decisions });
 let caseId: string;
@@ -78,7 +78,7 @@ test("head survives decision pruning and restart; max bigint is exact and target
  const target = await evidence("2".repeat(64)), high = request("9223372036854775807", "ban_member", target);
  const accepted = await decisions.acceptDecision(high, actor);
  await sql`DELETE FROM moderation.decisions WHERE decision_id = ${accepted.decisionId}`;
- const restarted = new Decisions(sql, cipher, new Map([[community, org]]));
+ const restarted = new Decisions(sql, cipher, new Map([[community, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
  await expect(restarted.acceptDecision(request("9223372036854775806", "unban_member", target), actor)).rejects.toMatchObject({ code: "member_intent_superseded" });
  expect((await restarted.acceptDecision(request("1", "ban_member", await evidence("3".repeat(64))), actor)).sourceOrder).toEqual({ version: 1, revision: "1" });
  const [head] = await sql`SELECT latest_revision::text AS revision FROM moderation.member_order_heads WHERE org_id = ${org} AND community_id = ${community} AND author = ${"2".repeat(64)}`;
@@ -87,7 +87,7 @@ test("head survives decision pruning and restart; max bigint is exact and target
 test("actual API role advances fenced heads atomically without granting counter deletion", async () => {
  const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
  try {
- const restricted = new Decisions(apiSql, cipher, new Map([[community, org]])), target = await evidence("4".repeat(64));
+ const restricted = new Decisions(apiSql, cipher, new Map([[community, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 }), target = await evidence("4".repeat(64));
  const inputs = [request("1", "ban_member", target), request("2", "unban_member", target)];
  const outcomes = await Promise.allSettled(inputs.map(i => restricted.acceptDecision(i, actor)));
  expect(outcomes[1].status).toBe("fulfilled");

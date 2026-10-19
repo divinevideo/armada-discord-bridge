@@ -195,3 +195,6 @@ GRANT UPDATE (audit_delete_after) ON moderation.lifecycle_events TO moderation_o
 
 REVOKE ALL ON FUNCTION moderation.resolve_lifecycle_case(text, uuid, uuid, uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION moderation.resolve_lifecycle_case(text, uuid, uuid, uuid) TO moderation_api, moderation_operator;
+
+-- Hold deadlines retain the explicit policy even when launch configuration changes.
+ALTER TABLE moderation.evidence_holds ADD COLUMN IF NOT EXISTS audit_retention_seconds bigint CHECK (audit_retention_seconds > 0), ADD COLUMN IF NOT EXISTS case_expires_at timestamptz;

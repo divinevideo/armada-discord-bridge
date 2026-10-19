@@ -8,6 +8,7 @@ import { discordPublicChannelPolicy, type PublicChannelRules } from "../../bridg
 import { CarrierIndex } from "./carrierIndex";
 import { ConcordActions } from "./concordActions";
 import type { Decisions } from "./decisions";
+import type { Lifecycle } from "./lifecycle";
 import { BridgeMappingResolver, DiscordActions, discordRequest } from "./discordActions";
 import { createExecutionContext } from "./executionContext";
 import { LocalRelayDriver } from "./localRelayDriver";
@@ -19,8 +20,14 @@ import { ModerationWorker } from "./worker";
 export function validateWorkerCommunity(community: CommunityV2, moderatorPk: string, communities: ReadonlyMap<string, string>): void {
   if (!communities.has(community.idHex) || communities.size !== 1 || community.owner === moderatorPk || community.privateChannels.length) throw new Error("Worker requires one approved public community and a non-owner member identity");
 }
+/** Audit cleanup uses the worker's operator connection; the API only sweeps evidence. */
+export async function expireModerationRecords(decisions: Pick<Decisions, "expire">, lifecycle: Pick<Lifecycle, "expireEvidence" | "expireAudit">): Promise<void> {
+  await decisions.expire();
+  await lifecycle.expireEvidence();
+  await lifecycle.expireAudit();
+}
 export interface WorkerHealth { ready: boolean; code: "starting" | "ready" | "policy_unavailable" | "rekey_recovery_required" | "delivery_unavailable" | "stopped"; checkedAt: number }
-export async function runModerationWorker(options: { sql: postgres.Sql; decisions: Decisions; community: CommunityV2; identity: LocalIdentity; communities: ReadonlyMap<string, string>; relayUrl: string; bridgeTenantId: string; puppetMaster: string; discordToken: string; publicChannels: PublicChannelRules; publicAuthors: string[]; signal: AbortSignal; health: WorkerHealth }): Promise<void> {
+export async function runModerationWorker(options: { sql: postgres.Sql; decisions: Decisions; lifecycle: Pick<Lifecycle, "expireEvidence" | "expireAudit">; community: CommunityV2; identity: LocalIdentity; communities: ReadonlyMap<string, string>; relayUrl: string; bridgeTenantId: string; puppetMaster: string; discordToken: string; publicChannels: PublicChannelRules; publicAuthors: string[]; signal: AbortSignal; health: WorkerHealth }): Promise<void> {
   validateWorkerCommunity(options.community, options.identity.pk, options.communities);
   const { sql, community, identity, health } = options;
   const store = new PolicyStore(sql), driver = new LocalRelayDriver(options.relayUrl);
@@ -71,7 +78,7 @@ export async function runModerationWorker(options: { sql: postgres.Sql; decision
             if (result.state !== "verified") { health.ready = false; health.code = "delivery_unavailable"; }
           }
           await worker.tick();
-          await options.decisions.expire();
+          await expireModerationRecords(options.decisions, options.lifecycle);
         } catch { health.ready = false; health.code = "policy_unavailable"; await watcher!.disconnected(); }
         await delay(1000, undefined, { signal: options.signal }).catch(() => {});
       }

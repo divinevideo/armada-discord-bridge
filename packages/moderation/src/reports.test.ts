@@ -76,3 +76,21 @@ test("API database identity can deliver cases but cannot edit relay authority or
   await expect(sql.begin(async (tx) => { await tx.unsafe('SET LOCAL ROLE moderation_api'); await tx`DELETE FROM moderation.member_bans WHERE FALSE`; })).rejects.toThrow(/permission denied/);
   await expect(sql.begin(async (tx) => { await tx.unsafe('SET LOCAL ROLE moderation_api'); await tx`DELETE FROM moderation.community_policy WHERE FALSE`; })).rejects.toThrow(/permission denied/);
 });
+
+import { Lifecycle } from "./lifecycle";
+test("capacity insertion skips held expiry and never returns an expired held report as fresh evidence", async () => {
+  const lifecycle = new Lifecycle(sql, cipher, new Map([[f.policy.communityId, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+  const reporter = { pubkey: randomBytes(32).toString("hex"), authEventId: randomBytes(32).toString("hex") };
+  const first = await reports.submitReport({ target, reason: "synthetic capacity case" }, reporter);
+  const held = await lifecycle.placeEvidenceHold({ caseId: first.caseId, reason: "capacity hold", holdUntil: new Date(Date.now() + 60000).toISOString() }, { orgId: org, actorId: "synthetic-admin", permissions: ["manage_moderation_records"] });
+  try {
+    await sql`UPDATE moderation.cases SET expires_at = clock_timestamp() - interval '1 second' WHERE case_id = ${first.caseId}`;
+    await expect(reports.submitReport({ target, reason: "repeat after expiry" }, { ...reporter, authEventId: randomBytes(32).toString("hex") })).rejects.toThrow(/held|expired/i);
+    expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${first.caseId}`).length).toBe(1);
+    const another = await reports.submitReport({ target, reason: "another synthetic reporter" }, { pubkey: randomBytes(32).toString("hex"), authEventId: randomBytes(32).toString("hex") });
+    expect(another.caseId).not.toBe(first.caseId);
+  } finally {
+    await lifecycle.releaseEvidenceHold({ holdId: held.holdId, reason: "capacity test release" }, { orgId: org, actorId: "synthetic-admin", permissions: ["manage_moderation_records"] });
+    await sql`DELETE FROM moderation.report_auth WHERE reporter = ${reporter.pubkey}`;
+  }
+});

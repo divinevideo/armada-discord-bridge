@@ -92,3 +92,15 @@ test("a Retry refused because a newer member decision superseded it returns its 
   expect(other.status).toBe(400);
   expect(await other.json()).toEqual({ error: "decision_not_accepted" });
 });
+
+test("publication refresh only schedules authenticated readback and returns current status", async () => {
+  let calls = 0;
+  const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([actor.orgId]), reports: { async submitReport() { throw new Error(); } }, decisions: { async acceptDecision() { throw new Error(); }, async get() { return status; }, async retry() { throw new Error("Do not reopen Retry"); }, async refreshPublicationProof(id, staff) { calls++; expect(id).toBe(status.decisionId); expect(staff).toEqual(actor); return status; } } });
+  const path = `/v1/decisions/${status.decisionId}/publication-refresh`, body = "{}";
+  expect((await api(new Request("https://rooms.example" + path, { method: "POST", body }))).status).toBe(403);
+  const response = await api(new Request("https://rooms.example" + path, { method: "POST", body, headers: signCoopRequest(secret, actor, "POST", path, body) }));
+  expect(response.status).toBe(202); expect(response.headers.get("cache-control")).toBe("no-store"); expect(await response.json()).toEqual(status); expect(calls).toBe(1);
+  const injected = JSON.stringify({ target: "browser supplied" });
+  expect((await api(new Request("https://rooms.example" + path, { method: "POST", body: injected, headers: signCoopRequest(secret, actor, "POST", path, injected) }))).status).toBe(400);
+  expect(calls).toBe(1);
+});

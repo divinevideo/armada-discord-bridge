@@ -13,8 +13,8 @@ const org = crypto.randomUUID(), community = "6".repeat(64);
 const staff = { orgId: org, actorId: "synthetic-guild-reviewer", permissions: ["view", "ban_member", "unban_member", "retry", "discord_guild_ban"] };
 const moderator = { ...staff, permissions: staff.permissions.filter(p => p !== "discord_guild_ban") };
 const cipher = new EvidenceCipher(randomBytes(32), 3600, 100_000);
-const outbox = new Decisions(sql, cipher, new Map([[community, org]]));
-const api = new Decisions(apiSql, cipher, new Map([[community, org]]));
+const outbox = new Decisions(sql, cipher, new Map([[community, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+const api = new Decisions(apiSql, cipher, new Map([[community, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
 beforeAll(() => migrateModeration(sql));
 afterAll(async () => {
   await sql`DELETE FROM moderation.decisions WHERE org_id = ${org}`;
@@ -166,7 +166,7 @@ test("populated upgrade fences unknown historical scope and refuses old Guild wr
   const url = new URL(process.env.DATABASE_URL!); url.pathname = "/" + dbName;
   const upgrade = postgres(url.toString(), { onnotice() {} });
   const restricted = postgres(url.toString(), { connection: { options: "-c role=moderation_api" }, onnotice() {} });
-  const historical = new Decisions(upgrade, cipher, new Map([[community, org]]));
+  const historical = new Decisions(upgrade, cipher, new Map([[community, org]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
   const fixture = async (seed: string, revision: number, guild: boolean, head = false) => {
     const id = crypto.randomUUID(), execution = crypto.randomUUID(), author = seed.repeat(64);
     if (head) await upgrade`INSERT INTO moderation.member_order_heads (org_id, community_id, author, latest_revision, latest_execution_id) VALUES (${org}, ${community}, ${author}, ${revision}, ${execution})`;

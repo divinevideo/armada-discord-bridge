@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import type postgres from "postgres";
 import type { DeliveryState, DeliveryTarget, RoomTarget } from "./contracts";
 import { EvidenceCipher } from "./evidence";
+import { Lifecycle, lockLifecycleCase, lockLifecycleDecision } from "./lifecycle";
+import type { LifecyclePolicyConfig } from "./apiReadiness";
+import type { DiscordRestriction } from "./lifecycleContracts";
 export type RoomAction = "remove_message" | "ban_member" | "unban_member";
 export interface VerifiedCoopActor { orgId: string; actorId: string; permissions: string[] }
 export interface SourceOrder { version: 1; revision: string }
@@ -9,9 +12,9 @@ export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string;
 /** `supersededBy` names the newer ban or unban for the same member that took
  * over this decision's undelivered targets (each reads failed /
  * superseded_by_newer_decision); null when nothing was superseded. */
-export interface DecisionStatus { executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
+export interface DecisionStatus { auditAvailable?: boolean; discordRestriction?: DiscordRestriction; executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
-export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean }
+export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean; publicationProofOnly?: boolean }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
 export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required" | "guild_scope_order_requires_operator";
 export class DecisionRefusedError extends Error {
@@ -64,10 +67,10 @@ const unknownGuildOrder = (c: string) => `${c}.action IN ('ban_member', 'unban_m
 const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${alias}.created_at, ${alias}.decision_id`;
 const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.state = 'failed' AND ${d}.publication_attempted
   AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL) AND ${c}.action IN ('ban_member', 'unban_member')
-  AND EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
+  AND (${c}.expires_at <= clock_timestamp() OR ${c}.appeal_state = 'open' OR EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
     WHERE ${newerThan("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
       AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
-      AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp()))`;
+      AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp())))`;
 // Acceptance and Retry serialize per member, so a Retry cannot restart a
 // decision that a concurrently accepted newer one supersedes.
 function lockMember(tx: postgres.TransactionSql, communityId: string, author: string) {
@@ -82,7 +85,7 @@ function stored(row: any): StoredDecision {
   return { decisionId: row.decision_id, orgId: row.org_id, caseId: row.case_id, target: { communityId: row.community_id, channelId: row.channel_id, rumorId: row.rumor_id }, author: row.author, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, expiresAt: row.expires_at };
 }
 export class Decisions {
-  constructor(private readonly sql: postgres.Sql, private readonly cipher: EvidenceCipher | undefined, private readonly communities: ReadonlyMap<string, string>) {}
+  constructor(private readonly sql: postgres.Sql, private readonly cipher: EvidenceCipher | undefined, private readonly communities: ReadonlyMap<string, string>, policy: LifecyclePolicyConfig = {}, private readonly lifecycle = new Lifecycle(sql, cipher, communities, policy)) {}
   async acceptDecision(input: ModerationDecision, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     const cipher = this.cipher;
     if (!cipher) throw new Error("Decision acceptance disabled for this process");
@@ -99,8 +102,10 @@ export class Decisions {
       await tx`SELECT pg_advisory_xact_lock(hashtextextended(${actor.orgId + ":" + input.executionId}, 483213))`;
       const [prior] = await tx`SELECT decision_id, fingerprint, fingerprint_version FROM moderation.decisions WHERE org_id = ${actor.orgId} AND execution_id = ${input.executionId}`;
       if (prior) { if ((prior.fingerprint_version !== fingerprintVersion && !(input.action === "remove_message" && !order && prior.fingerprint_version === 2)) || prior.fingerprint !== fingerprint) throw new Error("Decision replay conflict"); return prior.decision_id as string; }
+      this.lifecycle.requirePolicy();
+      await lockLifecycleCase(tx, actor.orgId, input.caseId);
       if (membership(input.action) && !order) throw new DecisionRefusedError("member_intent_order_required", "Membership source order required", { executionId: input.executionId });
-      const [evidence] = await tx`SELECT * FROM moderation.cases WHERE case_id = ${input.caseId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp() FOR SHARE`;
+      const [evidence] = await tx`SELECT * FROM moderation.cases WHERE case_id = ${input.caseId} AND org_id = ${actor.orgId} AND expires_at > clock_timestamp() FOR UPDATE`;
       if (!evidence || this.communities.get(evidence.community_id) !== actor.orgId) throw new Error("Case unavailable");
       if (membership(input.action)) {
         await lockMember(tx, evidence.community_id, evidence.author);
@@ -129,9 +134,9 @@ export class Decisions {
     if (!uuid.test(decisionId)) throw new Error("Decision unavailable");
     const [row] = await this.sql`SELECT * FROM moderation.decisions WHERE decision_id = ${decisionId} AND org_id = ${actor.orgId}`;
     if (!row || this.communities.get(row.community_id) !== actor.orgId || (!actor.permissions.includes("view") && !actor.permissions.includes(row.action))) throw new Error("Decision unavailable");
-    const deliveries = await this.sql`SELECT target, state, attempts, result_code, superseded_by FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
+    const deliveries = await this.sql`SELECT target, state, attempts, result_code, superseded_by, discord_restriction_state, discord_restriction_checked_at, discord_restriction_code FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
     const supersededBy = deliveries.find((d) => d.superseded_by)?.superseded_by ?? null;
-    return { executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
+    return { auditAvailable: row.audit !== null, discordRestriction: (() => { const d = deliveries.find(d => d.target === "discord"); return { state: d?.discord_restriction_state ?? "unknown", checkedAt: d?.discord_restriction_checked_at?.toISOString() ?? null, code: d?.discord_restriction_code ?? "not_checked" }; })(), executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
   }
   async getByExecution(executionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor);
@@ -157,6 +162,8 @@ export class Decisions {
     const [scope] = await this.sql`SELECT discord_guild_confirmed, community_id, author FROM moderation.decisions WHERE decision_id = ${decisionId}`;
     const guildRetryAllowed = !scope?.discord_guild_confirmed || actor.permissions.includes("discord_guild_ban");
     const retried = await this.sql.begin(async (tx) => {
+      const { decision } = await lockLifecycleDecision(tx, actor.orgId, decisionId);
+      if (decision.lifecycle_closed_at) throw new Error("Lifecycle closed");
       if (membership(status.action)) {
         await lockMember(tx, scope.community_id, scope.author);
         // Restarting an older decision would undo the newer one for this member.
@@ -224,7 +231,7 @@ export class Decisions {
       // decision's same target is in flight. An older row that a newer decision
       // committed just after the sweep may still be claimed here; it is then the
       // one in flight, and the newer target applies on top once it completes.
-      const [job] = await tx`SELECT d.*, (${tx.unsafe(publicationRecovery("d", "c"))}) AS reconcile_only FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
+      const [job] = await tx`SELECT d.*, (${tx.unsafe(publicationRecovery("d", "c"))}) AS reconcile_only, NOT EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) AS proof_only FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
         WHERE ((d.state IN ('pending', 'acknowledged') AND d.attempts < 8 AND c.expires_at > clock_timestamp()) OR (${tx.unsafe(publicationRecovery("d", "c"))}))
           AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
           AND NOT EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
@@ -236,7 +243,7 @@ export class Decisions {
         result_code = CASE WHEN result_code = 'concord_waiting_on_prior_publication' THEN NULL ELSE result_code END
         WHERE decision_id = ${job.decision_id} AND target = ${job.target}`;
       const [row] = await tx`SELECT * FROM moderation.decisions WHERE decision_id = ${job.decision_id}`;
-      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationEventIds: job.publication_event_ids, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only) };
+      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationEventIds: job.publication_event_ids, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only), publicationProofOnly: Boolean(job.reconcile_only && job.proof_only) };
     });
   }
   async defer(claim: DeliveryClaim): Promise<void> {
@@ -296,15 +303,38 @@ export class Decisions {
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease lost");
   }
+  async refreshPublicationProof(decisionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
+    await this.get(decisionId, actor);
+    await this.sql.begin(async tx => {
+      const { decision } = await lockLifecycleDecision(tx, actor.orgId, decisionId);
+      if (this.communities.get(decision.community_id) !== actor.orgId) throw new Error("Decision unavailable");
+      // Wake the existing operator-owned readback path without changing state,
+      // consuming a send attempt, disturbing a lease or reopening Retry.
+      await tx`UPDATE moderation.deliveries d SET available_at = clock_timestamp() FROM moderation.decisions c
+        WHERE c.decision_id = d.decision_id AND d.decision_id = ${decisionId} AND (${tx.unsafe(publicationRecovery("d", "c"))})
+          AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())`;
+    });
+    return this.get(decisionId, actor);
+  }
   async expire(): Promise<void> {
-    await this.sql.begin(async (tx) => {
+    const rows = await this.sql`SELECT org_id, decision_id FROM moderation.decisions WHERE expires_at <= clock_timestamp() ORDER BY org_id, case_id, decision_id`;
+    for (const row of rows) await this.sql.begin(async (tx) => {
+      await lockLifecycleDecision(tx, row.org_id, row.decision_id);
       await tx`UPDATE moderation.deliveries SET state = 'failed',
         result_code = CASE WHEN target = 'concord' AND (signed_events IS NOT NULL OR publication_event_ids IS NOT NULL) AND publication_attempted
           AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE action IN ('ban_member', 'unban_member'))
           THEN 'concord_recovery_requires_operator' ELSE 'decision_expired' END,
         signed_events = NULL, token = NULL, lease_until = NULL
-        WHERE decision_id IN (SELECT decision_id FROM moderation.decisions WHERE expires_at <= clock_timestamp()) AND state IN ('pending', 'acknowledged')`;
-      // Action audit has an independent lifecycle; execution expiry only clears delivery material.
+        WHERE decision_id = ${row.decision_id} AND state IN ('pending', 'acknowledged')`;
+      // Terminal delivery state does not extend the byte lifetime. A legacy
+      // attempted generation without IDs still needs an explicit unknown marker
+      // after erasure, or its successor could incorrectly infer no publication.
+      await tx`UPDATE moderation.deliveries SET signed_events = NULL,
+        result_code = CASE WHEN target = 'concord' AND publication_attempted AND publication_event_ids IS NULL
+          AND state NOT IN ('verified', 'not_applicable')
+          AND decision_id IN (SELECT decision_id FROM moderation.decisions WHERE action IN ('ban_member', 'unban_member'))
+          THEN 'concord_recovery_requires_operator' ELSE result_code END
+        WHERE decision_id = ${row.decision_id} AND signed_events IS NOT NULL`;
     });
   }
 }

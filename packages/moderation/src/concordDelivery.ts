@@ -20,7 +20,7 @@ export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActio
     } catch { /* Missing/invalid proof or unavailable policy cannot release a successor. */ }
     await assertCurrent();
     // No publish, replacement, old-action authorization or relay/Discord effect.
-    return settled ? { state: "not_applicable", code: "concord_superseded_publication_settled" } : waiting;
+    return settled ? { state: "not_applicable", code: claim.publicationProofOnly ? "concord_publication_settled" : "concord_superseded_publication_settled" } : waiting;
   }
   let events = (claim.signedEvents ?? await decisions.saveEvents(claim, await actions.prepare(claim.decision))) as NostrEvent[];
   try { await actions.validatePrepared(claim.decision, events); } catch (error) {

@@ -11,6 +11,7 @@ import { createModerationApi } from "./api";
 import { EvidenceCipher, RelayEvidenceResolver } from "./evidence";
 import { Decisions } from "./decisions";
 import { Reports } from "./reports";
+import { Lifecycle } from "./lifecycle";
 import { migrateModeration } from "./policyStore";
 import { runModerationWorker, type WorkerHealth } from "./runtime";
 async function main() {
@@ -28,7 +29,9 @@ async function main() {
   const stop = new AbortController();
   process.once("SIGTERM", () => stop.abort()); process.once("SIGINT", () => stop.abort());
   if (mode === "worker") {
-    const decisions = new Decisions(sql, undefined, communities);
+    const policy = { auditRetentionSeconds: process.env.MODERATION_AUDIT_RETENTION_SECONDS === undefined ? undefined : Number(process.env.MODERATION_AUDIT_RETENTION_SECONDS), holdMaxSeconds: process.env.MODERATION_HOLD_MAX_SECONDS === undefined ? undefined : Number(process.env.MODERATION_HOLD_MAX_SECONDS) };
+    const lifecycle = new Lifecycle(sql, undefined, communities, policy);
+    const decisions = new Decisions(sql, undefined, communities, policy);
     const community = rehydrateCommunity(await Bun.file(required("MODERATION_COMMUNITY_ENTRY_FILE")).json());
     const key = required("MODERATION_MEMBER_KEY");
     if (!community || !/^[0-9a-f]{64}$/.test(key)) throw new Error("Invalid moderation member provisioning");
@@ -41,17 +44,18 @@ async function main() {
       if (path !== "/readyz") return new Response(null, { status: 404 });
       return Response.json({ code: health.code }, { status: health.ready && Date.now() - health.checkedAt < 30_000 ? 200 : 503, headers: { "cache-control": "no-store" } });
     } });
-    try { await runModerationWorker({ sql, decisions, community, identity: localIdentity(Buffer.from(key, "hex")), communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
+    try { await runModerationWorker({ sql, decisions, lifecycle, community, identity: localIdentity(Buffer.from(key, "hex")), communities, relayUrl, bridgeTenantId: required("MODERATION_BRIDGE_TENANT_ID"), puppetMaster: required("BRIDGE_MASTER_SECRET"), discordToken: required("DISCORD_TOKEN"), publicChannels: parsePublicChannelRules(required("BRIDGE_PUBLIC_CHANNELS")), publicAuthors, signal: stop.signal, health }); }
     finally { await server.stop(true); await sql.end(); }
   } else {
     const config = loadModerationConfig(process.env);
     const cipher = new EvidenceCipher(config.evidenceKey, config.evidenceRetentionSeconds, config.evidenceMaxBytes);
-    const decisions = new Decisions(sql, cipher, communities);
+    const lifecycle = new Lifecycle(sql, cipher, communities, config);
     const handoff = new CoopHandoff(sql, { origin: required("MODERATION_COOP_ORIGIN"), apiKey: required("MODERATION_COOP_API_KEY"), orgId: required("MODERATION_COOP_ORG_ID"), accessClientId: process.env.MODERATION_COOP_ACCESS_CLIENT_ID, accessClientSecret: process.env.MODERATION_COOP_ACCESS_CLIENT_SECRET });
     if (config.communities.size !== 1 || ![...config.communities.values()].includes(required("MODERATION_COOP_ORG_ID"))) throw new Error("Coop organization mismatch");
     const pool = new RelayPool([relayUrl]);
-    const reports = new Reports(sql, cipher, new RelayEvidenceResolver(sql, (ids) => pool.queryStrict([{ ids }])), config.communities, config.evidenceMaxCases);
-    const api = createModerationApi({ ...config, orgs: new Set(config.communities.values()), reports, decisions });
+    const decisions = new Decisions(sql, cipher, communities, config, lifecycle);
+    const reports = new Reports(sql, cipher, new RelayEvidenceResolver(sql, (ids) => pool.queryStrict([{ ids }])), config.communities, config.evidenceMaxCases, lifecycle);
+    const api = createModerationApi({ ...config, orgs: new Set(config.communities.values()), reports, decisions, lifecycle });
     let cleanupFailed = false, handoffRunning = false;
     const dispatch = setInterval(() => { if (handoffRunning) return; handoffRunning = true; void handoff.tick().catch(() => {}).finally(() => { handoffRunning = false; }); }, 1000);
     const cleanup = setInterval(() => { void reports.expire().then(() => { cleanupFailed = false; }, () => { cleanupFailed = true; }); }, 30_000);

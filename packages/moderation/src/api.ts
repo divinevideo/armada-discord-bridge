@@ -1,6 +1,8 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { authenticateReport, type Reports } from "./reports";
 import { DecisionRefusedError, type Decisions, type VerifiedCoopActor } from "./decisions";
+import type { Lifecycle } from "./lifecycle";
+import { PolicyConfigurationRequiredError } from "./apiReadiness";
 const digest = (body: string) => createHash("sha256").update(body).digest("hex");
 const signature = (key: Uint8Array, method: string, path: string, body: string, timestamp: string, actor: string) => createHmac("sha256", key).update(JSON.stringify([method, path, digest(body), timestamp, actor])).digest("hex");
 /** Coop signs its server-derived staff identity after its own permission check. */
@@ -38,7 +40,7 @@ async function boundedBody(request: Request): Promise<string> {
   } finally { clearTimeout(timer); reader.releaseLock(); }
   return Buffer.concat(chunks).toString("utf8");
 }
-export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase" | "getByExecution">> }) {
+export function createModerationApi(options: { publicOrigin: string; allowedReportOrigins?: ReadonlySet<string>; coopSecret: Uint8Array; orgs: ReadonlySet<string>; reports: Pick<Reports, "submitReport"> & Partial<Pick<Reports, "getCase">>; decisions: Pick<Decisions, "acceptDecision" | "get" | "retry"> & Partial<Pick<Decisions, "forCase" | "getByExecution" | "refreshPublicationProof">>; lifecycle?: Pick<Lifecycle, "placeEvidenceHold" | "releaseEvidenceHold" | "readHeldEvidence" | "setAppeal" | "closeLifecycle"> }) {
   if (options.coopSecret.length < 32) throw new Error("Staff service credential required");
   const capacity = () => {
     let remaining = 100, window = Date.now();
@@ -51,10 +53,11 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
   const response = (value: unknown, status = 200) => Response.json(value, { status, headers: { "cache-control": "no-store" } });
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url), path = url.pathname;
+    const lifecycleRoute = /^\/v1\/(cases|holds|decisions)\/([0-9a-f-]{36})\/(holds|release|held-evidence|appeal|close|publication-refresh)$/.exec(path);
     const executionRoute = /^\/v1\/decision-executions\/([0-9a-f-]{36})$/.exec(path);
     const caseRoute = /^\/v1\/cases\/([0-9a-f-]{36})$/.exec(path);
     const decisionRoute = /^\/v1\/decisions\/([0-9a-f-]{36})(\/retry)?$/.exec(path);
-    if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute && !caseRoute && !executionRoute) return response({ error: "not_found" }, 404);
+    if (path !== "/v1/reports" && path !== "/v1/decisions" && !decisionRoute && !caseRoute && !executionRoute && !lifecycleRoute) return response({ error: "not_found" }, 404);
     // Neither public reports nor forged staff headers spend authenticated staff
     // capacity. Keep the existing 100/s cap independently for each trust domain.
     if (path === "/v1/reports" && !reportCapacity()) return response({ error: "rate_limited" }, 429);
@@ -71,6 +74,21 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
     try { actor = authenticateCoop(request, body, options.coopSecret, options.orgs); } catch { return response({ error: "staff_authorization_required" }, 403); }
     if (!staffCapacity()) return response({ error: "rate_limited" }, 429);
     try {
+      if (lifecycleRoute && request.method === "POST") {
+        const [, resource, id, operation] = lifecycleRoute;
+        const input = JSON.parse(body);
+        const expected = operation === "holds" ? "holdUntil,reason" : operation === "appeal" ? "reason,state" : operation === "publication-refresh" ? "" : "reason";
+        if (!input || Array.isArray(input) || Object.keys(input).sort().join(",") !== expected) throw new Error("Invalid lifecycle request");
+        if (resource === "decisions" && operation === "publication-refresh" && options.decisions.refreshPublicationProof) return response(await options.decisions.refreshPublicationProof(id, actor), 202);
+        if (options.lifecycle) {
+          if (resource === "cases" && operation === "holds") return response(await options.lifecycle.placeEvidenceHold({ ...input, caseId: id }, actor), 201);
+          if (resource === "holds" && operation === "release") return response(await options.lifecycle.releaseEvidenceHold({ ...input, holdId: id }, actor));
+          if (resource === "cases" && operation === "held-evidence") return response(await options.lifecycle.readHeldEvidence({ ...input, caseId: id }, actor));
+          if (resource === "decisions" && operation === "appeal") return response(await options.lifecycle.setAppeal({ ...input, decisionId: id }, actor));
+          if (resource === "decisions" && operation === "close") return response(await options.lifecycle.closeLifecycle({ ...input, decisionId: id }, actor));
+        }
+        return response({ error: "not_found" }, 404);
+      }
       if (executionRoute && request.method === "GET" && options.decisions.getByExecution) {
         try { return response(await options.decisions.getByExecution(executionRoute[1], actor)); }
         catch { return response({ error: "not_found" }, 404); }
@@ -87,6 +105,7 @@ export function createModerationApi(options: { publicOrigin: string; allowedRepo
     } catch (error) {
       // A refusal staff can resolve (act on the newer decision) names itself.
       // Everything else stays opaque.
+      if (error instanceof PolicyConfigurationRequiredError) return response({ error: error.code }, 503);
       if (error instanceof DecisionRefusedError) return response({ error: error.code, ...error.details }, 409);
       return response({ error: "decision_not_accepted" }, 400);
     }
