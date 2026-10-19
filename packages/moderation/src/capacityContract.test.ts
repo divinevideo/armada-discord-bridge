@@ -133,10 +133,12 @@ it("exports a disposable library launcher without an entrypoint bypass", () => {
 it("derives only a conservative review candidate with measured overshoot and explicit reserve", () => {
   const report = fixture().measurement;
   expect(summarizeCapacity(report).candidatePauseHistoryCount).toBeNull();
+  expect(summarizeCapacity(report).earliestFailureHistoryCount).toBeNull();
   expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBe(52);
   const boundary = report.cases[0].samples[0];
   report.cases[0].samples.push({ ...boundary, historyCount: 40, accepted: false, persisted: false, fanout: false });
   expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBe(27);
+  expect(summarizeCapacity(report).earliestFailureHistoryCount).toBe(40);
   report.cases[1].status = "unsupported";
   expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBeNull();
 });
