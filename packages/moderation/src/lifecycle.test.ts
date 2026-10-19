@@ -58,15 +58,48 @@ test("settled removal closes with a fixed deadline; appeal reopens and guards au
   await expect(lifecycle.closeLifecycle({ decisionId, reason: "blocked" }, actor)).rejects.toThrow();
   await lifecycle.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${decisionId}`)[0].audit).not.toBeNull();
 });
-test("ban, expired evidence, unknown and pending delivery cannot close", async () => {
+test("expired unknown, pending and active membership actions still cannot close", async () => {
   const caseId = await caseRow(), ban = await decisionRow(caseId, "ban_member");
-  await expect(lifecycle.closeLifecycle({ decisionId: ban, reason: "blocked" }, actor)).rejects.toThrow();
   const unknown = await decisionRow(caseId); await sql`UPDATE moderation.deliveries SET state = 'failed', publication_attempted = true WHERE decision_id = ${unknown} AND target = 'concord'`;
-  await expect(lifecycle.closeLifecycle({ decisionId: unknown, reason: "blocked" }, actor)).rejects.toThrow();
   const pending = await decisionRow(caseId); await sql`UPDATE moderation.deliveries SET state = 'pending' WHERE decision_id = ${pending} AND target = 'discord'`;
-  await expect(lifecycle.closeLifecycle({ decisionId: pending, reason: "blocked" }, actor)).rejects.toThrow();
-  const expired = await decisionRow(caseId); await expireCase(caseId);
-  await expect(lifecycle.closeLifecycle({ decisionId: expired, reason: "blocked" }, actor)).rejects.toThrow();
+  await expireCase(caseId);
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE case_id = ${caseId}`; });
+  for (const decisionId of [ban, unknown, pending]) await expect(lifecycle.closeLifecycle({ decisionId, reason: "expired but unresolved" }, actor)).rejects.toThrow();
+  await lifecycle.expireEvidence();
+  for (const decisionId of [ban, unknown, pending]) await expect(lifecycle.closeLifecycle({ decisionId, reason: "deleted evidence but unresolved" }, actor)).rejects.toThrow();
+});
+
+for (const evidenceState of ["expired", "deleted"] as const) test(`explicit closure of settled removal after evidence is ${evidenceState} starts independent audit retention`, async () => {
+  const caseId = await caseRow(), decisionId = await decisionRow(caseId);
+  const [before] = await sql`SELECT audit, execution_id, fingerprint FROM moderation.decisions WHERE decision_id = ${decisionId}`;
+  await expireCase(caseId);
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${decisionId}`; });
+  if (evidenceState === "deleted") await lifecycle.expireEvidence();
+  const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice: () => {} });
+  const operatorSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice: () => {} });
+  try {
+    const operator = new Lifecycle(operatorSql, undefined, communities, {});
+    await operator.expireAudit();
+    expect((await sql`SELECT lifecycle_closed_at, audit FROM moderation.decisions WHERE decision_id = ${decisionId}`)[0]).toEqual({ lifecycle_closed_at: null, audit: before.audit });
+    const staff = new Lifecycle(apiSql, cipher, communities, { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+    const closed = await staff.closeLifecycle({ decisionId, reason: "settled action after evidence expiry" }, actor);
+    expect(closed.closedAt).toBeString(); expect(closed.auditAvailable).toBe(true);
+    expect(new Date(closed.auditDeleteAfter!).getTime() - new Date(closed.closedAt!).getTime()).toBeGreaterThanOrEqual(60000);
+    await operator.expireAudit();
+    expect((await sql`SELECT audit, execution_id, fingerprint FROM moderation.decisions WHERE decision_id = ${decisionId}`)[0]).toEqual(before);
+    await expect(reports.getCase(caseId, actor)).rejects.toThrow();
+    expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(evidenceState === "deleted" ? 0 : 1);
+    await sql.begin(async tx => {
+      await tx`SET LOCAL session_replication_role = replica`;
+      await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '2 minutes', audit_delete_after = clock_timestamp() - interval '1 minute' WHERE decision_id = ${decisionId}`;
+      await tx`UPDATE moderation.lifecycle_events SET recorded_at = clock_timestamp() - interval '2 minutes' WHERE decision_id = ${decisionId}`;
+    });
+    await operator.expireAudit();
+    expect((await sql`SELECT audit, execution_id, fingerprint FROM moderation.decisions WHERE decision_id = ${decisionId}`)[0]).toEqual({ ...before, audit: null });
+    expect((await staff.closeLifecycle({ decisionId, reason: "idempotent after audit erasure" }, actor)).auditAvailable).toBe(false);
+    expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${decisionId}`)[0].audit).toBeNull();
+    expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(evidenceState === "deleted" ? 0 : 1);
+  } finally { await apiSql.end(); await operatorSql.end(); }
 });
 
 function paused(client: postgres.Sql, match: (text: string, rows: any[], values: unknown[]) => boolean) {

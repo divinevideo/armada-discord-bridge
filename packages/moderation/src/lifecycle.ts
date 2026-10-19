@@ -106,9 +106,11 @@ export class Lifecycle {
   async closeLifecycle(input: { decisionId: string; reason: string }, actor: VerifiedCoopActor): Promise<LifecycleStatus> {
     this.authorize(actor, "manage_moderation_records", input.decisionId, input.reason); const policy = this.requirePolicy();
     return this.sql.begin(async tx => {
-      const { decision, evidence, deliveries } = await lockLifecycleDecision(tx, actor.orgId, input.decisionId); this.current(decision, actor.orgId);
+      const { decision, deliveries } = await lockLifecycleDecision(tx, actor.orgId, input.decisionId); this.current(decision, actor.orgId);
       if (decision.lifecycle_closed_at) return status(decision);
-      if (!evidence || evidence.expires_at.getTime() <= Date.now() || !await this.eligible(tx, decision, deliveries)) throw new Error("Lifecycle not eligible for closure");
+      // Evidence expiry does not close audit automatically, and cannot make a
+      // settled action depend forever on keeping or rebuilding expired bytes.
+      if (!await this.eligible(tx, decision, deliveries)) throw new Error("Lifecycle not eligible for closure");
       await this.event(tx, actor, input.reason, "lifecycle_closed", decision.case_id, decision.decision_id);
       const retention = Math.max(policy.auditRetentionSeconds, Number(decision.audit_retention_seconds ?? 0));
       const [row] = await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp(), audit_retention_seconds = ${retention}, audit_delete_after = clock_timestamp() + (${retention} * interval '1 second') WHERE decision_id = ${input.decisionId} RETURNING *`; return status(row);
