@@ -1,0 +1,114 @@
+name: Prepare reviewed chat images
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full 40-character merged source SHA
+        required: true
+        type: string
+      publish:
+        description: Publish this verified artifact set (separate per-run authorization required)
+        type: boolean
+        default: false
+      publication_authorization:
+        description: Repeat the exact source SHA only when this publication run is approved
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: chat-source-release
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      HARNESS_SHA: ${{ github.workflow_sha }}
+      PUBLISH: ${{ inputs.publish }}
+      AUTHORIZATION: ${{ inputs.publication_authorization }}
+    steps:
+      - name: Validate literal input values before checkout
+        shell: bash
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HARNESS_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$PUBLISH" == true ]]; then [[ "$AUTHORIZATION" == "$SOURCE_SHA" ]]; fi
+      - name: Checkout protected workflow tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tooling
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require merged source and merged publisher
+        run: |
+          git -C tooling merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          git -C tooling merge-base --is-ancestor "$HARNESS_SHA" origin/main
+      - name: Checkout source as Docker context only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Test protected artifact tooling
+        run: python3 tooling/scripts/test-chat-image-artifacts.py
+      - name: Build complete source set without registry credentials
+        run: |
+          python3 tooling/scripts/chat-image-artifacts.py build --source "$GITHUB_WORKSPACE/candidate" --source-sha "$SOURCE_SHA" --harness-sha "$HARNESS_SHA" --artifacts "$GITHUB_WORKSPACE/artifacts"
+      - name: Record verified manifest hash
+        id: manifest
+        run: |
+          manifest_hash=$(sha256sum artifacts/artifact-set.json | cut -d ' ' -f 1)
+          echo "sha256=$manifest_hash" >> "$GITHUB_OUTPUT"
+      - name: Save complete verified source images
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chat-source-images
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+  publish:
+    if: github.ref == 'refs/heads/main' && inputs.publish == true && inputs.publication_authorization == inputs.source_sha
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      HARNESS_SHA: ${{ github.workflow_sha }}
+      MANIFEST_SHA: ${{ needs.build.outputs.manifest_sha256 }}
+      AUTHORIZATION: ${{ inputs.publication_authorization }}
+    steps:
+      - name: Checkout protected publisher only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: tooling
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download the exact build job artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: chat-source-images
+          path: artifacts
+      - name: Verify all artifacts before any registry authentication
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$AUTHORIZATION" == "$SOURCE_SHA" ]]
+          git -C tooling merge-base --is-ancestor "$SOURCE_SHA" origin/main
+          git -C tooling merge-base --is-ancestor "$HARNESS_SHA" origin/main
+          python3 tooling/scripts/chat-image-artifacts.py verify --source tooling --source-sha "$SOURCE_SHA" --harness-sha "$HARNESS_SHA" --artifacts artifacts --manifest-sha256 "$MANIFEST_SHA"
+      - name: Fail closed without an existing GAR CI identity
+        run: |
+          echo 'GAR publication is not configured: this repository has no approved existing CI identity binding.' >&2
+          echo 'Build artifacts are available. After separate publication authorization, use the protected publisher locally with the existing gcloud Docker credential helper.' >&2
+          exit 1
