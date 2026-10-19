@@ -125,6 +125,73 @@ class Artifacts(unittest.TestCase):
             self.assertNotEqual(entry['local_image_id'], entry['config_digest'])
         self.verify()
 
+    def test_indexed_archive_accepts_the_actual_config_daemon_handle(self):
+        self.containerd_archives()
+        for entry in self.manifest['images']:
+            entry['local_image_id'] = entry['config_digest']
+        self.verify()
+        self.publication_readback(False)
+
+    def test_indexed_archive_accepts_only_bound_runtime_handles(self):
+        self.containerd_archives()
+        for entry in self.manifest['images']:
+            with tarfile.open(self.root / entry['archive']) as tar:
+                root = json.load(tar.extractfile('index.json'))
+                index = a.descriptor_json(tar, root['manifests'][0])
+                entry['local_image_id'] = a.runtime_descriptor(index)['digest']
+        self.verify()
+        self.manifest['images'][0]['local_image_id'] = 'sha256:' + 'f' * 64
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_config_daemon_handle_still_requires_valid_index_descriptors(self):
+        self.containerd_archives()
+        entry = self.manifest['images'][0]
+        entry['local_image_id'] = entry['config_digest']
+        path = self.root / entry['archive']
+        with tarfile.open(path) as tar:
+            parts = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+        root = json.loads(parts['index.json'])
+        name = 'blobs/sha256/' + root['manifests'][0]['digest'].split(':')[1]
+        parts[name] += b' '
+        with tarfile.open(path, 'w') as tar:
+            for name, data in parts.items():
+                add(tar, name, data)
+        entry['archive_sha256'] = a.file_hash(path)
+        with self.assertRaises(ValueError):
+            self.verify()
+
+    def test_builder_records_actual_config_handle_for_an_indexed_archive(self):
+        import contextlib
+        import shutil
+        self.containerd_archives()
+        context = io.BytesIO()
+        with tarfile.open(fileobj=context, mode='w'):
+            pass
+        def stub_run(args, **kwargs):
+            if args[:3] == ['git', 'rev-parse', 'HEAD']:
+                return SHA.encode()
+            if args[:3] == ['git', 'status', '--porcelain']:
+                return b''
+            if args[:2] == ['git', 'archive']:
+                return context.getvalue()
+            if args[:3] == ['docker', 'image', 'inspect']:
+                entry = next(e for e in self.manifest['images'] if e['local_tag'] == args[-1])
+                return json.dumps([{'Id': entry['config_digest']}]).encode()
+            raise AssertionError(args)
+        def stub_call(args, **kwargs):
+            if args[:3] == ['docker', 'image', 'save']:
+                entry = next(e for e in self.manifest['images'] if e['local_tag'] == args[-1])
+                shutil.copyfile(self.root / entry['archive'], args[4])
+            else:
+                self.assertEqual(args[:3], ['docker', 'buildx', 'build'])
+        output = self.root / 'actual-handle-build'
+        with patch.object(a, 'run', side_effect=stub_run), patch.object(a, 'source_contract', return_value=self.contract), patch.object(a.subprocess, 'check_call', side_effect=stub_call), contextlib.redirect_stdout(io.StringIO()):
+            a.build(self.root, SHA, HARNESS, output)
+        manifest = json.loads((output / 'artifact-set.json').read_text())
+        for entry in manifest['images']:
+            self.assertEqual(entry['local_image_id'], entry['config_digest'])
+
     def test_registry_index_resolves_the_exact_runtime_config(self):
         runtime = json.dumps({'config': {'digest': self.manifest['images'][0]['config_digest']}}).encode()
         digest = 'sha256:' + hashlib.sha256(runtime).hexdigest()
