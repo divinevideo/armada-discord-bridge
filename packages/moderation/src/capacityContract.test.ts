@@ -81,7 +81,7 @@ describe("measured capacity contract", () => {
 
 import { capacityFixture, validateMatrix } from "../../../scripts/fixtures/strfry-capacity";
 import matrix from "../../../scripts/fixtures/capacity-matrix.json";
-import { controlState, verifiedEvent } from "./relayPolicy";
+import { controlState, verifiedEvent, inspectRelayEvent } from "./relayPolicy";
 import { bytesToHex, openWrap, parseEdition } from "@armada-bridge/concord-core";
 
 describe("capacity measurement fixtures", () => {
@@ -121,7 +121,7 @@ describe("capacity measurement fixtures", () => {
   });
 });
 
-import { capacityCalibrationLauncher, summarizeCapacity } from "../../../scripts/fixtures/strfry-capacity";
+import { capacityCalibrationLauncher, summarizeCapacity, serializeCapacityReport, expectedCapacityAcceptance } from "../../../scripts/fixtures/strfry-capacity";
 it("exports a disposable library launcher without an entrypoint bypass", () => {
   const launcher = capacityCalibrationLauncher("/data/synthetic-test.json");
   expect(launcher).toContain('"/data/synthetic-test.json"');
@@ -139,4 +139,32 @@ it("derives only a conservative review candidate with measured overshoot and exp
   expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBe(27);
   report.cases[1].status = "unsupported";
   expect(summarizeCapacity(report, 8).candidatePauseHistoryCount).toBeNull();
+});
+
+it("hashes the persisted JSON roundtrip when optional measurement fields are undefined", () => {
+  const value = fixture();
+  value.measurement.cases[0].reason = undefined;
+  const artifact = serializeCapacityReport(value.measurement);
+  const persisted = JSON.parse(artifact.json) as CapacityMeasurementReport;
+  expect(Object.hasOwn(persisted.cases[0], "reason")).toBe(false);
+  expect(artifact.hash).toBe(capacityReportHash(persisted));
+  value.measurement = persisted; value.reportHash = artifact.hash;
+  expect(validateCapacityContract(value, identity)).toBe(value);
+});
+
+it("production authority rejects zero-history chat but accepts owner bootstrap control and rekey", async () => {
+  const f = capacityFixture(0, { roots: 3, label: "zero-history-authority-proof" });
+  for (const [event, action] of [[f.message(1), "reject"], [f.append(), "accept"], [f.rekey(1), "accept"]] as const) {
+    const inspected = await inspectRelayEvent(event, { policy: f.policy, stream: f.streams.find(s => s.key.pk === event.pubkey), now: Date.now, isRemoved: async () => false, authorOf: async () => undefined });
+    expect(inspected.result.action).toBe(action);
+  }
+});
+it("classifies chat availability separately from bootstrap controls and injected faults", () => {
+  expect(expectedCapacityAcceptance("cold", 0)).toBe(false);
+  expect(expectedCapacityAcceptance("cold", 1)).toBe(true);
+  expect(expectedCapacityAcceptance("append", 0)).toBe(true);
+  expect(expectedCapacityAcceptance("rekey", 0)).toBe(true);
+  for (const id of ["plugin_failure", "external_timeout", "sql_timeout"] as const) {
+    for (const count of [0, 1, 16]) expect(expectedCapacityAcceptance(id, count)).toBe(false);
+  }
 });
