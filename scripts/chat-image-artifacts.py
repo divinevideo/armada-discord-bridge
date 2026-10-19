@@ -84,17 +84,33 @@ def read_member(tar, name, limit=16 * 1024 * 1024):
     return tar.extractfile(entry).read()
 
 
-def archive_identity(path):
+def archive_identity(path, local_id=None):
+    """Bind an observed daemon handle to config or the selected OCI descriptor chain."""
     with tarfile.open(path, 'r:') as archive:
         saved = json.loads(read_member(archive, 'manifest.json'))
         require(len(saved) == 1, 'Expected one saved runtime image')
-        config_digest = 'sha256:' + hashlib.sha256(read_member(archive, saved[0]['Config'])).hexdigest()
-        local_id = config_digest
+        config = read_member(archive, saved[0]['Config'])
+        config_digest = 'sha256:' + hashlib.sha256(config).hexdigest()
+        handles = {config_digest}
+        default_id = config_digest
         if 'index.json' in archive.getnames():
             root = json.loads(read_member(archive, 'index.json'))
             require(len(root['manifests']) == 1, 'Expected one local image descriptor')
-            local_id = root['manifests'][0]['digest']
-        return config_digest, local_id
+            descriptor = root['manifests'][0]
+            oci = descriptor_json(archive, descriptor)
+            handles.add(descriptor['digest'])
+            default_id = descriptor['digest']
+            if 'manifests' in oci:
+                descriptor = runtime_descriptor(oci)
+                oci = descriptor_json(archive, descriptor)
+                handles.add(descriptor['digest'])
+            require(oci['config']['digest'] == config_digest and oci['config']['size'] == len(config), 'OCI runtime config mismatch')
+        # Store the actual inspect.Id rather than infer daemon semantics from
+        # archive format. Config, image and index handles must all prove the
+        # same selected runtime through their verified descriptor/config chain.
+        observed = default_id if local_id is None else local_id
+        require(observed in handles, 'Daemon handle is not bound to the saved runtime')
+        return config_digest, observed
 
 
 def descriptor_json(archive, descriptor):
@@ -133,7 +149,7 @@ def inspect_archive(path, entry, revision, contract):
         saved = json.loads(read_member(archive, 'manifest.json'))
         require(len(saved) == 1 and saved[0].get('RepoTags') == [entry['local_tag']], 'Archive contains unexpected image/tag')
         image = saved[0]
-        identity = archive_identity(path)
+        identity = archive_identity(path, entry['local_image_id'])
         require(identity == (entry['config_digest'], entry['local_image_id']), 'Local image/config identity mismatch')
         if 'index.json' in names:
             root = json.loads(read_member(archive, 'index.json'))
@@ -263,8 +279,7 @@ def build(source, revision, harness, output):
             entry.update({'tag': target['repository'] + ':' + revision, 'local_tag': tag, 'archive': target['name'] + '.tar'})
             local_id = json.loads(run(['docker', 'image', 'inspect', tag]))[0]['Id']
             subprocess.check_call(['docker', 'image', 'save', '--output', str(output / entry['archive']), tag])
-            entry['config_digest'], entry['local_image_id'] = archive_identity(output / entry['archive'])
-            require(local_id == entry['local_image_id'], 'Saved archive differs from Docker local image handle')
+            entry['config_digest'], entry['local_image_id'] = archive_identity(output / entry['archive'], local_id)
             entry['archive_sha256'] = file_hash(output / entry['archive'])
             manifest['images'].append(entry)
     (output / 'artifact-set.json').write_text(json.dumps(manifest, indent=2) + '\n')
