@@ -3,7 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 revision=$(git rev-parse HEAD)
+[[ -z "$(git status --porcelain --untracked-files=no)" ]] || { echo 'Commit tracked changes before building source images.' >&2; exit 1; }
 platform=${BUILD_PLATFORM:-linux/amd64}
+[[ "$platform" == linux/amd64 ]] || { echo 'Source image contract requires linux/amd64.' >&2; exit 1; }
 : "${IMAGE_PREFIX:=divine-local}"
 for target in portal moderation bridge; do
   image="$IMAGE_PREFIX/$target:$revision"
@@ -39,3 +41,9 @@ export STRFRY_TEST_IMAGE="$relay"
 bash scripts/test-strfry-policy.sh
 bash scripts/test-strfry-purge.sh
 bash scripts/test-moderation-runtime.sh
+
+# Export only the deployed portal/moderation/relay set. The standalone bridge
+# above stays a separate runtime check and cannot substitute for the portal.
+artifacts=${ARTIFACT_DIR:-${TMPDIR:-/tmp}/bridge-source-artifacts-$revision}
+python3 scripts/chat-image-artifacts.py build --source "$PWD" --source-sha "$revision" --harness-sha "$revision" --artifacts "$artifacts"
+echo "PASS complete source artifacts at $artifacts; no publication performed."
