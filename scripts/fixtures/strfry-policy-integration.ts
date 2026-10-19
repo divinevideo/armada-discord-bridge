@@ -74,7 +74,7 @@ async function relay(mode: string) {
   const configPath = join(directory, `${mode}.conf`);
   await writeFile(configPath, config, { mode: 0o644 });
   const args = ["run", "-d", "--ulimit", "nofile=65536:65536", "--name", name, "--network", label, "-p", "127.0.0.1::7777", "-p", "127.0.0.1::8080", "-p", "127.0.0.1::8081", "-e", "MODERATION_DATABASE_URL=postgres://bridge@pg/bridge", "-v", `${configPath}:/data/strfry.conf:ro`];
-  for (const file of ["calibration.json", "calibration-launcher.ts", "calibration-policy.sh", "invalid-capacity.json"]) args.push("-v", `${join(directory, file)}:/data/${file}:ro`);
+  for (const file of ["calibration.json", "calibration-launcher.ts", "calibration-policy.sh", "invalid-capacity.json", "race-purger.ts"]) args.push("-v", `${join(directory, file)}:/data/${file}:ro`);
   args.push("-e", `MODERATION_COMMUNITY_ORGS=${JSON.stringify(Object.fromEntries(calibration.communities))}`);
   if (mode === "strict-invalid") args.push("-e", "MODERATION_CAPACITY_CONTRACT_FILE=/data/invalid-capacity.json");
   if (!strict && !["normal", "restored"].includes(mode)) {
@@ -116,6 +116,25 @@ try {
   await writeFile(join(directory, "calibration-launcher.ts"), capacityCalibrationLauncher("/data/calibration.json"), { mode: 0o644 });
   await writeFile(join(directory, "calibration-policy.sh"), "#!/bin/sh\nexec bun /data/calibration-launcher.ts\n", { mode: 0o755 });
   await writeFile(join(directory, "invalid-capacity.json"), JSON.stringify({ version: 1, synthetic: true }), { mode: 0o644 });
+  // Load the production purge dependencies and establish its database connection before the
+  // deliberately paused publication starts its fixed three-second external deadline.
+  await writeFile(join(directory, "race-purger.ts"), `
+import postgres from "/opt/divine/node_modules/postgres/src/index.js";
+import { CarrierIndex } from "/opt/divine/packages/moderation/src/carrierIndex.ts";
+import { RelayPurger } from "/opt/divine/packages/moderation/src/relayPurge.ts";
+import { LocalRelayDriver } from "/opt/divine/packages/moderation/src/localRelayDriver.ts";
+const [decisionId, communityId, channelId, rumorId] = process.argv.slice(2);
+const sql = postgres(process.env.MODERATION_DATABASE_URL!, { max: 2, onnotice: () => {} });
+try {
+  await sql\`SELECT 1\`;
+  const purger = new RelayPurger(new CarrierIndex(sql), new LocalRelayDriver("ws://127.0.0.1:7777"));
+  await Bun.write("/data/purger-ready", "ready");
+  while (!(await Bun.file("/data/admitted").exists())) await Bun.sleep(10);
+  const result = await purger.removeFromRelay({ communityId, channelId, rumorId }, decisionId);
+  process.stdout.write(JSON.stringify(result) + "\\n");
+  if (result.state !== "verified") process.exitCode = 1;
+} finally { await sql.end(); }
+`, { mode: 0o644 });
   for (const mode of ["strict-missing", "strict-invalid"]) {
     const instance = await relay(mode), writer = await connect(instance.url), reader = await connect(instance.url);
     reader.ws.send(JSON.stringify(["REQ", "strict-live", { authors: [fixture.chatKey.pk] }]));
@@ -190,17 +209,20 @@ try {
     await addCalibrationCommunity(racing.community.idHex);
     const instance = await relay("race");
     const racer = await connect(instance.url);
+    const removalId = crypto.randomUUID();
+    let finished = false;
+    const removal = docker("exec", instance.name, "bun", "/data/race-purger.ts", removalId, racing.policy.communityId, racing.channelId, racing.allowedRumorId).then((value) => { finished = true; return value; });
+    removal.catch(() => {});
+    const readinessDeadline = Date.now() + 20_000;
+    while (true) {
+      try { await docker("exec", instance.name, "test", "-f", "/data/purger-ready"); break; }
+      catch { if (Date.now() > readinessDeadline) throw new Error("Preloaded purge did not become ready"); await Bun.sleep(20); }
+    }
+    assert.equal(finished, false, "Preloaded purge must wait for an admitted writer");
+    assert.equal((await sql`SELECT 1 FROM moderation.tombstones WHERE community_id = ${racing.policy.communityId}`).length, 0, "Readiness must not start removal before publication");
     const publishing = racer.publish(racing.allowed);
     publishing.catch(() => {});
     const deadline = Date.now() + 5000;
-    while (true) {
-      try { await docker("exec", instance.name, "test", "-f", "/data/admitted"); break; }
-      catch { if (Date.now() > deadline) throw new Error("Admission gate not reached"); await Bun.sleep(20); }
-    }
-    const removalId = crypto.randomUUID();
-    let finished = false;
-    const removal = docker("exec", instance.name, "bun", "packages/moderation/src/relayPurgeCli.ts", removalId, racing.policy.communityId, racing.channelId, racing.allowedRumorId).then((value) => { finished = true; return value; });
-    removal.catch(() => {});
     while (!(await sql`SELECT 1 FROM moderation.tombstones WHERE community_id = ${racing.policy.communityId}`).length) {
       if (Date.now() > deadline) throw new Error("Tombstone not installed");
       await Bun.sleep(20);
