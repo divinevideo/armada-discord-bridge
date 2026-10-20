@@ -312,3 +312,43 @@ test("a ban superseded before any send does not keep the member's settled unban 
   const closed = await new Lifecycle(sql, cipher, memberScope, memberPolicy).closeLifecycle({ decisionId: unban.decisionId, reason: "settled unban" }, memberActor);
   expect(closed.closedAt).toBeString();
 });
+// Closure, and later audit erasure, require the member to be unbanned
+// everywhere. Each case leaves a settled ban -> unban pair with fresh Discord
+// proof, and keeps the member banned by exactly one source.
+async function setRelayBlock(author: string, blocked: boolean) {
+  await sql`INSERT INTO moderation.member_bans (community_id, author, blocked) VALUES (${community}, ${author}, ${blocked}) ON CONFLICT (community_id, author) DO UPDATE SET blocked = EXCLUDED.blocked`;
+}
+const stillBanned = [
+  { source: "a newer settled ban is the member's latest decision", author: () => randomBytes(32).toString("hex"),
+    async arrange(caseId: string, _author: string, base: number) { await settleMember((await memberDecision(caseId, "ban_member", String(base + 3))).decisionId); } },
+  // The relay unblock landed, but the Concord banlist fold still names the member.
+  { source: "the Concord banlist still bans the member", author: () => f.bannedMember.pk,
+    async arrange(_caseId: string, author: string) { await setRelayBlock(author, false); } },
+  // PolicyStore also folds this override into policy.banned, so that check and
+  // the direct member_bans read each refuse it on their own.
+  { source: "the relay still blocks the member", author: () => randomBytes(32).toString("hex"),
+    async arrange(_caseId: string, author: string) { await setRelayBlock(author, true); } },
+];
+for (const [index, scenario] of stillBanned.entries()) {
+  test(`closure is refused while ${scenario.source}`, async () => {
+    const author = scenario.author(), caseId = await memberCase(author);
+    const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
+    await settleMember(ban.decisionId); await settleMember(unban.decisionId);
+    await scenario.arrange(caseId, author, 0);
+    expect(await observeMember(ban.decisionId)).toBe(true);
+    await expect(new Lifecycle(sql, cipher, memberScope, memberPolicy).closeLifecycle({ decisionId: ban.decisionId, reason: `still banned ${index}` }, memberActor)).rejects.toThrow(/not eligible/);
+    expect((await sql`SELECT lifecycle_closed_at FROM moderation.decisions WHERE decision_id = ${ban.decisionId}`)[0].lifecycle_closed_at).toBeNull();
+  });
+  test(`elapsed audit is kept while ${scenario.source}`, async () => {
+    const author = scenario.author(), caseId = await memberCase(author);
+    const ban = await memberDecision(caseId, "ban_member", "11"), unban = await memberDecision(caseId, "unban_member", "12");
+    await settleMember(ban.decisionId); await settleMember(unban.decisionId);
+    // Closed while the member was unbanned, retention since elapsed.
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '2 minutes', audit_retention_seconds = 60, audit_delete_after = clock_timestamp() - interval '1 minute' WHERE decision_id = ${ban.decisionId}`; });
+    await scenario.arrange(caseId, author, 10);
+    expect(await observeMember(ban.decisionId)).toBe(true);
+    const client = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice: () => {} });
+    try { await new Lifecycle(client, undefined, memberScope, {}).expireAudit(); } finally { await client.end(); }
+    expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban.decisionId}`)[0].audit).not.toBeNull();
+  });
+}
