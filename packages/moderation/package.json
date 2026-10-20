@@ -1,0 +1,9 @@
+{
+  "name": "@armada-bridge/moderation",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": { "test": "bun test", "typecheck": "tsc --noEmit", "plugin": "bun src/strfryPlugin.ts" },
+  "dependencies": { "@armada-bridge/concord-core": "*", "nostr-tools": "^2.13.0", "postgres": "^3.4.5" }
+}

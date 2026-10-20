@@ -12,12 +12,14 @@ const servers: Array<ReturnType<typeof Bun.serve>> = [];
 function blossom(handler: Handler): { url: string; hits: Request[] } {
   const hits: Request[] = [];
   const server = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     fetch(req) {
       hits.push(req);
       return handler(req);
     },
   });
+  console.info("OWNED_TEST_SERVER", JSON.stringify({ pid: process.pid, ports: [server.port] }));
   servers.push(server);
   return { url: `http://127.0.0.1:${String(server.port)}`, hits };
 }

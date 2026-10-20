@@ -1,3 +1,4 @@
+import { guildInScope } from "@armada-bridge/bridge/src/deploymentMode";
 /**
  * Portal server: JSON API + static SPA, one Bun process. In dev, run the
  * Vite dev server alongside (`bun run --cwd packages/portal web`) which
@@ -35,7 +36,8 @@ import { seal, unseal } from "./seal";
 import { originGuard, securityHeaders } from "./security";
 
 const env = loadPortalEnv();
-await migrate(env.databaseUrl);
+if (process.env.PORTAL_SCHEMA_MODE && process.env.PORTAL_SCHEMA_MODE !== "verify") throw new Error("Invalid schema mode");
+await migrate(env.databaseUrl, { readOnly: process.env.PORTAL_SCHEMA_MODE === "verify" });
 const sql = postgres(env.databaseUrl, { onnotice: () => {} });
 const sessions = new Sessions(sql, env.sealKeyHex, env.baseUrl.startsWith("https:"));
 const manager = new BridgeManager(sql, env);
@@ -99,6 +101,15 @@ process.on("SIGUSR2", () => {
 });
 
 const app = new Hono();
+// Metrics listen on a separate, internal-only port; public portal routes expose none.
+if (process.env.PORTAL_METRICS_PORT) {
+  const port = Number(process.env.PORTAL_METRICS_PORT);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === env.port) throw new Error("Invalid metrics port");
+  Bun.serve({ hostname: "0.0.0.0", port, fetch(request) {
+    if (new URL(request.url).pathname !== "/metrics") return new Response(null, { status: 404 });
+    return new Response(`armada_discord_connected ${Number(manager.discordConnected)}\narmada_relay_sockets_down ${RelayPool.backlog().down}\n`, { headers: { "content-type": "text/plain; version=0.0.4" } });
+  } });
+}
 const redirectUri = `${env.baseUrl}/api/auth/discord/callback`;
 const overHttps = env.baseUrl.startsWith("https:");
 
@@ -181,6 +192,7 @@ type GuildAuthority = { ok: true; guild: SessionGuild } | { ok: false; status: 4
  * bearer by design and keep their fixture guilds.
  */
 async function guildAuthority(c: Context, session: SessionData, guildId: string): Promise<GuildAuthority> {
+  if (!guildInScope(env, guildId)) return { ok: false, status: 403, error: "guild is outside this deployment" };
   let guilds = session.guilds;
   if (!session.dev && Date.now() - (session.guildsFetchedAt ?? 0) > GUILD_AUTHORITY_TTL_MS) {
     if (!session.accessToken) {
@@ -527,7 +539,7 @@ app.get("/api/me", async (c) => {
   if (!session || !session.user.id) return c.json({ user: null, devLogin: env.devLogin, discordConfigured });
   return c.json({
     user: session.user,
-    guilds: session.guilds.filter((g) => g.canManage),
+    guilds: session.guilds.filter((g) => g.canManage && guildInScope(env, g.id)),
     devLogin: env.devLogin,
     discordConfigured,
   });
@@ -546,7 +558,11 @@ app.get("/api/guilds/:id/channels", async (c) => {
   if (!env.discordBotToken) return c.json({ error: "bot token not configured" }, 501);
   const channels = await botGuildTextChannels(env.discordBotToken, c.req.param("id"));
   if (!channels) return c.json({ present: false, installUrl: botInstallUrl(env.discordClientId, c.req.param("id")) });
-  return c.json({ present: true, channels });
+  const visible = [];
+  for (const channel of channels) {
+    try { await manager.assertChannelPolicy(c.req.param("id"), channel.id); visible.push(channel); } catch {}
+  }
+  return c.json({ present: true, channels: visible });
 });
 
 // ── Server import ────────────────────────────────────────────────────────────
@@ -729,6 +745,11 @@ app.post("/api/bridges/:id/link", async (c) => {
   }
   if (!guildChannels.some((ch) => ch.id === body.channelId)) {
     return c.json({ error: "that channel is not in that guild" }, 403);
+  }
+  try {
+    await manager.assertChannelPolicy(body.guildId, body.channelId);
+  } catch {
+    return c.json({ error: "Channel is excluded, private, or its public visibility could not be verified" }, 403);
   }
   // Second live bridge on one channel: last writer would win `byDiscordChannel`
   // and steal the channel from the bridge already mirroring it. A unique index

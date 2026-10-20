@@ -9,7 +9,8 @@ import {
   wrapDirectInvite,
 } from "@armada-bridge/concord-core";
 import type { CommunityV2, FoldedControl, InviteBundle } from "@armada-bridge/concord-core";
-import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
+import { identityRelayPool } from "./identityPool";
+import { generateSecretKey, getPublicKey, verifyEvent } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 
 import { intakeDirectInviteKeys } from "./keyIntake";
@@ -269,3 +270,45 @@ describe("direct-invite key intake", () => {
     expect(result.community.privateChannels[0].epoch).toBe(0n);
   });
 });
+
+it("restart recovers private keys only by authenticating the bridge identity to protected inbox relays", async () => {
+  const target = community();
+  const bridgeSk = generateSecretKey();
+  const bridge = localIdentity(bridgeSk);
+  const inviterSk = generateSecretKey();
+  const channelId = bytesToHex(random32());
+  const channelKey = bytesToHex(random32());
+  const wrap = await directInvite(bundleFor(target, [{ id: channelId, key: channelKey, epoch: 0, name: "private" }]), inviterSk, bridge.pk);
+  const server = Bun.serve<{ authenticated: boolean }>({ hostname: "127.0.0.1", port: 0,
+    fetch(request, server) { if (server.upgrade(request, { data: { authenticated: false } })) return; return new Response("no"); },
+    websocket: {
+      open(ws) { ws.send(JSON.stringify(["AUTH", "synthetic-inbox-challenge"])); },
+      message(ws, value) {
+        const frame = JSON.parse(String(value));
+        if (frame[0] === "AUTH") {
+          const event = frame[1];
+          ws.data.authenticated = event.pubkey === bridge.pk && verifyEvent(event) && event.kind === 22242 && event.tags.some((t: string[]) => t[0] === "challenge" && t[1] === "synthetic-inbox-challenge");
+          ws.send(JSON.stringify(["OK", event.id, ws.data.authenticated, ""]));
+        }
+        if (frame[0] === "REQ") {
+          if (!ws.data.authenticated) { ws.send(JSON.stringify(["CLOSED", frame[1], "auth-required: bridge inbox"])); return; }
+          ws.send(JSON.stringify(["EVENT", frame[1], wrap]));
+          ws.send(JSON.stringify(["EOSE", frame[1]]));
+        }
+      },
+    },
+  });
+  console.info("OWNED_TEST_SERVER", JSON.stringify({ pid: process.pid, ports: [server.port] }));
+  try {
+    // Fresh pools model both the initial boot and a restart; no keys survive in memory.
+    for (let boot = 0; boot < 2; boot++) {
+      const communityPool = identityRelayPool([`ws://127.0.0.1:${server.port}`], bridgeSk);
+      const floorPool = identityRelayPool([`ws://127.0.0.1:${server.port}`], bridgeSk);
+      try {
+        const recovered = await intakeDirectInviteKeys([communityPool, floorPool], bridge, target, onlyFrom(getPublicKey(inviterSk)));
+        expect(recovered.learned).toEqual([channelId]);
+        expect(bytesToHex(recovered.community.privateChannels[0].key)).toBe(channelKey);
+      } finally { await communityPool.close(); await floorPool.close(); }
+    }
+  } finally { server.stop(true); }
+}, 15000);

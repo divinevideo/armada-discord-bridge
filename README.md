@@ -32,9 +32,15 @@ never bridged without its community's consent.
 - **Server import**: mint a whole Armada community from a Discord server —
   channels, roles, and grants, with genesis signed by the owner's own key in
   their browser — then backfill history.
-Not yet: severance detection (ban, refounding, dissolution) is partial, and
-Discord-side commands are parsed from message text rather than registered as
-slash commands.
+- **Severance detection**: the bridge notices when its community is banned,
+  refounded, or dissolved, stops forwarding, and says why on the dashboard.
+  Each case is read from the protocol's own folds — the control-plane
+  Banlist, the base-rekey window, and the owner-signed dissolution tombstone —
+  never from a relay refusing a publish, which an outage can fake.
+- **Slash commands**: Discord-side commands are registered as application
+  commands and dispatched through the same handler the message-text path
+  used. Message-text parsing stays as a fallback so commands are answered
+  rather than mirrored into Armada as puppet messages.
 
 ## Layout
 
@@ -88,6 +94,19 @@ bunx tsc -p packages/portal/tsconfig.json --noEmit  # portal, separately
 Suites that need Postgres skip themselves when `DATABASE_URL` is unreachable,
 so a bare `bun test` is still meaningful.
 
+`scripts/test-integration.sh` is the whole gate — typechecks, `vite build`,
+the suites, and `scripts/assert-no-skipped-tests.sh`. Run that before you
+trust a green `bun test`: two suites covering the built SPA skip themselves
+when `web/dist` is absent, and the skip gate (correctly) refuses to pass on
+them, so a bare `bun test` followed by the gate looks like a failure whose
+message is nonetheless right.
+
+`scripts/test-bridge-runtime.sh` runs the bridge container's own entrypoint
+and needs GNU `timeout` (coreutils) on macOS.
+
+Run one `bun test` at a time against a shared `DATABASE_URL` — concurrent
+runs contend over `moderation.deliveries` and invent failures.
+
 ### Configuration
 
 Portal:
@@ -101,6 +120,8 @@ Portal:
 | `PORTAL_BASE_URL` | Public origin, used for OAuth redirects and to decide whether cookies are `Secure`. |
 | `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | OAuth application credentials. |
 | `DISCORD_TOKEN` | Bot token. Without it, bridges cannot go live. |
+| `BRIDGE_MODE` | `legacy` by default; `public` explicitly enables the separately deployed public-room service. |
+| `BRIDGE_PUBLIC_CHANNELS` | **Required in public mode.** JSON object with `guildId`, nonempty `channelIds`, and nonempty `excludedCategoryIds`, each containing Discord IDs. See the public-only compatibility note below. |
 | `PORTAL_DEV_LOGIN` | `1` enables the fake-session login, which hands any anonymous caller a session. The portal refuses to boot with it set when `PORTAL_BASE_URL` is `https:` or `NODE_ENV=production`. |
 | `BLOSSOM_SERVER` | Attachment re-hosting targets, comma-separated in preference order (e.g. `https://blossom.ditto.pub,https://blossom.primal.net`); each upload falls through to the next on failure. Empty leaves CDN links. |
 | `KLIPY_API_KEY` | Resolves Klipy GIF-picker sends to their real GIF via the Items API. Without it they are transcoded from the embed's mp4 (needs ffmpeg). |
@@ -113,6 +134,43 @@ from env instead — `BRIDGE_MASTER_SECRET`, `BRIDGE_PRIMARY_KEY`,
 `BRIDGE_INVITE_URL`, `DISCORD_TOKEN`, `DISCORD_GUILD_ID`,
 `DISCORD_CHANNEL_ID`, `CONCORD_CHANNEL_ID` — and runs with
 `docker compose --profile bridge up`.
+
+### Existing bridges and separate public rooms
+
+The ordinary portal and standalone bridge retain their existing behavior:
+private Concord channels, authorized Direct Invite key intake, and multiple
+guild/community pairings. Existing deployments need no public-pilot variables.
+Legacy private imports retain their independent keys, scoped access roles,
+owner-only key delivery and explicit per-channel mirroring choices.
+
+Public rooms are an explicit separate deployment using `BRIDGE_MODE=public`.
+It requires `BRIDGE_PUBLIC_CHANNELS`, for example with synthetic Discord IDs:
+
+```json
+{"guildId":"111111111111111111","channelIds":["222222222222222222"],"excludedCategoryIds":["333333333333333333"]}
+```
+
+Public mode permits only configured public Discord text channels in that guild
+and public Concord targets. Excluded categories and a category named `tickets`
+(case-insensitive) stay excluded even when the bot can see them. Visibility is
+checked again before effects and history reads. Both lists remain nonempty.
+Missing/invalid public settings fail startup; they never select legacy behavior.
+Public-pairing variables without explicit public mode are rejected.
+
+Use `docker compose -p <separate-project> -f docker-compose.public.yml up --build`
+only when deployment is authorized. This file is standalone, not an override of
+the ordinary compose file. It has its own database/volume and requires separate
+public bot/OAuth credentials, seal/session key, port and origin. Do not point a
+public process at the existing bridge database or give it legacy sealed roots.
+The existing Armada popup integration continues using its existing portal;
+OAuth/claim payloads are unchanged. Stopping the separate public deployment is
+its rollback, without cutting over existing bridges.
+
+Optional public `BRIDGE_MASTER_SECRET` and `BRIDGE_COMMUNITY_ID` must be supplied
+together and match the moderation worker's provisioned community/guild pairing.
+Existing legacy puppet identities are preserved; this is not a key rotation.
+Actual deployment, credentials, enrollment and public pilot acceptance remain
+separately authorized operations. See [the moderation runbook](docs/moderation-runbook.md).
 
 ## What the database holds
 

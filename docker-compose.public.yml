@@ -1,0 +1,44 @@
+# An opt-in, separate deployment. Never combine this file with docker-compose.yml.
+# Choose a separate compose project with -p; its volumes, DB and session key are independent.
+services:
+  public-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bridge_public
+      POSTGRES_USER: bridge_public
+      POSTGRES_PASSWORD: ${PUBLIC_POSTGRES_PASSWORD:?Set a dedicated public database password}
+    volumes:
+      - public-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge_public -d bridge_public"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  public-portal:
+    build:
+      context: .
+      target: portal
+    depends_on:
+      public-postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${PUBLIC_PORTAL_PORT:?Choose a separate local port}:8787"
+    environment:
+      BRIDGE_MODE: public
+      DATABASE_URL: postgres://bridge_public:${PUBLIC_POSTGRES_PASSWORD:?Set a dedicated public database password}@public-postgres/bridge_public
+      PORTAL_HOST: 0.0.0.0
+      PORTAL_BASE_URL: ${PUBLIC_PORTAL_BASE_URL:?Set the separate public portal origin}
+      PORTAL_SEAL_KEY: ${PUBLIC_PORTAL_SEAL_KEY:?Set a dedicated public seal/session key}
+      PORTAL_DEV_LOGIN: "0"
+      DISCORD_CLIENT_ID: ${PUBLIC_DISCORD_CLIENT_ID:?Set the public OAuth application ID}
+      DISCORD_CLIENT_SECRET: ${PUBLIC_DISCORD_CLIENT_SECRET:?Set the public OAuth application secret}
+      DISCORD_TOKEN: ${PUBLIC_DISCORD_TOKEN:?Set the separate public bot token}
+      BRIDGE_PUBLIC_CHANNELS: ${PUBLIC_BRIDGE_CHANNELS:?Set the public guild/channel/category JSON}
+      BRIDGE_MASTER_SECRET: ${PUBLIC_BRIDGE_MASTER_SECRET:-}
+      BRIDGE_COMMUNITY_ID: ${PUBLIC_BRIDGE_COMMUNITY_ID:-}
+      PORTAL_ALLOWED_ORIGINS: ${PUBLIC_PORTAL_ALLOWED_ORIGINS:-}
+      IMPORT_DEFAULT_RELAYS: ${PUBLIC_IMPORT_DEFAULT_RELAYS:-}
+      BLOSSOM_SERVER: ${PUBLIC_BLOSSOM_SERVER:-}
+    restart: unless-stopped
+volumes:
+  public-pgdata:

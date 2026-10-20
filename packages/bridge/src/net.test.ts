@@ -121,7 +121,13 @@ describe("assertSafeHttpUrl", () => {
   // Fail closed. Two resolutions happen (ours, then the socket's), so a name
   // our resolver cannot answer is not a name the socket cannot reach.
   it("refuses a name that does not resolve", async () => {
-    await expect(assertSafeHttpUrl("http://nothing.here.invalid/x")).rejects.toThrow(/non-public host/);
+    let resolved = "";
+    await expect(assertSafeHttpUrl("http://nothing.here.invalid/x", async (hostname) => { resolved = hostname; throw new Error("synthetic NXDOMAIN"); })).rejects.toThrow(/non-public host/);
+    expect(resolved).toBe("nothing.here.invalid");
+  });
+  it("still vets every address from an injected resolver", async () => {
+    await expect(assertSafeHttpUrl("https://media.example/x", async () => [{ address: "8.8.8.8" }, { address: "127.0.0.1" }])).rejects.toThrow(/non-public host/);
+    await expect(assertSafeHttpUrl("https://media.example/x", async () => [{ address: "not-an-ip" }])).rejects.toThrow(/non-public host/);
   });
 
   it("refuses bare intranet names that never name a real media origin", async () => {

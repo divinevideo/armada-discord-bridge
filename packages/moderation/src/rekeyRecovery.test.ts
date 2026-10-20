@@ -1,0 +1,24 @@
+import { expect, test } from "bun:test";
+import { generateSecretKey } from "nostr-tools/pure";
+import { baseRekeyGroupKey, buildRekeyRumors, bytesToHex, bytesToBase64, controlSignerGroupKey, encodeWrappedBaseKey, epochKeyCommitment, hex32, KIND_SEAL_ENCRYPTED, myLocator, sealRumor, wrapSeal } from "@armada-bridge/concord-core";
+import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
+import { ConcordActions } from "./concordActions";
+import { verifyRecoveredRoot } from "./rekeyRecovery";
+test("recovery requires an authorized complete rotation and the exact member-decrypted key", async () => {
+  const f = await moderationFixture();
+  const root = generateSecretKey(), controlRoot = generateSecretKey();
+  const controlPk = controlSignerGroupKey(controlRoot, f.community.id, 1n).pk;
+  const next = { ...f.community, root, rootEpoch: 1n, controlRoot, controlPk, refounder: f.moderator.pk, heldRoots: [{ epoch: 1n, key: root, controlPk, refounder: f.moderator.pk }, ...f.community.heldRoots] };
+  const { authority } = await new ConcordActions(f.community, f.moderator, async () => f.policy).authorize({ ...f.decision, action: "ban_member" });
+  const plain = bytesToBase64(encodeWrappedBaseKey(1n, root, hex32(controlPk), controlRoot));
+  const blobs = await Promise.all([f.owner.pk, f.moderator.pk].map(async (pk) => ({ locator: myLocator(f.moderator.pk, pk, "0".repeat(64), 1n), wrapped: await f.moderator.signer.nip44.encrypt(pk, plain) })));
+  const rumor = buildRekeyRumors(f.moderator.pk, { scope: { kind: "root" }, prevEpoch: 0n, newEpoch: 1n, prevCommit: bytesToHex(epochKeyCommitment(0n, f.community.root)) }, blobs, Date.now(), authority)[0];
+  const group = baseRekeyGroupKey(f.community.root, f.community.id, 1n);
+  const event = wrapSeal(await sealRumor(rumor, KIND_SEAL_ENCRYPTED, group, f.moderator.signer), group);
+  const cutoff = rumor.created_at;
+  await expect(verifyRecoveredRoot(next, f.moderator, f.policy, [event])).rejects.toThrow();
+  next.heldRoots = next.heldRoots.map((entry) => entry.epoch === 0n ? { ...entry, retiredAt: cutoff } : entry);
+  await verifyRecoveredRoot(next, f.moderator, f.policy, [event]);
+  await expect(verifyRecoveredRoot({ ...next, root: generateSecretKey() }, f.moderator, f.policy, [event])).rejects.toThrow();
+  await expect(verifyRecoveredRoot(next, f.moderator, f.policy, [])).rejects.toThrow();
+});

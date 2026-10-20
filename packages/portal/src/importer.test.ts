@@ -45,7 +45,7 @@ import type { EventTemplate } from "nostr-tools/pure";
 import type { GuildSnapshot, RestMessage } from "./discordRest";
 import type { PortalEnv } from "./env";
 import { buildImportPlan } from "./importPlan";
-import type { SignedSeal } from "./importPlan";
+import type { SignedSeal, ImportPlan, PlannedChannel } from "./importPlan";
 import { Importer, parseAdminPubkey } from "./importer";
 import type { ImportRow } from "./importer";
 import type { BridgeRow } from "./manager";
@@ -54,6 +54,7 @@ import { unseal } from "./seal";
 const SEAL_KEY = "0123456789abcdef".repeat(4);
 
 const env: PortalEnv = {
+  mode: "public",
   databaseUrl: "",
   port: 0,
   host: "127.0.0.1",
@@ -230,7 +231,7 @@ describe("import dedupe guard", () => {
         { bridge_id: "b-existing", discord_guild_id: "100", community_id: "prior-community", status: "active" },
       ] as Array<Record<string, unknown>>,
     };
-    const importer = new Importer(fakeSql(store), env, {} as never, () => wirePool([]));
+    const importer = new Importer(fakeSql(store), env, {} as never, () => wirePool([]), undefined, undefined, undefined, async (_id, work) => work());
     store.imports.set("imp2", {
       import_id: "imp2",
       owner_discord_id: "user1",
@@ -275,7 +276,7 @@ describe("resuming imports a restart interrupted", () => {
     store.imports.set("recent", row("recent", "wiring", 60_000));
     store.imports.set("stale", row("stale", "history", 30 * 24 * 60 * 60 * 1000));
     store.imports.set("finished", row("finished", "done", 60_000));
-    const importer = new Importer(fakeSql(store), env, {} as never, () => wirePool([]));
+    const importer = new Importer(fakeSql(store), env, {} as never, () => wirePool([]), undefined, undefined, undefined, async (_id, work) => work());
 
     await importer.resumeInterrupted();
     await new Promise((resolve) => setTimeout(resolve, 20)); // let the relaunch settle
@@ -297,7 +298,11 @@ describe("importer pipeline", () => {
     const wire: NostrEvent[] = [];
     const activated: BridgeRow[] = [];
     const routed: Array<{ channelId: string; id: string; timestampMs?: number }> = [];
+    const capacityChecks: string[] = [];
     const manager = {
+      assertPublicChannel: async () => {},
+      assertPublicChannels: async () => {},
+      assertPublicCapacity: async (communityId: string) => { capacityChecks.push(communityId); },
       activateImported: async (row: BridgeRow) => void activated.push(row),
       // The wiring step provisions the identity, admits the bridge to any
       // private channel, then starts it — so the stub hands back a row with a
@@ -346,9 +351,12 @@ describe("importer pipeline", () => {
       () => wirePool(wire),
       historyFetch,
       async () => {},
+      undefined,
+      async (_id, work) => work(),
     );
 
     const plan = buildImportPlan(snapshot);
+    plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
     store.imports.set("imp1", {
       import_id: "imp1",
       owner_discord_id: "user1",
@@ -404,17 +412,13 @@ describe("importer pipeline", () => {
     expect(fold.metadata?.name).toBe("Test Fleet");
     expect(fold.metadata?.description).toBe("hello");
 
-    // Channels: voice suffixed + tagged; the private one imported, gated.
+    // Only the public text channels are imported.
     const channels = [...fold.channels.values()].filter((c) => !c.deleted);
     expect(channels.map((c) => c.name).sort()).toEqual([
       "briefing",
       "general",
-      "hangout-voice",
-      "mods-only",
-      "news",
     ]);
     const briefing = channels.find((c) => c.name === "briefing")!;
-    const hangout = channels.find((c) => c.name === "hangout-voice")!;
     const generalFolded = channels.find((c) => c.name === "general")!;
 
     // The sidebar arrangement has to land where ARMADA reads it, so these go
@@ -436,43 +440,16 @@ describe("importer pipeline", () => {
           ),
         )
         .map((c) => c.name),
-    ).toEqual(["general", "news", "hangout-voice", "mods-only", "briefing"]);
+    ).toEqual(["general", "briefing"]);
 
     // Discord-only facts ride our own namespace, not `armada.*`.
     const discordOf = (m: { custom?: Record<string, unknown> }) =>
       m.custom?.["discord.import"] as { topic?: string; type?: string } | undefined;
-    expect(discordOf(hangout.metadata)?.type).toBe("voice");
     expect(discordOf(generalFolded.metadata)?.topic).toBe("plans, chaos, and everything else");
 
-    // The private channel: @everyone was denied VIEW_CHANNEL on Discord, so it
-    // imports as a CORD-03 Private Channel — `private: true`, and a Role scoped
-    // to it that is its access list (CORD-04 §2). It is NOT in the public
-    // bundle: a key every joiner reads gates nothing.
-    const modsOnly = channels.find((c) => c.name === "mods-only")!;
-    expect(modsOnly.metadata.private).toBe(true);
-    expect(channelRoles(fold.roster, modsOnly.channelIdHex).map((r) => r.name)).toEqual(["mods-only"]);
+    expect(channels.every((c) => !c.metadata.private)).toBe(true);
     expect(bundle.channels).toEqual([]);
-    // Only the owner is entitled at import time (position 0, supreme); nobody
-    // else has an npub yet.
-    expect(isEntitled(fold.roster, fold.ownerHex, userPk, modsOnly.channelIdHex)).toBe(true);
-    expect(
-      isEntitled(fold.roster, fold.ownerHex, row().plan.checkpoints.opPkHex!, modsOnly.channelIdHex),
-    ).toBe(false);
-
-    // ...and the owner is handed its key as a Direct Invite (CORD-05 §6),
-    // giftwrapped to them and indexable by the `k` tag.
-    const directInvite = wire.find(
-      (e) => e.kind === 1059 && e.tags.some(([n, v]) => n === "k" && v === "3313"),
-    )!;
-    expect(directInvite).toBeDefined();
-    expect(directInvite.tags).toContainEqual(["p", userPk]);
-    const delivered = await unwrapDirectInvite(directInvite, localIdentity(userSk).signer);
-    expect(delivered?.sender).toBe(row().plan.checkpoints.opPkHex!);
-    const keyBundle = parseDirectInviteRumor(delivered!.rumor.kind, delivered!.rumor.content)!;
-    expect(keyBundle.channels.map((c) => [c.id, c.name])).toEqual([[modsOnly.channelIdHex, "mods-only"]]);
-    // A real 32-byte secret, independent of the community root (CORD-03 §1).
-    expect(keyBundle.channels[0].key).toMatch(/^[0-9a-f]{64}$/);
-    expect(keyBundle.channels[0].key).not.toBe(bundle.community_root);
+    expect(wire.some((e) => e.tags.some(([name, value]) => name === "k" && value === "3313"))).toBe(false);
 
     // Roles: stock Admin at 1, then Chief (ADMINISTRATOR → ADMIN_ALL), then Mod.
     // The channel-access Role sits below them all and is scoped, not server-wide.
@@ -551,8 +528,10 @@ describe("importer pipeline", () => {
     );
 
     // Idempotency: a re-run from checkpoints publishes nothing new.
+    expect(capacityChecks.length).toBeGreaterThan(0);
+    expect(new Set(capacityChecks).size).toBe(1);
     const wireLen = wire.length;
-    await (importer as unknown as { run: (id: string) => Promise<void> }).run("imp1");
+    await (importer as unknown as { runOwned: (id: string) => Promise<void> }).runOwned("imp1");
     expect(wire.length).toBe(wireLen);
     expect(activated.length).toBe(2);
     expect(row().status).toBe("done");
@@ -568,6 +547,9 @@ describe("importer pipeline", () => {
     const store = { imports: new Map<string, Record<string, unknown>>(), bridges: [] as Array<Record<string, unknown>> };
     const wire: NostrEvent[] = [];
     const manager = {
+      assertPublicChannel: async () => {},
+      assertPublicChannels: async () => {},
+      assertPublicCapacity: async () => {},
       activateImported: async () => {},
       provisionImported: async (row: BridgeRow) => ({ ...row, primary_pk: `pk-${row.bridge_id}` }),
       startImported: async () => {},
@@ -584,9 +566,11 @@ describe("importer pipeline", () => {
       async () => [],
       async () => {},
       1, // publishRetryMs: don't sleep out the retry budget in a unit test
+      async (_id, work) => work(),
     );
 
     const plan = buildImportPlan(snapshot);
+    plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
     store.imports.set("impDrop", {
       import_id: "impDrop",
       owner_discord_id: "user1",
@@ -622,4 +606,75 @@ describe("importer pipeline", () => {
     // Nothing was wired: no bridge row points at a channel that never landed.
     expect(store.bridges.length).toBe(0);
   });
+});
+
+describe("public-only import boundary", () => {
+  it("rejects an old preview containing a selected private channel before genesis", async () => {
+    const store = { imports: new Map<string, Record<string, unknown>>(), bridges: [] as Array<Record<string, unknown>> };
+    store.imports.set("private-preview", {
+      import_id: "private-preview", owner_discord_id: "user1", discord_guild_id: "100",
+      status: "previewed", plan: buildImportPlan(snapshot), community_id: null,
+    });
+    const manager = { assertPublicChannel: async () => {}, assertPublicChannels: async () => {} };
+    const importer = new Importer(fakeSql(store), env, manager as never, () => wirePool([]), async () => [], async () => {});
+    await expect(importer.prepare("private-preview", "user1", { ownerNpub: getPublicKey(generateSecretKey()) })).rejects.toThrow(/public/i);
+    expect(store.imports.get("private-preview")!.community_id).toBeNull();
+  });
+
+  it("stops history fetching and forwarding when visibility changes during replay", async () => {
+    let allowed = true;
+    let fetched = 0;
+    let sent = 0;
+    const manager = {
+      assertPublicChannel: async () => { if (!allowed) throw new Error("visibility denied"); },
+      assertPublicChannels: async () => { if (!allowed) throw new Error("visibility denied"); },
+      resyncFor: async () => {},
+      routerFor: () => ({ router: { onDiscordMessage: async () => { sent++; } }, link: {} }),
+    };
+    const importer = new Importer(fakeSql({ imports: new Map(), bridges: [] }), env, manager as never, () => wirePool([]), async () => {
+      fetched++;
+      allowed = false;
+      return fetched === 1 ? [restMsg("1005", "2023-04-02T10:00:00Z")] : [];
+    });
+    const plan = buildImportPlan(snapshot);
+    plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
+    const channel = plan.channels.find((c) => c.discordId === "1")!;
+    await expect((importer as unknown as { backfillChannel(id: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> }).backfillChannel("test", plan, channel)).rejects.toThrow("visibility denied");
+    expect(fetched).toBe(1);
+    expect(sent).toBe(0);
+  });
+});
+
+it("does not mark history complete when this worker does not own the bridge", async () => {
+  const plan = buildImportPlan(snapshot);
+  plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
+  const channel = plan.channels[0];
+  const store = { imports: new Map<string, Record<string, unknown>>([["unowned", { import_id: "unowned", plan }]]), bridges: [] as Array<Record<string, unknown>> };
+  const manager = { assertPublicChannel: async () => {}, assertPublicChannels: async () => {}, resyncFor: async () => {}, routerFor: () => undefined };
+  const importer = new Importer(fakeSql(store), env, manager as never);
+  await expect((importer as unknown as { backfillChannel(id: string, plan: ImportPlan, channel: PlannedChannel): Promise<void> }).backfillChannel("unowned", plan, channel)).rejects.toThrow(/not owned/);
+  expect(channel.historyDoneAt).toBeUndefined();
+});
+
+it("authorizes the whole selected import once per effect, including other-channel revocation", async () => {
+  const plan = buildImportPlan(snapshot);
+  plan.channels = plan.channels.filter((c) => !c.private && c.discordType === 0);
+  expect(plan.channels.length).toBeGreaterThan(1);
+  let allowed = true;
+  const batches: string[][] = [];
+  const manager = {
+    assertPublicChannel: async () => { throw new Error("unexpected per-channel read"); },
+    assertPublicChannels: async (guild: string, ids: string[]) => {
+      expect(guild).toBe(plan.guild.id);
+      batches.push(ids);
+      if (!allowed) throw new Error("other selected channel revoked");
+    },
+  };
+  const importer = new Importer(fakeSql({ imports: new Map(), bridges: [] }), env, manager as never);
+  const gate = importer as unknown as { assertPublicPlan(plan: ImportPlan): Promise<void> };
+  await gate.assertPublicPlan(plan);
+  allowed = false;
+  await expect(gate.assertPublicPlan(plan)).rejects.toThrow("other selected channel revoked");
+  const selected = plan.channels.filter((c) => c.selected).map((c) => c.discordId);
+  expect(batches).toEqual([selected, selected]);
 });

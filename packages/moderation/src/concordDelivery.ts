@@ -1,0 +1,60 @@
+import type { NostrEvent } from "nostr-tools/pure";
+import type { RelayPool } from "../../bridge/src/concord/pool";
+import { StalePreparedBanlistError, type ConcordActions } from "./concordActions";
+import type { Decisions, DeliveryClaim } from "./decisions";
+import { RetryableDeliveryError, type DeliveryAttempt } from "./discordActions";
+import { verifiedEvent } from "./relayPolicy";
+export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActions, decisions: Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted">, relay: Pick<RelayPool, "publish" | "queryStrict">, assertCurrent: () => Promise<void>): Promise<DeliveryAttempt> {
+  if (claim.reconcileOnly) {
+    const waiting: DeliveryAttempt = { state: "failed", code: "concord_recovery_awaiting_proof", retryAfterSeconds: 300 };
+    if (claim.publicationAttempted !== true) return waiting;
+    await assertCurrent();
+    let settled = false;
+    try {
+      const legacy = claim.signedEvents;
+      const ids = claim.publicationEventIds ?? (Array.isArray(legacy) && legacy.length === 1 ? [verifiedEvent(legacy[0] as NostrEvent).id] : undefined);
+      if (ids?.length === 1 && /^[0-9a-f]{64}$/.test(ids[0])) {
+        const fetched = (await relay.queryStrict([{ ids }])).map(verifiedEvent).filter((event) => event.id === ids[0]);
+        if (fetched.length) settled = await actions.publicationInCurrentHistory(claim.decision, [fetched[0]]);
+      }
+    } catch { /* Missing/invalid proof or unavailable policy cannot release a successor. */ }
+    await assertCurrent();
+    // No publish, replacement, old-action authorization or relay/Discord effect.
+    return settled ? { state: "not_applicable", code: claim.publicationProofOnly ? "concord_publication_settled" : "concord_superseded_publication_settled" } : waiting;
+  }
+  let events = (claim.signedEvents ?? await decisions.saveEvents(claim, await actions.prepare(claim.decision))) as NostrEvent[];
+  try { await actions.validatePrepared(claim.decision, events); } catch (error) {
+    if (!(error instanceof StalePreparedBanlistError)) throw error;
+    // Relay absence is not proof of non-publication. Rebase only a generation
+    // whose durable send marker is false; legacy/uncertain bytes need an
+    // operator, not a new edition that could undo intervening moderation.
+    if (claim.publicationAttempted !== false) return { state: "failed", code: "concord_recovery_requires_operator" };
+    await assertCurrent();
+    events = await decisions.replaceUnattemptedEvents(claim, events, await actions.prepare(claim.decision)) as NostrEvent[];
+    await actions.validatePrepared(claim.decision, events);
+  }
+  for (const event of events) {
+    await assertCurrent();
+    await actions.authorize(claim.decision);
+    await decisions.markPublicationAttempted(claim, events);
+    // Persisting intent is an await, not an authority or lease guarantee for
+    // the following network effect. Recheck after the durable write settles.
+    await actions.authorize(claim.decision);
+    await assertCurrent();
+    try { await relay.publish(event); } catch { throw new RetryableDeliveryError("concord_transport_unavailable"); }
+  }
+  const fetched = await relay.queryStrict([{ ids: events.map((event) => event.id) }]).catch(() => { throw new RetryableDeliveryError("concord_readback_unavailable"); });
+  const found = new Set(fetched.map((event) => verifiedEvent(event).id));
+  if (events.some((event) => !found.has(event.id))) return { state: "acknowledged", code: "concord_awaiting_readback" };
+  // Refresh authority after readback as well: a losing banlist edition can be
+  // stored successfully while never becoming the canonical community state.
+  try { await actions.validatePrepared(claim.decision, events); } catch (error) {
+    if (error instanceof StalePreparedBanlistError) return { state: "failed", code: "concord_recovery_requires_operator" };
+    throw error;
+  }
+  if (claim.decision.action !== "remove_message") {
+    const { folded } = await actions.authorize(claim.decision);
+    if (folded.banned.has(claim.decision.author) !== (claim.decision.action === "ban_member")) return { state: "acknowledged", code: "concord_awaiting_fold" };
+  }
+  return { state: "verified", code: "concord_enforcement_verified" };
+}

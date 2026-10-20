@@ -10,8 +10,8 @@
  */
 
 import {
-  Permissions,
   STOCK_RELAYS,
+  Permissions,
   inviteDeliveryRelays,
   isAuthorized,
   parseInviteLink,
@@ -21,10 +21,15 @@ import { hexToBytes } from "@noble/hashes/utils.js";
 import { decode as nip19decode } from "nostr-tools/nip19";
 import postgres from "postgres";
 
+import { PublicCapacityGuard } from "../../moderation/src/publicCapacity";
+import { CONCORD_EFFECT_METHODS, guardEffects } from "./effectGuard";
+import { BridgeLeases, bridgeResource } from "./db/leases";
+import { discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
 import { BlossomStore } from "./blossom";
 import { KlipyClient } from "./klipy";
 import { ConcordClient, resolveInvite } from "./concord/client";
 import { intakeDirectInviteKeys } from "./concord/keyIntake";
+import { identityRelayPool } from "./concord/identityPool";
 import { RelayPool } from "./concord/pool";
 import { localIdentity } from "./concord/signer";
 import { loadConfig } from "./config";
@@ -57,16 +62,51 @@ if (!inviteUrl || !guildId || !channelId || !config.discordToken) {
   process.exit(0);
 }
 
+const publicPolicy = config.mode === "public" ? discordPublicChannelPolicy(config.publicChannels!, config.discordToken) : undefined;
+await publicPolicy?.assertPublicChannel(guildId, channelId);
+const sql = postgres(config.databaseUrl, { onnotice: () => {} });
+const capacity = new PublicCapacityGuard(sql);
+// Register cleanup as resources appear, so loss during startup does not touch
+// bindings that have not initialized yet. A supervisor can then restart us.
+const cleanup: Array<() => void | Promise<void>> = [() => sql.end()];
+let shuttingDown = false;
+let exitCode = 0;
+async function shutdown(code = 0): Promise<void> {
+  exitCode = Math.max(exitCode, code);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("bridge: shutting down");
+  while (cleanup.length) await Promise.resolve().then(cleanup.pop()!).catch(() => {});
+  process.exit(exitCode);
+}
+const lease = await new BridgeLeases(sql).acquire(bridgeResource(guildId, channelId), () => {
+  console.error("bridge: terminal lease loss; restart required");
+  void shutdown(1);
+});
+if (!lease) throw new Error("Bridge lease is owned by another worker");
+cleanup.push(() => lease.release());
+const assertMayForward = async () => {
+  await lease.assertCurrent();
+  await publicPolicy?.assertPublicChannel(guildId, channelId);
+  const current = rawClient.channel(concordChannelId!);
+  if (!current || (config.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
+  if (config.mode === "public") await capacity.assertPublicProducer(community.idHex);
+  await lease.assertCurrent();
+};
+
 // ── Concord side ─────────────────────────────────────────────────────────────
 const invite = parseInviteLink(inviteUrl);
 if (!invite) throw new Error("BRIDGE_INVITE_URL is not a valid Armada invite");
 const bootstrap = new RelayPool(invite.bootstrapRelays.length ? invite.bootstrapRelays : STOCK_RELAYS);
+cleanup.push(() => bootstrap.close());
 const { community } = await resolveInvite(inviteUrl, bootstrap);
 await bootstrap.close();
-console.log(`bridge: joined material for community ${community.name} (${community.idHex.slice(0, 8)}…)`);
+console.log(`bridge: joined material for community ${community.name} (${community.idHex})`);
 
-const pool = new RelayPool(community.relays);
-const primary = localIdentity(primarySk(config.primarySecretKey));
+const primaryKey = primarySk(config.primarySecretKey);
+const primary = localIdentity(primaryKey);
+const pool = identityRelayPool(community.relays, primaryKey);
+cleanup.push(() => pool.close());
 
 // Fold the Control Plane FIRST. It reads from the community root the invite
 // already carried, so it needs no private-channel key — which means the
@@ -74,32 +114,37 @@ const primary = localIdentity(primarySk(config.primarySecretKey));
 // before we accept any. The intake below refuses bundles from anyone else.
 const preflight = new ConcordClient(community, pool, primary);
 const folded = await preflight.syncControl();
+let rawClient = preflight;
+if (config.mode !== "public") {
 
-// Private-channel keys addressed to us since the last boot. The join bundle
-// only ever carried what the inviter vended at the time, so a channel we were
-// granted afterwards is readable only once its Direct Invite is opened — and
-// this has to run BEFORE the client that serves `channels()` is built, or the
-// grant is invisible until the next restart. The stock floor is scanned
-// alongside the community relays because that is where a sender delivers to an
-// npub with no published inbox (which we were, until the 10050 below).
-const floor = new RelayPool(inviteDeliveryRelays([]));
-const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
-  isAuthorizedSender: (pk) =>
-    isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
-}).finally(() => void floor.close());
-if (intake.learned.length > 0) {
-  console.log(`bridge: learned ${intake.learned.length} private-channel key(s) from direct invites`);
+  // Private-channel keys addressed to us since the last boot. The join bundle
+  // only ever carried what the inviter vended at the time, so a channel we were
+  // granted afterwards is readable only once its Direct Invite is opened — and
+  // this has to run BEFORE the client that serves `channels()` is built, or the
+  // grant is invisible until the next restart. The stock floor is scanned
+  // alongside the community relays because that is where a sender delivers to an
+  // npub with no published inbox (which we were, until the 10050 below).
+  const floor = identityRelayPool(inviteDeliveryRelays([]), primaryKey);
+  const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
+    isAuthorizedSender: (pk) =>
+      isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
+  }).finally(() => void floor.close());
+  if (intake.learned.length > 0) {
+    console.log(`bridge: learned ${intake.learned.length} private-channel key(s) from direct invites`);
+  }
+
+  // Re-fold only when the intake actually changed the key set; otherwise the
+  // preflight client already holds the answer.
+  rawClient = intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
+  if (intake.learned.length > 0) await rawClient.syncControl();
 }
-
-// Re-fold only when the intake actually changed the key set; otherwise the
-// preflight client already holds the answer.
-const client = intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
-if (intake.learned.length > 0) await client.syncControl();
+const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
 
 const concordChannelId =
   process.env.CONCORD_CHANNEL_ID?.trim() || client.channels()[0]?.idHex;
 const channel = concordChannelId ? client.channel(concordChannelId) : undefined;
-if (!channel) throw new Error(`concord channel not found (have: ${client.channels().map((c) => c.idHex.slice(0, 8)).join(", ")})`);
+if (!channel) throw new Error(`concord channel not found (have: ${client.channels().map((c) => c.idHex).join(", ")})`);
+if (config.mode === "public" && channel.isPrivate) throw new Error("Concord channel must be public");
 console.log(`bridge: target channel #${channel.name}`);
 
 await client.publishJoin().catch((error) => console.warn("bridge: guestbook join failed", error));
@@ -118,7 +163,6 @@ await client
   .catch((error) => console.warn("bridge: DM relay list publish failed", error));
 
 // ── Storage, Discord, router ────────────────────────────────────────────────
-const sql = postgres(config.databaseUrl, { onnotice: () => {} });
 const store = new PostgresMappingStore(sql);
 
 const link: ChannelLink = {
@@ -159,7 +203,11 @@ const adapter = new DiscordAdapter(config.discordToken, {
     if (typing.bot || typing.channelId !== link.discordChannelId) return;
     await router.onDiscordTyping(typing.userId, link);
   },
+}, async (id) => {
+  if (id !== channelId) throw new Error("Channel not configured");
+  await assertMayForward();
 });
+cleanup.push(() => adapter.stop());
 await adapter.start();
 router = new BridgeRouter(
   client,
@@ -169,6 +217,7 @@ router = new BridgeRouter(
   profiles,
   { applicationId: adapter.applicationId, webhookIds: adapter.ownWebhookIds },
   {
+    beforeSideEffect: assertMayForward,
     bridgeEdits: config.bridgeEdits,
     blobs: config.blossomServer ? new BlossomStore(config.blossomServer) : undefined,
     klipy: config.klipyApiKey ? new KlipyClient(config.klipyApiKey) : undefined,
@@ -206,6 +255,7 @@ let currentChannel = channel;
 }
 
 let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);
+cleanup.push(() => unsubscribe());
 // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
 // goes silent while publishes (fresh channel lookup) keep working.
 const unsubControl = client.subscribeControl(() => {
@@ -218,16 +268,8 @@ const unsubControl = client.subscribeControl(() => {
   unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, onCursor);
   console.log("bridge: stream keys rotated; chat subscription refreshed");
 });
+cleanup.push(() => unsubControl());
 console.log("bridge: live in both directions");
 
-async function shutdown(): Promise<void> {
-  console.log("bridge: shutting down");
-  unsubscribe();
-  unsubControl();
-  await adapter.stop().catch(() => {});
-  await pool.close().catch(() => {});
-  await sql.end().catch(() => {});
-  process.exit(0);
-}
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());

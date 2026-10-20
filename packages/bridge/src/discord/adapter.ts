@@ -16,6 +16,7 @@ import {
   GatewayIntentBits,
   Options,
   Partials,
+  type ChatInputCommandInteraction,
   type Message,
   type MessageReaction,
   type PartialMessageReaction,
@@ -32,6 +33,11 @@ import type {
   DiscordReactionAdd,
   WebhookSender,
 } from "../router";
+import {
+  SLASH_COMMAND_NAMES,
+  interactionToCommandText,
+  slashCommandRegistration,
+} from "./commands";
 
 export const BRIDGE_WEBHOOK_NAME = "armada-bridge";
 
@@ -82,6 +88,26 @@ export function parseBotCommand(content: string): string | undefined {
   return match?.[1].toLowerCase();
 }
 
+/**
+ * Present a slash interaction as the command message the text path would have
+ * delivered. The host handler reads exactly `content`, `channelId`, `author.bot`,
+ * `webhookId`, and `reply(text)`; this object is the whole of that contract. The
+ * cast to `Message` is the seam: it keeps one handler signature across both
+ * transports instead of teaching the host a second, near-identical one.
+ */
+function commandMessageFor(interaction: ChatInputCommandInteraction, content: string): Message {
+  return {
+    content,
+    channelId: interaction.channelId,
+    author: { bot: false },
+    webhookId: undefined,
+    reply: async (payload: string | { content?: string }) => {
+      const text = typeof payload === "string" ? payload : (payload.content ?? "");
+      await interaction.reply({ content: text });
+    },
+  } as unknown as Message;
+}
+
 export class DiscordAdapter implements WebhookSender {
   readonly client: Client;
   /** Webhook ids we created; the router uses this set for echo suppression. */
@@ -91,6 +117,7 @@ export class DiscordAdapter implements WebhookSender {
   constructor(
     private readonly token: string,
     private readonly handlers: DiscordAdapterHandlers,
+    private readonly beforeEffect: (channelId: string) => Promise<void> = async () => { throw new Error("Bridge effect policy is not configured"); },
   ) {
     this.client = new Client({
       intents: [
@@ -179,6 +206,12 @@ export class DiscordAdapter implements WebhookSender {
         })
         .catch((error) => console.error("bridge: onTyping failed", error));
     });
+    this.client.on("interactionCreate", (interaction) => {
+      if (!interaction.isChatInputCommand()) return;
+      void this.handleSlashInteraction(interaction).catch((error) =>
+        console.error("bridge: slash command failed", error),
+      );
+    });
   }
 
   get applicationId(): string {
@@ -196,6 +229,63 @@ export class DiscordAdapter implements WebhookSender {
       if (this.client.isReady()) return resolve();
       this.client.once("clientReady", () => resolve());
     });
+    // Register the slash commands once the gateway is up. Fired and not waited
+    // on: a REST hiccup here must not take the gateway down (a down gateway is
+    // what turns a blip into a mass sever), and `set` is a full replace, so the
+    // next boot heals a partial registration. Global scope covers every guild
+    // the bot joins now or later — per-guild would need a restart to reach a
+    // new guild, and the command surface is identical everywhere.
+    void this.registerSlashCommands().catch((error) =>
+      console.error("bridge: slash command registration failed", error),
+    );
+  }
+
+  /**
+   * Register (or replace) the bot's application commands. `guildId` scopes the
+   * registration to one guild for instant visibility during development; omit
+   * it for the global registration that is the default.
+   */
+  async registerSlashCommands(guildId?: string): Promise<void> {
+    const application = this.client.application;
+    if (!application) throw new Error("Discord application not ready");
+    const payload = slashCommandRegistration();
+    if (guildId) await application.commands.set(payload, guildId);
+    else await application.commands.set(payload);
+  }
+
+  /**
+   * Dispatch a slash-command interaction to the same handler the message-text
+   * path uses (`onBotCommand`), by presenting the interaction as the equivalent
+   * command message. A dedicated interaction handler would be the obvious
+   * design, but the host (the portal manager) owns the command behaviour —
+   * which channels count as live bridges, the effect gate, the reply text —
+   * behind `onBotCommand`; a new hook would need the host to change. Routing
+   * both transports through one handler keeps that behaviour (and its
+   * permission checks) in exactly one place and byte-identical across them.
+   */
+  async handleSlashInteraction(interaction: ChatInputCommandInteraction): Promise<void> {
+    if (!SLASH_COMMAND_NAMES.has(interaction.commandName)) return;
+    const options = interaction.options.data
+      .filter((o) => o.value !== undefined)
+      .map((o) => ({ name: o.name, value: String(o.value) }));
+    const content = interactionToCommandText(interaction.commandName, options);
+    const handler = this.handlers.onBotCommand;
+    if (!handler) {
+      await interaction.reply({ ephemeral: true, content: "Commands are not configured for this bridge." });
+      return;
+    }
+    const handled = await handler(commandMessageFor(interaction, content));
+    // The text path can simply not answer a channel it does not own (another
+    // bot may answer there). A slash command cannot: Discord requires an
+    // acknowledgement within three seconds, and our command is namespaced to
+    // this application so "another bot" cannot own it. An ephemeral note is the
+    // closest thing to the text path's silence — only the invoker sees it.
+    if (!handled && !interaction.replied) {
+      await interaction.reply({
+        ephemeral: true,
+        content: "This channel is not a live bridge to an Armada community.",
+      });
+    }
   }
 
   async stop(): Promise<void> {
@@ -203,6 +293,7 @@ export class DiscordAdapter implements WebhookSender {
   }
 
   private async webhookFor(channelId: string): Promise<Webhook> {
+    await this.beforeEffect(channelId);
     const cached = this.webhookCache.get(channelId);
     if (cached) return cached;
 
@@ -214,9 +305,8 @@ export class DiscordAdapter implements WebhookSender {
     const existing = (await text.fetchWebhooks()).find(
       (wh) => wh.name === BRIDGE_WEBHOOK_NAME && wh.token,
     );
-    const webhook =
-      existing ??
-      (await text.createWebhook({ name: BRIDGE_WEBHOOK_NAME, reason: "Armada bridge persona posts" }));
+    await this.beforeEffect(channelId);
+    const webhook = existing ?? (await text.createWebhook({ name: BRIDGE_WEBHOOK_NAME, reason: "Armada bridge persona posts" }));
     this.webhookCache.set(channelId, webhook);
     this.ownWebhookIds.add(webhook.id);
     return webhook;
@@ -243,6 +333,7 @@ export class DiscordAdapter implements WebhookSender {
       allowedMentions: { parse: [] as [] },
     });
     try {
+      await this.beforeEffect(link.discordChannelId);
       const created = await webhook.send(payload(sanitizeUsername(message.username)));
       return created.id;
     } catch (error) {
@@ -251,6 +342,7 @@ export class DiscordAdapter implements WebhookSender {
       // display name: retry once under a neutral one.
       if (!isUsernameRejection(error)) throw error;
       console.warn(`discord rejected webhook username ${JSON.stringify(message.username)}; retrying as "bridged member"`);
+      await this.beforeEffect(link.discordChannelId);
       const created = await webhook.send(payload("bridged member"));
       return created.id;
     }
@@ -259,6 +351,7 @@ export class DiscordAdapter implements WebhookSender {
   /** WebhookSender: edit a webhook-authored mirror in place. */
   async edit(link: ChannelLink, discordMessageId: string, content: string): Promise<void> {
     const webhook = await this.webhookFor(link.discordChannelId);
+    await this.beforeEffect(link.discordChannelId);
     await webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } });
   }
 
@@ -270,6 +363,7 @@ export class DiscordAdapter implements WebhookSender {
    */
   async notice(channelId: string, content: string): Promise<void> {
     const channel = await this.textChannel(channelId);
+    await this.beforeEffect(channelId);
     await channel.send({ content, allowedMentions: { parse: [] } });
   }
 
@@ -299,9 +393,11 @@ export class DiscordAdapter implements WebhookSender {
   async delete(link: ChannelLink, discordMessageId: string): Promise<void> {
     const webhook = await this.webhookFor(link.discordChannelId);
     try {
+      await this.beforeEffect(link.discordChannelId);
       await webhook.deleteMessage(discordMessageId);
     } catch {
       const channel = await this.textChannel(link.discordChannelId);
+      await this.beforeEffect(link.discordChannelId);
       await channel.messages.delete(discordMessageId);
     }
   }
@@ -309,6 +405,7 @@ export class DiscordAdapter implements WebhookSender {
   /** WebhookSender: show the bot's typing indicator (lasts ~10s or until a send). */
   async sendTyping(link: ChannelLink): Promise<void> {
     const channel = await this.textChannel(link.discordChannelId);
+    await this.beforeEffect(link.discordChannelId);
     await channel.sendTyping();
   }
 
@@ -316,6 +413,7 @@ export class DiscordAdapter implements WebhookSender {
   async react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
     const channel = await this.textChannel(link.discordChannelId);
     const message = await channel.messages.fetch(discordMessageId);
+    await this.beforeEffect(link.discordChannelId);
     await message.react(emoji);
   }
 
@@ -334,6 +432,7 @@ export class DiscordAdapter implements WebhookSender {
     const message = await channel.messages.fetch(discordMessageId);
     const botId = this.client.user?.id;
     if (!botId) return;
+    await this.beforeEffect(link.discordChannelId);
     await message.reactions.resolve(emoji)?.users.remove(botId);
   }
 }
