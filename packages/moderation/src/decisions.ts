@@ -362,7 +362,15 @@ export class Decisions {
     return this.get(decisionId, actor);
   }
   async expire(): Promise<void> {
-    const rows = await this.sql`SELECT org_id, decision_id FROM moderation.decisions WHERE expires_at <= clock_timestamp() ORDER BY org_id, case_id, decision_id`;
+    // Decisions are never deleted, so every expired one would otherwise be
+    // re-locked on every worker pass forever. Select only those with a row one
+    // of the two UPDATEs below still changes: the predicate is theirs, exactly
+    // (an unsettled delivery, or retained signed bytes), and both clear it, so
+    // a processed decision drops out and the bounded batch always advances.
+    // Widen this if either UPDATE's WHERE ever widens, or expiry silently stops.
+    const rows = await this.sql`SELECT c.org_id, c.decision_id FROM moderation.decisions c WHERE c.expires_at <= clock_timestamp()
+        AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = c.decision_id AND (d.state IN ('pending', 'acknowledged') OR d.signed_events IS NOT NULL))
+      ORDER BY c.org_id, c.case_id, c.decision_id LIMIT 100`;
     for (const row of rows) await this.sql.begin(async (tx) => {
       await lockLifecycleDecision(tx, row.org_id, row.decision_id);
       await tx`UPDATE moderation.deliveries SET state = 'failed',

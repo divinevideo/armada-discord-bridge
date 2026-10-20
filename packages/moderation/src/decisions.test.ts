@@ -816,3 +816,25 @@ test("erasing a legacy failed publication without receipt IDs keeps its successo
     expect(await concordRow(successor.decisionId)).toMatchObject({ state: 'pending', attempts: 0, result_code: 'concord_waiting_on_prior_publication' });
   } finally { await h.cleanup(); }
 });
+
+test("expiry does not revisit an expired decision that has nothing left to expire", async () => {
+  const expireNow = (id: string) => sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${id}`; });
+  const settled = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  await expireNow(settled.decisionId);
+  await decisions.expire();
+  expect((await decisions.get(settled.decisionId, actor)).deliveries.every(d => d.state === "failed" && d.resultCode === "decision_expired")).toBe(true);
+  const pending = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  await expireNow(pending.decisionId);
+  // Hold the settled decision's row as a long staff transaction would. Expiry
+  // that still selects it would wait here instead of reaching the pending one.
+  let release!: () => void, locked!: () => void;
+  const held = new Promise<void>(r => { release = r; }), isLocked = new Promise<void>(r => { locked = r; });
+  const holder = sql.begin(async tx => { await tx`SELECT 1 FROM moderation.decisions WHERE decision_id = ${settled.decisionId} FOR UPDATE`; locked(); await held; });
+  await isLocked;
+  const run = decisions.expire();
+  let outcome: string;
+  try { outcome = await Promise.race([run.then(() => "finished"), Bun.sleep(1500).then(() => "blocked on a settled decision")]); }
+  finally { release(); await holder; await run; }
+  expect(outcome).toBe("finished");
+  expect((await decisions.get(pending.decisionId, actor)).deliveries.every(d => d.state === "failed" && d.resultCode === "decision_expired")).toBe(true);
+});
