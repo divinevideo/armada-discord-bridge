@@ -37,7 +37,7 @@ export function controlState(policy: CommunityPolicy) {
   return { editions, folded: foldControlState(editions, hex32(policy.communityId), policy.owner) };
 }
 
-export async function inspectRelayEvent(input: NostrEvent, context: AdmissionContext): Promise<{ result: AdmissionResult; carrier?: CarrierRecord; references?: { target: RoomTarget; eventId: string; ids: string[] }; observedAuthor?: string; control?: NostrEvent; removals?: RoomTarget[]; rekey?: { communityId: string; epoch: string; event: NostrEvent } }> {
+export async function inspectRelayEvent(input: NostrEvent, context: AdmissionContext): Promise<{ result: AdmissionResult; carrier?: CarrierRecord; references?: { target: RoomTarget; eventId: string; ids: string[] }; observedAuthor?: string; control?: NostrEvent; removals?: RoomTarget[]; rekey?: { communityId: string; epoch: string; event: NostrEvent }; retraction?: boolean }> {
   const id = typeof input?.id === "string" && HEX_ID.test(input.id) ? input.id : "0".repeat(64);
   const reject: AdmissionResult = { id, action: "reject", msg: "blocked: room policy unavailable or event not permitted" };
   let references: { target: RoomTarget; eventId: string; ids: string[] } | undefined;
@@ -106,7 +106,9 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
         const members = JSON.parse(opened.content);
         requireThat(Array.isArray(members) && members.length <= 400 && members.every((member) => typeof member === "string" && HEX_ID.test(member)));
       } else return { result: reject };
-      return { result: accept, observedAuthor: opened.kind === 3306 && opened.content === "join" ? opened.author : undefined };
+      // A self-signed Leave only withdraws its author (an additive signal for
+      // the capacity gate, never an admission grant).
+      return { result: accept, observedAuthor: opened.kind === 3306 && opened.content === "join" ? opened.author : undefined, retraction: opened.kind === 3306 && opened.content === "leave" };
     }
     requireThat(!policy.rekeyPending);
     requireThat(descriptor.plane === "chat" && descriptor.channelId && CHAT_KINDS.has(opened.kind));
@@ -121,12 +123,15 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
     // is now removed. These are verified references, never an admission grant.
     requireThat(!(await context.isRemoved(target)));
     for (const rumorId of targetRumorIds) requireThat(!(await context.isRemoved({ ...target, rumorId })));
+    let selfAuthored = false;
     if (opened.kind === 5 || opened.kind === 3302) {
       const targets = opened.tags.filter((tag) => tag[0] === "e").map((tag) => tag[1]);
       requireThat(targets.length > 0 && targets.length <= 100 && targets.every((value) => HEX_ID.test(value)));
+      selfAuthored = true;
       for (const rumorId of targets) {
         const author = await context.authorOf({ ...target, rumorId });
         requireThat(author && (author === opened.author || (opened.kind === 5 && citationSatisfied(folded, hex32(policy.communityId), opened.author, citationFromTags(opened.tags)) && canActOnMember(folded.roster, opened.author, policy.owner, author, Permissions.MANAGE_MESSAGES))));
+        if (author !== opened.author) selfAuthored = false;
       }
     }
     if (opened.kind === 1740) requireThat(isAuthorized(folded.roster, opened.author, policy.owner, Permissions.MANAGE_METADATA));
@@ -137,7 +142,7 @@ export async function inspectRelayEvent(input: NostrEvent, context: AdmissionCon
     const expiresAt = expiration.length ? Number(expiration[0][1]) * 1000 : undefined;
     if (expiration.length) requireThat(/^[0-9]+$/.test(expiration[0][1]) && Number.isSafeInteger(expiresAt) && expiresAt! > context.now());
     requireThat(context.now() < policy.validUntil);
-    return { result: accept, references, observedAuthor: opened.author, removals: opened.kind === 5 ? opened.tags.filter((tag) => tag[0] === "e").map((tag) => ({ ...target, rumorId: tag[1] })) : undefined, carrier: { ...target, eventId: event.id, author: opened.author, kind: opened.kind, expiresAt, policyRevision: policy.revision, targetRumorIds } };
+    return { result: accept, references, observedAuthor: opened.author, retraction: opened.kind === 5 && selfAuthored, removals: opened.kind === 5 ? opened.tags.filter((tag) => tag[0] === "e").map((tag) => ({ ...target, rumorId: tag[1] })) : undefined, carrier: { ...target, eventId: event.id, author: opened.author, kind: opened.kind, expiresAt, policyRevision: policy.revision, targetRumorIds } };
   } catch {
     return { result: reject, references };
   }

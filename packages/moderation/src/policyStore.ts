@@ -146,7 +146,7 @@ export class PolicyStore {
           try { return await read(); }
           catch (error) { lookupFailures.push(error); throw error; }
         };
-        const { result, carrier, references, rekey, observedAuthor, control, removals } = await inspectRelayEvent(event, {
+        const { result, carrier, references, rekey, observedAuthor, control, removals, retraction } = await inspectRelayEvent(event, {
           policy, stream: row && streamOf(row), now: Date.now, publicAuthorKnown: known.length > 0,
           isRemoved: (target) => lookup(async () => (await tx`SELECT 1 FROM moderation.tombstones WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId}`).length > 0),
           authorOf: (target) => lookup(async () => (await tx`SELECT author FROM moderation.carriers WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} LIMIT 1`)[0]?.author as string | undefined),
@@ -166,6 +166,10 @@ export class PolicyStore {
             if (control) urgent = bytesToHex(parseEdition(opened).entityId) === bytesToHex(banlistLocator(hex32(communityId)));
             else if (opened.kind === 5 || opened.kind === 3309) urgent = isAuthorized(state.folded.roster, opened.author, policy!.owner, opened.kind === 5 ? Permissions.MANAGE_MESSAGES : Permissions.KICK) && citationSatisfied(state.folded, hex32(communityId), opened.author, citationFromTags(opened.tags));
           }
+          // Verified self-deletions and guestbook leaves use the same measured
+          // gate as staff actions. They add no control or rekey history, so
+          // they preserve the finite reserve for actions that grow history.
+          if (retraction && !control && !rekey) urgent = true;
           await this.capacity.assertAdmission(tx, policy!, org, urgent, { control: control?.id, rekey: rekey?.event.id, bytes: Buffer.byteLength(JSON.stringify(event)) }, performance.now() - admissionStart);
         }
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
