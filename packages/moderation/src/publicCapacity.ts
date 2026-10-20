@@ -6,6 +6,12 @@ import type { CommunityPolicy } from "./contracts";
 import { PolicyStore, policyLock } from "./policyStore";
 export interface PublicCapacitySnapshot { orgId: string; communityId: string; observedAt: number; historyCount: number; historyBytes: number; rekeyCount: number; streamCount: number; inFlight: number; /** Optional monotonic elapsed time through the gate, not full settled admission. */ innerAdmissionMs?: number }
 export interface PublicCapacityState { state: "unknown" | "normal" | "warning" | "paused"; reasonCode: string; remainingBudget: number }
+/** NIP-01 machine-readable prefix: a capacity refusal is a transient limit on
+ * the room, not a judgment about the sender. It is the only reason besides the
+ * opaque policy refusal that leaves the relay plugin (strfryPlugin.ts). */
+export const CAPACITY_REFUSAL = "rate-limited: room is at capacity, try again later";
+/** Thrown only by the capacity gate, so admission can tell it from policy. */
+export class CapacityRefusal extends Error {}
 const unknown = (reasonCode: string): PublicCapacityState => ({ state: "unknown", reasonCode, remainingBudget: 0 });
 export function evaluatePublicCapacity(snapshot: PublicCapacitySnapshot, contract: PublicCapacityContract | undefined, now: number): PublicCapacityState {
   if (!contract) return unknown("capacity_contract_required");
@@ -15,7 +21,7 @@ export function evaluatePublicCapacity(snapshot: PublicCapacitySnapshot, contrac
   if (snapshot.historyBytes > contract.maxima.historyBytes || snapshot.rekeyCount > contract.maxima.rekeyCount || snapshot.streamCount > contract.maxima.streamCount || snapshot.inFlight > contract.maxima.inFlight || (snapshot.innerAdmissionMs ?? 0) > contract.maxima.innerAdmissionMs || snapshot.historyCount + snapshot.inFlight >= contract.thresholds.pauseHistoryCount) return { state: "paused", reasonCode: "capacity_bound_reached", remainingBudget };
   return { state: snapshot.historyCount + snapshot.inFlight >= contract.thresholds.warningHistoryCount ? "warning" : "normal", reasonCode: "capacity_within_bounds", remainingBudget };
 }
-export function assertPublicChatAllowed(state: PublicCapacityState): void { if (!["normal", "warning"].includes(state.state)) throw new Error("Public capacity unavailable"); }
+export function assertPublicChatAllowed(state: PublicCapacityState): void { if (!["normal", "warning"].includes(state.state)) throw new CapacityRefusal("Public capacity unavailable"); }
 function canonical(value: unknown): string { if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`; if (value && typeof value === "object") return `{${Object.keys(value).sort().map(k => JSON.stringify(k) + ":" + canonical((value as any)[k])).join(",")}}`; return JSON.stringify(value); }
 export function loadPublicCapacity(env: Record<string, string | undefined> = process.env) {
   let communities = new Map<string, string>(), contract: PublicCapacityContract | undefined;
@@ -76,11 +82,11 @@ export class PublicCapacityStore {
     if (projected.control && !policy.controlEvents.some(e => e.id === projected.control)) { snapshot.historyCount++; snapshot.historyBytes += projected.bytes; }
     if (projected.rekey && !(await tx`SELECT 1 FROM moderation.rekey_events WHERE event_id = ${projected.rekey}`).length) { snapshot.historyCount++; snapshot.rekeyCount++; snapshot.historyBytes += projected.bytes; }
     snapshot.innerAdmissionMs = gateElapsedMs;
-    if (!this.contract || !row || row.contract_hash !== this.contractHash) throw Error("Capacity configuration unavailable");
+    if (!this.contract || !row || row.contract_hash !== this.contractHash) throw new CapacityRefusal("Capacity configuration unavailable");
     const evaluated = evaluatePublicCapacity({ ...snapshot, observedAt: row.observed_at.getTime() }, this.contract, Date.now());
     if (urgent) {
-      if (snapshot.historyBytes > this.contract.maxima.historyBytes || snapshot.rekeyCount > this.contract.maxima.rekeyCount || snapshot.streamCount > this.contract.maxima.streamCount || gateElapsedMs > this.contract.maxima.innerAdmissionMs || evaluated.remainingBudget <= 0) throw Error("Moderation capacity reserve exhausted");
-    } else { if (["paused", "unknown"].includes(row.state)) throw Error("Public capacity paused"); assertPublicChatAllowed(evaluated); }
+      if (snapshot.historyBytes > this.contract.maxima.historyBytes || snapshot.rekeyCount > this.contract.maxima.rekeyCount || snapshot.streamCount > this.contract.maxima.streamCount || gateElapsedMs > this.contract.maxima.innerAdmissionMs || evaluated.remainingBudget <= 0) throw new CapacityRefusal("Moderation capacity reserve exhausted");
+    } else { if (["paused", "unknown"].includes(row.state)) throw new CapacityRefusal("Public capacity paused"); assertPublicChatAllowed(evaluated); }
   }
   async assertPublicProducer(orgId: string, communityId: string): Promise<void> {
     await this.sql.begin(async tx => { await policyLock(tx, communityId, true); const policy = await new PolicyStore(tx as unknown as postgres.Sql).getPolicy(communityId); if (!policy || !policy.complete || policy.rekeyPending || policy.validUntil <= Date.now()) throw Error("Capacity policy unavailable"); await this.assertAdmission(tx, policy, orgId, false, { bytes: 0 }, 0); });

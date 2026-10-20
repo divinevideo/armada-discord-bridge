@@ -5,6 +5,8 @@ import { observeWorkerCapacity } from "./runtime";
 import { collectMetrics } from "./metrics";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { PublicCapacityGuard, PublicCapacityStore, evaluatePublicCapacity, assertPublicChatAllowed, type PublicCapacitySnapshot } from "./publicCapacity";
+const CAPACITY_REFUSAL = "rate-limited: room is at capacity, try again later";
+const OPAQUE = "blocked: room policy unavailable or event not permitted";
 import { ConcordActions } from "./concordActions";
 import { controlState } from "./relayPolicy";
 import { buildRoleEdition, moderatorRole, sealEdition, currentControlWriteGroup, buildRumor, channelBindingTags, sealRumor, KIND_SEAL_ENCRYPTED } from "@armada-bridge/concord-core";
@@ -38,9 +40,14 @@ test("native admission fails closed before carrier mutation; finite reserve keep
  const guarded = new PolicyStore(sql, { capacity: { communities, contract } });
  expect((await guarded.admit(f.allowed)).action).toBe("accept");
  await capacity.pause({ orgId: org, communityId: f.community.idHex, reasonCode: "operator_pause" });
- const extra = wrapSeal(f.allowedSeal, f.chatKey); expect((await guarded.admit(extra)).action).toBe("reject");
+ // A pause reads as capacity, not as moderation; a policy refusal stays opaque.
+ const extra = wrapSeal(f.allowedSeal, f.chatKey); expect(await guarded.admit(extra)).toEqual({ id: extra.id, action: "reject", msg: CAPACITY_REFUSAL });
  expect((await sql`SELECT 1 FROM moderation.carriers WHERE event_id = ${extra.id}`).length).toBe(0);
- expect((await new PolicyStore(sql, { capacity: { communities, contract: undefined } }).admit(f.allowed)).action).toBe("reject");
+ expect((await guarded.admit(f.banned)).msg).toBe(OPAQUE);
+ // A failure that is not the capacity gate's own refusal is never named as one.
+ expect((await guarded.admit(wrapSeal(f.allowedSeal, f.chatKey), AbortSignal.abort())).msg).toBe(OPAQUE);
+ expect((await new PolicyStore(sql, { capacity: { communities, contract: undefined } }).admit(f.allowed)).msg).toBe(CAPACITY_REFUSAL);
+ expect((await new PolicyStore(sql, { capacity: { communities: new Map(), contract } }).admit(wrapSeal(f.allowedSeal, f.chatKey))).msg).toBe(OPAQUE);
 });
 
 test("worker observes counts with operator authority, validator is read-only after repeated bootstrap", async () => {

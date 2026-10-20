@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { runPlugin } from "./strfryPlugin";
+const CAPACITY_REFUSAL = "rate-limited: room is at capacity, try again later";
 const id = "ab".repeat(32);
 async function* input(lines: string[]) { for (const line of lines) yield Buffer.from(line); }
 
@@ -44,4 +45,20 @@ test("rate limits before invoking cryptography", async () => {
   await runPlugin(input([request.repeat(3)]), (line) => { output.push(line); }, async () => { calls++; return { id, action: "accept" }; }, { burst: 2 });
   expect(calls).toBe(2);
   expect(JSON.parse(output[2]).action).toBe("reject");
+});
+test("only the fixed capacity refusal crosses the boundary; every other reason stays opaque", async () => {
+  const opaque = "blocked: room policy unavailable or event not permitted";
+  for (const [msg, expected] of [[CAPACITY_REFUSAL, CAPACITY_REFUSAL], ["rate-limited: synthetic internal reason", opaque], ["blocked: banned synthetic member", opaque], [undefined, opaque]] as const) {
+    const output: string[] = [];
+    await runPlugin(input([JSON.stringify({ type: "new", event: { id } }) + "\n"]), (line) => { output.push(line); }, async () => ({ id, action: "reject", ...(msg ? { msg } : {}) }));
+    expect(JSON.parse(output[0])).toEqual({ id, action: "reject", msg: expected });
+  }
+  for (const result of [{ id: "cd".repeat(32), action: "reject", msg: CAPACITY_REFUSAL }, { id, action: "invalid", msg: CAPACITY_REFUSAL }] as const) {
+    const output: string[] = [];
+    await runPlugin(input([JSON.stringify({ type: "new", event: { id } }) + "\n"]), (line) => { output.push(line); }, async () => result as any);
+    expect(JSON.parse(output[0])).toEqual({ id, action: "reject", msg: opaque });
+  }
+  const output: string[] = [];
+  await runPlugin(input([JSON.stringify({ type: "new", event: { id } }) + "\n"]), (line) => { output.push(line); }, async () => ({ id, action: "accept", msg: CAPACITY_REFUSAL }));
+  expect(JSON.parse(output[0])).toEqual({ id, action: "accept" });
 });

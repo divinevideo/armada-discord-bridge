@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type postgres from "postgres";
-import { PublicCapacityStore } from "./publicCapacity";
+import { CAPACITY_REFUSAL, CapacityRefusal, PublicCapacityStore } from "./publicCapacity";
 import type { PublicCapacityContract } from "./capacityContract";
 import { openWrap, parseEdition, banlistLocator, hex32, isAuthorized, Permissions, citationFromTags, citationSatisfied } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
@@ -186,7 +186,12 @@ export class PolicyStore {
         signal?.throwIfAborted();
         return result;
       });
-    } catch (error) { if (restoring) throw error; return rejected; }
+    } catch (error) {
+      if (restoring) throw error;
+      // Only the capacity gate's own refusal is named. It runs after policy
+      // accepted the event, so it says nothing about why anything else fails.
+      return error instanceof CapacityRefusal ? { id, action: "reject", msg: CAPACITY_REFUSAL } : rejected;
+    }
   }
 
   private assertRecoveryPolicy(policy: CommunityPolicy | undefined): asserts policy is CommunityPolicy {
