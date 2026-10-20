@@ -13,9 +13,9 @@ const decisions = new Decisions(apiSql, cipher, communities, { auditRetentionSec
 const api = createModerationApi({ publicOrigin: "https://rooms.example", coopSecret: secret, orgs: new Set([org]), reports: { async submitReport() { throw Error("unused"); } }, decisions });
 beforeAll(() => migrateModeration(sql));
 afterAll(async () => { await sql`DELETE FROM moderation.decisions WHERE org_id = ${org} AND reverses_decision_id IS NOT NULL`; await sql`DELETE FROM moderation.decisions WHERE org_id = ${org}`; await sql`DELETE FROM moderation.cases WHERE org_id = ${org}`; await apiSql.end(); await sql.end(); });
-async function prior(guild = false) {
+async function prior(guild = false, inCommunity = community) {
  const id = crypto.randomUUID(), caseId = crypto.randomUUID(), author = randomBytes(32).toString("hex");
- await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, fingerprint_version, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, expires_at) VALUES (${id}, ${org}, ${crypto.randomUUID()}, ${crypto.randomUUID()}, 1, ${caseId}, ${community}, ${"8".repeat(64)}, ${"9".repeat(64)}, ${author}, 'ban_member', ${guild}, clock_timestamp() - interval '1 day')`; });
+ await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`INSERT INTO moderation.decisions (decision_id, org_id, execution_id, fingerprint, fingerprint_version, case_id, community_id, channel_id, rumor_id, author, action, discord_guild_confirmed, expires_at) VALUES (${id}, ${org}, ${crypto.randomUUID()}, ${crypto.randomUUID()}, 1, ${caseId}, ${inCommunity}, ${"8".repeat(64)}, ${"9".repeat(64)}, ${author}, 'ban_member', ${guild}, clock_timestamp() - interval '1 day')`; });
  for (const target of ["concord", "divine_relay", "discord"]) await sql`INSERT INTO moderation.deliveries (decision_id, target, state) VALUES (${id}, ${target}, 'verified')`;
  return { id, caseId, author };
 }
@@ -62,4 +62,17 @@ test("new revision supersedes an older unsent reversal without reviving the old 
  expect((await decisions.get(first.decisionId, actor)).deliveries.every(d => d.resultCode === "superseded_by_newer_decision")).toBe(true);
  expect((await decisions.get(first.decisionId, actor)).supersededBy).toBe(next.decisionId);
  expect((await decisions.get(old.id, actor)).deliveries.every(d => d.state === "verified")).toBe(true);
+});
+test("a ban in a community no longer mapped to the actor's org cannot be reversed and writes nothing", async () => {
+ // The decision row still carries the actor's org; only the community mapping
+ // says whether this org may act there now, e.g. after the community moves.
+ const moved = "6".repeat(64), unmapped = "5".repeat(64);
+ const scoped = new Decisions(apiSql, cipher, new Map([[community, org], [moved, "synthetic-other-org"]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+ for (const inCommunity of [moved, unmapped]) {
+  const old = await prior(false, inCommunity);
+  await expect(scoped.getReversalContext(old.id, actor)).rejects.toThrow(/unavailable/);
+  await expect(scoped.acceptReversal(old.id, request(), actor)).rejects.toMatchObject({ code: "decision_source_unavailable" });
+  expect((await sql`SELECT decision_id FROM moderation.decisions WHERE reverses_decision_id = ${old.id}`).length).toBe(0);
+  expect((await sql`SELECT author FROM moderation.member_order_heads WHERE org_id = ${org} AND community_id = ${inCommunity} AND author = ${old.author}`).length).toBe(0);
+ }
 });
