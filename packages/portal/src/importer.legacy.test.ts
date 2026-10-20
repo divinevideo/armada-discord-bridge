@@ -11,6 +11,7 @@ import { describe, expect, it } from "bun:test";
 import {
   ADMIN_ALL,
   Permissions,
+  STOCK_RELAYS,
   base64ToBytes,
   bytesToHex,
   canWriteControl,
@@ -266,11 +267,12 @@ describe("legacy importer pipeline", () => {
     };
     // The relay guard resolves every host and refuses what it cannot resolve,
     // so a fixture relay would otherwise be a DNS lookup in a unit test.
+    const dialed: string[][] = [];
     const importer = new Importer(
       fakeSql(store),
       env,
       manager as never,
-      () => wirePool(wire),
+      (relays) => { dialed.push(relays); return wirePool(wire); },
       historyFetch,
       async () => {},
       undefined,
@@ -505,6 +507,36 @@ describe("legacy importer pipeline", () => {
     await expect(internal.admitBridgeToPrivateChannel("imp1", prepared.community, prepared.opSk, prepared.plan, privatePlan, bridgeIdentity.pk)).rejects.toThrow("private lease lost");
     expect(wire.length).toBe(beforeLoss);
     internal.importGuards.delete("imp1");
+
+    // The owner's inbox list is the owner's own signed event, so it names
+    // whatever host they like; it is dialed only after the same vetting as
+    // every other untrusted relay list. A curated list that vets to nothing
+    // is not delivered to the stock relays either: the owner's client scans
+    // their list, so a stock delivery would read as sent and never arrive.
+    const inboxList = (tags: string[][], created_at: number) =>
+      finalizeEvent({ kind: 10050, created_at, tags, content: "" }, userSk) as unknown as NostrEvent;
+    const hosts = (lists: string[][]) => lists.flat().map((relay) => new URL(relay).hostname);
+    const keyDeliveries = () => wire.filter((e) => e.kind === 1059 && e.tags.some(([n, v]) => n === "k" && v === "3313")).length;
+    const now = Math.floor(Date.now() / 1000);
+    wire.push(inboxList([["relay", "wss://1.1.1.1/"], ["relay", "ws://127.0.0.1:6379/"]], now));
+    delete prepared.plan.checkpoints.ownerChannelKeysSentAt;
+    dialed.length = 0;
+    const sentBefore = keyDeliveries();
+    await internal.publishEditions("imp1", prepared.community, prepared.opSk, prepared.plan);
+    expect(hosts(dialed)).toContain("1.1.1.1");
+    expect(hosts(dialed)).not.toContain("127.0.0.1");
+    expect(keyDeliveries()).toBe(sentBefore + 1);
+    wire.push(inboxList([["relay", "ws://127.0.0.1:6379/"], ["relay", "ws://10.0.0.5/"]], now + 1));
+    delete prepared.plan.checkpoints.ownerChannelKeysSentAt;
+    delete prepared.plan.checkpoints.ownerChannelKeysError;
+    dialed.length = 0;
+    await internal.publishEditions("imp1", prepared.community, prepared.opSk, prepared.plan);
+    expect(hosts(dialed)).not.toContain("127.0.0.1");
+    expect(hosts(dialed)).not.toContain("10.0.0.5");
+    for (const relay of STOCK_RELAYS) expect(dialed.flat()).not.toContain(relay);
+    expect(prepared.plan.checkpoints.ownerChannelKeysSentAt).toBeUndefined();
+    expect(prepared.plan.checkpoints.ownerChannelKeysError).toMatch(/owner inbox/);
+    delete prepared.plan.checkpoints.ownerChannelKeysError;
     prepared.plan.checkpoints.ownerChannelKeysSentAt = sentAt;
 
     // Idempotency: a re-run from checkpoints publishes nothing new.
