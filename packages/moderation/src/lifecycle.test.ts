@@ -39,7 +39,7 @@ test("hold preserves the exact expired snapshot, duplicate deadline and ordinary
   const caseId = await caseRow(), holdUntil = new Date(Date.now() + 120000).toISOString();
   const held = await lifecycle.placeEvidenceHold({ caseId, holdUntil, reason: "synthetic hold" }, actor);
   const [before] = await sql`SELECT evidence, expires_at FROM moderation.cases WHERE case_id = ${caseId}`;
-  expect(await lifecycle.placeEvidenceHold({ caseId, holdUntil: new Date(Date.now() + 240000).toISOString(), reason: "duplicate" }, actor)).toEqual(held);
+  expect(await lifecycle.placeEvidenceHold({ caseId, holdUntil: new Date(Date.now() + 60000).toISOString(), reason: "duplicate" }, actor)).toEqual(held);
   await expireCase(caseId); await reports.expire();
   expect((await sql`SELECT evidence FROM moderation.cases WHERE case_id = ${caseId}`)[0].evidence).toEqual(before.evidence);
   await expect(reports.getCase(caseId, actor)).rejects.toThrow();
@@ -50,6 +50,71 @@ test("hold preserves the exact expired snapshot, duplicate deadline and ordinary
   await expect(lifecycle.readHeldEvidence({ caseId, reason: "denied" }, { ...actor, orgId: "other" })).rejects.toThrow();
   await lifecycle.releaseEvidenceHold({ holdId: held.holdId, reason: "synthetic release" }, actor);
   expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(0);
+});
+const holdMs = 3600 * 1000;
+const holdsOf = (caseId: string) => sql`SELECT hold_id, hold_until, released_at FROM moderation.evidence_holds WHERE case_id = ${caseId} ORDER BY created_at`;
+const eventsOf = (caseId: string, kind: string) => sql`SELECT hold_id FROM moderation.lifecycle_events WHERE case_id = ${caseId} AND kind = ${kind}`;
+test("a later hold request extends the active hold, audited, and never shortens it", async () => {
+  const caseId = await caseRow(), first = new Date(Date.now() + 120000).toISOString();
+  const held = await lifecycle.placeEvidenceHold({ caseId, holdUntil: first, reason: "synthetic hold" }, actor);
+  const later = new Date(Date.now() + 600000).toISOString();
+  const extended = await lifecycle.placeEvidenceHold({ caseId, holdUntil: later, reason: "longer preservation" }, actor);
+  expect(extended).toEqual({ ...held, holdUntil: later });
+  expect((await holdsOf(caseId)).map(h => h.hold_until.toISOString())).toEqual([later]);
+  expect((await eventsOf(caseId, "hold_extended")).map(e => e.hold_id)).toEqual([held.holdId]);
+  expect(await lifecycle.placeEvidenceHold({ caseId, holdUntil: first, reason: "shorter request" }, actor)).toEqual(extended);
+  expect((await eventsOf(caseId, "hold_extended")).length).toBe(1);
+});
+test("extension beyond the configured maximum is refused and leaves the hold unchanged", async () => {
+  const caseId = await caseRow(), held = await lifecycle.placeEvidenceHold({ caseId, holdUntil: new Date(Date.now() + 120000).toISOString(), reason: "synthetic hold" }, actor);
+  await expect(lifecycle.placeEvidenceHold({ caseId, holdUntil: new Date(Date.now() + holdMs + 60000).toISOString(), reason: "too long" }, actor)).rejects.toThrow(/deadline/);
+  expect((await holdsOf(caseId)).map(h => h.hold_until.toISOString())).toEqual([held.holdUntil]);
+  expect((await eventsOf(caseId, "hold_extended")).length).toBe(0);
+});
+test("an active hold extends after the case's natural expiry, through the restricted API role", async () => {
+  const caseId = await caseRow(), client = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice: () => {} });
+  try {
+    const api = new Lifecycle(client, cipher, communities, { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+    const held = await api.placeEvidenceHold({ caseId, holdUntil: new Date(Date.now() + 120000).toISOString(), reason: "synthetic hold" }, actor);
+    await expireCase(caseId); await lifecycle.expireEvidence();
+    const later = new Date(Date.now() + 900000).toISOString();
+    expect(await api.placeEvidenceHold({ caseId, holdUntil: later, reason: "renewal after expiry" }, actor)).toEqual({ ...held, holdUntil: later });
+    expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(1);
+  } finally { await client.end(); }
+});
+test("hold deadlines move only forward, only while active, and only for the deadline column", async () => {
+  const caseId = await caseRow(), held = await lifecycle.placeEvidenceHold({ caseId, holdUntil: new Date(Date.now() + 120000).toISOString(), reason: "synthetic hold" }, actor);
+  await expect(Promise.resolve(sql`UPDATE moderation.evidence_holds SET hold_until = hold_until - interval '1 second' WHERE hold_id = ${held.holdId}`)).rejects.toThrow(/hold/i);
+  await expect(Promise.resolve(sql`UPDATE moderation.evidence_holds SET hold_until = hold_until + interval '1 minute', encrypted_audit = ${Buffer.from("replacement")} WHERE hold_id = ${held.holdId}`)).rejects.toThrow(/immutable/i);
+  await expect(Promise.resolve(sql`UPDATE moderation.evidence_holds SET hold_until = hold_until + interval '1 minute', released_at = clock_timestamp() WHERE hold_id = ${held.holdId}`)).rejects.toThrow(/hold/i);
+  await lifecycle.releaseEvidenceHold({ holdId: held.holdId, reason: "synthetic release" }, actor);
+  await expect(Promise.resolve(sql`UPDATE moderation.evidence_holds SET hold_until = hold_until + interval '1 minute' WHERE hold_id = ${held.holdId}`)).rejects.toThrow(/hold/i);
+});
+test("opening an appeal holds the case's evidence to the configured maximum, extending an active hold", async () => {
+  const caseId = await caseRow(), decisionId = await decisionRow(caseId), before = Date.now();
+  await lifecycle.setAppeal({ decisionId, state: "open", reason: "member appeal" }, actor);
+  const [hold] = await holdsOf(caseId);
+  expect(hold.released_at).toBeNull();
+  expect(hold.hold_until.getTime()).toBeGreaterThanOrEqual(before + holdMs);
+  expect(hold.hold_until.getTime()).toBeLessThanOrEqual(Date.now() + holdMs);
+  expect((await eventsOf(caseId, "hold_created")).map(e => e.hold_id)).toEqual([hold.hold_id]);
+  const other = await caseRow(), otherDecision = await decisionRow(other);
+  const short = await lifecycle.placeEvidenceHold({ caseId: other, holdUntil: new Date(Date.now() + 60000).toISOString(), reason: "staff hold" }, actor);
+  await expireCase(other); await lifecycle.expireEvidence();
+  await lifecycle.setAppeal({ decisionId: otherDecision, state: "open", reason: "appeal after expiry" }, actor);
+  const holds = await holdsOf(other);
+  expect(holds.map(h => h.hold_id)).toEqual([short.holdId]);
+  expect(holds[0].hold_until.getTime()).toBeGreaterThan(Date.now() + holdMs - 60000);
+  expect((await eventsOf(other, "hold_extended")).map(e => e.hold_id)).toEqual([short.holdId]);
+});
+test("an appeal on an expired, unheld case opens without creating a hold", async () => {
+  for (const erased of [false, true]) {
+    const caseId = await caseRow(), decisionId = await decisionRow(caseId);
+    await expireCase(caseId); if (erased) await lifecycle.expireEvidence();
+    expect((await lifecycle.setAppeal({ decisionId, state: "open", reason: "late appeal" }, actor)).appealState).toBe("open");
+    expect((await holdsOf(caseId)).length).toBe(0);
+    expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(erased ? 0 : 1);
+  }
 });
 test("cleanup before hold refuses without recreating evidence", async () => {
   const caseId = await caseRow(); await expireCase(caseId); await lifecycle.expireEvidence();
@@ -174,6 +239,9 @@ test("reclose after reopening preserves the recorded retention interval", async 
   const closed = await lifecycle.closeLifecycle({ decisionId, reason: "first" }, actor);
   await lifecycle.setAppeal({ decisionId, state: "open", reason: "reopen" }, actor);
   await lifecycle.setAppeal({ decisionId, state: "closed", reason: "settled appeal" }, actor);
+  // The appeal's evidence hold outlives the appeal until staff release it.
+  await expect(lifecycle.closeLifecycle({ decisionId, reason: "held" }, actor)).rejects.toThrow(/not eligible/);
+  for (const hold of await holdsOf(caseId)) await lifecycle.releaseEvidenceHold({ holdId: hold.hold_id, reason: "appeal settled" }, actor);
   const shorter = new Lifecycle(sql, cipher, communities, { auditRetentionSeconds: 1, holdMaxSeconds: 3600 });
   const next = await shorter.closeLifecycle({ decisionId, reason: "reclose" }, actor);
   expect(new Date(next.auditDeleteAfter!).getTime()).toBeGreaterThanOrEqual(new Date(closed.auditDeleteAfter!).getTime());

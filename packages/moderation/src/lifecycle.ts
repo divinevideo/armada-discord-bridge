@@ -48,19 +48,39 @@ export class Lifecycle {
     const id = crypto.randomUUID(), audit = this.cipher.seal(`${actor.orgId}:${id}`, { actorId: actor.actorId, reason });
     await tx`INSERT INTO moderation.lifecycle_events (event_id, org_id, case_id, decision_id, hold_id, kind, encrypted_audit) VALUES (${id}, ${actor.orgId}, ${caseId}, ${decisionId}, ${holdId}, ${kind}, ${audit})`;
   }
+  /** One placement rule for staff holds and appeals. An active hold is
+   * extended rather than duplicated, and extension still works after the case's
+   * natural expiry because the active hold is what kept the evidence. A request
+   * ending no later than the active hold returns it unchanged: holds never
+   * shorten here (release is the explicit, audited way to end one). With no
+   * active hold, expired evidence is refused (undefined): a hold must not be
+   * created over evidence that is already due for erasure. The caller owns the
+   * case boundary and has validated `until` against the configured maximum. */
+  private async holdCase(tx: postgres.TransactionSql, actor: VerifiedCoopActor, reason: string, row: any, until: Date, auditRetentionSeconds: number): Promise<any | undefined> {
+    const [existing] = await tx`SELECT * FROM moderation.evidence_holds WHERE org_id = ${actor.orgId} AND case_id = ${row.case_id} AND released_at IS NULL AND hold_until > clock_timestamp() ORDER BY hold_until DESC, created_at, hold_id LIMIT 1 FOR UPDATE`;
+    if (existing) {
+      if (until.getTime() <= existing.hold_until.getTime()) return existing;
+      await this.event(tx, actor, reason, "hold_extended", row.case_id, null, existing.hold_id);
+      const [extended] = await tx`UPDATE moderation.evidence_holds SET hold_until = ${until} WHERE hold_id = ${existing.hold_id} RETURNING *`;
+      return extended;
+    }
+    if (row.expires_at.getTime() <= Date.now()) return undefined;
+    if (!this.cipher) throw new Error("Lifecycle audit encryption unavailable");
+    const holdId = crypto.randomUUID();
+    const [held] = await tx`INSERT INTO moderation.evidence_holds (hold_id, org_id, case_id, hold_until, encrypted_audit, audit_retention_seconds, case_expires_at) VALUES (${holdId}, ${actor.orgId}, ${row.case_id}, ${until}, ${this.cipher.seal(`${actor.orgId}:${holdId}`, { actorId: actor.actorId, reason })}, ${auditRetentionSeconds}, ${row.expires_at}) RETURNING *`;
+    await this.event(tx, actor, reason, "hold_created", row.case_id, null, holdId); return held;
+  }
   async placeEvidenceHold(input: { caseId: string; reason: string; holdUntil: string }, actor: VerifiedCoopActor): Promise<HoldStatus> {
     this.authorize(actor, "manage_moderation_records", input.caseId, input.reason);
+    // The maximum is measured from this request, for a new hold and for an
+    // extension alike, so a renewal can reach at most holdMaxSeconds from now.
     const policy = this.requirePolicy(), until = new Date(input.holdUntil);
     if (!Number.isFinite(until.getTime()) || until.getTime() <= Date.now() || until.getTime() > Date.now() + policy.holdMaxSeconds * 1000) throw new Error("Invalid hold deadline");
     return this.sql.begin(async tx => {
       const row = await lockLifecycleCase(tx, actor.orgId, input.caseId); this.current(row, actor.orgId);
-      const [existing] = await tx`SELECT * FROM moderation.evidence_holds WHERE org_id = ${actor.orgId} AND case_id = ${input.caseId} AND released_at IS NULL AND hold_until > clock_timestamp() ORDER BY created_at, hold_id LIMIT 1`;
-      if (existing) return holdStatus(existing);
-      if (row.expires_at.getTime() <= Date.now()) throw new Error("Evidence expired");
-      if (!this.cipher) throw new Error("Lifecycle audit encryption unavailable");
-      const holdId = crypto.randomUUID();
-      const [held] = await tx`INSERT INTO moderation.evidence_holds (hold_id, org_id, case_id, hold_until, encrypted_audit, audit_retention_seconds, case_expires_at) VALUES (${holdId}, ${actor.orgId}, ${input.caseId}, ${until}, ${this.cipher.seal(`${actor.orgId}:${holdId}`, { actorId: actor.actorId, reason: input.reason })}, ${policy.auditRetentionSeconds}, ${row.expires_at}) RETURNING *`;
-      await this.event(tx, actor, input.reason, "hold_created", input.caseId, null, holdId); return holdStatus(held);
+      const held = await this.holdCase(tx, actor, input.reason, row, until, policy.auditRetentionSeconds);
+      if (!held) throw new Error("Evidence expired");
+      return holdStatus(held);
     }) as Promise<HoldStatus>;
   }
   async releaseEvidenceHold(input: { holdId: string; reason: string }, actor: VerifiedCoopActor): Promise<HoldStatus> {
@@ -91,10 +111,14 @@ export class Lifecycle {
     return { caseId: input.caseId, target: { communityId: row.community_id, channelId: row.channel_id, rumorId: row.rumor_id }, author: row.author, content: value.evidence.content, reason: value.reason, createdAt: value.evidence.createdAt, ...(value.evidence.editedAt === undefined ? {} : { editedAt: value.evidence.editedAt }), expiresAt: row.expires_at.toISOString() };
   }
   async setAppeal(input: { decisionId: string; state: "open" | "closed"; reason: string }, actor: VerifiedCoopActor): Promise<LifecycleStatus> {
-    this.authorize(actor, "manage_moderation_records", input.decisionId, input.reason); this.requirePolicy();
+    this.authorize(actor, "manage_moderation_records", input.decisionId, input.reason); const policy = this.requirePolicy();
     if (!["open", "closed"].includes(input.state)) throw new Error("Invalid appeal state");
     return this.sql.begin(async tx => {
-      const { decision } = await lockLifecycleDecision(tx, actor.orgId, input.decisionId); this.current(decision, actor.orgId);
+      const { decision, evidence } = await lockLifecycleDecision(tx, actor.orgId, input.decisionId); this.current(decision, actor.orgId);
+      // An appeal is reviewed against the evidence, so opening one preserves it
+      // for the longest window policy allows. Evidence already gone stays gone:
+      // the appeal still opens, on the sealed decision audit alone.
+      if (input.state === "open" && evidence) await this.holdCase(tx, actor, input.reason, evidence, new Date(Date.now() + policy.holdMaxSeconds * 1000), policy.auditRetentionSeconds);
       if (input.state === "open" && decision.lifecycle_closed_at) await this.event(tx, actor, input.reason, "lifecycle_reopened", decision.case_id, decision.decision_id);
       await this.event(tx, actor, input.reason, input.state === "open" ? "appeal_opened" : "appeal_closed", decision.case_id, decision.decision_id);
       const [row] = await tx`UPDATE moderation.decisions SET appeal_state = ${input.state}, lifecycle_closed_at = CASE WHEN ${input.state} = 'open' THEN NULL ELSE lifecycle_closed_at END, audit_delete_after = CASE WHEN ${input.state} = 'open' THEN NULL ELSE audit_delete_after END WHERE decision_id = ${input.decisionId} RETURNING *`; return status(row);
