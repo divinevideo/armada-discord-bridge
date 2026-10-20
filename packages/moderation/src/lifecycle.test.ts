@@ -20,7 +20,7 @@ const reports = new Reports(sql, cipher, { resolve: async () => { throw new Erro
 // Membership closure reads every decision for the member in its org, so these
 // tests keep their own org rather than share rows with the removal tests above.
 const memberOrg = `synthetic-member-${crypto.randomUUID()}`, memberScope = new Map([[community, memberOrg]]);
-const memberActor = { orgId: memberOrg, actorId: "synthetic-admin", permissions: ["view", "ban_member", "unban_member", "manage_moderation_records"] };
+const memberActor = { orgId: memberOrg, actorId: "synthetic-admin", permissions: ["view", "remove_message", "ban_member", "unban_member", "manage_moderation_records"] };
 const memberPolicy = { auditRetentionSeconds: 60, holdMaxSeconds: 3600 };
 beforeAll(async () => { await migrateModeration(sql); await new PolicyStore(sql).install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0); });
 afterAll(async () => {
@@ -283,8 +283,8 @@ test("noncanonical uppercase UUID cannot acquire a different lifecycle boundary"
   expect((await sql`SELECT hold_id FROM moderation.evidence_holds WHERE case_id = ${caseId}`).length).toBe(0);
 });
 
-async function memberCase(author: string) {
-  const id = crypto.randomUUID(); const evidence = cipher.seal(`${memberOrg}:${id}`, { evidence: { content: "synthetic member report", createdAt: 1 }, reason: "synthetic report" });
+async function memberCase(author: string, id: string = crypto.randomUUID()) {
+  const evidence = cipher.seal(`${memberOrg}:${id}`, { evidence: { content: "synthetic member report", createdAt: 1 }, reason: "synthetic report" });
   await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at) VALUES (${id}, ${memberOrg}, ${community}, ${"b".repeat(64)}, ${"c".repeat(64)}, ${author}, ${crypto.randomUUID()}, ${evidence}, clock_timestamp() + interval '1 hour')`; return id;
 }
 function memberDecision(caseId: string, action: "ban_member" | "unban_member", revision: string) {
@@ -352,3 +352,60 @@ for (const [index, scenario] of stillBanned.entries()) {
     expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban.decisionId}`)[0].audit).not.toBeNull();
   });
 }
+
+// Expiry runs inside the worker loop: a row the database refuses must not end
+// the pass, or every row after it stays due and the worker reports unready.
+// Case IDs are chosen so the refused row sorts first within this org.
+const sortedCase = (first: string) => first + crypto.randomUUID().slice(1);
+async function closedElapsed(decisionId: string) {
+  await new Lifecycle(sql, cipher, memberScope, memberPolicy).closeLifecycle({ decisionId, reason: "settled" }, memberActor);
+  await sql.begin(async tx => {
+    await tx`SET LOCAL session_replication_role = replica`;
+    await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '3 minutes', audit_delete_after = clock_timestamp() - interval '2 minutes' WHERE decision_id = ${decisionId}`;
+    await tx`UPDATE moderation.lifecycle_events SET recorded_at = clock_timestamp() - interval '3 minutes' WHERE decision_id = ${decisionId}`;
+  });
+}
+/** A removal whose audit and journal are due, in an expired case. */
+async function dueRemoval(caseId: string) {
+  await memberCase(randomBytes(32).toString("hex"), caseId);
+  const removal = await new Decisions(sql, cipher, memberScope, memberPolicy).acceptDecision({ caseId, executionId: crypto.randomUUID(), action: "remove_message", reason: "synthetic removal", scope: "message", discordGuildConfirmed: false }, memberActor);
+  await settleMember(removal.decisionId); await closedElapsed(removal.decisionId);
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.cases SET expires_at = clock_timestamp() - interval '1 second' WHERE case_id = ${caseId}`; });
+  return removal.decisionId;
+}
+async function cleared(decisionId: string) {
+  const [row] = await sql`SELECT audit IS NULL AS erased, (SELECT count(*)::int FROM moderation.lifecycle_events e WHERE e.decision_id = ${decisionId}) AS events FROM moderation.decisions WHERE decision_id = ${decisionId}`;
+  return row;
+}
+async function forget(decisionIds: string[]) {
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`DELETE FROM moderation.lifecycle_events WHERE decision_id IN ${tx(decisionIds)}`; await tx`DELETE FROM moderation.decisions WHERE decision_id IN ${tx(decisionIds)}`; });
+}
+test("audit the database refuses to erase does not stop a later due decision's cleanup in the same pass", async () => {
+  // Settled by readback: closure accepts it, the 017 erasure trigger does not.
+  const author = randomBytes(32).toString("hex"), caseId = await memberCase(author, sortedCase("0"));
+  const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
+  await settleMember(ban.decisionId); await settleMember(unban.decisionId);
+  await sql`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = 'concord_publication_settled' WHERE decision_id = ${ban.decisionId} AND target = 'concord'`;
+  expect(await observeMember(ban.decisionId)).toBe(true);
+  await closedElapsed(ban.decisionId);
+  const later = await dueRemoval(sortedCase("f"));
+  const client = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice: () => {} });
+  try {
+    await expect(Promise.resolve(client`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban.decisionId}`)).rejects.toThrow(/not eligible/);
+    await expireModerationRecords(new Decisions(client, undefined, memberScope), new Lifecycle(client, undefined, memberScope, {}));
+    expect(await cleared(later)).toEqual({ erased: true, events: 0 });
+    expect(await cleared(ban.decisionId)).toEqual({ erased: false, events: 1 });
+  } finally { await client.end(); await forget([ban.decisionId, unban.decisionId]); }
+});
+test("a case whose hold and journal cleanup fails does not stop later cases in the same pass", async () => {
+  const failing = sortedCase("0"), later = sortedCase("f");
+  const first = await dueRemoval(failing), second = await dueRemoval(later);
+  const client = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice: () => {} });
+  // Fail only the per-case journal pass for the first case.
+  const faulty = new Proxy(client, { get(target, key) { if (key !== "begin") return Reflect.get(target, key); return (callback: any) => client.begin(tx => callback(new Proxy(tx, { apply(target, receiver, args) { if (String(args[0]?.[0]).startsWith("SELECT DISTINCT community_id, author FROM moderation.decisions") && args.includes(failing)) return tx`SELECT 1/0`; return Reflect.apply(target, receiver, args); } }))); } });
+  try {
+    await new Lifecycle(faulty, undefined, memberScope, {}).expireAudit();
+    expect(await cleared(first)).toEqual({ erased: true, events: 1 });
+    expect(await cleared(second)).toEqual({ erased: true, events: 0 });
+  } finally { await client.end(); }
+});

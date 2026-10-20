@@ -156,12 +156,12 @@ export class Lifecycle {
   }
   async expireAudit() {
     const rows = await this.sql`SELECT org_id, decision_id FROM moderation.decisions WHERE audit IS NOT NULL AND audit_delete_after <= clock_timestamp() ORDER BY org_id, case_id, decision_id`;
-    for (const row of rows) await this.sql.begin(async tx => {
+    for (const row of rows) await this.isolated("decision", row.decision_id, () => this.sql.begin(async tx => {
       const { decision, deliveries } = await lockLifecycleDecision(tx, row.org_id, row.decision_id);
       if (decision.lifecycle_closed_at && decision.audit_delete_after?.getTime() <= Date.now() && await this.eligible(tx, decision, deliveries, true)) await tx`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${decision.decision_id}`;
-    });
-    const cases = await this.sql`SELECT DISTINCT org_id, case_id FROM moderation.evidence_holds UNION SELECT DISTINCT org_id, case_id FROM moderation.lifecycle_events`;
-    for (const row of cases) await this.sql.begin(async tx => {
+    }));
+    const cases = await this.sql`SELECT DISTINCT org_id, case_id FROM moderation.evidence_holds UNION SELECT DISTINCT org_id, case_id FROM moderation.lifecycle_events ORDER BY org_id, case_id`;
+    for (const row of cases) await this.isolated("case", row.case_id, () => this.sql.begin(async tx => {
       await lockLifecycleCase(tx, row.org_id, row.case_id);
       await lockCaseRecords(tx, row.org_id, row.case_id);
       const [active] = await tx`SELECT 1 FROM moderation.evidence_holds WHERE org_id = ${row.org_id} AND case_id = ${row.case_id} AND released_at IS NULL AND hold_until > clock_timestamp()`;
@@ -174,6 +174,15 @@ export class Lifecycle {
       await tx`UPDATE moderation.lifecycle_events e SET audit_delete_after = GREATEST(e.audit_delete_after, c.audit_delete_after) FROM moderation.decisions c WHERE e.decision_id = c.decision_id AND e.org_id = ${row.org_id} AND e.case_id = ${row.case_id} AND c.audit_delete_after IS NOT NULL`;
       await tx`DELETE FROM moderation.lifecycle_events e WHERE e.org_id = ${row.org_id} AND e.case_id = ${row.case_id} AND e.audit_delete_after <= clock_timestamp() AND NOT EXISTS (SELECT 1 FROM moderation.cases c WHERE c.org_id = e.org_id AND c.case_id = e.case_id AND c.expires_at > clock_timestamp()) AND (e.decision_id IS NULL OR EXISTS (SELECT 1 FROM moderation.decisions c WHERE c.decision_id = e.decision_id AND c.audit IS NULL AND c.lifecycle_closed_at IS NOT NULL AND c.appeal_state <> 'open'))`;
       await tx`DELETE FROM moderation.evidence_holds h WHERE h.org_id = ${row.org_id} AND h.case_id = ${row.case_id} AND h.audit_delete_after <= clock_timestamp() AND NOT EXISTS (SELECT 1 FROM moderation.cases c WHERE c.org_id = h.org_id AND c.case_id = h.case_id AND c.expires_at > clock_timestamp()) AND NOT EXISTS (SELECT 1 FROM moderation.lifecycle_events e WHERE e.hold_id = h.hold_id)`;
-    });
+    }));
+  }
+  /** Each record is its own transaction. One the database refuses (its triggers
+   * re-check erasure and can disagree with eligible()) or that fails for its own
+   * reason must not end the pass: the worker runs this every second, so an
+   * escaping error would leave every later record due forever and mark the
+   * worker unready. The record keeps its audit and is retried next pass. Failing
+   * to list due records still throws. */
+  private async isolated(kind: "decision" | "case", id: string, work: () => Promise<unknown>) {
+    try { await work(); } catch (error) { console.error(`moderation: audit cleanup skipped ${kind} ${id}; it stays retained and due: ${error instanceof Error ? error.message : "unknown error"}`); }
   }
 }
