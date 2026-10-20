@@ -8,6 +8,8 @@ import { EvidenceCipher } from "./evidence";
 import { Lifecycle } from "./lifecycle";
 import { Reports } from "./reports";
 import { expireModerationRecords } from "./runtime";
+import { Decisions } from "./decisions";
+import { DiscordRestrictionObserver } from "./discordRestriction";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 const f = await moderationFixture();
 const org = `synthetic-b2-${crypto.randomUUID()}`, community = f.community.idHex;
@@ -15,9 +17,14 @@ const cipher = new EvidenceCipher(randomBytes(32), 3600, 200000), communities = 
 const actor = { orgId: org, actorId: "synthetic-admin", permissions: ["view", "manage_moderation_records", "view_held_evidence"] };
 const lifecycle = new Lifecycle(sql, cipher, communities, { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
 const reports = new Reports(sql, cipher, { resolve: async () => { throw new Error("unused"); } }, communities, 10, lifecycle);
+// Membership closure reads every decision for the member in its org, so these
+// tests keep their own org rather than share rows with the removal tests above.
+const memberOrg = `synthetic-member-${crypto.randomUUID()}`, memberScope = new Map([[community, memberOrg]]);
+const memberActor = { orgId: memberOrg, actorId: "synthetic-admin", permissions: ["view", "ban_member", "unban_member", "manage_moderation_records"] };
+const memberPolicy = { auditRetentionSeconds: 60, holdMaxSeconds: 3600 };
 beforeAll(async () => { await migrateModeration(sql); await new PolicyStore(sql).install(refreshPolicy(f.policy), [f.chatStream, f.controlStream, f.guestbookStream], 0); });
 afterAll(async () => {
-  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`DELETE FROM moderation.lifecycle_events WHERE org_id = ${org}`; await tx`DELETE FROM moderation.evidence_holds WHERE org_id = ${org}`; await tx`DELETE FROM moderation.decisions WHERE org_id = ${org}`; await tx`DELETE FROM moderation.cases WHERE org_id = ${org}`; await tx`DELETE FROM moderation.member_order_heads WHERE org_id = ${org}`; await tx`DELETE FROM moderation.community_policy WHERE community_id = ${community}`; }); await sql.end();
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; for (const o of [org, memberOrg]) { await tx`DELETE FROM moderation.lifecycle_events WHERE org_id = ${o}`; await tx`DELETE FROM moderation.evidence_holds WHERE org_id = ${o}`; await tx`DELETE FROM moderation.decisions WHERE org_id = ${o}`; await tx`DELETE FROM moderation.cases WHERE org_id = ${o}`; await tx`DELETE FROM moderation.member_order_heads WHERE org_id = ${o}`; } await tx`DELETE FROM moderation.community_policy WHERE community_id = ${community}`; }); await sql.end();
 });
 async function caseRow() {
   const id = crypto.randomUUID(); const evidence = cipher.seal(`${org}:${id}`, { evidence: { content: "selected synthetic edit", createdAt: 1, editedAt: 2 }, reason: "synthetic report" });
@@ -237,7 +244,6 @@ test("missing policy blocks new holds before allocation, but legacy holds cannot
 });
 
 import { createModerationApi, signCoopRequest } from "./api";
-import { Decisions } from "./decisions";
 test("signed lifecycle routes enforce separate capabilities, ordinary expiry and no-store", async () => {
   const caseId = await caseRow(), secret = randomBytes(32);
   const decisions = new Decisions(sql, cipher, communities, { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
@@ -275,4 +281,34 @@ test("noncanonical uppercase UUID cannot acquire a different lifecycle boundary"
   const caseId = await caseRow();
   await expect(lifecycle.placeEvidenceHold({ caseId: caseId.toUpperCase(), reason: "case variant", holdUntil: new Date(Date.now() + 60000).toISOString() }, actor)).rejects.toThrow();
   expect((await sql`SELECT hold_id FROM moderation.evidence_holds WHERE case_id = ${caseId}`).length).toBe(0);
+});
+
+async function memberCase(author: string) {
+  const id = crypto.randomUUID(); const evidence = cipher.seal(`${memberOrg}:${id}`, { evidence: { content: "synthetic member report", createdAt: 1 }, reason: "synthetic report" });
+  await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at) VALUES (${id}, ${memberOrg}, ${community}, ${"b".repeat(64)}, ${"c".repeat(64)}, ${author}, ${crypto.randomUUID()}, ${evidence}, clock_timestamp() + interval '1 hour')`; return id;
+}
+function memberDecision(caseId: string, action: "ban_member" | "unban_member", revision: string) {
+  return new Decisions(sql, cipher, memberScope, memberPolicy).acceptDecision({ caseId, executionId: crypto.randomUUID(), action, reason: "synthetic membership", scope: "community", discordGuildConfirmed: false, sourceOrder: { version: 1, revision } }, memberActor);
+}
+/** Stands in for the worker having delivered every target (no Guild scope, no Discord member). */
+async function settleMember(decisionId: string) {
+  await sql`UPDATE moderation.deliveries SET state = CASE WHEN target = 'discord' THEN 'not_applicable' ELSE 'verified' END, token = NULL, lease_until = NULL, available_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${decisionId}`;
+}
+function observeMember(decisionId: string) {
+  return new DiscordRestrictionObserver(sql, { async messages() { return []; }, async member() { return undefined; } }, { async assertPublicChannel() {} }, async () => { throw new Error("unused"); }, memberScope).refresh(decisionId);
+}
+test("a ban superseded before any send does not keep the member's settled unban open", async () => {
+  const author = randomBytes(32).toString("hex"), caseId = await memberCase(author);
+  const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
+  // The claim sweep supersedes the unsent ban. Another suite's leftover row may
+  // be the one claimed; put it back untouched.
+  const decisions = new Decisions(sql, cipher, memberScope, memberPolicy), claimed = await decisions.claim();
+  if (claimed && claimed.decision.orgId !== memberOrg) await decisions.defer(claimed);
+  const superseded = await sql`SELECT target, state, result_code, publication_attempted, publication_event_ids FROM moderation.deliveries WHERE decision_id = ${ban.decisionId} ORDER BY target`;
+  // publication_attempted keeps its conservative default: it cannot say "never sent".
+  expect(superseded.map(r => ({ ...r }))).toEqual(["concord", "discord", "divine_relay"].map(target => ({ target, state: "failed", result_code: "superseded_by_newer_decision", publication_attempted: true, publication_event_ids: null })));
+  await settleMember(unban.decisionId);
+  expect(await observeMember(unban.decisionId)).toBe(true);
+  const closed = await new Lifecycle(sql, cipher, memberScope, memberPolicy).closeLifecycle({ decisionId: unban.decisionId, reason: "settled unban" }, memberActor);
+  expect(closed.closedAt).toBeString();
 });

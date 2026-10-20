@@ -121,8 +121,15 @@ export class Lifecycle {
     const policy = await new PolicyStore(tx as unknown as postgres.Sql).getPolicy(decision.community_id);
     if (!policy || policy.banned.includes(decision.author) || controlState(policy).folded.banned.has(decision.author)) return false;
     const [blocked] = await tx`SELECT 1 FROM moderation.member_bans WHERE community_id = ${decision.community_id} AND author = ${decision.author} AND blocked`;
+    // A superseded row cannot hold the member's lifecycle open: the claim sweep
+    // supersedes only rows that are not in flight, so none carries a Concord
+    // generation that may have reached a relay, and a newer decision owns the
+    // target. Do not key this on publication_attempted: it defaults to true and
+    // the sweep leaves it, so every row superseded before a send reads
+    // "attempted" and the member's later settled decisions could never close.
+    // A Concord row that does carry a publication identity still blocks.
     const [unresolved] = await tx`SELECT 1 FROM moderation.decisions c JOIN moderation.deliveries d USING (decision_id) WHERE c.org_id = ${decision.org_id} AND c.community_id = ${decision.community_id} AND c.author = ${decision.author}
-      AND (d.lease_until > clock_timestamp() OR (d.state NOT IN ('verified','not_applicable') AND NOT (d.state = 'failed' AND d.result_code = 'superseded_by_newer_decision' AND NOT d.publication_attempted))) LIMIT 1`;
+      AND (d.lease_until > clock_timestamp() OR (d.state NOT IN ('verified','not_applicable') AND NOT (d.state = 'failed' AND d.result_code = 'superseded_by_newer_decision' AND (d.target <> 'concord' OR d.publication_event_ids IS NULL)))) LIMIT 1`;
     return !blocked && !unresolved;
   }
   async closeLifecycle(input: { decisionId: string; reason: string }, actor: VerifiedCoopActor): Promise<LifecycleStatus> {
