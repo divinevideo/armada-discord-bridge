@@ -200,7 +200,8 @@ test("the actual API role accepts decisions while retaining case locks and colum
     for (const row of rows) expect(row).toEqual({ token: null, lease_until: null, available: true, updated: true, signed_events: events, publication_attempted: true });
     const columns = await sql`SELECT column_name FROM information_schema.columns WHERE table_schema = 'moderation' AND table_name = 'decisions'`;
     for (const { column_name } of columns) {
-      const permitted = ["audit", "lifecycle_closed_at", "audit_delete_after", "audit_retention_seconds", "appeal_state"].includes(column_name);
+      // Audit erasure belongs to the worker's operator role, not the API.
+      const permitted = ["lifecycle_closed_at", "audit_delete_after", "audit_retention_seconds", "appeal_state"].includes(column_name);
       const update = api`UPDATE moderation.decisions SET ${api(column_name)} = ${api(column_name)} WHERE decision_id = ${accepted.decisionId}`.execute();
       if (permitted) await update;
       else await expect(update).rejects.toThrow(/permission denied/);
