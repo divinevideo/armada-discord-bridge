@@ -838,3 +838,19 @@ test("expiry does not revisit an expired decision that has nothing left to expir
   expect(outcome).toBe("finished");
   expect((await decisions.get(pending.decisionId, actor)).deliveries.every(d => d.state === "failed" && d.resultCode === "decision_expired")).toBe(true);
 });
+
+test("restriction refresh schedules observation of a settled delivery without rescheduling a pending send", async () => {
+  const accepted = await decisions.acceptDecision({ ...input, executionId: crypto.randomUUID() }, actor);
+  const discordAt = async () => (await sql`SELECT available_at FROM moderation.deliveries WHERE decision_id = ${accepted.decisionId} AND target = 'discord'`)[0].available_at.getTime();
+  for (const state of ["pending", "acknowledged"]) {
+    // A send honoring Retry-After or backoff keeps its schedule and its attempts.
+    await sql`UPDATE moderation.deliveries SET state = ${state}, available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${accepted.decisionId} AND target = 'discord'`;
+    const before = await discordAt();
+    await decisions.refreshDiscordRestriction(accepted.decisionId, actor);
+    expect(await discordAt()).toBe(before);
+  }
+  await sql`UPDATE moderation.deliveries SET state = 'verified', available_at = clock_timestamp() - interval '1 hour' WHERE decision_id = ${accepted.decisionId} AND target = 'discord'`;
+  const before = await discordAt();
+  await decisions.refreshDiscordRestriction(accepted.decisionId, actor);
+  expect(await discordAt()).toBeGreaterThan(before);
+});

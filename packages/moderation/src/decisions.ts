@@ -344,7 +344,13 @@ export class Decisions {
     await this.get(decisionId, actor);
     await this.sql.begin(async tx => {
       await lockLifecycleDecision(tx, actor.orgId, decisionId);
-      await tx`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${decisionId} AND target = 'discord' AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
+      // Observation only. For an unsettled delivery available_at is the send
+      // schedule: moving it up would let any viewing staff member cancel a
+      // Discord Retry-After or backoff and spend the send budget. Such a row
+      // needs no refresh anyway: its next completion moves available_at past
+      // the last check, which already makes the observer due again.
+      await tx`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${decisionId} AND target = 'discord'
+        AND state NOT IN ('pending', 'acknowledged') AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
     });
     return this.get(decisionId, actor);
   }
