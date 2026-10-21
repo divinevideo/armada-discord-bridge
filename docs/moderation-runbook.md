@@ -29,6 +29,12 @@ remain operator-gated indefinitely. There is no automatic release or ordinary
 Retry that resolves those cases; retain the uncertainty and escalate for an
 authorized recovery decision instead of clearing the marker.
 
+During an upgrade from per-member ordering, already-attempted generations for
+different members may coexist. They may reconcile by read-only canonical
+readback even before expiry, without spending send attempts or publishing over
+one another. Missing proof keeps them unresolved; this is not an operator
+release for an event that never landed or whose identity is gone.
+
 Concord retries preserve signed event bytes once publication may have begun.
 An older, superseded action is never prepared again by Retry. A live failed
 Concord target with retained attempted bytes and send attempts remaining may

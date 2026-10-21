@@ -1004,6 +1004,41 @@ test("operator recovery stays failed across missing proof, worker failure, resta
   } finally { await client.end(); await operatorSql.end(); await h.cleanup(); }
 });
 
+for (const state of ["pending", "acknowledged"] as const) test(`pre-upgrade ${state} community publications can reconcile without republishing or spending attempts`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member"), second = await otherCommunityMember(h, "ban_member");
+    // Model two attempted generations left by the old per-member fence. Each
+    // would block the other's normal send under the new community-wide fence.
+    for (const [index, id] of [first.decisionId, second.decisionId].entries()) {
+      await sql`UPDATE moderation.deliveries SET state = ${state}, attempts = 2, publication_attempted = true,
+        publication_event_ids = ARRAY[${String(index + 1).repeat(64)}], result_code = 'concord_transport_unavailable', available_at = clock_timestamp()
+        WHERE decision_id = ${id} AND target = 'concord'`;
+    }
+    let sends = 0;
+    const ids = new Set<string>();
+    for (let pass = 0; pass < 2; pass++) {
+      const claim = (await h.outbox.claim())!;
+      expect(claim.reconcileOnly).toBe(true);
+      expect(claim.attempts).toBe(2);
+      ids.add(claim.decision.decisionId);
+      const result = await deliverConcord(claim, h.actions, h.outbox, {
+        queryStrict: async () => [], publish: async () => { sends++; throw new Error("Readback must not publish"); },
+      } as never, async () => {});
+      expect(result).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+      await h.outbox.complete(claim, result.state, result.code, result.retryAfterSeconds);
+    }
+    expect([...ids].sort()).toEqual([first.decisionId, second.decisionId].sort());
+    expect(sends).toBe(0);
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", attempts: 2 });
+    expect(await concordRow(second.decisionId)).toMatchObject({ state: "failed", attempts: 2 });
+    // Absence has not become a settled receipt or released new community work.
+    const next = await h.accept("unban_member");
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(next.decisionId)).toMatchObject({ state: "pending", attempts: 0, result_code: "concord_waiting_on_prior_publication" });
+  } finally { await h.cleanup(); }
+});
+
 for (const uncertain of [false, true]) test(`expired relay-only reversal ${uncertain ? "retains publication uncertainty" : "verifies Concord and lifts the relay ban"}`, async () => {
   const h = await memberHarness("member");
   const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });

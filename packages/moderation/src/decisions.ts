@@ -72,12 +72,17 @@ const unknownGuildOrder = (c: string) => `${c}.action IN ('ban_member', 'unban_m
     WHERE h.org_id = ${c}.org_id AND h.community_id = ${c}.community_id AND h.author = ${c}.author AND h.guild_scope_known_after > ${c}.source_revision
       AND (h.latest_guild_revision IS NULL OR h.latest_guild_revision <= ${c}.source_revision)))`;
 const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${alias}.created_at, ${alias}.decision_id`;
-const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.state = 'failed' AND ${d}.publication_attempted
+// Pre-upgrade workers could leave two attempted community generations live.
+// Their sends must not pass each other, but read-only reconciliation must not
+// inherit that mutual wait. Missing proof still leaves both fences intact.
+const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.publication_attempted
   AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL) AND ${c}.action IN ('ban_member', 'unban_member')
-  AND (${c}.expires_at <= clock_timestamp() OR ${c}.appeal_state = 'open' OR EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
+  AND ((${d}.state IN ('pending', 'acknowledged') AND EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
+    WHERE ${sameCommunity("o", c)} AND od.target = 'concord' AND ${inFlight("od")}))
+  OR (${d}.state = 'failed' AND (${c}.expires_at <= clock_timestamp() OR ${c}.appeal_state = 'open' OR EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
     WHERE ${sameCommunity("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
       AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
-      AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp())))`;
+      AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp())))))`;
 // Relay unbans cannot execute before their own Concord outcome is proved.
 // Waiting on another destination is not a delivery attempt: spending this
 // budget while a community publication is fenced can strand a later unban.
