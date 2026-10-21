@@ -13,7 +13,8 @@ import { deliverConcord } from "./concordDelivery";
 import { RetryableDeliveryError } from "./discordActions";
 import { PolicyStore } from "./policyStore";
 import { controlState } from "./relayPolicy";
-import { ModerationWorker, type ExecutionContext } from "./worker";
+import { ModerationWorker, executeDelivery, type ExecutionContext } from "./worker";
+import { createExecutionContext } from "./executionContext";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 const org = crypto.randomUUID(), caseId = crypto.randomUUID(), executionId = crypto.randomUUID();
 const actor = { orgId: org, actorId: "synthetic-reviewer", permissions: ["remove_message", "ban_member", "unban_member", "retry"] };
@@ -997,4 +998,50 @@ test("operator recovery stays failed across missing proof, worker failure, resta
     await h.deliver((await h.outbox.claim())!);
     expect(await h.banned()).toBe(false);
   } finally { await client.end(); await operatorSql.end(); await h.cleanup(); }
+});
+
+for (const uncertain of [false, true]) test(`expired relay-only reversal ${uncertain ? "retains publication uncertainty" : "verifies Concord and lifts the relay ban"}`, async () => {
+  const h = await memberHarness("member");
+  const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
+  const operatorSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice() {} });
+  const scope = new Map([[h.f.community.idHex, h.staff.orgId]]), store = new PolicyStore(operatorSql), operator = new Decisions(operatorSql, undefined, scope);
+  try {
+    const first = await h.accept("ban_member");
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
+    await store.setBan(h.f.community.idHex, h.who.pk, true);
+    await sql`UPDATE moderation.deliveries SET state = 'verified' WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`;
+    if (uncertain) await h.deliver((await operator.claim())!, { ...h.relay, publish: async () => { throw new Error("uncertain transport"); } });
+    else await sql`UPDATE moderation.deliveries SET state = 'failed', publication_attempted = false, result_code = 'current_authority_or_delivery_unavailable' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
+    await operator.expire();
+    const caseId = h.request("unban_member").caseId;
+    await sql`DELETE FROM moderation.cases WHERE case_id = ${caseId}`;
+    const api = new Decisions(apiSql, cipher, scope, { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+    expect((await api.getReversalContext(first.decisionId, h.staff)).author).toBe(h.who.pk);
+    const { executionId, reason, sourceOrder } = h.request("unban_member");
+    const next = await api.acceptReversal(first.decisionId, { executionId, reason, sourceOrder, action: "unban_member", scope: "community", discordGuildConfirmed: false }, h.staff);
+    await hold(next.decisionId, "concord");
+    if (uncertain) await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const concord = (await operator.claim())!;
+    const result = await deliverConcord(concord, h.actions, operator, h.relay as never, async () => {});
+    await operator.complete(concord, result.state, result.code, result.retryAfterSeconds);
+    expect(result.state).toBe(uncertain ? "failed" : "verified");
+    expect(concord.decision.decisionId).toBe(uncertain ? first.decisionId : next.decisionId);
+    if (uncertain) {
+      expect(concord.reconcileOnly).toBe(true);
+      expect(h.published).toHaveLength(0);
+      expect(await concordRow(next.decisionId)).toMatchObject({ state: "pending", attempts: 0, signed_events: null });
+      expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator" });
+    }
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${next.decisionId} AND target = 'divine_relay'`;
+    const relay = (await operator.claim())!;
+    expect(relay.target).toBe("divine_relay"); expect(relay.decision.decisionId).toBe(next.decisionId);
+    const context = createExecutionContext({ sql: operatorSql, store, actions: h.actions, claim: relay, assertCurrent: () => operator.renew(relay), decisions: operator,
+      relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+    const applied = await executeDelivery(relay.decision, relay.target, context);
+    await operator.complete(relay, applied.state, applied.code, applied.retryAfterSeconds);
+    expect(applied).toEqual(uncertain ? { state: "acknowledged", code: "relay_awaiting_concord_state" } : { state: "verified", code: "relay_member_policy_verified" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(uncertain);
+    expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(0);
+  } finally { await apiSql.end(); await operatorSql.end(); await h.cleanup(); }
 });
