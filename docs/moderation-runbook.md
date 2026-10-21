@@ -285,3 +285,117 @@ bounds; do not interpret the pause as stopping all member writes.
 A pause survives restart, low counts and missing samples. To observe or pause using the existing operator database connection, run `bun packages/moderation/src/capacityOperator.ts observe COMMUNITY_ID` or `bun packages/moderation/src/capacityOperator.ts pause COMMUNITY_ID REASON_CODE`. Explicit resume is `bun packages/moderation/src/capacityOperator.ts resume COMMUNITY_ID ACTOR_ID CONTRACT_HASH` and rechecks the current complete policy, measured contract and counts under the same lock. The read API and validator cannot clear the latch. Apply018 after repeated bootstrap too; its final grants remove broad replayed001 authority.
 
 Capacity metrics contain only aggregate counts/states and observation age. Full settled inner-admission latency is unknown in the counts-only operator snapshot. gate_elapsed_ms is an optional partial monotonic pressure signal through the admission gate, not full latency. Set MODERATION_CAPACITY_TIMING=1 to emit aggregate settled inner-admission timing to plugin stderr for measurement; stdout remains the existing relay decision protocol. Existing SQL1500ms/plugin2000ms/external3000ms fences and commit/cancellation settlement remain mandatory. Neither missing telemetry nor a synthetic timing value is a measured launch proof.
+
+## Public pilot publication recovery
+
+This release supports a fresh, separately scoped **public pilot** community. It
+is not an in-place conversion of a private or multiple-community bridge. Those
+bridges keep their compatible path. Before admitting a pilot, run:
+
+```
+bun packages/moderation/src/publicationOperator.ts preflight COMMUNITY_ID
+bun packages/moderation/src/publicationOperator.ts status COMMUNITY_ID
+```
+
+Use the existing operator database connection and the single-community
+`MODERATION_COMMUNITY_ORGS` mapping. Worker startup performs the same provenance
+preflight and invalidates admission policy if it fails. A legacy publication with neither retained signed bytes nor verified structural
+metadata, including an identity-less marker, is **excluded**, not declared recovered. Restore authentic original
+publication provenance from an existing trusted record/backup, or provision a
+fresh separate pilot community and mapping. Preserve the old decisions and audit.
+An operator assertion, an ordinary grant revocation, or a root rekey cannot
+establish that an unknown delayed edition is impossible; do not clear its marker.
+The preflight establishes local publication provenance, not deployment history or
+production acceptance.
+
+Decision status includes `publicationBlockers`, naming the holding decision,
+original event ID when known, recovery version, lease and available recovery
+class. This survives the waiting decision's expiry. Use the operator status
+command for maintenance, including non-Coop diagnostics.
+
+Stop the community worker before recovery. The command checks both controller
+and execution locks; no force option exists. Supply a request JSON file:
+
+```
+{"decisionId":"00000000-0000-4000-8000-000000000001","expectedVersion":0,"eventId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation":"replay","reason":"Relay restored; replay original publication"}
+```
+
+Supply an operator audit identity JSON file with the mapped `orgId`, a nonempty
+`actorId`, and permissions `view`, `recover_publication`, and the decision's action
+(`ban_member` or `unban_member`). For example (all identifiers synthetic):
+
+```
+{"orgId":"synthetic-pilot","actorId":"synthetic-operator","permissions":["view","recover_publication","ban_member","unban_member"]}
+```
+
+The local operator database credential is the
+command's access boundary; the file records who authorized maintenance. The
+mounted member identity must still have current Concord authority over the
+subject. Use existing worker provisioning (`MODERATION_COMMUNITY_ENTRY_FILE`,
+`MODERATION_MEMBER_KEY`, `MODERATION_LOCAL_RELAY_URL`) plus
+`MODERATION_EVIDENCE_KEY` for the encrypted actor/reason audit:
+
+```
+bun packages/moderation/src/publicationOperator.ts recover COMMUNITY_ID request.json actor.json
+```
+
+`replay` is one deliberate attempt of the **exact retained, unexpired original
+signed event**. It never prepares replacement bytes or replenishes the normal
+eight-attempt budget. Current authority and the original generation are checked
+before sending and after readback. The audit and incremented recovery version
+commit before network I/O. Repeating a stale request is refused. An unavailable
+relay leaves uncertainty fenced; inspect status and make another deliberate
+request using the new recovery version after its lease clears.
+
+Use `operation: "prove"` after expiry, or for a losing generation. The command
+first accepts exact original canonical ancestry as a receipt. For an expired
+legacy row with an ID but no structural metadata, an `originalEvent` object may
+be supplied; its signature and exact durable original ID are checked. Relay
+absence never releases a fence.
+
+A losing generation can instead be released only with this narrow existing
+protocol proof: the canonical banlist history contains an **owner-authored
+sibling at the original version and predecessor**, followed by an
+**owner-authored canonical head at a strictly greater version**. The command
+checks actual kernel folds with the old sibling present for both fresh and
+tracking clients; both must retain the canonical head and member set. This
+includes the chain check as well as owner authority, because a greater version
+alone does not establish supersession. Owner-authorized publication/advancement
+is an external prerequisite, not something this CLI signs or performs. If the
+proof fails, advance the owner-authorized branch and retry or use a fresh
+separate pilot community; no same-community bypass is available.
+
+Successful owner supersession records `not_applicable /
+concord_operator_superseded`. It is **not** proof that the old ban/unban was
+applied and does not qualify its relay unban. Submit fresh ordered intent if
+that member still needs a change. Later queued members can proceed on the
+proved canonical head. Exact event IDs and verified structural metadata
+(entity/version/predecessor/hash/rumor/signer) survive signed-payload expiry;
+actor/reason use existing deliberate lifecycle audit retention. Recovery
+ordering records remain immutable. Restart the worker only after inspecting
+status and rerunning preflight. Upgrade/rollback must preserve migration 023
+and its records; rolling back application code does not erase recovery history.
+
+The released moderation image already contains the CLI at
+/app/packages/moderation/src/publicationOperator.ts (the runtime image copies
+the whole moderation package). From an approved Linux maintenance host that can
+reach the local relay on loopback and the operator database, an explicit image
+invocation is:
+
+```
+docker run --rm --network host --env-file "$RECOVERY_ENV_FILE" --mount "type=bind,src=$COMMUNITY_ENTRY_FILE,dst=/recovery/community.json,readonly" --mount "type=bind,src=$RECOVERY_REQUEST_FILE,dst=/recovery/request.json,readonly" --mount "type=bind,src=$RECOVERY_ACTOR_FILE,dst=/recovery/actor.json,readonly" --env MODERATION_COMMUNITY_ENTRY_FILE=/recovery/community.json --entrypoint bun "$MODERATION_IMAGE" packages/moderation/src/publicationOperator.ts recover "$COMMUNITY_ID" /recovery/request.json /recovery/actor.json
+```
+
+Use the reviewed image digest for `MODERATION_IMAGE`; use absolute, readable
+paths for the three mounted files. `RECOVERY_ENV_FILE` contains existing
+maintenance provisioning, including an operator-role database URL reachable
+from that host and `MODERATION_LOCAL_RELAY_URL` reachable on its loopback
+interface. It is not a copy of an API-only credential. If running remotely,
+establish approved local port forwarding for the relay WebSocket and database
+first, then point these two URLs at their forwarded loopback ports. Do not
+publish ports or change relay authentication to make recovery work. The same
+CLI is supported from a checkout of the reviewed release with Bun 1.3.10 and
+`bun install --ignore-scripts --frozen-lockfile`, using
+`bun --env-file "$RECOVERY_ENV_FILE" packages/moderation/src/publicationOperator.ts status "$COMMUNITY_ID"`.
+The image/network commands above are maintenance instructions; this release
+work does not execute them against a deployed service.

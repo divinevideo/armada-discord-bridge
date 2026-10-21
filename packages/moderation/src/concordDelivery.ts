@@ -41,7 +41,7 @@ export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActio
   for (const event of events) {
     await assertCurrent();
     await actions.authorize(claim.decision);
-    await decisions.markPublicationAttempted(claim, events);
+    await decisions.markPublicationAttempted(claim, events, claim.decision.action === "remove_message" ? undefined : actions.publicationMetadata(events));
     // Persisting intent is an await, not an authority or lease guarantee for
     // the following network effect. Recheck after the durable write settles.
     await actions.authorize(claim.decision);

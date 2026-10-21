@@ -1,3 +1,4 @@
+import { publicationBlockers } from "./publicationRecovery";
 import { createHash } from "node:crypto";
 import type postgres from "postgres";
 import type { DeliveryState, DeliveryTarget, RoomTarget } from "./contracts";
@@ -15,7 +16,7 @@ export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string;
 /** `supersededBy` names the newer ban or unban for the same member that took
  * over this decision's undelivered targets (each reads failed /
  * superseded_by_newer_decision); null when nothing was superseded. */
-export interface DecisionStatus { auditAvailable?: boolean; discordRestriction?: DiscordRestriction; executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
+export interface DecisionStatus { publicationBlockers?: Awaited<ReturnType<typeof publicationBlockers>>; auditAvailable?: boolean; discordRestriction?: DiscordRestriction; executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
 export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean; publicationProofOnly?: boolean; claimedState?: DeliveryState }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
@@ -191,7 +192,7 @@ export class Decisions {
     if (!row || this.communities.get(row.community_id) !== actor.orgId || (!actor.permissions.includes("view") && !actor.permissions.includes(row.action))) throw new Error("Decision unavailable");
     const deliveries = await this.sql`SELECT target, state, attempts, result_code, superseded_by, discord_restriction_state, discord_restriction_checked_at, discord_restriction_code FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
     const supersededBy = deliveries.find((d) => d.superseded_by)?.superseded_by ?? null;
-    return { auditAvailable: row.audit !== null, discordRestriction: (() => { const d = deliveries.find(d => d.target === "discord"); return { state: d?.discord_restriction_state ?? "unknown", checkedAt: d?.discord_restriction_checked_at?.toISOString() ?? null, code: d?.discord_restriction_code ?? "not_checked" }; })(), executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
+    return { publicationBlockers: membership(row.action) ? (await publicationBlockers(this.sql, row.community_id)).filter(blocker => blocker.orgId === actor.orgId) : [], auditAvailable: row.audit !== null, discordRestriction: (() => { const d = deliveries.find(d => d.target === "discord"); return { state: d?.discord_restriction_state ?? "unknown", checkedAt: d?.discord_restriction_checked_at?.toISOString() ?? null, code: d?.discord_restriction_code ?? "not_checked" }; })(), executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
   }
   async getByExecution(executionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor);
@@ -349,14 +350,14 @@ export class Decisions {
     claim.publicationEventIds = null;
     return rows[0].signed_events;
   }
-  async markPublicationAttempted(claim: DeliveryClaim, events: unknown[]): Promise<void> {
+  async markPublicationAttempted(claim: DeliveryClaim, events: unknown[], metadata?: import("./concordActions").PublicationMetadata): Promise<void> {
     // Commit this BEFORE network I/O: a crash or timeout is not proof that a
     // relay did not receive the edition. Such generations remain replay-only.
     const member = membership(claim.decision.action);
     const id = (events[0] as { id?: unknown } | undefined)?.id;
     if (member && (events.length !== 1 || typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id))) throw new Error("Invalid publication identity");
     const ids = member ? [id as string] : null;
-    const rows = await this.sql`UPDATE moderation.deliveries SET publication_attempted = true, publication_event_ids = ${ids}, updated_at = clock_timestamp()
+    const rows = await this.sql`UPDATE moderation.deliveries SET publication_attempted = true, publication_event_ids = ${ids}, publication_metadata = COALESCE(publication_metadata, ${metadata ? this.sql.json({ ...metadata }) : null}), updated_at = clock_timestamp()
       WHERE decision_id = ${claim.decision.decisionId} AND target = 'concord' AND target = ${claim.target}
         AND token = ${claim.token} AND lease_until > clock_timestamp()
         AND signed_events = ${this.sql.json(events as never)} RETURNING target`;
@@ -373,7 +374,7 @@ export class Decisions {
     // Marked rows currently run read-only recovery; the verified arm and state
     // CASE also defend this invariant if a future proved-send path is added.
     const resolvedConcord = (state === "verified" && resultCode === "concord_enforcement_verified") ||
-      settledConcordReceipt(state, resultCode);
+      settledConcordReceipt(state, resultCode) || (state === "not_applicable" && resultCode === "concord_operator_superseded");
     const rows = await this.sql`UPDATE moderation.deliveries SET
       state = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN 'failed' ELSE ${state} END,
       result_code = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN result_code ELSE ${resultCode} END,

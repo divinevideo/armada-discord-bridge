@@ -1,3 +1,5 @@
+import { buildBanlistEdition, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex } from "@armada-bridge/concord-core";
+import { recoverPublication, assertPilotPublicationProvenance } from "./publicationRecovery";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
@@ -277,6 +279,8 @@ async function memberHarness(subject: "member" | "bannedMember") {
   await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
     VALUES (${subjectCase}, ${orgId}, ${f.community.idHex}, ${f.channelId}, ${f.allowedRumorId}, ${who.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic")}, clock_timestamp() + interval '1 hour')`;
   const cleanup = async () => {
+    // Synthetic test teardown only; runtime lifecycle retention stays enforced.
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`DELETE FROM moderation.lifecycle_events WHERE org_id = ${orgId}`; });
     await sql`DELETE FROM moderation.decisions WHERE org_id = ${orgId}`;
     await sql`DELETE FROM moderation.cases WHERE org_id = ${orgId}`;
     await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.community.idHex}`;
@@ -1191,5 +1195,131 @@ for (const code of ["concord_publication_settled", "unrelated_not_applicable"]) 
       relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
     expect(await executeDelivery(relay!.decision, relay!.target, context)).toEqual({ state: "acknowledged", code: "relay_awaiting_concord_state" });
     expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(true);
+  } finally { await h.cleanup(); }
+});
+
+test("operator exact replay recovers an exhausted outage then another member's unban; stale requests cannot repeat", async () => {
+  const h = await memberHarness("member");
+  const operator = { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] };
+  try {
+    const first = await h.accept("ban_member");
+    let original: NostrEvent | undefined;
+    for (let i = 0; i < 8; i++) {
+      const claim = (await h.outbox.claim())!;
+      await h.deliver(claim, { ...h.relay, publish: async event => { original ??= event; expect(event.id).toBe(original.id); throw Error("outage"); } });
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    }
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", attempts: 8, result_code: "retry_budget_exhausted" });
+    const next = await otherCommunityMember(h);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${first.decisionId}`;
+    expect(await h.outbox.claim()).toBeUndefined();
+    const status = await h.outbox.get(next.decisionId, h.staff);
+    expect(status.publicationBlockers).toContainEqual(expect.objectContaining({ decisionId: first.decisionId, eventId: original!.id, recoveryVersion: 0 }));
+    const request = { decisionId: first.decisionId, expectedVersion: 0, eventId: original!.id, operation: "replay" as const, reason: "Synthetic restored relay" };
+    const recover = (actor = operator) => recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: h.relay as never, actor, request });
+    await expect(recover(h.staff)).rejects.toThrow(/authorization/);
+    await expect(recover({ ...operator, orgId: crypto.randomUUID() })).rejects.toThrow();
+    const result = await recover();
+    expect(result).toMatchObject({ state: "verified", code: "concord_enforcement_verified" });
+    expect((await concordRow(first.decisionId)).attempts).toBe(8);
+    expect(h.published.map(event => event.id)).toEqual([original!.id]);
+    await expect(recover()).rejects.toThrow(/Stale/);
+    const [audit] = await sql`SELECT * FROM moderation.lifecycle_events WHERE event_id = ${result.recoveryId}`;
+    expect(cipher.open(`${h.staff.orgId}:${result.recoveryId}`, audit.encrypted_audit)).toEqual({ actorId: operator.actorId, reason: request.reason });
+    await expect((async () => { await sql`UPDATE moderation.publication_recoveries SET operation = 'prove' WHERE recovery_id = ${result.recoveryId}`; })()).rejects.toThrow(/immutable/);
+    await h.drain();
+    expect((await concordRow(next.decisionId)).state).toBe("verified");
+    h.published.push(original!);
+    const current = controlState(refreshPolicy({ ...h.f.policy, controlEvents: [...h.f.policy.controlEvents, ...h.published] })).folded;
+    expect(current.banned.has(h.f.bannedMember.pk)).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
+test("legacy identity-less uncertainty rejects pilot preflight and reports the holding decision", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async () => { throw Error("legacy outage"); } });
+    await sql`UPDATE moderation.deliveries SET signed_events = NULL, publication_metadata = NULL, state = 'failed', result_code = 'concord_recovery_requires_operator' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await expect(assertPilotPublicationProvenance(sql, h.f.community.idHex)).rejects.toThrow(/pilot_publication_provenance_required/);
+    await sql`UPDATE moderation.deliveries SET publication_event_ids = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const next = await otherCommunityMember(h);
+    await expect(assertPilotPublicationProvenance(sql, h.f.community.idHex)).rejects.toThrow(/pilot_publication_provenance_required/);
+    expect((await h.outbox.get(next.decisionId, h.staff)).publicationBlockers).toContainEqual(expect.objectContaining({ decisionId: first.decisionId, recovery: "authentic_provenance_or_separate_community" }));
+    expect(await h.outbox.claim()).toBeUndefined();
+  } finally { await h.cleanup(); }
+});
+
+test("owner canonical sibling and advancing head release a losing generation after payload expiry, and delayed old bytes cannot undo the next unban", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    let old!: NostrEvent;
+    const claim = (await h.outbox.claim())!;
+    const prepared = parseEdition(openWrap((await h.actions.prepare(claim.decision))[0], h.f.controlStream.key));
+    // Choose a high rumor ID before sealing so the owner-sibling fixture does
+    // not depend on finding a rare lower hash for a randomly tiny old ID.
+    let timestamp = Math.floor(Date.now() / 1000), rumor;
+    do { rumor = buildBanlistEdition(h.f.community.id, JSON.parse(prepared.content), { actorPubkey: h.f.moderator.pk, version: prepared.version, prevHash: prepared.prevHash, authority: prepared.authority, createdAtSecs: timestamp-- }); } while (!rumor.id.startsWith("f"));
+    await h.outbox.saveEvents(claim, [await sealEdition(rumor, currentControlWriteGroup(h.f.community), h.f.moderator.signer)]);
+    await h.deliver(claim, { ...h.relay, publish: async event => { old = event; throw Error("outage"); } });
+    const candidate = parseEdition(openWrap(old, h.f.controlStream.key));
+    const ownerEvent = async (version: bigint, prevHash: Uint8Array | undefined, createdAtSecs = Math.floor(Date.now() / 1000)) => sealEdition(buildBanlistEdition(h.f.community.id, [h.f.bannedMember.pk], { actorPubkey: h.f.owner.pk, version, prevHash, createdAtSecs }), currentControlWriteGroup(h.f.community), h.f.owner.signer);
+    let sibling!: NostrEvent;
+    for (let i = 0; i < 1000; i++) {
+      sibling = await ownerEvent(candidate.version, candidate.prevHash, Math.floor(Date.now() / 1000) - i);
+      if (bytesToHex(parseEdition(openWrap(sibling, h.f.controlStream.key)).rumorId) < bytesToHex(candidate.rumorId)) break;
+    }
+    const siblingEdition = parseEdition(openWrap(sibling, h.f.controlStream.key));
+    h.published.push(sibling);
+    const request = { decisionId: first.decisionId, expectedVersion: 0, eventId: old.id, operation: "prove" as const, reason: "Synthetic owner supersession" };
+    const recover = () => recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: h.relay as never, actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] }, request });
+    // Equal-version dominance alone does not release the fence.
+    await expect(recover()).rejects.toThrow(/supersession/);
+    const advancing = await ownerEvent(candidate.version + 1n, siblingEdition.selfHash);
+    h.published.push(advancing);
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
+    await h.outbox.expire();
+    expect((await concordRow(first.decisionId)).signed_events).toBeNull();
+    const result = await recover();
+    expect(result).toMatchObject({ state: "not_applicable", code: "concord_operator_superseded" });
+    const next = await otherCommunityMember(h);
+    await h.drain();
+    expect((await concordRow(next.decisionId)).state).toBe("verified");
+    h.published.push(old);
+    const state = controlState(refreshPolicy({ ...h.f.policy, controlEvents: [...h.f.policy.controlEvents, ...h.published] }));
+    expect(state.folded.incomplete).toEqual([]);
+    expect(state.folded.banned.has(h.f.bannedMember.pk)).toBe(false);
+    const latest = state.folded.heads.get(bytesToHex(candidate.entityId))!;
+    expect(latest.version).toBe(candidate.version + 2n);
+  } finally { await h.cleanup(); }
+});
+
+test("recovery refuses missing IDs, losing same-version editions, and concurrent controllers", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    let old!: NostrEvent;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { old = event; throw Error("outage"); } });
+    const candidate = parseEdition(openWrap(old, h.f.controlStream.key));
+    const actor = { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] };
+    const request = { decisionId: first.decisionId, expectedVersion: 0, eventId: old.id, operation: "replay" as const, reason: "Synthetic repair" };
+    const run = (relay = h.relay) => recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: relay as never, actor, request });
+    await sql`UPDATE moderation.deliveries SET publication_event_ids = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await expect(run()).rejects.toThrow(/identity/);
+    await sql`UPDATE moderation.deliveries SET publication_event_ids = ARRAY[${old.id}] WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const sibling = await sealEdition(buildBanlistEdition(h.f.community.id, [h.f.bannedMember.pk], { actorPubkey: h.f.owner.pk, version: candidate.version, prevHash: candidate.prevHash }), currentControlWriteGroup(h.f.community), h.f.owner.signer);
+    h.published.push(sibling);
+    await expect(run()).rejects.toThrow();
+    h.published.length = 0;
+    let entered!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const wait = new Promise<void>(resolve => { release = resolve; });
+    const recovery = run({ ...h.relay, publish: async event => { entered(); await wait; await h.relay.publish(event); } });
+    await started;
+    try { await expect(run()).rejects.toThrow(/Stop community worker/); }
+    finally { release(); }
+    expect(await recovery).toMatchObject({ state: "verified" });
+    expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${first.decisionId}`).length).toBe(1);
   } finally { await h.cleanup(); }
 });

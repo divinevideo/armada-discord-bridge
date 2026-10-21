@@ -1,3 +1,4 @@
+import { assertPilotPublicationProvenance } from "./publicationRecovery";
 import { setTimeout as delay } from "node:timers/promises";
 import type postgres from "postgres";
 import { baseRekeyGroupKey, channelsView, controlGroups, guestbookGroups, registerStreamKeys } from "@armada-bridge/concord-core";
@@ -39,6 +40,7 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
   validateWorkerCommunity(options.community, options.identity.pk, options.communities);
   const { sql, community, identity, health } = options;
   const capacity = options.capacity ?? loadPublicCapacity();
+  try { await assertPilotPublicationProvenance(sql, community.idHex); } catch (error) { await new PolicyStore(sql).invalidate(community.idHex); throw error; }
   const store = new PolicyStore(sql), driver = new LocalRelayDriver(options.relayUrl);
   const purger = new RelayPurger(new CarrierIndex(sql), driver);
   let watcher: PolicyWatcher | undefined;

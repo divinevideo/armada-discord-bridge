@@ -4,6 +4,7 @@ import type { NostrEvent } from "nostr-tools/pure";
 import type { CommunityPolicy } from "./contracts";
 import type { StoredDecision } from "./decisions";
 import { controlState, verifiedEvent } from "./relayPolicy";
+export interface PublicationMetadata { entityId: string; version: string; prevHash: string | null; selfHash: string; rumorId: string; author: string }
 export class StalePreparedBanlistError extends Error {}
 function canonicalIncludes(edition: ParsedEdition, { editions, folded }: ReturnType<typeof controlState>): boolean {
   const entity = bytesToHex(edition.entityId);
@@ -36,6 +37,33 @@ export class ConcordActions {
     const authority = { entityId, version: grant.version, editionHash: grant.hash };
     if (!citationSatisfied(state.folded, this.community.id, this.identity.pk, authority)) throw new Error("Moderator citation invalid");
     return { ...state, policy, authority };
+  }
+  publicationMetadata(events: NostrEvent[]): PublicationMetadata {
+    if (events.length !== 1) throw new Error("Unexpected publication set");
+    const p = parseEdition(openWrap(verifiedEvent(events[0]), currentControlWriteGroup(this.community)));
+    if (bytesToHex(p.entityId) !== bytesToHex(banlistLocator(this.community.id)) || p.author !== this.identity.pk) throw new Error("Publication scope invalid");
+    return { entityId: bytesToHex(p.entityId), version: p.version.toString(), prevHash: p.prevHash ? bytesToHex(p.prevHash) : null, selfHash: bytesToHex(p.selfHash), rumorId: bytesToHex(p.rumorId), author: p.author };
+  }
+  /** Owner sibling authority settles the standing-list walk before the old
+   * moderator's sibling. A later owner head then rewrites the complete list.
+   * Check the actual chain too: version superiority alone is insufficient. */
+  async ownerSupersession(decision: StoredDecision, metadata: PublicationMetadata): Promise<boolean> {
+    const { editions, folded } = await this.authorize({ ...decision, expiresAt: new Date(Date.now() + 60_000) });
+    const eid = bytesToHex(banlistLocator(this.community.id));
+    if (metadata.entityId !== eid || metadata.author !== this.identity.pk || !/^[1-9][0-9]*$/.test(metadata.version) || ![metadata.selfHash, metadata.rumorId, metadata.author, ...(metadata.prevHash ? [metadata.prevHash] : [])].every(id => /^[0-9a-f]{64}$/.test(id))) return false;
+    const version = BigInt(metadata.version), head = folded.headEditions.get(eid);
+    if (!head || head.author !== this.community.owner || head.version <= version) return false;
+    const sibling = editions.find(p => bytesToHex(p.entityId) === eid && p.author === this.community.owner && p.version === version && canonicalIncludes(p, { editions, folded }));
+    if (!sibling || (sibling.prevHash ? bytesToHex(sibling.prevHash) : null) !== metadata.prevHash) return false;
+    // Content and citation cannot change the sibling winner: the owner is
+    // admissible first at this version and its authority cannot be outranked.
+    const old: ParsedEdition = { ...sibling, author: metadata.author, version, prevHash: metadata.prevHash ? hex32(metadata.prevHash) : undefined, selfHash: hex32(metadata.selfHash), rumorId: hex32(metadata.rumorId), content: "[]" };
+    for (const prior of [undefined, folded.heads]) {
+      const next = foldControlState([...editions, old], this.community.id, this.community.owner, prior);
+      const h = next.heads.get(eid);
+      if (next.incomplete.length || !h || bytesToHex(h.hash) !== bytesToHex(head.selfHash) || [...next.banned].sort().join() !== [...folded.banned].sort().join()) return false;
+    }
+    return true;
   }
   async prepare(decision: StoredDecision): Promise<NostrEvent[]> {
     const { folded, authority } = await this.authorize(decision);
