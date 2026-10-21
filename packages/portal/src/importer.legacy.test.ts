@@ -535,10 +535,10 @@ describe("legacy importer pipeline", () => {
     expect(keyDeliveries()).toBe(beforeFailedLookup);
     for (const relay of STOCK_RELAYS) expect(dialed.flat()).not.toContain(relay);
     expect(prepared.plan.checkpoints.ownerChannelKeysSentAt).toBeUndefined();
-    expect(prepared.plan.checkpoints.ownerChannelKeysError).toMatch(/owner inbox/);
+    expect(prepared.plan.checkpoints.ownerChannelKeysError).toMatch(/owner inbox lookup unavailable/);
     const failedCheckpoint = (await internal.load("imp1")).plan.checkpoints;
     expect(failedCheckpoint.ownerChannelKeysSentAt).toBeUndefined();
-    expect(failedCheckpoint.ownerChannelKeysError).toMatch(/owner inbox/);
+    expect(failedCheckpoint.ownerChannelKeysError).toMatch(/owner inbox lookup unavailable/);
     inboxLookupFails = false;
     delete prepared.plan.checkpoints.ownerChannelKeysError;
     dialed.length = 0;
@@ -554,17 +554,21 @@ describe("legacy importer pipeline", () => {
     await internal.publishEditions("imp1", prepared.community, prepared.opSk, prepared.plan);
     expect(hosts(dialed)).toContain("1.1.1.1");
     expect(hosts(dialed)).not.toContain("127.0.0.1");
+    for (const relay of STOCK_RELAYS) expect(dialed.flat()).not.toContain(relay);
     expect(keyDeliveries()).toBe(sentBefore + 1);
+    expect(prepared.plan.checkpoints.ownerChannelKeysSentAt).toBeDefined();
     wire.push(inboxList([["relay", "ws://127.0.0.1:6379/"], ["relay", "ws://10.0.0.5/"]], now + 1));
     delete prepared.plan.checkpoints.ownerChannelKeysSentAt;
     delete prepared.plan.checkpoints.ownerChannelKeysError;
     dialed.length = 0;
+    const sentBeforeRefusal = keyDeliveries();
     await internal.publishEditions("imp1", prepared.community, prepared.opSk, prepared.plan);
     expect(hosts(dialed)).not.toContain("127.0.0.1");
     expect(hosts(dialed)).not.toContain("10.0.0.5");
     for (const relay of STOCK_RELAYS) expect(dialed.flat()).not.toContain(relay);
+    expect(keyDeliveries()).toBe(sentBeforeRefusal);
     expect(prepared.plan.checkpoints.ownerChannelKeysSentAt).toBeUndefined();
-    expect(prepared.plan.checkpoints.ownerChannelKeysError).toMatch(/owner inbox/);
+    expect(prepared.plan.checkpoints.ownerChannelKeysError).toMatch(/not publicly reachable/);
     delete prepared.plan.checkpoints.ownerChannelKeysError;
     prepared.plan.checkpoints.ownerChannelKeysSentAt = sentAt;
 
