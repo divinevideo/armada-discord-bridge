@@ -5,6 +5,11 @@ export function validateReversalInput(input: ReversalInput): void {
 }
 /** A retained decision supplies identity, never recreated report bytes or a caller target. */
 export function reversalContext(row: any, deliveries: any[], communities: ReadonlyMap<string, string>): ReversalContext | undefined {
-  if (!row || row.action !== "ban_member" || communities.get(row.community_id) !== row.org_id || !["concord", "divine_relay"].every(target => deliveries.some(d => d.target === target && d.state === "verified"))) return;
+  // Each destination can enforce independently. Canonical readback proves the
+  // original Concord publication without rewriting its delivery as a send.
+  const enforced = deliveries.some(d => (d.target === "divine_relay" && d.state === "verified") ||
+    (d.target === "concord" && (d.state === "verified" || (d.state === "not_applicable" &&
+      ["concord_publication_settled", "concord_superseded_publication_settled"].includes(d.result_code)))));
+  if (!row || row.action !== "ban_member" || communities.get(row.community_id) !== row.org_id || !enforced) return;
   return { decisionId: row.decision_id, caseId: row.case_id, communityId: row.community_id, channelId: row.channel_id, rumorId: row.rumor_id, author: row.author, action: "ban_member", discordGuildConfirmed: row.discord_guild_confirmed };
 }

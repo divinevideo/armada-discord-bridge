@@ -139,7 +139,7 @@ export class Decisions {
     assertActor(actor, "unban_member");
     if (!uuid.test(decisionId)) throw new Error("Decision unavailable");
     const [row] = await this.sql`SELECT * FROM moderation.decisions WHERE org_id = ${actor.orgId} AND decision_id = ${decisionId}`;
-    const deliveries = await this.sql`SELECT target, state FROM moderation.deliveries WHERE decision_id = ${decisionId}`;
+    const deliveries = await this.sql`SELECT target, state, result_code FROM moderation.deliveries WHERE decision_id = ${decisionId}`;
     const context = reversalContext(row, deliveries, this.communities);
     if (!context) throw new Error("Decision unavailable");
     return context;

@@ -854,3 +854,29 @@ test("restriction refresh schedules observation of a settled delivery without re
   await decisions.refreshDiscordRestriction(accepted.decisionId, actor);
   expect(await discordAt()).toBeGreaterThan(before);
 });
+
+test("a canonical ban settled after expiry supplies a fresh reversal that unbans without report evidence", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { h.published.push(event); throw new Error("lost acknowledgement"); } });
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
+    await h.outbox.expire();
+    await sql`DELETE FROM moderation.cases WHERE case_id = ${h.request("unban_member").caseId}`;
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(await h.deliver((await h.outbox.claim())!)).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
+    expect(await h.banned()).toBe(true);
+    const client = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
+    try {
+      const api = new Decisions(client, cipher, new Map([[h.f.community.idHex, h.staff.orgId]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+      expect((await api.getReversalContext(first.decisionId, h.staff)).author).toBe(h.who.pk);
+      const { executionId, reason, sourceOrder } = h.request("unban_member");
+      const next = await api.acceptReversal(first.decisionId, { executionId, reason, sourceOrder, action: "unban_member", scope: "community", discordGuildConfirmed: false }, h.staff);
+      await hold(next.decisionId, "concord");
+      expect(await h.deliver((await h.outbox.claim())!)).toMatchObject({ state: "verified" });
+      expect(await h.banned()).toBe(false);
+      expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${h.request("unban_member").caseId}`).length).toBe(0);
+    } finally { await client.end(); }
+  } finally { await h.cleanup(); }
+});

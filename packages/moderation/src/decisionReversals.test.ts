@@ -48,7 +48,7 @@ test("reversal authorization, definitive source refusal and source order remain 
  await expect(decisions.acceptReversal(old.id, request(), { ...actor, orgId: "other" })).rejects.toMatchObject({ code: "decision_source_unavailable" });
  const missing = request(); const refused = await call(`/v1/decisions/${crypto.randomUUID()}/reversals`, missing);
  expect(refused.status).toBe(409); expect(await refused.json()).toEqual({ error: "decision_source_unavailable", executionId: missing.executionId });
- await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${old.id} AND target = 'concord'`;
+ await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${old.id} AND target IN ('concord', 'divine_relay')`;
  await expect(decisions.acceptReversal(old.id, request(), actor)).rejects.toMatchObject({ code: "decision_source_unavailable" });
  await sql`UPDATE moderation.deliveries SET state = 'verified' WHERE decision_id = ${old.id}`;
  const first = await decisions.acceptReversal(old.id, request("2"), actor);
@@ -75,4 +75,29 @@ test("a ban in a community no longer mapped to the actor's org cannot be reverse
   expect((await sql`SELECT decision_id FROM moderation.decisions WHERE reverses_decision_id = ${old.id}`).length).toBe(0);
   expect((await sql`SELECT author FROM moderation.member_order_heads WHERE org_id = ${org} AND community_id = ${inCommunity} AND author = ${old.author}`).length).toBe(0);
  }
+});
+
+for (const [concord, code, relay] of [
+ ["not_applicable", "concord_publication_settled", "failed"],
+ ["not_applicable", "concord_superseded_publication_settled", "failed"],
+ ["failed", "concord_recovery_requires_operator", "verified"],
+ ["verified", "concord_enforcement_verified", "failed"],
+] as const) test(`expired ban reversal accepts proved enforcement ${concord}/${code}/${relay} under the API role`, async () => {
+ const old = await prior();
+ await sql`UPDATE moderation.deliveries SET state = ${concord}, result_code = ${code} WHERE decision_id = ${old.id} AND target = 'concord'`;
+ await sql`UPDATE moderation.deliveries SET state = ${relay} WHERE decision_id = ${old.id} AND target = 'divine_relay'`;
+ expect((await call(`/v1/decisions/${old.id}/reversal-context`)).status).toBe(200);
+ const response = await call(`/v1/decisions/${old.id}/reversals`, request());
+ expect(response.status).toBe(202);
+ const accepted = await response.json() as { decisionId: string };
+ expect((await sql`SELECT reverses_decision_id FROM moderation.decisions WHERE decision_id = ${accepted.decisionId}`)[0].reverses_decision_id).toBe(old.id);
+ expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${old.caseId}`).length).toBe(0);
+});
+for (const state of ["pending", "failed", "not_applicable"] as const) test(`an unproved ${state} Concord ban without verified relay enforcement cannot supply reversal context`, async () => {
+ const old = await prior();
+ await sql`UPDATE moderation.deliveries SET state = 'failed' WHERE decision_id = ${old.id}`;
+ await sql`UPDATE moderation.deliveries SET state = ${state}, result_code = 'concord_recovery_awaiting_proof' WHERE decision_id = ${old.id} AND target = 'concord'`;
+ expect((await call(`/v1/decisions/${old.id}/reversal-context`)).status).toBe(400);
+ await expect(decisions.acceptReversal(old.id, request(), actor)).rejects.toMatchObject({ code: "decision_source_unavailable" });
+ expect((await sql`SELECT decision_id FROM moderation.decisions WHERE reverses_decision_id = ${old.id}`).length).toBe(0);
 });
