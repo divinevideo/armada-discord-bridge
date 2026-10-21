@@ -880,3 +880,84 @@ test("a canonical ban settled after expiry supplies a fresh reversal that unbans
     } finally { await client.end(); }
   } finally { await h.cleanup(); }
 });
+
+async function otherCommunityMember(h: Awaited<ReturnType<typeof memberHarness>>) {
+  const caseId = crypto.randomUUID();
+  await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
+    VALUES (${caseId}, ${h.staff.orgId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.f.bannedMember.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic other member")}, clock_timestamp() + interval '1 hour')`;
+  const status = await h.outbox.acceptDecision({ ...h.request("unban_member"), caseId }, h.staff);
+  await hold(status.decisionId, "concord");
+  return status;
+}
+test("an uncertain community generation fences another member until canonical proof settles it", async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member"), limbo: NostrEvent[] = [];
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { limbo.push(event); throw new Error("uncertain transport"); } });
+    const second = await otherCommunityMember(h);
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending" });
+    await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'retry_budget_exhausted', attempts = 8, available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const recovery = (await h.outbox.claim())!;
+    expect(recovery).toMatchObject({ reconcileOnly: true, publicationProofOnly: true });
+    expect(await h.deliver(recovery)).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, signed_events: null });
+    h.published.push(...limbo);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(await h.deliver((await h.outbox.claim())!)).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
+    expect(await h.deliver((await h.outbox.claim())!)).toMatchObject({ state: "verified" });
+    expect(await h.banned()).toBe(true);
+    const final = await h.actions.authorize({ decisionId: second.decisionId, orgId: h.staff.orgId, caseId: h.request("ban_member").caseId, target: second.target, author: h.f.bannedMember.pk, action: "unban_member", discordGuildConfirmed: false, expiresAt: new Date(Date.now() + 60000) });
+    expect(final.folded.banned.has(h.f.bannedMember.pk)).toBe(false);
+    expect(await concordRow(first.decisionId)).toMatchObject({ signed_events: limbo, attempts: 8 });
+  } finally { await h.cleanup(); }
+});
+test("simultaneous claimers serialize different members of one community before either generation is prepared", async () => {
+  const h = await memberHarness("member"), selected = latch(), finish = latch();
+  const applicationName = `community-claim-${crypto.randomUUID()}`;
+  const secondSql = postgres(process.env.DATABASE_URL!, { max: 1, connection: { application_name: applicationName }, onnotice() {} });
+  let firstClaim: ReturnType<Decisions["claim"]> | undefined, secondClaim: ReturnType<Decisions["claim"]> | undefined;
+  try {
+    const first = await h.accept("ban_member");
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
+    const second = await otherCommunityMember(h);
+    const a = new Decisions(claimBarrier(sql, undefined, async () => { selected.resolve(); await finish.promise; }), undefined, new Map());
+    const b = new Decisions(secondSql, undefined, new Map());
+    firstClaim = a.claim(); await selected.promise;
+    expect((await sql`SELECT lease_until FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`)[0].lease_until).toBeNull();
+    secondClaim = b.claim();
+    let blocked = false;
+    for (let attempt = 0; attempt < 200; attempt++) {
+      const [backend] = await sql`SELECT wait_event_type FROM pg_stat_activity WHERE application_name = ${applicationName}`;
+      if (backend?.wait_event_type === "Lock") { blocked = true; break; }
+      await Bun.sleep(5);
+    }
+    expect(blocked).toBe(true); finish.resolve();
+    const [one, two] = await Promise.all([firstClaim, secondClaim]);
+    expect(one?.decision.decisionId).toBe(first.decisionId); expect(two).toBeUndefined();
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, signed_events: null });
+    await h.deliver(one!);
+    expect(await h.deliver((await h.outbox.claim())!)).toMatchObject({ state: "verified" });
+    expect(await h.banned()).toBe(true);
+  } finally { finish.resolve(); await Promise.allSettled([...(firstClaim ? [firstClaim] : []), ...(secondClaim ? [secondClaim] : [])]); await secondSql.end(); await h.cleanup(); }
+});
+test("a community publication fence leaves other communities and non-Concord destinations claimable", async () => {
+  const h = await memberHarness("member"), independent = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member");
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
+    const sending = (await h.outbox.claim())!;
+    const second = await otherCommunityMember(h);
+    const other = await independent.accept("ban_member");
+    expect((await independent.outbox.claim())?.decision.decisionId).toBe(other.decisionId);
+    for (const target of ["divine_relay", "discord"] as const) {
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${second.decisionId} AND target = ${target}`;
+      const claim = (await h.outbox.claim())!; expect(claim.target).toBe(target); expect(claim.decision.decisionId).toBe(second.decisionId);
+      await h.outbox.complete(claim, "verified", "synthetic_destination_verified");
+    }
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending" });
+    await h.deliver(sending);
+  } finally { await independent.cleanup(); await h.cleanup(); }
+});

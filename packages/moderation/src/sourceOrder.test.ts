@@ -105,7 +105,8 @@ test("delivery supersession and Retry use source revisions despite inverted acce
  await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1 WHERE decision_id = ${a.decisionId}`;
  await expect(decisions.retry(a.decisionId, actor)).rejects.toThrow(/supersedes/);
  await sql`UPDATE moderation.deliveries SET state = 'pending' WHERE decision_id = ${a.decisionId}`;
- await decisions.claim();
+ const claimed = await decisions.claim();
+ if (claimed) await decisions.complete(claimed, "verified", "synthetic_settled");
  expect((await decisions.get(a.decisionId, actor)).deliveries.every(d => d.resultCode === "superseded_by_newer_decision")).toBe(true);
  expect((await decisions.get(a.decisionId, actor)).supersededBy).toBe(b.decisionId);
 });
@@ -167,7 +168,10 @@ test("durable newer head still fences old delivery Retry after the newer decisio
  await sql`UPDATE moderation.deliveries SET state = 'failed', attempts = 1 WHERE decision_id = ${first.decisionId}`;
  await expect(decisions.retry(first.decisionId, actor)).rejects.toMatchObject({ code: "member_decision_superseded" });
  await sql`UPDATE moderation.deliveries SET state = 'pending' WHERE decision_id = ${first.decisionId}`;
- await decisions.claim();
+ // The sweep may claim another fixture's due row. Complete that lease so it
+ // cannot fence subsequent community tests after this assertion finishes.
+ const claimed = await decisions.claim();
+ if (claimed) await decisions.complete(claimed, "verified", "synthetic_settled");
  expect((await decisions.get(first.decisionId, actor)).deliveries.every(d => d.resultCode === "superseded_by_newer_decision")).toBe(true);
 });
 test("rollback preflight refuses revisioned history including heads with pruned decisions", async () => {
@@ -195,8 +199,14 @@ test("legacy uncertain Concord publication blocks its revisioned successor until
    await decisions.complete(claim, "verified", "synthetic_settled");
  }
  await sql`UPDATE moderation.deliveries SET state = 'verified', result_code = 'synthetic_reconciled' WHERE decision_id = ${legacyId}`;
- const released = await decisions.claim(); expect(released?.decision.decisionId).toBe(next.decisionId);
- await decisions.complete(released!, "verified", "synthetic_settled");
+ // Reconciliation releases all community members, including earlier fixture
+ // jobs. Drain them as above until this successor has actually been claimed.
+ let released = false;
+ for (let claim; (claim = await decisions.claim());) {
+   await decisions.complete(claim, "verified", "synthetic_settled");
+   if (claim.decision.decisionId === next.decisionId) { released = true; break; }
+ }
+ expect(released).toBe(true);
  // Time-travel synthetic fixtures only; runtime roles retain immutable timestamps.
  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${next.decisionId}`; });
  await decisions.expire();

@@ -42,6 +42,11 @@ const membership = (action: string) => action === "ban_member" || action === "un
 const inFlight = (d: string) => `(((${d}.state IN ('pending', 'acknowledged')) AND COALESCE(${d}.lease_until > clock_timestamp(), false))
   OR (${d}.target = 'concord' AND ${d}.publication_attempted AND ${d}.state NOT IN ('verified', 'not_applicable')
     AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL OR COALESCE(${d}.result_code = 'concord_recovery_requires_operator', false))))`;
+// Membership editions share one banlist head across every member and org
+// mapping. Claim serialization below makes a committed lease/publication
+// visible before another worker can select a different member's generation.
+const sameCommunity = (other: string, c: string) => `${c}.action IN ('ban_member', 'unban_member') AND ${other}.action IN ('ban_member', 'unban_member')
+  AND ${other}.community_id = ${c}.community_id AND ${other}.decision_id <> ${c}.decision_id`;
 const sameMember = (other: string, c: string) => `${c}.action IN ('ban_member', 'unban_member') AND ${other}.action IN ('ban_member', 'unban_member')
   AND ${other}.org_id = ${c}.org_id AND ${other}.community_id = ${c}.community_id AND ${other}.author = ${c}.author`;
 // Source revisions define intent order, regardless of HTTP acceptance time.
@@ -70,7 +75,7 @@ const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${
 const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.state = 'failed' AND ${d}.publication_attempted
   AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL) AND ${c}.action IN ('ban_member', 'unban_member')
   AND (${c}.expires_at <= clock_timestamp() OR ${c}.appeal_state = 'open' OR EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
-    WHERE ${newerThan("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
+    WHERE ${sameCommunity("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
       AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
       AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp())))`;
 // Acceptance and Retry serialize per member, so a Retry cannot restart a
@@ -263,7 +268,10 @@ export class Decisions {
         FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.target = 'concord' AND d.state = 'pending'
           AND d.result_code IS NULL AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
           AND EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
-            WHERE ${tx.unsafe(olderThan("o", "c"))} AND od.target = 'concord' AND ${tx.unsafe(inFlight("od"))})`;
+            WHERE ${tx.unsafe(sameCommunity("o", "c"))} AND od.target = 'concord' AND ${tx.unsafe(inFlight("od"))})`;
+      // Concord sends wait across members while the shared generation is
+      // unsettled. Read-only receipts may still resolve that uncertainty.
+      // Other destinations retain their own membership/Guild ordering.
       // A membership target waits, without spending attempts, while an older
       // decision's same target is in flight. An older row that a newer decision
       // committed just after the sweep may still be claimed here; it is then the
@@ -271,6 +279,9 @@ export class Decisions {
       const [job] = await tx`SELECT d.*, (${tx.unsafe(publicationRecovery("d", "c"))}) AS reconcile_only, NOT EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) AS proof_only FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
         WHERE ((d.state IN ('pending', 'acknowledged') AND d.attempts < 8 AND c.expires_at > clock_timestamp()) OR (${tx.unsafe(publicationRecovery("d", "c"))}))
           AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
+          AND ((${tx.unsafe(publicationRecovery("d", "c"))}) OR d.target <> 'concord' OR NOT EXISTS (
+            SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
+              WHERE ${tx.unsafe(sameCommunity("o", "c"))} AND od.target = 'concord' AND ${tx.unsafe(inFlight("od"))}))
           AND NOT EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
             WHERE ${tx.unsafe(olderForTarget("o", "c", "d"))} AND od.target = d.target AND ${tx.unsafe(inFlight("od"))})
         ORDER BY d.available_at, d.decision_id, d.target FOR UPDATE OF d SKIP LOCKED LIMIT 1`;
