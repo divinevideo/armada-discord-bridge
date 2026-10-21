@@ -1,5 +1,5 @@
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
-import { ConcordActions } from "./concordActions";
+import { createPublicationRecoveryActions } from "./publicationOperator";
 import { recoverPublication } from "./publicationRecovery";
 import { expect, test } from "bun:test";
 import { relayFixture } from "../../../scripts/fixtures/relay-events";
@@ -32,8 +32,6 @@ for (const invalidOriginal of [false, true]) test(`maintenance ${invalidOriginal
   const relay = { queryStrict: async (filters: { ids?: string[] }[]) => { observe(); return filters[0].ids ? [] : f.policy.controlEvents; } };
   // Same watcher/actions composition as publicationOperator; its fresh
   // authority snapshot must never install a fresh relay-admission policy.
-  const watcher = new PolicyWatcher(f.community, store as never, relay as never, [f.moderator.pk], f.moderator, { readOnly: true });
-  const actions = new ConcordActions(f.community, f.moderator, () => watcher.refresh());
   const eventId = "a".repeat(64);
   const row = { decision_id: f.decision.decisionId, org_id: "synthetic-pilot", case_id: f.decision.caseId,
     action: "ban_member", author: f.member.pk, discord_guild_confirmed: false, expires_at: new Date(Date.now() + 60_000),
@@ -42,6 +40,7 @@ for (const invalidOriginal of [false, true]) test(`maintenance ${invalidOriginal
     observe();
     return strings.join().includes("pg_try_advisory") ? [{ owned: true }] : [row];
   }, { begin: async (work: (tx: unknown) => Promise<unknown>) => work(sql) });
+  const actions = createPublicationRecoveryActions({ sql: sql as never, community: f.community, identity: f.moderator, store: store as never, relay: relay as never, operation: "prove" });
   await expect(recoverPublication({ sql: sql as never,
     decisions: { get: async () => ({ target: f.decision.target, action: "ban_member" }) } as never,
     actions, relay: relay as never, cipher: undefined as never,

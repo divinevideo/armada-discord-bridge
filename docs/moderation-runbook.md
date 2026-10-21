@@ -313,9 +313,13 @@ original event ID when known, recovery version, lease and available recovery
 class. This survives the waiting decision's expiry. Use the operator status
 command for maintenance, including non-Coop diagnostics.
 
-Maintenance authorization refreshes a read-only control snapshot; it never
-installs or re-enables relay admission, on success or failure. Restart the
-worker after successful recovery and preflight to install admission policy.
+Proof-only maintenance uses a read-only control snapshot and cannot enable
+admission, even when authentic original provenance settles a legacy row. Exact
+replay instead checks the whole community's publication provenance before every
+installing authority refresh, while holding controller and execution ownership.
+An eligible pilot can refresh normal admission after an outage or policy expiry;
+an excluded community is refused before any installation. Restart the worker
+after successful recovery and preflight to resume normal processing.
 
 Stop the community worker before recovery. The command checks both controller
 and execution locks; no force option exists. Supply a request JSON file:

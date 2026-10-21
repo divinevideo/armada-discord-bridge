@@ -1,3 +1,4 @@
+import { createPublicationRecoveryActions } from "./publicationOperator";
 import { buildBanlistEdition, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex } from "@armada-bridge/concord-core";
 import { recoverPublication, assertPilotPublicationProvenance } from "./publicationRecovery";
 import { afterAll, beforeAll, expect, test } from "bun:test";
@@ -1321,5 +1322,86 @@ test("recovery refuses missing IDs, losing same-version editions, and concurrent
     finally { release(); }
     expect(await recovery).toMatchObject({ state: "verified" });
     expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${first.decisionId}`).length).toBe(1);
+  } finally { await h.cleanup(); }
+});
+
+test("operator exact replay refreshes expired persisted admission and the next member unban crosses real relay admission", async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql);
+  try {
+    const first = await h.accept("ban_member");
+    let original!: NostrEvent;
+    for (let i = 0; i < 8; i++) {
+      await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { original = event; throw Error("outage"); } });
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    }
+    const next = await otherCommunityMember(h);
+    await store.invalidate(h.f.community.idHex);
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
+    const admissions: string[] = [];
+    const relay = {
+      queryStrict: async (filters: { ids?: string[] }[]) => filters[0].ids ? h.published.filter(event => filters[0].ids!.includes(event.id)) : [...h.f.policy.controlEvents, ...h.published],
+      publish: async (event: NostrEvent) => {
+        const result = await store.admit(event);
+        admissions.push(result.action);
+        if (result.action !== "accept") throw Error("Local relay admission rejected");
+        await h.relay.publish(event);
+      },
+    };
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay" });
+    const result = await recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never,
+      actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
+      request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, operation: "replay", reason: "Synthetic relay restored after policy expiry" } });
+    expect(result).toMatchObject({ state: "verified", code: "concord_enforcement_verified" });
+    expect((await concordRow(first.decisionId)).attempts).toBe(8);
+    expect(h.published[0].id).toBe(original.id);
+    for (let claim; (claim = await h.outbox.claim());) await h.deliver(claim, relay as never);
+    expect((await concordRow(next.decisionId)).state).toBe("verified");
+    expect(admissions).toEqual(["accept", "accept"]);
+    expect(controlState((await store.getPolicy(h.f.community.idHex))!).folded.banned.has(h.f.bannedMember.pk)).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
+for (const missingId of [false, true]) test(`excluded ${missingId ? "missing-ID" : "ID-only"} history prevents another member's replay from installing admission`, async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql);
+  try {
+    const first = await h.accept("ban_member");
+    let original!: NostrEvent;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { original = event; throw Error("outage"); } });
+    const excluded = await otherCommunityMember(h);
+    await sql`UPDATE moderation.deliveries SET state = 'failed', publication_attempted = true, signed_events = NULL, publication_metadata = NULL,
+      publication_event_ids = ${missingId ? null : ["b".repeat(64)]}, result_code = 'concord_recovery_requires_operator' WHERE decision_id = ${excluded.decisionId} AND target = 'concord'`;
+    await store.invalidate(h.f.community.idHex);
+    let reads = 0;
+    const relay = { ...h.relay, queryStrict: async () => { reads++; return h.f.policy.controlEvents; } };
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay" });
+    await expect(recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never,
+      actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
+      request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, operation: "replay", reason: "Synthetic excluded community" } })).rejects.toThrow(/pilot_publication_provenance_required/);
+    expect(reads).toBe(0);
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
+    expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${first.decisionId}`).length).toBe(0);
+  } finally { await h.cleanup(); }
+});
+
+test("read-only proof can settle authentic original legacy provenance without enabling admission", async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql);
+  try {
+    const first = await h.accept("ban_member");
+    let original!: NostrEvent;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { original = event; await h.relay.publish(event); throw Error("acknowledgment lost"); } });
+    await sql`UPDATE moderation.deliveries SET state = 'failed', signed_events = NULL, publication_metadata = NULL, result_code = 'concord_recovery_requires_operator' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await store.invalidate(h.f.community.idHex);
+    await expect(assertPilotPublicationProvenance(sql, h.f.community.idHex)).rejects.toThrow(/pilot_publication_provenance_required/);
+    const relay = { ...h.relay, queryStrict: async (filters: { ids?: string[] }[]) => {
+      expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
+      return filters[0].ids ? [] : [...h.f.policy.controlEvents, ...h.published];
+    } };
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "prove" });
+    const result = await recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never,
+      actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
+      request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, originalEvent: original, operation: "prove", reason: "Synthetic original provenance recovered" } });
+    expect(result).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
+    await assertPilotPublicationProvenance(sql, h.f.community.idHex);
   } finally { await h.cleanup(); }
 });

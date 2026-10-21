@@ -1,4 +1,6 @@
 import postgres from "postgres";
+import type { CommunityV2 } from "@armada-bridge/concord-core";
+import type { LocalIdentity } from "../../bridge/src/concord/signer";
 import { rehydrateCommunity } from "@armada-bridge/concord-core";
 import { localIdentity } from "../../bridge/src/concord/signer";
 import { RelayPool } from "../../bridge/src/concord/pool";
@@ -8,7 +10,19 @@ import { Decisions } from "./decisions";
 import { EvidenceCipher } from "./evidence";
 import { PolicyStore } from "./policyStore";
 import { PolicyWatcher } from "./policyWatcher";
-import { assertPilotPublicationProvenance, publicationBlockers, recoverPublication } from "./publicationRecovery";
+import { assertPilotPublicationProvenance, publicationBlockers, recoverPublication, type RecoveryRequest } from "./publicationRecovery";
+
+/** recoverPublication invokes authority only while holding controller and
+ * execution ownership. Proof must not open admission; replay may refresh an
+ * eligible pilot exactly as the ordinary worker does. Guard every refresh. */
+export function createPublicationRecoveryActions(options: { sql: postgres.Sql; community: CommunityV2; identity: LocalIdentity; store: PolicyStore; relay: Pick<RelayPool, "queryStrict">; operation: RecoveryRequest["operation"] }): ConcordActions {
+  const { sql, community, identity, store, relay, operation } = options;
+  const watcher = new PolicyWatcher(community, store, relay, [identity.pk], identity, { readOnly: operation === "prove" });
+  return new ConcordActions(community, identity, async () => {
+    if (operation === "replay") await assertPilotPublicationProvenance(sql, community.idHex);
+    return watcher.refresh();
+  });
+}
 
 async function main() {
   const [operation, communityId, requestFile, actorFile] = process.argv.slice(2);
@@ -22,6 +36,7 @@ async function main() {
     if (operation === "preflight") { await assertPilotPublicationProvenance(sql, communityId!); console.log(JSON.stringify({ eligible: true })); return; }
     if (operation === "status") { console.log(JSON.stringify(await publicationBlockers(sql, communityId!))); return; }
     if (!requestFile || !actorFile) throw Error("Recovery request and operator audit identity files required");
+    const request: RecoveryRequest = await Bun.file(requestFile).json();
     const community = rehydrateCommunity(await Bun.file(process.env.MODERATION_COMMUNITY_ENTRY_FILE ?? "").json());
     if (!community || community.idHex !== communityId || community.privateChannels.length) throw Error("Approved public pilot entry required");
     const key = process.env.MODERATION_MEMBER_KEY ?? "", evidenceKey = process.env.MODERATION_EVIDENCE_KEY ?? "";
@@ -30,12 +45,11 @@ async function main() {
     if (relayUrl.protocol !== "ws:" || !["127.0.0.1", "localhost", "[::1]"].includes(relayUrl.hostname)) throw Error("Local relay required");
     pool = new RelayPool([relayUrl.href]);
     const identity = localIdentity(Buffer.from(key, "hex"));
-    const watcher = new PolicyWatcher(community, new PolicyStore(sql), pool, [identity.pk], identity, { readOnly: true });
-    const actions = new ConcordActions(community, identity, () => watcher.refresh());
+    const actions = createPublicationRecoveryActions({ sql, community, identity, store: new PolicyStore(sql), relay: pool, operation: request.operation });
     const cipher = new EvidenceCipher(Buffer.from(evidenceKey, "hex"), 1, 100_000);
     const decisions = new Decisions(sql, cipher, communities);
     console.log(JSON.stringify(await recoverPublication({ sql, decisions, cipher, actions, relay: pool,
-      actor: await Bun.file(actorFile).json(), request: await Bun.file(requestFile).json() })));
+      actor: await Bun.file(actorFile).json(), request })));
   } finally { await pool?.close(); await sql.end(); }
 }
 if (import.meta.main) await main().catch(error => { console.error(error.message); process.exitCode = 1; });
