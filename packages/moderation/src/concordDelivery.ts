@@ -4,6 +4,11 @@ import { StalePreparedBanlistError, type ConcordActions } from "./concordActions
 import type { Decisions, DeliveryClaim } from "./decisions";
 import { RetryableDeliveryError, type DeliveryAttempt } from "./discordActions";
 import { verifiedEvent } from "./relayPolicy";
+/** A read-only canonical receipt is not a verified send. Keep every consumer
+ * on this state/code pair; the SQL predicates and migration 022 repeat it. */
+export function settledConcordReceipt(state: string, resultCode: string | null | undefined): boolean {
+  return state === "not_applicable" && (resultCode === "concord_publication_settled" || resultCode === "concord_superseded_publication_settled");
+}
 export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActions, decisions: Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted">, relay: Pick<RelayPool, "publish" | "queryStrict">, assertCurrent: () => Promise<void>): Promise<DeliveryAttempt> {
   if (claim.reconcileOnly) {
     const waiting: DeliveryAttempt = { state: "failed", code: "concord_recovery_awaiting_proof", retryAfterSeconds: 300 };

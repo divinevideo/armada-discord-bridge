@@ -5,6 +5,7 @@ import { EvidenceCipher } from "./evidence";
 import { Lifecycle, lockLifecycleCase, lockLifecycleDecision } from "./lifecycle";
 import type { LifecyclePolicyConfig } from "./apiReadiness";
 import { reversalContext, validateReversalInput } from "./decisionReversals";
+import { settledConcordReceipt } from "./concordDelivery";
 import type { ReversalInput, ReversalContext } from "./lifecycleContracts";
 import type { DiscordRestriction } from "./lifecycleContracts";
 export type RoomAction = "remove_message" | "ban_member" | "unban_member";
@@ -86,6 +87,7 @@ const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' A
 // Relay unbans cannot execute before their own Concord outcome is proved.
 // Waiting on another destination is not a delivery attempt: spending this
 // budget while a community publication is fenced can strand a later unban.
+// The SQL receipt states/codes must match settledConcordReceipt.
 const relayAwaitingConcord = (d: string, c: string) => `${d}.target = 'divine_relay' AND ${c}.action = 'unban_member' AND NOT EXISTS (
   SELECT 1 FROM moderation.deliveries cd WHERE cd.decision_id = ${d}.decision_id AND cd.target = 'concord'
     AND (cd.state = 'verified' OR (cd.state = 'not_applicable' AND cd.result_code IN ('concord_publication_settled', 'concord_superseded_publication_settled'))))`;
@@ -365,8 +367,10 @@ export class Decisions {
     // Failed observation cannot downgrade an operator-only outcome into a
     // Retry-able transport failure. Only the worker's proved resolution clears
     // it; preserve both marker and terminal state in this lease-fenced write.
+    // Marked rows currently run read-only recovery; the verified arm and state
+    // CASE also defend this invariant if a future proved-send path is added.
     const resolvedConcord = (state === "verified" && resultCode === "concord_enforcement_verified") ||
-      (state === "not_applicable" && ["concord_publication_settled", "concord_superseded_publication_settled"].includes(resultCode));
+      settledConcordReceipt(state, resultCode);
     const rows = await this.sql`UPDATE moderation.deliveries SET
       state = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN 'failed' ELSE ${state} END,
       result_code = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN result_code ELSE ${resultCode} END,

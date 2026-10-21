@@ -5,6 +5,7 @@ import { Decisions } from "./decisions";
 import { EvidenceCipher } from "./evidence";
 import { migrateModeration } from "./policyStore";
 import { createModerationApi, signCoopRequest } from "./api";
+import { reversalContext } from "./decisionReversals";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice() {} });
 const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
 const org = `synthetic-reversal-${crypto.randomUUID()}`, community = "7".repeat(64), cipher = new EvidenceCipher(randomBytes(32), 3600, 100000);
@@ -20,6 +21,12 @@ async function prior(guild = false, inCommunity = community) {
  return { id, caseId, author };
 }
 const request = (revision = "1") => ({ executionId: crypto.randomUUID(), action: "unban_member" as const, reason: "synthetic fresh reversal", scope: "community" as const, discordGuildConfirmed: false, sourceOrder: { version: 1 as const, revision } });
+for (const state of ["failed", "pending"] as const) for (const code of ["concord_publication_settled", "concord_superseded_publication_settled"]) test(`reversal rejects mismatched receipt ${state}/${code}`, () => {
+ const row = { decision_id: crypto.randomUUID(), org_id: org, community_id: community, action: "ban_member" };
+ const relay = { target: "divine_relay", state: "failed" };
+ expect(reversalContext(row, [{ target: "concord", state, result_code: code }, relay], communities)).toBeUndefined();
+ expect(reversalContext(row, [{ target: "concord", state: "not_applicable", result_code: code }, relay], communities)?.decisionId).toBe(row.decision_id);
+});
 async function call(path: string, input?: unknown, staff = actor) { const body = input === undefined ? "" : JSON.stringify(input), method = input === undefined ? "GET" : "POST"; return api(new Request("https://rooms.example" + path, { method, ...(input === undefined ? {} : { body }), headers: signCoopRequest(secret, staff, method, path, body) })); }
 test("expired_deleted_case_can_be_reversed with a fresh window and server-owned target", async () => {
  const old = await prior(), input = request();

@@ -2,8 +2,16 @@ import { expect, test } from "bun:test";
 import { buildBanlistEdition, buildGrantEdition, bytesToHex, currentControlWriteGroup, grantLocator, openWrap, parseEdition, sealEdition } from "@armada-bridge/concord-core";
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
 import { ConcordActions } from "./concordActions";
-import { deliverConcord } from "./concordDelivery";
+import { deliverConcord, settledConcordReceipt } from "./concordDelivery";
 import type { Decisions, DeliveryClaim } from "./decisions";
+test("only exact not-applicable canonical receipt pairs count as settled", () => {
+  for (const code of ["concord_publication_settled", "concord_superseded_publication_settled"]) {
+    for (const state of ["pending", "acknowledged", "failed", "verified", "not_applicable"]) {
+      expect(settledConcordReceipt(state, code)).toBe(state === "not_applicable");
+    }
+  }
+  for (const code of [null, undefined, "concord_recovery_awaiting_proof", "unrelated_not_applicable"]) expect(settledConcordReceipt("not_applicable", code)).toBe(false);
+});
 function memoryDecisions(calls: string[] = []): Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted"> {
   return {
     saveEvents: async (claim, events) => { calls.push("persist"); claim.signedEvents = events; claim.publicationAttempted = false; return events; },

@@ -1,6 +1,7 @@
 -- Canonical readback records a settled observation, not a new send. Align
 -- audit erasure with the application's exact settled receipt codes while
 -- retaining all closure, retention, appeal, hold and restriction predicates.
+-- The state/code pair must match settledConcordReceipt in src/concordDelivery.ts.
 -- No existing rows/deadlines are rewritten. 017 replays first on boot.
 CREATE OR REPLACE FUNCTION moderation.protect_decision_audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
