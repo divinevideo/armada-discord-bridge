@@ -54,11 +54,18 @@ export class ConcordActions {
     const version = BigInt(metadata.version), head = folded.headEditions.get(eid);
     if (!head || head.author !== this.community.owner || head.version <= version) return false;
     const sibling = editions.find(p => bytesToHex(p.entityId) === eid && p.author === this.community.owner && p.version === version && canonicalIncludes(p, { editions, folded }));
-    if (!sibling || (sibling.prevHash ? bytesToHex(sibling.prevHash) : null) !== metadata.prevHash) return false;
-    // Content and citation cannot change the sibling winner: the owner is
-    // admissible first at this version and its authority cannot be outranked.
-    const old: ParsedEdition = { ...sibling, author: metadata.author, version, prevHash: metadata.prevHash ? hex32(metadata.prevHash) : undefined, selfHash: hex32(metadata.selfHash), rumorId: hex32(metadata.rumorId), content: "[]" };
-    for (const prior of [undefined, folded.heads]) {
+    if (!sibling || (sibling.prevHash ? bytesToHex(sibling.prevHash) : null) !== metadata.prevHash || bytesToHex(sibling.selfHash) !== metadata.selfHash) return false;
+    // A client may already hold the lost edition's hash as its floor. A
+    // different-content owner sibling cannot connect that client's chain,
+    // however far its own branch advances. The content hash excludes author
+    // and rumor ID, so an owner can endorse the exact old content and then
+    // replace it at the next version without depending on sibling ID order.
+    // This synthetic old entry probes chain gaps; the unchanged kernel's
+    // owner-first authority walk excludes any lower-authority sibling.
+    const old: ParsedEdition = { ...sibling, author: metadata.author, version, prevHash: metadata.prevHash ? hex32(metadata.prevHash) : undefined, selfHash: hex32(metadata.selfHash), rumorId: hex32(metadata.rumorId) };
+    const originalFloor = new Map(folded.heads);
+    originalFloor.set(eid, { version, hash: hex32(metadata.selfHash) });
+    for (const prior of [undefined, folded.heads, originalFloor]) {
       const next = foldControlState([...editions, old], this.community.id, this.community.owner, prior);
       const h = next.heads.get(eid);
       if (next.incomplete.length || !h || bytesToHex(h.hash) !== bytesToHex(head.selfHash) || [...next.banned].sort().join() !== [...folded.banned].sort().join()) return false;

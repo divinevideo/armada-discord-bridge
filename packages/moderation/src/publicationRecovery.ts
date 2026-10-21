@@ -19,7 +19,7 @@ export async function publicationBlockers(sql: postgres.Sql, communityId: string
     WHERE c.community_id = ${communityId} AND (${sql.unsafe(uncertain)} OR (d.target = 'concord' AND c.action IN ('ban_member','unban_member') AND d.state IN ('pending','acknowledged') AND d.lease_until > clock_timestamp())) ORDER BY c.created_at, c.decision_id`;
   return rows.map(row => ({ decisionId: row.decision_id as string, orgId: row.org_id as string,
     publicationAttempted: Boolean(row.publication_attempted), eventId: row.publication_event_ids?.[0] as string | undefined, recoveryVersion: row.recovery_version as number,
-    recovery: !row.publication_attempted ? "wait_for_current_lease" : !row.publication_event_ids?.length ? "authentic_provenance_or_separate_community" : row.has_bytes ? "exact_replay_or_owner_supersession" : row.has_metadata ? "canonical_receipt_or_owner_supersession" : "recover_original_event",
+    recovery: !row.publication_attempted ? "wait_for_current_lease" : !row.publication_event_ids?.length ? "authentic_provenance_or_separate_community" : row.has_bytes ? row.has_metadata ? "exact_replay_or_owner_supersession" : "replay_before_expiry_or_recover_original_event" : row.has_metadata ? "canonical_receipt_or_owner_supersession" : "recover_original_event",
     leased: Boolean(row.leased) }));
 }
 /** First public pilots cannot adopt unknown pre-upgrade publication history. */

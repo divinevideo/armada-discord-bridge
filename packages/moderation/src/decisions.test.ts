@@ -1,5 +1,5 @@
 import { createPublicationRecoveryActions } from "./publicationOperator";
-import { buildBanlistEdition, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex } from "@armada-bridge/concord-core";
+import { buildBanlistEdition, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
 import { recoverPublication, assertPilotPublicationProvenance } from "./publicationRecovery";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
@@ -1241,6 +1241,9 @@ test("legacy identity-less uncertainty rejects pilot preflight and reports the h
   try {
     const first = await h.accept("ban_member");
     await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async () => { throw Error("legacy outage"); } });
+    await sql`UPDATE moderation.deliveries SET publication_metadata = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect((await h.outbox.get(first.decisionId, h.staff)).publicationBlockers).toContainEqual(expect.objectContaining({ decisionId: first.decisionId, recovery: "replay_before_expiry_or_recover_original_event" }));
+    await assertPilotPublicationProvenance(sql, h.f.community.idHex);
     await sql`UPDATE moderation.deliveries SET signed_events = NULL, publication_metadata = NULL, state = 'failed', result_code = 'concord_recovery_requires_operator' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
     await expect(assertPilotPublicationProvenance(sql, h.f.community.idHex)).rejects.toThrow(/pilot_publication_provenance_required/);
     await sql`UPDATE moderation.deliveries SET publication_event_ids = NULL WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
@@ -1251,37 +1254,50 @@ test("legacy identity-less uncertainty rejects pilot preflight and reports the h
   } finally { await h.cleanup(); }
 });
 
-test("owner canonical sibling and advancing head release a losing generation after payload expiry, and delayed old bytes cannot undo the next unban", async () => {
+for (const scenario of ["different_content", "owner_rumor_first", "old_rumor_first"]) test(`owner supersession preserves the original tracking floor: ${scenario}`, async () => {
   const h = await memberHarness("member");
   try {
     const first = await h.accept("ban_member");
     let old!: NostrEvent;
     const claim = (await h.outbox.claim())!;
     const prepared = parseEdition(openWrap((await h.actions.prepare(claim.decision))[0], h.f.controlStream.key));
-    // Choose a high rumor ID before sealing so the owner-sibling fixture does
-    // not depend on finding a rare lower hash for a randomly tiny old ID.
+    // Keep the original ID away from either extreme so both sibling orders
+    // are exercised without a rare-hash fixture or an unbounded owner search.
     let timestamp = Math.floor(Date.now() / 1000), rumor;
-    do { rumor = buildBanlistEdition(h.f.community.id, JSON.parse(prepared.content), { actorPubkey: h.f.moderator.pk, version: prepared.version, prevHash: prepared.prevHash, authority: prepared.authority, createdAtSecs: timestamp-- }); } while (!rumor.id.startsWith("f"));
+    do { rumor = buildBanlistEdition(h.f.community.id, JSON.parse(prepared.content), { actorPubkey: h.f.moderator.pk, version: prepared.version, prevHash: prepared.prevHash, authority: prepared.authority, createdAtSecs: timestamp-- }); } while (!rumor.id.startsWith("7"));
     await h.outbox.saveEvents(claim, [await sealEdition(rumor, currentControlWriteGroup(h.f.community), h.f.moderator.signer)]);
     await h.deliver(claim, { ...h.relay, publish: async event => { old = event; throw Error("outage"); } });
     const candidate = parseEdition(openWrap(old, h.f.controlStream.key));
-    const ownerEvent = async (version: bigint, prevHash: Uint8Array | undefined, createdAtSecs = Math.floor(Date.now() / 1000)) => sealEdition(buildBanlistEdition(h.f.community.id, [h.f.bannedMember.pk], { actorPubkey: h.f.owner.pk, version, prevHash, createdAtSecs }), currentControlWriteGroup(h.f.community), h.f.owner.signer);
+    const ownerEvent = async (version: bigint, prevHash: Uint8Array | undefined, createdAtSecs = Math.floor(Date.now() / 1000)) => sealEdition(buildBanlistEdition(h.f.community.id,
+      version === candidate.version && scenario !== "different_content" ? JSON.parse(candidate.content) : [h.f.bannedMember.pk],
+      { actorPubkey: h.f.owner.pk, version, prevHash, createdAtSecs }), currentControlWriteGroup(h.f.community), h.f.owner.signer);
     let sibling!: NostrEvent;
     for (let i = 0; i < 1000; i++) {
       sibling = await ownerEvent(candidate.version, candidate.prevHash, Math.floor(Date.now() / 1000) - i);
-      if (bytesToHex(parseEdition(openWrap(sibling, h.f.controlStream.key)).rumorId) < bytesToHex(candidate.rumorId)) break;
+      if ((bytesToHex(parseEdition(openWrap(sibling, h.f.controlStream.key)).rumorId) < bytesToHex(candidate.rumorId)) === (scenario !== "old_rumor_first")) break;
     }
     const siblingEdition = parseEdition(openWrap(sibling, h.f.controlStream.key));
+    expect(bytesToHex(siblingEdition.rumorId) < bytesToHex(candidate.rumorId)).toBe(scenario !== "old_rumor_first");
     h.published.push(sibling);
     const request = { decisionId: first.decisionId, expectedVersion: 0, eventId: old.id, operation: "prove" as const, reason: "Synthetic owner supersession" };
     const recover = () => recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: h.relay as never, actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] }, request });
+    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
+    await h.outbox.expire();
+    expect((await concordRow(first.decisionId)).signed_events).toBeNull();
     // Equal-version dominance alone does not release the fence.
     await expect(recover()).rejects.toThrow(/supersession/);
     const advancing = await ownerEvent(candidate.version + 1n, siblingEdition.selfHash);
     h.published.push(advancing);
-    await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${first.decisionId}`; });
-    await h.outbox.expire();
-    expect((await concordRow(first.decisionId)).signed_events).toBeNull();
+    if (scenario === "different_content") {
+      const withOld = controlState(refreshPolicy({ ...h.f.policy, controlEvents: [...h.f.policy.controlEvents, ...h.published, old] }));
+      const floor = new Map(withOld.folded.heads);
+      floor.set(bytesToHex(candidate.entityId), { version: candidate.version, hash: candidate.selfHash });
+      expect(foldControlState(withOld.editions, h.f.community.id, h.f.community.owner, floor).incomplete.length).toBeGreaterThan(0);
+      await expect(recover()).rejects.toThrow(/supersession/);
+      expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${first.decisionId}`).length).toBe(0);
+      return;
+    }
+    expect(bytesToHex(siblingEdition.selfHash)).toBe(bytesToHex(candidate.selfHash));
     const result = await recover();
     expect(result).toMatchObject({ state: "not_applicable", code: "concord_operator_superseded" });
     const next = await otherCommunityMember(h);
@@ -1293,6 +1309,11 @@ test("owner canonical sibling and advancing head release a losing generation aft
     expect(state.folded.banned.has(h.f.bannedMember.pk)).toBe(false);
     const latest = state.folded.heads.get(bytesToHex(candidate.entityId))!;
     expect(latest.version).toBe(candidate.version + 2n);
+    const floor = new Map(state.folded.heads);
+    floor.set(bytesToHex(candidate.entityId), { version: candidate.version, hash: candidate.selfHash });
+    const tracked = foldControlState(state.editions, h.f.community.id, h.f.community.owner, floor);
+    expect(tracked.incomplete).toEqual([]);
+    expect(tracked.banned.has(h.f.bannedMember.pk)).toBe(false);
   } finally { await h.cleanup(); }
 });
 

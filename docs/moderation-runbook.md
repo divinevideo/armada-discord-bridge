@@ -308,6 +308,14 @@ establish that an unknown delayed edition is impossible; do not clear its marker
 The preflight establishes local publication provenance, not deployment history or
 production acceptance.
 
+A pre-023 attempted row may still have authentic bytes but no structural
+metadata. Status names it `replay_before_expiry_or_recover_original_event`:
+it is eligible while those bytes survive, not guaranteed eligible after they
+expire. Preserve authentic original provenance or recover before its execution
+window ends. After expiry, missing metadata excludes that community on the next
+worker preflight; it is not a reason to extend the payload lifetime or invent
+metadata in SQL.
+
 Decision status includes `publicationBlockers`, naming the holding decision,
 original event ID when known, recovery version, lease and available recovery
 class. This survives the waiting decision's expiry. Use the operator status
@@ -363,15 +371,25 @@ absence never releases a fence.
 
 A losing generation can instead be released only with this narrow existing
 protocol proof: the canonical banlist history contains an **owner-authored
-sibling at the original version and predecessor**, followed by an
+sibling at the original version and predecessor with the exact original
+content hash**, followed by an
 **owner-authored canonical head at a strictly greater version**. The command
-checks actual kernel folds with the old sibling present for both fresh and
-tracking clients; both must retain the canonical head and member set. This
+checks actual kernel folds with the old sibling present for a fresh client,
+the bridge's current tracking floor, and a client holding the original
+edition's own floor; all must retain the canonical head and member set. This
 includes the chain check as well as owner authority, because a greater version
 alone does not establish supersession. Owner-authorized publication/advancement
 is an external prerequisite, not something this CLI signs or performs. If the
-proof fails, advance the owner-authorized branch and retry or use a fresh
-separate pilot community; no same-community bypass is available.
+proof fails, do not merely advance a different-content sibling branch: it
+cannot connect a client already tracking the original hash. The owner must
+endorse the exact authentic original content at its original version and
+predecessor, then advance that common hash with a new complete list. Edition
+identity hashes exact content bytes but not signer or rumor ID, so this
+connects both sibling orders without grinding hashes or changing the kernel.
+If that content cannot be recovered and verified against the retained hash,
+keep the fence and use a fresh separate pilot community. Owner signing remains
+an external authorized prerequisite; this CLI never performs it. No
+same-community bypass is available.
 
 Successful owner supersession records `not_applicable /
 concord_operator_superseded`. It is **not** proof that the old ban/unban was
