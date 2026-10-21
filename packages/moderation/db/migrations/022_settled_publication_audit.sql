@@ -1,7 +1,10 @@
 -- Canonical readback records a settled observation, not a new send. Align
 -- audit erasure with the application's exact settled receipt codes while
 -- retaining all closure, retention, appeal, hold and restriction predicates.
--- The state/code pair must match settledConcordReceipt in src/concordDelivery.ts.
+-- The state/code pair must match resolvedConcordReceipt in src/concordDelivery.ts.
+-- Owner supersession resolves uncertainty without proving the old action was
+-- applied. All other closure, current unban, restriction and retention gates
+-- still apply before erasure; relay/reversal proof uses the narrower predicate.
 -- No existing rows/deadlines are rewritten. 017 replays first on boot.
 CREATE OR REPLACE FUNCTION moderation.protect_decision_audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
@@ -49,7 +52,7 @@ BEGIN
       OR EXISTS (SELECT 1 FROM moderation.evidence_holds h WHERE h.org_id = OLD.org_id AND h.case_id = OLD.case_id AND h.released_at IS NULL AND h.hold_until > clock_timestamp())
       OR EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = OLD.decision_id AND (d.state NOT IN ('verified','not_applicable') OR d.lease_until > clock_timestamp()
         OR (d.target = 'concord' AND d.publication_attempted AND d.state <> 'verified'
-          AND NOT COALESCE(d.state = 'not_applicable' AND d.result_code IN ('concord_publication_settled','concord_superseded_publication_settled'), false)) OR d.discord_restriction_state = 'present' OR (d.target = 'discord' AND OLD.discord_guild_confirmed AND d.discord_restriction_state = 'unknown'))) THEN
+          AND NOT COALESCE(d.state = 'not_applicable' AND d.result_code IN ('concord_publication_settled','concord_superseded_publication_settled','concord_operator_superseded'), false)) OR d.discord_restriction_state = 'present' OR (d.target = 'discord' AND OLD.discord_guild_confirmed AND d.discord_restriction_state = 'unknown'))) THEN
       RAISE EXCEPTION 'Decision audit is not eligible for cleanup';
     END IF;
   END IF;

@@ -6,7 +6,7 @@ import { EvidenceCipher } from "./evidence";
 import { Lifecycle, lockLifecycleCase, lockLifecycleDecision } from "./lifecycle";
 import type { LifecyclePolicyConfig } from "./apiReadiness";
 import { reversalContext, validateReversalInput } from "./decisionReversals";
-import { settledConcordReceipt } from "./concordDelivery";
+import { resolvedConcordReceipt } from "./concordDelivery";
 import type { ReversalInput, ReversalContext } from "./lifecycleContracts";
 import type { DiscordRestriction } from "./lifecycleContracts";
 export type RoomAction = "remove_message" | "ban_member" | "unban_member";
@@ -365,17 +365,18 @@ export class Decisions {
     claim.publicationAttempted = true;
     claim.publicationEventIds = ids;
   }
-  async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0): Promise<void> {
+  async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0, connection: postgres.Sql | postgres.TransactionSql = this.sql): Promise<void> {
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0 || !/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
     if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
     // Failed observation cannot downgrade an operator-only outcome into a
     // Retry-able transport failure. Only the worker's proved resolution clears
     // it; preserve both marker and terminal state in this lease-fenced write.
-    // Marked rows currently run read-only recovery; the verified arm and state
-    // CASE also defend this invariant if a future proved-send path is added.
+    // Ordinary marked rows only observe proof. Explicit maintenance recovery
+    // can also verify an exact replay; neither path may clear the marker on a
+    // transport/ownership failure or an unproved not-applicable outcome.
     const resolvedConcord = (state === "verified" && resultCode === "concord_enforcement_verified") ||
-      settledConcordReceipt(state, resultCode) || (state === "not_applicable" && resultCode === "concord_operator_superseded");
-    const rows = await this.sql`UPDATE moderation.deliveries SET
+      resolvedConcordReceipt(state, resultCode);
+    const rows = await connection`UPDATE moderation.deliveries SET
       state = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN 'failed' ELSE ${state} END,
       result_code = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN result_code ELSE ${resultCode} END,
       lease_until = NULL, token = NULL, updated_at = clock_timestamp(),

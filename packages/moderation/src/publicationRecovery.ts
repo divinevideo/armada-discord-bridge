@@ -93,7 +93,18 @@ export async function recoverPublication(options: { sql: postgres.Sql; decisions
     await current();
     if (outcome.code === "concord_operator_superseded" && !await actions.ownerSupersession(decision, row.publication_metadata ?? actions.publicationMetadata(events!))) throw new Error("Supersession proof changed");
     await current();
-    await decisions.complete(claim, outcome.state === "verified" || outcome.state === "not_applicable" ? outcome.state : "failed", outcome.code);
+    await sql.begin(async tx => {
+      const locked = await lockLifecycleDecision(tx, actor.orgId, request.decisionId);
+      const relayLeg = locked.deliveries.find(delivery => delivery.target === "divine_relay");
+      if (outcome!.code === "concord_operator_superseded" && decision.action === "unban_member" && relayLeg && !["verified", "not_applicable"].includes(relayLeg.state) && relayLeg.lease_until > new Date()) throw new Error("Outstanding relay delivery lease");
+      await decisions.complete(claim, outcome!.state, outcome!.code, 0, tx);
+      // Supersession does not apply this unban at the relay. Retire its old
+      // dependent work in the same fenced transaction instead of leaving it
+      // waiting forever (or expiring into an uncloseable failed leg). Fresh
+      // ordered intent still supplies any desired relay change.
+      if (outcome!.code === "concord_operator_superseded" && decision.action === "unban_member") await tx`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = 'concord_operator_superseded', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+        WHERE decision_id = ${request.decisionId} AND target = 'divine_relay' AND state NOT IN ('verified','not_applicable') AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
+    });
     return { recoveryId, ...outcome };
   });
 }

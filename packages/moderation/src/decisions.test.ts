@@ -1257,7 +1257,9 @@ test("legacy identity-less uncertainty rejects pilot preflight and reports the h
 for (const scenario of ["different_content", "owner_rumor_first", "old_rumor_first"]) test(`owner supersession preserves the original tracking floor: ${scenario}`, async () => {
   const h = await memberHarness("member");
   try {
-    const first = await h.accept("ban_member");
+    const supersededUnban = scenario === "old_rumor_first";
+    const first = await h.accept(supersededUnban ? "unban_member" : "ban_member");
+    if (supersededUnban) await new PolicyStore(sql).setBan(h.f.community.idHex, h.who.pk, true);
     let old!: NostrEvent;
     const claim = (await h.outbox.claim())!;
     const prepared = parseEdition(openWrap((await h.actions.prepare(claim.decision))[0], h.f.controlStream.key));
@@ -1298,8 +1300,24 @@ for (const scenario of ["different_content", "owner_rumor_first", "old_rumor_fir
       return;
     }
     expect(bytesToHex(siblingEdition.selfHash)).toBe(bytesToHex(candidate.selfHash));
+    if (supersededUnban) {
+      // The controller is stopped, but a crashed relay claim can still carry
+      // a lease. Neither half of completion may retire that active claim.
+      await sql`UPDATE moderation.deliveries SET lease_until = clock_timestamp() + interval '1 minute' WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`;
+      await expect(recover()).rejects.toThrow(/relay delivery lease/);
+      expect(await concordRow(first.decisionId)).toMatchObject({ state: "pending" });
+      expect((await sql`SELECT state FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`)[0].state).toBe("failed");
+      // Synthetic lease passage. A real operator waits for the owned lease.
+      await sql`UPDATE moderation.deliveries SET lease_until = NULL, token = NULL WHERE decision_id = ${first.decisionId}`;
+      request.expectedVersion++;
+    }
     const result = await recover();
     expect(result).toMatchObject({ state: "not_applicable", code: "concord_operator_superseded" });
+    if (supersededUnban) {
+      expect((await sql`SELECT state, result_code, attempts FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`)[0])
+        .toEqual({ state: "not_applicable", result_code: "concord_operator_superseded", attempts: 0 });
+      expect((await new PolicyStore(sql).getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(true);
+    }
     const next = await otherCommunityMember(h);
     await h.drain();
     expect((await concordRow(next.decisionId)).state).toBe("verified");

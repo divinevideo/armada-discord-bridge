@@ -473,11 +473,16 @@ test("a case whose hold and journal cleanup fails does not stop later cases in t
   } finally { await client.end(); }
 });
 
-for (const code of ["concord_publication_settled", "concord_superseded_publication_settled"]) test(`operator audit cleanup honors settled canonical receipt ${code} after independent retention and repeated boot`, async () => {
+for (const code of ["concord_publication_settled", "concord_superseded_publication_settled", "concord_operator_superseded"]) test(`operator audit cleanup honors resolved receipt ${code} after independent retention and repeated boot`, async () => {
   const author = randomBytes(32).toString("hex"), caseId = await memberCase(author);
   const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
   await settleMember(ban.decisionId); await settleMember(unban.decisionId);
   await sql`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = ${code}, publication_event_ids = ARRAY[${randomBytes(32).toString("hex")}] WHERE decision_id = ${ban.decisionId} AND target = 'concord'`;
+  const recoveryId = crypto.randomUUID();
+  if (code === "concord_operator_superseded") {
+    await sql`INSERT INTO moderation.publication_recoveries (recovery_id, decision_id, org_id, recovery_version, event_id, operation) VALUES (${recoveryId}, ${ban.decisionId}, ${memberOrg}, 1, ${randomBytes(32).toString("hex")}, 'prove')`;
+    await sql`INSERT INTO moderation.lifecycle_events (event_id, org_id, case_id, decision_id, kind, encrypted_audit) VALUES (${recoveryId}, ${memberOrg}, ${caseId}, ${ban.decisionId}, 'publication_recovery', ${cipher.seal(`${memberOrg}:${recoveryId}`, { actorId: memberActor.actorId, reason: "synthetic owner proof" })})`;
+  }
   expect(await observeMember(ban.decisionId)).toBe(true);
   const api = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
   const operator = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice() {} });
@@ -489,6 +494,11 @@ for (const code of ["concord_publication_settled", "concord_superseded_publicati
     await cleanup.expireAudit();
     expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban.decisionId}`)[0].audit).toEqual(before.audit);
     await closedElapsed(ban.decisionId);
+    if (code === "concord_operator_superseded") {
+      // The first cleanup scheduled this event's future deadline. Simulate
+      // passage of its full interval too; real cleanup never shortens it.
+      await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.lifecycle_events SET audit_delete_after = clock_timestamp() - interval '2 minutes' WHERE event_id = ${recoveryId}`; });
+    }
     const snapshot = await sql`SELECT to_jsonb(c) AS row FROM moderation.decisions c WHERE decision_id = ${ban.decisionId}`;
     await migrateModeration(sql); await migrateModeration(sql);
     expect((await sql`SELECT to_jsonb(c) AS row FROM moderation.decisions c WHERE decision_id = ${ban.decisionId}`)[0].row).toEqual(snapshot[0].row);
@@ -496,9 +506,15 @@ for (const code of ["concord_publication_settled", "concord_superseded_publicati
     else await operator`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban.decisionId}`;
     expect((await sql`SELECT audit, execution_id, fingerprint FROM moderation.decisions WHERE decision_id = ${ban.decisionId}`)[0]).toEqual({ ...before, audit: null });
     expect((await sql`SELECT publication_event_ids, publication_attempted, attempts, state, result_code FROM moderation.deliveries WHERE decision_id = ${ban.decisionId} AND target = 'concord'`)[0]).toEqual(receipt);
+    if (code === "concord_operator_superseded") {
+      await sql`UPDATE moderation.cases SET expires_at = clock_timestamp() - interval '1 second' WHERE case_id = ${caseId}`;
+      await cleanup.expireEvidence(); await cleanup.expireAudit();
+      expect((await sql`SELECT event_id FROM moderation.lifecycle_events WHERE event_id = ${recoveryId}`).length).toBe(0);
+      expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE recovery_id = ${recoveryId}`).length).toBe(1);
+    }
   } finally { await api.end(); await operator.end(); }
 });
-for (const [state, code] of [["not_applicable", null], ["not_applicable", "concord_recovery_awaiting_proof"], ["failed", "concord_publication_settled"], ["pending", "concord_publication_settled"]] as const) test(`unknown receipt ${state}/${code} cannot close or erase audit`, async () => {
+for (const [state, code] of [["not_applicable", null], ["not_applicable", "concord_recovery_awaiting_proof"], ["failed", "concord_publication_settled"], ["pending", "concord_publication_settled"], ["failed", "concord_operator_superseded"], ["pending", "concord_operator_superseded"]] as const) test(`unknown receipt ${state}/${code} cannot close or erase audit`, async () => {
   const author = randomBytes(32).toString("hex"), caseId = await memberCase(author);
   const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
   await settleMember(ban.decisionId); await settleMember(unban.decisionId);

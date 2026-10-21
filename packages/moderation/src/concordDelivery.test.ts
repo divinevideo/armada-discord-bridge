@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { buildBanlistEdition, buildGrantEdition, bytesToHex, currentControlWriteGroup, grantLocator, openWrap, parseEdition, sealEdition } from "@armada-bridge/concord-core";
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
 import { ConcordActions } from "./concordActions";
-import { deliverConcord, settledConcordReceipt } from "./concordDelivery";
+import { deliverConcord, settledConcordReceipt, resolvedConcordReceipt } from "./concordDelivery";
 import type { Decisions, DeliveryClaim } from "./decisions";
 test("only exact not-applicable canonical receipt pairs count as settled", () => {
   for (const code of ["concord_publication_settled", "concord_superseded_publication_settled"]) {
@@ -10,7 +10,13 @@ test("only exact not-applicable canonical receipt pairs count as settled", () =>
       expect(settledConcordReceipt(state, code)).toBe(state === "not_applicable");
     }
   }
-  for (const code of [null, undefined, "concord_recovery_awaiting_proof", "unrelated_not_applicable"]) expect(settledConcordReceipt("not_applicable", code)).toBe(false);
+  for (const code of [null, undefined, "concord_recovery_awaiting_proof", "unrelated_not_applicable", "concord_operator_superseded"]) expect(settledConcordReceipt("not_applicable", code)).toBe(false);
+});
+test("operator supersession resolves uncertainty without proving application", () => {
+  for (const state of ["pending", "acknowledged", "failed", "verified", "not_applicable"]) {
+    expect(resolvedConcordReceipt(state, "concord_operator_superseded")).toBe(state === "not_applicable");
+    expect(settledConcordReceipt(state, "concord_operator_superseded")).toBe(false);
+  }
 });
 function memoryDecisions(calls: string[] = []): Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted"> {
   return {

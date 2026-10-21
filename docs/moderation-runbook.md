@@ -395,7 +395,16 @@ Successful owner supersession records `not_applicable /
 concord_operator_superseded`. It is **not** proof that the old ban/unban was
 applied and does not qualify its relay unban. Submit fresh ordered intent if
 that member still needs a change. Later queued members can proceed on the
-proved canonical head. Exact event IDs and verified structural metadata
+proved canonical head. A superseded unban's undelivered relay leg is retired
+as not applicable in the same lease-fenced completion transaction, without
+changing relay enforcement or replenishing attempts. Supersession resolves
+publication uncertainty for lifecycle closure, but it is not enforcement
+proof: current verified unban, relay state, Discord restriction observations,
+holds, appeals and independent retention must still satisfy every existing
+closure/erasure guard. Recovery actor/reason can then expire with that
+decision's audit; immutable opaque recovery ordering remains.
+
+Exact event IDs and verified structural metadata
 (entity/version/predecessor/hash/rumor/signer) survive signed-payload expiry;
 actor/reason use existing deliberate lifecycle audit retention. Recovery
 ordering records remain immutable. Restart the worker only after inspecting
