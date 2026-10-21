@@ -1,5 +1,7 @@
 import { createPublicationRecoveryActions } from "./publicationOperator";
-import { buildBanlistEdition, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
+import { buildBanlistEdition, buildGrantEdition, banlistLocator, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
+import { generateSecretKey } from "nostr-tools/pure";
+import { localIdentity } from "../../bridge/src/concord/signer";
 import { recoverPublication, assertPilotPublicationProvenance, publicationBlockers } from "./publicationRecovery";
 import { runModerationWorker } from "./runtime";
 import { afterAll, beforeAll, expect, test } from "bun:test";
@@ -1510,4 +1512,112 @@ test("read-only recovery authority includes durable pending rekeys and moderator
     await sql`DELETE FROM moderation.member_bans WHERE community_id = ${h.f.community.idHex} AND author = ${h.f.moderator.pk}`;
     await h.cleanup();
   }
+});
+
+type RecoveryHarness = Awaited<ReturnType<typeof memberHarness>>;
+const recoveryStaff = (h: RecoveryHarness) => ({ ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] });
+const recoveryPolicy = async (h: RecoveryHarness) => {
+  const policy = (await new PolicyStore(sql).getPolicy(h.f.community.idHex))!;
+  return refreshPolicy({ ...policy, controlEvents: [...policy.controlEvents, ...h.published] });
+};
+async function lostGeneration(h: RecoveryHarness) {
+  await h.accept("ban_member");
+  const claim = (await h.outbox.claim())!;
+  let old!: NostrEvent;
+  await h.deliver(claim, { ...h.relay, publish: async event => { old = event; throw Error("synthetic outage"); } });
+  return { decision: claim.decision, old, edition: parseEdition(openWrap(old, h.f.controlStream.key)) };
+}
+async function expireGeneration(h: RecoveryHarness, id: string) {
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET expires_at = clock_timestamp() - interval '1 second' WHERE decision_id = ${id}`; });
+  await h.outbox.expire(); expect((await concordRow(id)).signed_events).toBeNull();
+}
+async function endorseGeneration(h: RecoveryHarness, edition: ReturnType<typeof parseEdition>, by: { pk: string; signer: Parameters<typeof sealEdition>[2] } = h.f.owner, authority?: Parameters<typeof buildBanlistEdition>[2]["authority"]) {
+  return sealEdition(buildBanlistEdition(h.f.community.id, JSON.parse(edition.content), { actorPubkey: by.pk, version: edition.version, prevHash: edition.prevHash, authority }), currentControlWriteGroup(h.f.community), by.signer);
+}
+async function advanceOwner(h: RecoveryHarness) {
+  const { folded } = controlState(await recoveryPolicy(h)), head = folded.heads.get(bytesToHex(banlistLocator(h.f.community.id)))!;
+  return sealEdition(buildBanlistEdition(h.f.community.id, [...folded.banned].sort(), { actorPubkey: h.f.owner.pk, version: head.version + 1n, prevHash: head.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer);
+}
+const proveGeneration = (h: RecoveryHarness, decisionId: string, eventId: string) => recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: h.relay as never, actor: recoveryStaff(h),
+  request: { decisionId, expectedVersion: 0, eventId, operation: "prove", reason: "Synthetic owner proof" } });
+
+for (const missingOwner of ["sibling", "head"] as const) test(`owner proof refuses a non-owner ${missingOwner} despite exact content identity`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, old, edition } = await lostGeneration(h); await expireGeneration(h, decision.decisionId);
+    if (missingOwner === "sibling") {
+      const other = localIdentity(generateSecretKey());
+      h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: other.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+      const { authority } = await new ConcordActions(h.f.community, other, () => recoveryPolicy(h)).authorize(decision);
+      h.published.push(await endorseGeneration(h, edition, other, authority));
+      h.published.push(await advanceOwner(h));
+    } else {
+      h.published.push(await endorseGeneration(h, edition));
+      h.published.push(...await h.actions.prepare({ ...decision, decisionId: crypto.randomUUID(), author: "ab".repeat(32) }));
+    }
+    await expect(proveGeneration(h, decision.decisionId, old.id)).rejects.toThrow(/supersession proof required/);
+    expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${decision.decisionId}`).length).toBe(0);
+  } finally { await h.cleanup(); }
+});
+test("owner proof is rechecked if a later moderator edition arrives during recovery", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, old, edition } = await lostGeneration(h); await expireGeneration(h, decision.decisionId);
+    h.published.push(await endorseGeneration(h, edition)); h.published.push(await advanceOwner(h));
+    const later = await h.actions.prepare({ ...decision, decisionId: crypto.randomUUID(), author: "ab".repeat(32) });
+    const proof = h.actions.ownerSupersession.bind(h.actions);
+    h.actions.ownerSupersession = async (...args) => { const valid = await proof(...args); if (!h.published.includes(later[0])) h.published.push(...later); return valid; };
+    await expect(proveGeneration(h, decision.decisionId, old.id)).rejects.toThrow(/Supersession proof changed/);
+    expect((await concordRow(decision.decisionId)).state).not.toBe("not_applicable");
+  } finally { await h.cleanup(); }
+});
+
+async function replayGeneration(h: RecoveryHarness, onRefresh: () => Promise<void> = async () => {}) {
+  const { decision, old } = await lostGeneration(h);
+  const actions = new ConcordActions(h.f.community, h.f.moderator, async () => { await onRefresh(); return recoveryPolicy(h); });
+  const replay = (expectedVersion: number, relay = h.relay, actor = recoveryStaff(h)) => recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never, actor,
+    request: { decisionId: decision.decisionId, expectedVersion, eventId: old.id, operation: "replay", reason: "Synthetic restored relay" } });
+  const recoveries = () => sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${decision.decisionId}`;
+  return { decision, replay, recoveries };
+}
+test("each controller and execution lock independently refuses recovery", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { replay, recoveries } = await replayGeneration(h);
+    for (const ns of [483218, 483215]) await sql.begin(async held => {
+      await held`SELECT pg_advisory_xact_lock(hashtextextended(${h.f.community.idHex}, ${ns}))`;
+      await expect(replay(0)).rejects.toThrow(/Stop community worker/);
+    });
+    expect(await recoveries()).toHaveLength(0); expect(h.published).toHaveLength(0);
+    expect(await replay(0)).toMatchObject({ state: "verified" });
+  } finally { await h.cleanup(); }
+});
+test("stale recovery versions fail before authority refresh even after a failed replay", async () => {
+  const h = await memberHarness("member"); let refreshes = 0;
+  try {
+    const { replay } = await replayGeneration(h, async () => { refreshes++; });
+    expect(await replay(0, { ...h.relay, publish: async () => { throw Error("still unavailable"); } })).toMatchObject({ state: "failed" });
+    refreshes = 0; await expect(replay(0)).rejects.toThrow(/^Stale recovery or original publication identity unavailable$/);
+    expect(refreshes).toBe(0); expect(h.published).toHaveLength(0);
+    expect(await replay(1)).toMatchObject({ state: "verified" });
+  } finally { await h.cleanup(); }
+});
+test("recovery CAS refuses a version changed after the initial check", async () => {
+  const h = await memberHarness("member"); let id = "", moved = false;
+  try {
+    const { decision, replay, recoveries } = await replayGeneration(h, async () => {
+      if (moved || !id) return; moved = true;
+      await sql`UPDATE moderation.deliveries SET recovery_version = recovery_version + 1 WHERE decision_id = ${id} AND target = 'concord'`;
+    });
+    id = decision.decisionId; await expect(replay(0)).rejects.toThrow(/^Stale recovery$/);
+    expect(moved).toBe(true); expect(await recoveries()).toHaveLength(0); expect(h.published).toHaveLength(0);
+  } finally { await h.cleanup(); }
+});
+test("recovery requires the decision's action in addition to operator capability", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { replay, recoveries } = await replayGeneration(h);
+    await expect(replay(0, h.relay, { ...h.staff, permissions: ["view", "recover_publication", "unban_member"] })).rejects.toThrow(/Recovery scope unavailable/);
+    expect(await recoveries()).toHaveLength(0); expect(h.published).toHaveLength(0);
+  } finally { await h.cleanup(); }
 });
