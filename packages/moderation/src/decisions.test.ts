@@ -1482,3 +1482,32 @@ test("read-only proof can settle authentic original legacy provenance without en
     await assertPilotPublicationProvenance(sql, h.f.community.idHex);
   } finally { await h.cleanup(); }
 });
+
+test("read-only recovery authority includes durable pending rekeys and moderator relay bans", async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql);
+  try {
+    const first = await h.accept("ban_member");
+    let original!: NostrEvent;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { original = event; await h.relay.publish(event); throw Error("lost acknowledgment"); } });
+    const relay = { ...h.relay, queryStrict: async (filters: { ids?: string[] }[]) => filters[0].ids ? h.published.filter(event => filters[0].ids!.includes(event.id)) : [...h.f.policy.controlEvents, ...h.published] };
+    const prove = () => recoverPublication({ sql, decisions: h.outbox, cipher, relay: relay as never,
+      actions: createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "prove" }),
+      actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
+      request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, operation: "prove", reason: "Synthetic receipt" } });
+    await store.invalidate(h.f.community.idHex);
+    await sql`INSERT INTO moderation.rekey_events (event_id, community_id, epoch, event) VALUES (${"e".repeat(64)}, ${h.f.community.idHex}, ${(h.f.community.rootEpoch + 1n).toString()}, ${sql.json({})})`;
+    expect((await store.getPolicy(h.f.community.idHex))!.rekeyPending).toBe(true);
+    await expect(prove()).rejects.toThrow(/Current room authority unavailable/);
+    await sql`DELETE FROM moderation.rekey_events WHERE community_id = ${h.f.community.idHex}`;
+    await store.setBan(h.f.community.idHex, h.f.moderator.pk, true);
+    await expect(prove()).rejects.toThrow(/Current room authority unavailable/);
+    await store.setBan(h.f.community.idHex, h.f.moderator.pk, false);
+    expect((await sql`SELECT recovery_id FROM moderation.publication_recoveries WHERE decision_id = ${first.decisionId}`).length).toBe(0);
+    expect(await prove()).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
+  } finally {
+    await sql`DELETE FROM moderation.rekey_events WHERE community_id = ${h.f.community.idHex}`;
+    await sql`DELETE FROM moderation.member_bans WHERE community_id = ${h.f.community.idHex} AND author = ${h.f.moderator.pk}`;
+    await h.cleanup();
+  }
+});

@@ -51,8 +51,9 @@ export class PolicyWatcher {
       // Maintenance needs fresh authority without publishing an admission
       // grant: unsuccessful provenance recovery must leave exclusion intact.
       if (this.options.readOnly) {
+        const snapshot = await this.store.snapshot(policy);
         if (generation !== this.generation) throw new Error("Control disconnected during refresh");
-        return policy;
+        return snapshot;
       }
       const rekeys = this.community.heldRoots.map((root) => ({ ...descriptor("rekey", baseRekeyGroupKey(root.key, this.community.id, root.epoch + 1n), root.epoch + 1n), previousEpoch: root.epoch.toString(), previousCommit: bytesToHex(epochKeyCommitment(root.epoch, root.key)) }));
       const streams = [...controlStreams, ...rekeys, ...guestbookGroups(this.community).map((key, index) => descriptor("guestbook", key, this.community.heldRoots[index].epoch))];

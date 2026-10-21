@@ -19,6 +19,21 @@ test("a disconnect during snapshot fetch cannot install a fresh admitting policy
   expect(invalidated).toBeGreaterThan(0);
 });
 
+test("a disconnect while read-only overlays load cannot return authority", async () => {
+  const f = await relayFixture();
+  let entered!: () => void, release!: () => void;
+  const ready = new Promise<void>(resolve => { entered = resolve; });
+  const wait = new Promise<void>(resolve => { release = resolve; });
+  let installed = 0, invalidated = 0;
+  const store: any = { getPolicy: async () => f.policy, install: async () => { installed++; }, invalidate: async () => { invalidated++; },
+    snapshot: async (policy: typeof f.policy) => { entered(); await wait; return policy; } };
+  const watcher = new PolicyWatcher(f.community, store, { queryStrict: async () => [f.controlEvent] }, [], undefined, { readOnly: true });
+  const refresh = watcher.refresh();
+  try { await ready; await watcher.disconnected(); release(); await expect(refresh).rejects.toThrow(/disconnected/); }
+  finally { release(); }
+  expect(installed).toBe(0); expect(invalidated).toBe(0);
+});
+
 for (const invalidOriginal of [false, true]) test(`maintenance ${invalidOriginal ? "invalid original" : "missing proof"} cannot enable excluded admission during recovery`, async () => {
   const f = await moderationFixture();
   let admission = { ...f.policy, complete: false, validUntil: 0 }, installed = 0, invalidated = 0;
@@ -28,6 +43,7 @@ for (const invalidOriginal of [false, true]) test(`maintenance ${invalidOriginal
     getPolicy: async () => { observe(); return admission; },
     install: async (policy: typeof admission) => { admission = policy; installed++; observe(); },
     invalidate: async () => { admission = { ...admission, complete: false, validUntil: 0 }; invalidated++; },
+    snapshot: async (policy: typeof admission) => { observe(); return policy; },
   };
   const relay = { queryStrict: async (filters: { ids?: string[] }[]) => { observe(); return filters[0].ids ? [] : f.policy.controlEvents; } };
   // Same watcher/actions composition as publicationOperator; its fresh

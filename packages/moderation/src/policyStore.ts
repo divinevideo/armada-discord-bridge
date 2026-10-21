@@ -75,16 +75,29 @@ export class PolicyStore {
     const [row] = await sql`SELECT revision, payload FROM moderation.community_policy WHERE community_id = ${communityId}`;
     if (!row) return undefined;
     const streams = await sql`SELECT * FROM moderation.streams WHERE community_id = ${communityId} AND plane = 'control'`;
+    return { ...row.payload, ...await this.overlay(sql, communityId, row.payload), revision: Number(row.revision), controlStreams: streams.map(streamOf) };
+  }
+
+  /** Installed and maintenance authority must see the same durable additions.
+   * Omitting a pending rekey or relay ban would make proof authorize a member
+   * the normal installed-policy path refuses. This helper only reads. */
+  private async overlay(sql: Sql, communityId: string, payload: Pick<CommunityPolicy, "controlEvents" | "banned" | "rootEpoch">) {
     const accepted = await sql`SELECT event FROM moderation.accepted_control WHERE community_id = ${communityId} LIMIT 4097`;
-    const controlEvents = [...new Map([...row.payload.controlEvents, ...accepted.map((entry) => entry.event)].map((event) => [event.id, event])).values()];
+    const controlEvents = [...new Map([...payload.controlEvents, ...accepted.map((entry) => entry.event)].map((event) => [event.id, event])).values()];
     if (controlEvents.length > 4096) throw new Error("Control history exceeds bound");
     const overrides = await sql`SELECT author, blocked FROM moderation.member_bans WHERE community_id = ${communityId}`;
-    const banned = new Set<string>(row.payload.banned);
+    const banned = new Set<string>(payload.banned);
     for (const override of overrides) {
       if (override.blocked) banned.add(override.author); else banned.delete(override.author);
     }
-    const pending = await sql`SELECT 1 FROM moderation.rekey_events WHERE community_id = ${communityId} AND epoch > ${row.payload.rootEpoch ?? "0"} LIMIT 1`;
-    return { ...row.payload, controlEvents, rekeyPending: pending.length > 0, banned: [...banned], revision: Number(row.revision), controlStreams: streams.map(streamOf) };
+    const pending = await sql`SELECT 1 FROM moderation.rekey_events WHERE community_id = ${communityId} AND epoch > ${payload.rootEpoch ?? "0"} LIMIT 1`;
+    return { controlEvents, rekeyPending: pending.length > 0, banned: [...banned] };
+  }
+
+  /** Apply installed-policy overlays without persisting an admission grant. */
+  async snapshot(policy: CommunityPolicy): Promise<CommunityPolicy> {
+    requireId(policy.communityId);
+    return { ...policy, ...await this.overlay(this.sql, policy.communityId, policy) };
   }
 
   async rekeyEvents(communityId: string): Promise<NostrEvent[]> {
