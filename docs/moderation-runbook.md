@@ -18,6 +18,17 @@ Keep pre-016 outbox workers stopped as well as old API writers: their scope-blin
 
 `member_decision_superseded` from Retry is not proof that every target was superseded. A community moderator without Guild authority also receives it when only a Guild target survives and no community target can resume. Inspect the individual delivery rows and escalate that surviving target to authorized Guild staff; do not issue a replacement community action to retry it. More precise consumer refusal/display behavior remains a consumer-contract follow-up.
 
+Concord membership delivery is serialized across the whole community, because
+all members share one banlist generation. An uncertain publication therefore
+holds Concord bans and unbans for every member in that community, not just the
+member named by the original action. Divine relay and Discord deliveries, and
+other communities, can continue; inspect each destination rather than assuming
+their enforcement states agree. Canonical proof releases the fence. A losing
+noncanonical generation or a legacy generation with no surviving identity can
+remain operator-gated indefinitely. There is no automatic release or ordinary
+Retry that resolves those cases; retain the uncertainty and escalate for an
+authorized recovery decision instead of clearing the marker.
+
 Concord retries preserve signed event bytes once publication may have begun.
 An older, superseded action is never prepared again by Retry. A live failed
 Concord target with retained attempted bytes and send attempts remaining may
@@ -247,6 +258,13 @@ Apply the additive schema with incompatible writers drained. After any lifecycle
 Mount externally reviewed measurement JSON at MODERATION_CAPACITY_CONTRACT_FILE in the relay plugin, worker, portal and standalone public bridge. MODERATION_SOURCE_SHA is bound to the image build revision; validation compares the contract against that source and the actual native platform. MODERATION_COMMUNITY_ORGS supplies the existing approved organization/community scope. Missing, invalid, mismatched or stale evidence closes new public mutation. Legacy mode keeps its existing behavior. Do not convert synthetic calibration into a launch contract or claim a destination envelope from an emulated build.
 
 The worker observes actual complete history, bytes, rekeys and streams under its operator database authority. The validator can only read the durable018 state; it repeats current counts under the admission policy lock before mutation. Ordinary chat and managed elective control warn at the warning bound and stop at the pause bound. Only already-verified staff deletion, banlist control and rekey authority can use the finite measured reserve; no caller emergency flag exists. Relay-side self-deletions whose every target the member authored, and authenticated guestbook leaves, use that same measured capacity gate after policy admission; ordinary chat, edits and joins remain paused. Exhaustion, unavailable policy and unknown configuration fail closed. A capacity refusal (pause, unknown or missing contract, exhausted reserve) reaches clients as `rate-limited: room is at capacity, try again later`; all other refusals retain the opaque `blocked:` message. Independently authorized external churn remains a controller-model release assumption.
+
+Member self-deletions and leaves newly remain admissible during a capacity pause.
+This is a control-history growth gate, not a complete traffic shutdown or a
+per-member rate quota. Repeated authenticated leaves do not consume the
+control-history reserve, and the gate does not require a prior join for each
+leave. They still require policy admission and the measured gate's remaining
+bounds; do not interpret the pause as stopping all member writes.
 
 A pause survives restart, low counts and missing samples. To observe or pause using the existing operator database connection, run `bun packages/moderation/src/capacityOperator.ts observe COMMUNITY_ID` or `bun packages/moderation/src/capacityOperator.ts pause COMMUNITY_ID REASON_CODE`. Explicit resume is `bun packages/moderation/src/capacityOperator.ts resume COMMUNITY_ID ACTOR_ID CONTRACT_HASH` and rechecks the current complete policy, measured contract and counts under the same lock. The read API and validator cannot clear the latch. Apply018 after repeated bootstrap too; its final grants remove broad replayed001 authority.
 
