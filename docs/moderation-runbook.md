@@ -29,8 +29,12 @@ remain operator-gated indefinitely. There is no automatic release or ordinary
 Retry that resolves those cases; retain the uncertainty and escalate for an
 authorized recovery decision instead of clearing the marker.
 
-During an upgrade from per-member ordering, already-attempted generations for
-different members may coexist. They may reconcile by read-only canonical
+Before upgrading from per-member ordering, stop accepting new membership
+decisions and let the current compatible worker settle attempted Concord
+deliveries where proof is available. Do not equate an unproved generation with
+a drained outbox or resume an incompatible worker to force it through.
+Leftover attempted generations for different members may coexist. They may
+reconcile by read-only canonical
 readback even before expiry, without spending send attempts or publishing over
 one another. Missing proof keeps them unresolved; this is not an operator
 release for an event that never landed or whose identity is gone.
@@ -258,6 +262,12 @@ Explicit closure is available after evidence expiry/deletion for settled actions
 
 Apply the additive schema with incompatible writers drained. After any lifecycle/hold/reversal/source fence exists, retain its safety records and use a compatible build or roll forward. Never resume audit-at-evidence-expiry cleanup, reset heads, recycle executions, recreate evidence or downgrade to an unfenced writer. Restore the ordering ledgers and execution facts together. Public admission remains closed until a source-matched measured capacity contract and reviewed destination/controller envelope exist; implementation and synthetic calibration do not certify a public launch.
 
+
+Currently, an open appeal does not independently extend evidence retention
+past its timed hold. Staff must renew that hold before it lapses if evidence
+must remain; expiry or explicit release can erase the evidence while the
+appeal stays open. Held access still requires an active hold. An appeal-based
+retention or access override requires a separate policy decision.
 
 ## Durable public capacity
 
