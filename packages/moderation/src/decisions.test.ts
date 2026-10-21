@@ -1171,18 +1171,15 @@ for (const superseded of [false, true]) test(`readback-settled unban ${supersede
       await h.deliver(claim, { ...h.relay, publish: async event => { limbo.push(event); throw new Error("lost acknowledgement"); } });
       await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'concord'`;
     }
-    const otherCase = crypto.randomUUID();
-    await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
-      VALUES (${otherCase}, ${h.staff.orgId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.f.member.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic recovery trigger")}, clock_timestamp() + interval '1 hour')`;
-    const other = await h.outbox.acceptDecision({ ...h.request("ban_member"), caseId: otherCase }, h.staff);
-    await hold(other.decisionId, "concord");
+    // Its own waiting relay unban requires readback; no unrelated community
+    // decision may be needed to discover that the publication already landed.
     const newer = superseded ? await h.accept("ban_member") : undefined;
-    if (newer) await hold(newer.decisionId);
+    await h.outbox.refreshPublicationProof(unban.decisionId, h.staff);
     h.published.push(...limbo);
     const recovery = (await h.outbox.claim())!;
     expect(recovery).toMatchObject({ reconcileOnly: true, decision: { decisionId: unban.decisionId } });
     expect(await h.deliver(recovery)).toMatchObject({ state: "not_applicable", code: superseded ? "concord_superseded_publication_settled" : "concord_publication_settled" });
-    await hold(other.decisionId);
+    if (newer) await hold(newer.decisionId);
     await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`;
     if (superseded) {
       expect(await h.outbox.claim()).toBeUndefined();

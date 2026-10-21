@@ -77,11 +77,15 @@ const memberOrder = (alias: string) => `${alias}.source_revision NULLS FIRST, ${
 // Pre-upgrade workers could leave two attempted community generations live.
 // Their sends must not pass each other, but read-only reconciliation must not
 // inherit that mutual wait. Missing proof still leaves both fences intact.
+// A failed unban's own waiting relay leg also needs readback before expiry;
+// no unrelated member decision should be required to discover its receipt.
 const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' AND ${d}.publication_attempted
   AND (${d}.signed_events IS NOT NULL OR ${d}.publication_event_ids IS NOT NULL) AND ${c}.action IN ('ban_member', 'unban_member')
   AND ((${d}.state IN ('pending', 'acknowledged') AND EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
     WHERE ${sameCommunity("o", c)} AND od.target = 'concord' AND ${inFlight("od")}))
-  OR (${d}.state = 'failed' AND (${c}.expires_at <= clock_timestamp() OR ${c}.appeal_state = 'open' OR EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
+  OR (${d}.state = 'failed' AND (${c}.expires_at <= clock_timestamp() OR ${c}.appeal_state = 'open'
+    OR (${c}.action = 'unban_member' AND EXISTS (SELECT 1 FROM moderation.deliveries rd WHERE rd.decision_id = ${c}.decision_id AND rd.target = 'divine_relay' AND rd.state IN ('pending','acknowledged')))
+    OR EXISTS (SELECT 1 FROM moderation.decisions n JOIN moderation.deliveries nd USING (decision_id)
     WHERE ${sameCommunity("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
       AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
       AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp())))))`;
