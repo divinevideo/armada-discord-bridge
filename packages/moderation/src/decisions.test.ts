@@ -902,7 +902,7 @@ test("an uncertain community generation fences another member until canonical pr
     await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { limbo.push(event); throw new Error("uncertain transport"); } });
     const second = await otherCommunityMember(h);
     expect(await h.outbox.claim()).toBeUndefined();
-    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending" });
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending", result_code: "concord_waiting_on_prior_publication" });
     await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'retry_budget_exhausted', attempts = 8, available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
     const recovery = (await h.outbox.claim())!;
     expect(recovery).toMatchObject({ reconcileOnly: true, publicationProofOnly: true });
@@ -962,7 +962,7 @@ test("a community publication fence leaves other communities and non-Concord des
       const claim = (await h.outbox.claim())!; expect(claim.target).toBe(target); expect(claim.decision.decisionId).toBe(second.decisionId);
       await h.outbox.complete(claim, "verified", "synthetic_destination_verified");
     }
-    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending" });
+    expect(await concordRow(second.decisionId)).toMatchObject({ attempts: 0, state: "pending", result_code: "concord_waiting_on_prior_publication" });
     await h.deliver(sending);
   } finally { await independent.cleanup(); await h.cleanup(); }
 });

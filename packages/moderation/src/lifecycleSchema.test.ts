@@ -135,6 +135,12 @@ for (const role of ["moderation_api", "moderation_operator"]) {
     expect(row.audit_delete_after.getTime() - row.lifecycle_closed_at.getTime()).toBeGreaterThanOrEqual(60000);
     expect(Buffer.from(row.audit).toString()).toBe("synthetic-closure-audit");
   });
+  test(`${role} keeps a requested deadline longer than closure plus retention`, async () => {
+    const id = crypto.randomUUID(); await insertDecision(id, Buffer.from("synthetic-long-deadline-audit"));
+    await sql.begin(async tx => { await tx.unsafe(`SET LOCAL ROLE ${role}`); await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp(), audit_retention_seconds = 60, audit_delete_after = clock_timestamp() + interval '1 day' WHERE decision_id = ${id}`; });
+    const [row] = await sql`SELECT audit_delete_after - lifecycle_closed_at > interval '23 hours' AS kept FROM moderation.decisions WHERE decision_id = ${id}`;
+    expect(row.kept).toBe(true);
+  });
   test(`${role} cannot give a closed decision without a deadline one shorter than its retention`, async () => {
     // Closures recorded before this guard may lack a deadline; the shorten check only covers an existing one.
     const id = crypto.randomUUID(); await insertDecision(id, Buffer.from("synthetic-undated-audit"));
