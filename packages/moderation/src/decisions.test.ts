@@ -1621,3 +1621,15 @@ test("recovery requires the decision's action in addition to operator capability
     expect(await recoveries()).toHaveLength(0); expect(h.published).toHaveLength(0);
   } finally { await h.cleanup(); }
 });
+
+test("blocker status exposes the replay deadline and expiry without reviving intent", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision } = await lostGeneration(h);
+    const [row] = await sql`SELECT expires_at FROM moderation.decisions WHERE decision_id = ${decision.decisionId}`;
+    expect(await publicationBlockers(sql, h.f.community.idHex)).toContainEqual(expect.objectContaining({ decisionId: decision.decisionId, executionExpiresAt: row.expires_at.toISOString(), executionWindowExpired: false }));
+    await expireGeneration(h, decision.decisionId);
+    expect(await publicationBlockers(sql, h.f.community.idHex)).toContainEqual(expect.objectContaining({ decisionId: decision.decisionId, executionWindowExpired: true }));
+    expect((await concordRow(decision.decisionId)).signed_events).toBeNull();
+  } finally { await h.cleanup(); }
+});

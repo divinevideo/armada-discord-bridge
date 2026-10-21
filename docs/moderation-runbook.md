@@ -27,7 +27,9 @@ their enforcement states agree. Canonical proof releases the fence. A losing
 noncanonical generation or a legacy generation with no surviving identity can
 remain operator-gated indefinitely. There is no automatic release or ordinary
 Retry that resolves those cases; retain the uncertainty and escalate for an
-authorized recovery decision instead of clearing the marker.
+authorized recovery decision instead of clearing the marker. The supported
+public-pilot procedure and its limits are in
+[Public pilot publication recovery](#public-pilot-publication-recovery).
 
 Before upgrading from per-member ordering, stop accepting new membership
 decisions and let the current compatible worker settle attempted Concord
@@ -56,12 +58,11 @@ target proceed. This read-only check does not reset or spend the send budget and
 can settle an expired action without executing it. Missing, invalid, noncanonical
 or unavailable proof never releases the successor: the old target records
 `concord_recovery_awaiting_proof`, and waiting targets report
-`concord_waiting_on_prior_publication`. A missing-proof/expired-generation
-operator release procedure (including legacy rows whose identities were already
-erased before this migration) and its broader proof-retention policy remain part of the
-unresolved case/audit lifecycle contract; do not clear markers or guess a
-successful outcome in SQL. Read-only recovery uses the existing maximum retry
-backoff, not a tight loop.
+`concord_waiting_on_prior_publication`. For public pilots, use the supported
+[operator recovery procedure](#public-pilot-publication-recovery), not marker
+clearing or a guessed successful outcome in SQL. Unknown legacy provenance is
+explicitly excluded there, not declared recovered. Read-only recovery uses the
+existing maximum retry backoff, not a tight loop.
 
 Legacy unfenced expired rows with a conservative send marker but no surviving
 identity are quarantined as operator recovery only if they were claimed, not
@@ -269,6 +270,12 @@ must remain; expiry or explicit release can erase the evidence while the
 appeal stays open. Held access still requires an active hold. An appeal-based
 retention or access override requires a separate policy decision.
 
+When opening an appeal, record its case, actual `holdUntil`, and the staff
+owner responsible for renewal in the operational handoff. Schedule that owner's
+review before the deadline; confirm a deliberate audited extension or release
+before it passes. An open appeal alone is not a reminder or an extension, and
+the service does not supply an automatic renewal/alert system.
+
 ## Durable public capacity
 
 Mount externally reviewed measurement JSON at MODERATION_CAPACITY_CONTRACT_FILE in the relay plugin, worker, portal and standalone public bridge. MODERATION_SOURCE_SHA is bound to the image build revision; validation compares the contract against that source and the actual native platform. MODERATION_COMMUNITY_ORGS supplies the existing approved organization/community scope. Missing, invalid, mismatched or stale evidence closes new public mutation. Legacy mode keeps its existing behavior. Do not convert synthetic calibration into a launch contract or claim a destination envelope from an emulated build.
@@ -320,6 +327,11 @@ Decision status includes `publicationBlockers`, naming the holding decision,
 original event ID when known, recovery version, lease and available recovery
 class. This survives the waiting decision's expiry. Use the operator status
 command for maintenance, including non-Coop diagnostics.
+Status also reports `executionExpiresAt` and `executionWindowExpired` for each
+blocker. Assign an operator to inspect exhausted deliveries before that
+deadline: an unexpired window is necessary for replay, not sufficient authority
+or proof that the old head still permits it. Do not defer an outage handoff
+until the retained bytes have already expired.
 
 Proof-only maintenance uses a read-only control snapshot and cannot enable
 admission, even when authentic original provenance settles a legacy row. Exact
@@ -386,10 +398,40 @@ endorse the exact authentic original content at its original version and
 predecessor, then advance that common hash with a new complete list. Edition
 identity hashes exact content bytes but not signer or rumor ID, so this
 connects both sibling orders without grinding hashes or changing the kernel.
+This connects the lost edition and its exact-content endorsement only. Another
+competing content hash at that version can still win the chain walk and make
+an advance on the endorsement incomplete. Before any owner-authorized advance,
+verify that the served complete history actually connects through the intended
+endorsement. Do not advance an incompatible branch merely because its owner
+signature passes the authority gate. Any change to those kernel fork/chain
+semantics belongs in CORD, not in this maintenance command.
 If that content cannot be recovered and verified against the retained hash,
 keep the fence and use a fresh separate pilot community. Owner signing remains
 an external authorized prerequisite; this CLI never performs it. No
 same-community bypass is available.
+
+Before owner proof, inspect the original structural metadata using the existing
+operator database access (no publication or key material is needed for this
+read):
+
+```sql
+SELECT publication_metadata, c.expires_at
+FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
+WHERE d.decision_id = 'DECISION_ID' AND d.target = 'concord';
+```
+
+The endorsement must match the original version, predecessor and content hash.
+If content is lost, a non-owner edit made replay stale, or no complete safe
+owner branch can be established, keep the fence and use the documented fresh
+pilot fallback. Both operations also retain the current source-channel
+authority check: a missing, deleted or private source channel prevents in-place
+recovery. Do not weaken that boundary or change visibility just to release a
+delivery; treat it as another excluded in-place case.
+
+A request rejected before its initial proof is established writes no recovery
+audit. After the recovery audit/version commits, a later proof/lease failure
+does retain that attempt and its lease. Inspect status before retrying; do not
+assume every refusal leaves `expectedVersion` unchanged.
 
 Successful owner supersession records `not_applicable /
 concord_operator_superseded`. It is **not** proof that the old ban/unban was
@@ -403,6 +445,9 @@ proof: current verified unban, relay state, Discord restriction observations,
 holds, appeals and independent retention must still satisfy every existing
 closure/erasure guard. Recovery actor/reason can then expire with that
 decision's audit; immutable opaque recovery ordering remains.
+
+Decisions that expired while waiting are not revived by recovery or by a fresh
+community. Submit fresh ordered intent for each member still needing a change.
 
 Exact event IDs and verified structural metadata
 (entity/version/predecessor/hash/rumor/signer) survive signed-payload expiry;

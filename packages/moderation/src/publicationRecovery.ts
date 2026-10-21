@@ -12,12 +12,13 @@ import { verifiedEvent } from "./relayPolicy";
 const uncertain = `(d.target = 'concord' AND c.action IN ('ban_member','unban_member') AND d.publication_attempted
  AND d.state NOT IN ('verified','not_applicable') AND (d.signed_events IS NOT NULL OR d.publication_event_ids IS NOT NULL OR d.result_code = 'concord_recovery_requires_operator'))`;
 export async function publicationBlockers(sql: postgres.Sql, communityId: string) {
-  const rows = await sql`SELECT c.decision_id, c.org_id, d.signed_events IS NOT NULL AS has_bytes,
+  const rows = await sql`SELECT c.decision_id, c.org_id, c.expires_at, c.expires_at <= clock_timestamp() AS execution_expired, d.signed_events IS NOT NULL AS has_bytes,
     d.publication_attempted, d.publication_event_ids, d.publication_metadata IS NOT NULL AS has_metadata, d.recovery_version,
     d.lease_until > clock_timestamp() AS leased, ${sql.unsafe(uncertain)} AS uncertain
     FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
     WHERE c.community_id = ${communityId} AND (${sql.unsafe(uncertain)} OR (d.target = 'concord' AND c.action IN ('ban_member','unban_member') AND d.state IN ('pending','acknowledged') AND d.lease_until > clock_timestamp())) ORDER BY c.created_at, c.decision_id`;
   return rows.map(row => ({ decisionId: row.decision_id as string, orgId: row.org_id as string,
+    executionExpiresAt: (row.expires_at as Date).toISOString(), executionWindowExpired: Boolean(row.execution_expired),
     publicationAttempted: Boolean(row.publication_attempted), eventId: row.publication_event_ids?.[0] as string | undefined, recoveryVersion: row.recovery_version as number,
     // A newly leased first send still has the conservative attempted default
     // until saveEvents writes its generation. Lease-only waits are not unknown
