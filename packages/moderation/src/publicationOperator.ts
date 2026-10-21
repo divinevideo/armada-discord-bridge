@@ -30,7 +30,7 @@ async function main() {
     if (relayUrl.protocol !== "ws:" || !["127.0.0.1", "localhost", "[::1]"].includes(relayUrl.hostname)) throw Error("Local relay required");
     pool = new RelayPool([relayUrl.href]);
     const identity = localIdentity(Buffer.from(key, "hex"));
-    const watcher = new PolicyWatcher(community, new PolicyStore(sql), pool, [identity.pk], identity);
+    const watcher = new PolicyWatcher(community, new PolicyStore(sql), pool, [identity.pk], identity, { readOnly: true });
     const actions = new ConcordActions(community, identity, () => watcher.refresh());
     const cipher = new EvidenceCipher(Buffer.from(evidenceKey, "hex"), 1, 100_000);
     const decisions = new Decisions(sql, cipher, communities);

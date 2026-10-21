@@ -313,6 +313,10 @@ original event ID when known, recovery version, lease and available recovery
 class. This survives the waiting decision's expiry. Use the operator status
 command for maintenance, including non-Coop diagnostics.
 
+Maintenance authorization refreshes a read-only control snapshot; it never
+installs or re-enables relay admission, on success or failure. Restart the
+worker after successful recovery and preflight to install admission policy.
+
 Stop the community worker before recovery. The command checks both controller
 and execution locks; no force option exists. Supply a request JSON file:
 
