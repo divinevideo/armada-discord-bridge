@@ -268,11 +268,20 @@ describe("legacy importer pipeline", () => {
     // The relay guard resolves every host and refuses what it cannot resolve,
     // so a fixture relay would otherwise be a DNS lookup in a unit test.
     const dialed: string[][] = [];
+    let inboxLookupFails = false;
     const importer = new Importer(
       fakeSql(store),
       env,
       manager as never,
-      (relays) => { dialed.push(relays); return wirePool(wire); },
+      (relays) => {
+        dialed.push(relays);
+        const pool = wirePool(wire), query = pool.query;
+        pool.query = async (filters, options) => {
+          if (inboxLookupFails && filters.some((filter) => filter.kinds?.includes(10050))) throw new Error("synthetic inbox lookup unavailable");
+          return query(filters, options);
+        };
+        return pool;
+      },
       historyFetch,
       async () => {},
       undefined,
@@ -517,6 +526,26 @@ describe("legacy importer pipeline", () => {
       finalizeEvent({ kind: 10050, created_at, tags, content: "" }, userSk) as unknown as NostrEvent;
     const hosts = (lists: string[][]) => lists.flat().map((relay) => new URL(relay).hostname);
     const keyDeliveries = () => wire.filter((e) => e.kind === 1059 && e.tags.some(([n, v]) => n === "k" && v === "3313")).length;
+    // Unknown inboxes remain retryable; only a confirmed absent list uses stock.
+    const beforeFailedLookup = keyDeliveries();
+    inboxLookupFails = true;
+    delete prepared.plan.checkpoints.ownerChannelKeysSentAt;
+    dialed.length = 0;
+    await internal.publishEditions("imp1", prepared.community, prepared.opSk, prepared.plan);
+    expect(keyDeliveries()).toBe(beforeFailedLookup);
+    for (const relay of STOCK_RELAYS) expect(dialed.flat()).not.toContain(relay);
+    expect(prepared.plan.checkpoints.ownerChannelKeysSentAt).toBeUndefined();
+    expect(prepared.plan.checkpoints.ownerChannelKeysError).toMatch(/owner inbox/);
+    const failedCheckpoint = (await internal.load("imp1")).plan.checkpoints;
+    expect(failedCheckpoint.ownerChannelKeysSentAt).toBeUndefined();
+    expect(failedCheckpoint.ownerChannelKeysError).toMatch(/owner inbox/);
+    inboxLookupFails = false;
+    delete prepared.plan.checkpoints.ownerChannelKeysError;
+    dialed.length = 0;
+    await internal.publishEditions("imp1", prepared.community, prepared.opSk, prepared.plan);
+    expect(keyDeliveries()).toBe(beforeFailedLookup + 1);
+    for (const relay of STOCK_RELAYS) expect(dialed.flat()).toContain(relay);
+    expect(prepared.plan.checkpoints.ownerChannelKeysSentAt).toBeDefined();
     const now = Math.floor(Date.now() / 1000);
     wire.push(inboxList([["relay", "wss://1.1.1.1/"], ["relay", "ws://127.0.0.1:6379/"]], now));
     delete prepared.plan.checkpoints.ownerChannelKeysSentAt;

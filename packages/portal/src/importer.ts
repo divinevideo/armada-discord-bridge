@@ -1054,15 +1054,16 @@ export class Importer {
         // their client scans (their 10050 DM relays, else NIP-65 reads). A
         // FAILED lookup is not "no list" — delivering to the stock floor would
         // report success while the invite sat somewhere they never read.
-        const inbox = (await recipientInboxRelays(pool, community.owner)) ?? [];
+        const inbox = await recipientInboxRelays(pool, community.owner);
         // That list is the owner's own published event: vet it like every
         // other untrusted relay list (manager.ts). No stock fallback for
         // a list that vets to nothing: the owner's client scans the list they
         // published, so a stock delivery would read as sent and never arrive.
         // The stock floor stays for an owner who published no list at all.
-        const reachable = await filterPublicRelays(inbox, []);
         let deliveryPool: RelayLike | undefined;
         try {
+          if (inbox === null) throw new Error("owner inbox lookup unavailable");
+          const reachable = await filterPublicRelays(inbox, []);
           if (inbox.length > 0 && reachable.length === 0) throw new Error("owner inbox relays are not publicly reachable");
           deliveryPool = guardEffects(this.poolFactory(inviteDeliveryRelays(reachable)), beforeEffect, new Set(["publish"]));
           await deliveryPool.publish(wrap);
