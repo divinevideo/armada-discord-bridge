@@ -1345,7 +1345,7 @@ for (const scenario of ["different_content", "owner_rumor_first", "old_rumor_fir
       // a lease. Neither half of completion may retire that active claim.
       await sql`UPDATE moderation.deliveries SET lease_until = clock_timestamp() + interval '1 minute' WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`;
       await expect(recover()).rejects.toThrow(/relay delivery lease/);
-      expect(await concordRow(first.decisionId)).toMatchObject({ state: "pending" });
+      expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator" });
       expect((await sql`SELECT state FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`)[0].state).toBe("failed");
       // Synthetic lease passage. A real operator waits for the owned lease.
       await sql`UPDATE moderation.deliveries SET lease_until = NULL, token = NULL WHERE decision_id = ${first.decisionId}`;
@@ -1632,4 +1632,23 @@ test("blocker status exposes the replay deadline and expiry without reviving int
     expect(await publicationBlockers(sql, h.f.community.idHex)).toContainEqual(expect.objectContaining({ decisionId: decision.decisionId, executionWindowExpired: true }));
     expect((await concordRow(decision.decisionId)).signed_events).toBeNull();
   } finally { await h.cleanup(); }
+});
+
+test("a recovery interrupted after its audit never reopens an operator-gated send", async () => {
+  const h = await memberHarness("member");
+  const renew = h.outbox.renew.bind(h.outbox);
+  try {
+    const { decision, old } = await lostGeneration(h);
+    await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'concord_recovery_requires_operator' WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
+    h.outbox.renew = async () => { throw Error("synthetic post-audit ownership loss"); };
+    await expect(recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: h.relay as never, actor: recoveryStaff(h),
+      request: { decisionId: decision.decisionId, expectedVersion: 0, eventId: old.id, operation: "replay", reason: "Synthetic interrupted recovery" } })).rejects.toThrow(/ownership loss/);
+    expect(await concordRow(decision.decisionId)).toMatchObject({ state: "failed", attempts: 1, result_code: "concord_recovery_requires_operator" });
+    expect((await sql`SELECT recovery_version FROM moderation.deliveries WHERE decision_id = ${decision.decisionId} AND target = 'concord'`)[0].recovery_version).toBe(1);
+    expect(h.published).toHaveLength(0);
+    // Model passage of this test's own lease, not a production reset.
+    await sql`UPDATE moderation.deliveries SET token = NULL, lease_until = NULL WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
+    expect(await h.outbox.claim()).toBeUndefined();
+    await expect(h.outbox.retry(decision.decisionId, h.staff)).rejects.toThrow();
+  } finally { h.outbox.renew = renew; await h.cleanup(); }
 });

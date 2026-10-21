@@ -76,7 +76,9 @@ export async function recoverPublication(options: { sql: postgres.Sql; decisions
     // is its own CAS; the ordinary eight-attempt budget is never reset.
     await sql.begin(async tx => {
       await lockLifecycleDecision(tx, actor.orgId, request.decisionId);
-      const changed = await tx`UPDATE moderation.deliveries SET recovery_version = recovery_version + 1, state = 'pending', token = ${token}, lease_until = clock_timestamp() + interval '60 seconds'
+      // Ownership is not send eligibility. A crash after this durable audit
+      // must not turn a failed/operator-gated row into ordinary pending work.
+      const changed = await tx`UPDATE moderation.deliveries SET recovery_version = recovery_version + 1, token = ${token}, lease_until = clock_timestamp() + interval '60 seconds'
         WHERE decision_id = ${request.decisionId} AND target = 'concord' AND recovery_version = ${request.expectedVersion}
           AND state NOT IN ('verified','not_applicable') AND publication_attempted AND publication_event_ids = ARRAY[${request.eventId}]
           AND (lease_until IS NULL OR lease_until <= clock_timestamp()) RETURNING target`;
