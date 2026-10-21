@@ -179,3 +179,52 @@ test("lifecycle events cannot mix explicit, hold and decision case identities", 
   expect((await sql`SELECT case_id FROM moderation.lifecycle_events WHERE event_id = ${eventId}`)[0].case_id).toBe(a);
   expect((await sql`SELECT event_id FROM moderation.lifecycle_events WHERE event_id = ${legacyEventId}`).length).toBe(1);
 });
+
+
+for (const role of ["moderation_api", "moderation_operator"]) {
+  test(`${role} cannot consume audit retention before a long transaction closes`, async () => {
+    const id = crypto.randomUUID(); await insertDecision(id, Buffer.from("synthetic-aged-transaction-audit"));
+    for (const target of ["concord", "divine_relay", "discord"]) await sql`INSERT INTO moderation.deliveries (decision_id, target, state) VALUES (${id}, ${target}, 'verified')`;
+    await sql.begin(async tx => {
+      await tx.unsafe(`SET LOCAL ROLE ${role}`);
+      // One second is a synthetic test interval, not a production policy.
+      await tx`SELECT pg_sleep(1.1)`;
+      let closed = false, erased = false;
+      try {
+        await tx.savepoint(nested => nested`UPDATE moderation.decisions SET lifecycle_closed_at = transaction_timestamp(), audit_retention_seconds = 1, audit_delete_after = transaction_timestamp() + interval '1 second' WHERE decision_id = ${id}`);
+        closed = true;
+      } catch (error) { expect(error).toMatchObject({ code: "P0001" }); }
+      await tx`SET LOCAL ROLE moderation_operator`;
+      try {
+        await tx.savepoint(nested => nested`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${id}`);
+        erased = true;
+      } catch (error) { expect(error).toMatchObject({ code: "P0001" }); }
+      // Both operations are attempted before assertions, so RED proves actual
+      // immediate erasure rather than stopping at the accepted close alone.
+      expect({ closed, erased }).toEqual({ closed: false, erased: false });
+      const [row] = await tx`SELECT lifecycle_closed_at, audit FROM moderation.decisions WHERE decision_id = ${id}`;
+      expect(row.lifecycle_closed_at).toBeNull();
+      expect(Buffer.from(row.audit).toString()).toBe("synthetic-aged-transaction-audit");
+    });
+  });
+  test(`${role} starts retention at the database closure clock after work in the closing statement`, async () => {
+    const id = crypto.randomUUID(); await insertDecision(id, Buffer.from("synthetic-aged-statement-audit"));
+    for (const target of ["concord", "divine_relay", "discord"]) await sql`INSERT INTO moderation.deliveries (decision_id, target, state) VALUES (${id}, ${target}, 'verified')`;
+    await sql.begin(async tx => {
+      await tx.unsafe(`SET LOCAL ROLE ${role}`);
+      const [closed] = await tx`UPDATE moderation.decisions SET lifecycle_closed_at = statement_timestamp(), audit_retention_seconds = 1, audit_delete_after = statement_timestamp() + interval '1 second'
+        FROM (SELECT pg_sleep(1.1)) AS prior_work WHERE decision_id = ${id}
+        RETURNING lifecycle_closed_at >= statement_timestamp() + interval '1 second' AS closed_after_work,
+          audit_delete_after >= statement_timestamp() + interval '2 seconds' AS full_new_interval,
+          audit_delete_after - lifecycle_closed_at = interval '1 second' AS exact_retention`;
+      await tx`SET LOCAL ROLE moderation_operator`;
+      let erased = false;
+      try {
+        await tx.savepoint(nested => nested`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${id}`);
+        erased = true;
+      } catch (error) { expect(error).toMatchObject({ code: "P0001" }); }
+      expect({ closed_after_work: closed.closed_after_work, full_new_interval: closed.full_new_interval, exact_retention: closed.exact_retention, erased }).toEqual({ closed_after_work: true, full_new_interval: true, exact_retention: true, erased: false });
+      expect(Buffer.from((await tx`SELECT audit FROM moderation.decisions WHERE decision_id = ${id}`)[0].audit).toString()).toBe("synthetic-aged-statement-audit");
+    });
+  });
+}

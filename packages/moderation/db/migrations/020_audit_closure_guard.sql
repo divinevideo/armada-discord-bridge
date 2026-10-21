@@ -1,12 +1,12 @@
 -- Audit erasure (017) relies on the closure time and deadline stored on the
--- row. Enforce what the application already does: a new closure records the
--- current time, and its deadline is at least closure plus the retention
--- snapshot, so the stored deadline always reflects retention policy.
+-- row. A new closure uses the database clock at the row transition, with
+-- its full retention interval still ahead. Transaction/statement start times
+-- can precede work or lock waits and must not consume that interval.
 CREATE OR REPLACE FUNCTION moderation.protect_lifecycle_closure() RETURNS trigger
 LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN
   IF OLD.lifecycle_closed_at IS NULL AND NEW.lifecycle_closed_at IS NOT NULL
-    AND (NEW.lifecycle_closed_at < transaction_timestamp() OR NEW.lifecycle_closed_at > clock_timestamp()) THEN
+    AND (NEW.lifecycle_closed_at < statement_timestamp() OR NEW.lifecycle_closed_at > clock_timestamp()) THEN
     RAISE EXCEPTION 'Lifecycle closure must record the current time';
   END IF;
   -- Every closure carries its deadline. A closure recorded before this guard
@@ -17,6 +17,14 @@ BEGIN
     AND (NEW.audit_retention_seconds IS NULL OR NEW.audit_delete_after IS NULL
       OR NEW.audit_delete_after < NEW.lifecycle_closed_at + NEW.audit_retention_seconds * interval '1 second') THEN
     RAISE EXCEPTION 'Lifecycle closure must keep audit for its retention';
+  END IF;
+  IF OLD.lifecycle_closed_at IS NULL AND NEW.lifecycle_closed_at IS NOT NULL THEN
+    -- The caller supplies closure intent, not the authoritative clock. Even
+    -- this statement may already be old when its row trigger runs. Stamp one
+    -- database-owned time and keep any longer requested deadline intact.
+    NEW.lifecycle_closed_at := clock_timestamp();
+    NEW.audit_delete_after := GREATEST(NEW.audit_delete_after,
+      NEW.lifecycle_closed_at + NEW.audit_retention_seconds * interval '1 second');
   END IF;
   RETURN NEW;
 END $$;

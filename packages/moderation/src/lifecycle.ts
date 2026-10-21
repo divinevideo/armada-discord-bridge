@@ -166,8 +166,8 @@ export class Lifecycle {
       if (!await this.eligible(tx, decision, deliveries)) throw new Error("Lifecycle not eligible for closure");
       await this.event(tx, actor, input.reason, "lifecycle_closed", decision.case_id, decision.decision_id);
       const retention = Math.max(policy.auditRetentionSeconds, Number(decision.audit_retention_seconds ?? 0));
-      // One clock for both columns, so the deadline is exactly closure plus
-      // retention, which 020 enforces, regardless of SET evaluation order.
+      // Request both values together; 020 stamps the database's row-closing
+      // clock and preserves the full interval after any statement/lock wait.
       const [row] = await tx`UPDATE moderation.decisions SET lifecycle_closed_at = statement_timestamp(), audit_retention_seconds = ${retention}, audit_delete_after = statement_timestamp() + (${retention} * interval '1 second') WHERE decision_id = ${input.decisionId} RETURNING *`; return status(row);
     }) as Promise<LifecycleStatus>;
   }
