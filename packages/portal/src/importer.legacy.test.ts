@@ -265,8 +265,6 @@ describe("legacy importer pipeline", () => {
       pageIndex.set(channelId, i + 1);
       return pages[Math.min(i, pages.length - 1)];
     };
-    // The relay guard resolves every host and refuses what it cannot resolve,
-    // so a fixture relay would otherwise be a DNS lookup in a unit test.
     const dialed: string[][] = [];
     let inboxLookupFails = false;
     const importer = new Importer(
@@ -283,6 +281,9 @@ describe("legacy importer pipeline", () => {
         return pool;
       },
       historyFetch,
+      // The relay guard resolves every host and refuses what it cannot resolve,
+      // so a fixture relay would otherwise be a DNS lookup in a unit test. The
+      // owner-inbox filter calls the real guard, hence IP-literal inbox fixtures.
       async () => {},
       undefined,
       async (_id, work) => work(),
