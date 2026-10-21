@@ -17,7 +17,7 @@ export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string;
  * superseded_by_newer_decision); null when nothing was superseded. */
 export interface DecisionStatus { auditAvailable?: boolean; discordRestriction?: DiscordRestriction; executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
-export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean; publicationProofOnly?: boolean }
+export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean; publicationProofOnly?: boolean; claimedState?: DeliveryState }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
 export type DecisionRefusal = "member_decision_superseded" | "member_intent_superseded" | "member_intent_order_conflict" | "member_intent_order_required" | "guild_scope_order_requires_operator" | "decision_source_unavailable";
 export class DecisionRefusedError extends Error {
@@ -309,11 +309,14 @@ export class Decisions {
         result_code = CASE WHEN result_code IN ('concord_waiting_on_prior_publication', 'relay_awaiting_concord_state') THEN NULL ELSE result_code END
         WHERE decision_id = ${job.decision_id} AND target = ${job.target}`;
       const [row] = await tx`SELECT * FROM moderation.decisions WHERE decision_id = ${job.decision_id}`;
-      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationEventIds: job.publication_event_ids, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only), publicationProofOnly: Boolean(job.reconcile_only && job.proof_only) };
+      return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationEventIds: job.publication_event_ids, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only), publicationProofOnly: Boolean(job.reconcile_only && job.proof_only), claimedState: job.state as DeliveryState };
     });
   }
   async defer(claim: DeliveryClaim): Promise<void> {
-    const rows = await this.sql`UPDATE moderation.deliveries SET state = ${claim.reconcileOnly ? "failed" : "pending"}, attempts = attempts - ${claim.reconcileOnly ? 0 : 1}, token = NULL, lease_until = NULL, available_at = clock_timestamp() + interval '1 second'
+    // Contention is not a failed observation. Upgrade readback can start from
+    // pending/acknowledged as well as failed; keep its eligibility unchanged
+    // until the worker actually gets the execution lock and observes proof.
+    const rows = await this.sql`UPDATE moderation.deliveries SET state = ${claim.reconcileOnly ? claim.claimedState ?? "failed" : "pending"}, attempts = attempts - ${claim.reconcileOnly ? 0 : 1}, token = NULL, lease_until = NULL, available_at = clock_timestamp() + interval '1 second'
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease lost");
   }

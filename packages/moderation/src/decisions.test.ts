@@ -1039,6 +1039,23 @@ for (const state of ["pending", "acknowledged"] as const) test(`pre-upgrade ${st
   } finally { await h.cleanup(); }
 });
 
+for (const state of ["pending", "acknowledged"] as const) test(`deferring pre-upgrade ${state} readback preserves its state and eligibility`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const first = await h.accept("ban_member"), second = await otherCommunityMember(h, "ban_member");
+    for (const [index, id] of [first.decisionId, second.decisionId].entries()) await sql`UPDATE moderation.deliveries SET state = ${state}, attempts = 2, publication_attempted = true,
+      publication_event_ids = ARRAY[${String(index + 1).repeat(64)}], result_code = 'concord_transport_unavailable', available_at = clock_timestamp()
+      WHERE decision_id = ${id} AND target = 'concord'`;
+    const claim = (await h.outbox.claim())!;
+    expect(claim).toMatchObject({ reconcileOnly: true, claimedState: state, attempts: 2 });
+    await h.outbox.defer(claim);
+    expect(await concordRow(claim.decision.decisionId)).toMatchObject({ state, attempts: 2, result_code: "concord_transport_unavailable" });
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${claim.decision.decisionId}`;
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${claim.decision.decisionId} AND target = 'concord'`;
+    expect(await h.outbox.claim()).toMatchObject({ reconcileOnly: true, claimedState: state, attempts: 2, decision: { decisionId: claim.decision.decisionId } });
+  } finally { await h.cleanup(); }
+});
+
 for (const uncertain of [false, true]) test(`expired relay-only reversal ${uncertain ? "retains publication uncertainty" : "verifies Concord and lifts the relay ban"}`, async () => {
   const h = await memberHarness("member");
   const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
