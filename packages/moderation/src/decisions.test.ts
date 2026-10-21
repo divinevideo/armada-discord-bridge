@@ -1,6 +1,7 @@
 import { createPublicationRecoveryActions } from "./publicationOperator";
 import { buildBanlistEdition, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
-import { recoverPublication, assertPilotPublicationProvenance } from "./publicationRecovery";
+import { recoverPublication, assertPilotPublicationProvenance, publicationBlockers } from "./publicationRecovery";
+import { runModerationWorker } from "./runtime";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import postgres from "postgres";
 import { randomBytes } from "node:crypto";
@@ -252,6 +253,22 @@ const settle = (decisionId: string, state = "verified") => sql`UPDATE moderation
 /** Holds a decision's deliveries out of the outbox. */
 const hold = (decisionId: string, except?: string) => sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${decisionId} AND target IS DISTINCT FROM ${except ?? null}`;
 const concordRow = async (decisionId: string) => (await sql`SELECT state, result_code, superseded_by, signed_events, attempts FROM moderation.deliveries WHERE decision_id = ${decisionId} AND target = 'concord'`)[0];
+
+/** Stop real startup at its controller lock, against an owned local endpoint.
+ * Passing preflight must not require opening any relay or Discord session. */
+async function workerAtOwnedController(h: Awaited<ReturnType<typeof memberHarness>>) {
+  let requests = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => { requests++; return new Response("unexpected test request", { status: 503 }); } });
+  const communities = new Map([[h.f.community.idHex, h.staff.orgId]]);
+  try {
+    await sql.begin(async held => {
+      await held`SELECT pg_advisory_xact_lock(hashtextextended(${h.f.community.idHex}, 483218))`;
+      await runModerationWorker({ sql, decisions: h.outbox, lifecycle: { expireEvidence: async () => {}, expireAudit: async () => {} }, capacity: { communities, contract: undefined }, community: h.f.community, identity: h.f.moderator, communities,
+        relayUrl: `ws://127.0.0.1:${server.port}`, bridgeTenantId: "synthetic-tenant", puppetMaster: "synthetic", discordToken: "", publicChannels: { guildId: "1".repeat(18), channelIds: ["2".repeat(18)], excludedCategoryIds: ["3".repeat(18)] }, publicAuthors: [],
+        signal: new AbortController().signal, health: { ready: false, code: "starting", checkedAt: 0 } });
+    });
+  } finally { server.stop(true); expect(requests).toBe(0); }
+}
 
 /** A real outbox, real Concord preparation and readback, and a Concord fold
  * over what the fake local relay has stored. Relay and Discord targets are held. */
@@ -1251,6 +1268,27 @@ test("legacy identity-less uncertainty rejects pilot preflight and reports the h
     await expect(assertPilotPublicationProvenance(sql, h.f.community.idHex)).rejects.toThrow(/pilot_publication_provenance_required/);
     expect((await h.outbox.get(next.decisionId, h.staff)).publicationBlockers).toContainEqual(expect.objectContaining({ decisionId: first.decisionId, recovery: "authentic_provenance_or_separate_community" }));
     expect(await h.outbox.claim()).toBeUndefined();
+  } finally { await h.cleanup(); }
+});
+
+test("an unsaved first-send lease is a wait, but a leased unknown publication still excludes startup", async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql);
+  try {
+    const first = await h.accept("ban_member"), claim = (await h.outbox.claim())!;
+    const waiting = await otherCommunityMember(h);
+    expect(await publicationBlockers(sql, h.f.community.idHex)).toEqual([expect.objectContaining({ decisionId: first.decisionId, publicationAttempted: true, recovery: "wait_for_current_lease", leased: true })]);
+    expect((await h.outbox.get(waiting.decisionId, h.staff)).publicationBlockers).toEqual([expect.objectContaining({ decisionId: first.decisionId, recovery: "wait_for_current_lease" })]);
+    await assertPilotPublicationProvenance(sql, h.f.community.idHex);
+    await expect(workerAtOwnedController(h)).rejects.toThrow(/Community controller already owned/);
+    // Refused controller startup invalidates its old policy at shutdown.
+    const revision = (await store.getPolicy(h.f.community.idHex))!.revision;
+    await store.install(refreshPolicy({ ...h.f.policy, revision: revision + 1 }), [h.f.chatStream, h.f.controlStream, h.f.guestbookStream], revision);
+    await h.deliver(claim);
+    await sql`UPDATE moderation.deliveries SET state = 'failed', signed_events = NULL, publication_metadata = NULL, publication_event_ids = NULL,
+      result_code = 'concord_recovery_requires_operator', lease_until = clock_timestamp() + interval '1 minute' WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(await publicationBlockers(sql, h.f.community.idHex)).toEqual([expect.objectContaining({ decisionId: first.decisionId, recovery: "authentic_provenance_or_separate_community", leased: true })]);
+    await expect(workerAtOwnedController(h)).rejects.toThrow(/pilot_publication_provenance_required/);
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
   } finally { await h.cleanup(); }
 });
 
