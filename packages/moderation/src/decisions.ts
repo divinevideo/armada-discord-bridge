@@ -346,7 +346,15 @@ export class Decisions {
   async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0): Promise<void> {
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0 || !/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
     if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
-    const rows = await this.sql`UPDATE moderation.deliveries SET state = ${state}, result_code = ${resultCode}, lease_until = NULL, token = NULL, updated_at = clock_timestamp(),
+    // Failed observation cannot downgrade an operator-only outcome into a
+    // Retry-able transport failure. Only the worker's proved resolution clears
+    // it; preserve both marker and terminal state in this lease-fenced write.
+    const resolvedConcord = (state === "verified" && resultCode === "concord_enforcement_verified") ||
+      (state === "not_applicable" && ["concord_publication_settled", "concord_superseded_publication_settled"].includes(resultCode));
+    const rows = await this.sql`UPDATE moderation.deliveries SET
+      state = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN 'failed' ELSE ${state} END,
+      result_code = CASE WHEN target = 'concord' AND result_code = 'concord_recovery_requires_operator' AND NOT ${resolvedConcord} THEN result_code ELSE ${resultCode} END,
+      lease_until = NULL, token = NULL, updated_at = clock_timestamp(),
       available_at = clock_timestamp() + (${Math.max(retryAfterSeconds, Math.min(300, 2 ** claim.attempts))} * interval '1 second')
       WHERE decision_id = ${claim.decision.decisionId} AND target = ${claim.target} AND token = ${claim.token} AND lease_until > clock_timestamp() RETURNING target`;
     if (!rows.length) throw new Error("Delivery lease lost");

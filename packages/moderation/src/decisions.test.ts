@@ -961,3 +961,40 @@ test("a community publication fence leaves other communities and non-Concord des
     await h.deliver(sending);
   } finally { await independent.cleanup(); await h.cleanup(); }
 });
+
+test("operator recovery stays failed across missing proof, worker failure, restart and API Retry until canonical settlement", async () => {
+  const h = await memberHarness("member");
+  const operatorSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice() {} });
+  const operator = new Decisions(operatorSql, undefined, new Map([[h.f.community.idHex, h.staff.orgId]]));
+  const proof = async () => {
+    const claim = (await operator.claim())!;
+    const result = await deliverConcord(claim, h.actions, operator, h.relay as never, async () => {});
+    await operator.complete(claim, result.state, result.code, result.retryAfterSeconds);
+    return result;
+  };
+  const client = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
+  try {
+    const first = await h.accept("ban_member"), limbo: NostrEvent[] = [];
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
+    await h.deliver((await h.outbox.claim())!, { ...h.relay, publish: async event => { limbo.push(event); throw new Error("uncertain transport"); } });
+    await sql`UPDATE moderation.deliveries SET state = 'failed', result_code = 'concord_recovery_requires_operator', available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    const second = await h.accept("unban_member");
+    const before = await concordRow(first.decisionId);
+    expect(await proof()).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", attempts: before.attempts, signed_events: before.signed_events });
+    const api = new Decisions(client, cipher, new Map([[h.f.community.idHex, h.staff.orgId]]), { auditRetentionSeconds: 60, holdMaxSeconds: 3600 });
+    await expect(api.retry(first.decisionId, h.staff)).rejects.toMatchObject({ code: "member_decision_superseded" });
+    await migrateModeration(sql);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await operator.complete((await operator.claim())!, "failed", "worker_ownership_or_delivery_failed");
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator", attempts: before.attempts });
+    await expect(api.retry(first.decisionId, h.staff)).rejects.toMatchObject({ code: "member_decision_superseded" });
+    expect(await concordRow(second.decisionId)).toMatchObject({ state: "pending", attempts: 0 });
+    h.published.push(...limbo);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(await proof()).toMatchObject({ state: "not_applicable", code: "concord_superseded_publication_settled" });
+    expect(await concordRow(first.decisionId)).toMatchObject({ state: "not_applicable", result_code: "concord_superseded_publication_settled", attempts: before.attempts });
+    await h.deliver((await h.outbox.claim())!);
+    expect(await h.banned()).toBe(false);
+  } finally { await client.end(); await operatorSql.end(); await h.cleanup(); }
+});
