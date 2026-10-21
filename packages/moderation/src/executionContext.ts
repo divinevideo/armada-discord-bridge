@@ -17,8 +17,12 @@ export function createExecutionContext(options: { sql: postgres.Sql; store: Poli
     removeFromRelay: (target, id) => options.purger.removeFromRelay(target, id),
     async setRelayBan(decision) {
       if (decision.action === "unban_member") {
-        const [delivery] = await options.sql`SELECT state FROM moderation.deliveries WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
-        if (delivery?.state !== "verified" || (await options.actions.authorize(decision)).folded.banned.has(decision.author)) return false;
+        // Canonical readback settles a publication without calling it a new
+        // verified send. Accept only those exact receipts, never an arbitrary
+        // not_applicable result, and still require the current fold to unban.
+        const [delivery] = await options.sql`SELECT state, result_code FROM moderation.deliveries WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
+        const settled = delivery?.state === "not_applicable" && ["concord_publication_settled", "concord_superseded_publication_settled"].includes(delivery.result_code);
+        if (!(delivery?.state === "verified" || settled) || (await options.actions.authorize(decision)).folded.banned.has(decision.author)) return false;
       }
       await options.assertCurrent();
       await options.actions.authorize(decision);

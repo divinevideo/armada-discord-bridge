@@ -78,6 +78,12 @@ const publicationRecovery = (d: string, c: string) => `${d}.target = 'concord' A
     WHERE ${sameCommunity("n", c)} AND nd.target = 'concord' AND nd.state IN ('pending', 'acknowledged')
       AND n.expires_at > clock_timestamp() AND nd.available_at <= clock_timestamp()
       AND (nd.lease_until IS NULL OR nd.lease_until <= clock_timestamp())))`;
+// Relay unbans cannot execute before their own Concord outcome is proved.
+// Waiting on another destination is not a delivery attempt: spending this
+// budget while a community publication is fenced can strand a later unban.
+const relayAwaitingConcord = (d: string, c: string) => `${d}.target = 'divine_relay' AND ${c}.action = 'unban_member' AND NOT EXISTS (
+  SELECT 1 FROM moderation.deliveries cd WHERE cd.decision_id = ${d}.decision_id AND cd.target = 'concord'
+    AND (cd.state = 'verified' OR (cd.state = 'not_applicable' AND cd.result_code IN ('concord_publication_settled', 'concord_superseded_publication_settled'))))`;
 // Acceptance and Retry serialize per member, so a Retry cannot restart a
 // decision that a concurrently accepted newer one supersedes.
 function lockMember(tx: postgres.TransactionSql, communityId: string, author: string) {
@@ -269,6 +275,10 @@ export class Decisions {
           AND d.result_code IS NULL AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
           AND EXISTS (SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
             WHERE ${tx.unsafe(sameCommunity("o", "c"))} AND od.target = 'concord' AND ${tx.unsafe(inFlight("od"))})`;
+      await tx`UPDATE moderation.deliveries d SET result_code = 'relay_awaiting_concord_state'
+        FROM moderation.decisions c WHERE c.decision_id = d.decision_id AND d.state IN ('pending', 'acknowledged')
+          AND d.result_code IS NULL AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
+          AND ${tx.unsafe(relayAwaitingConcord("d", "c"))}`;
       // Concord sends wait across members while the shared generation is
       // unsettled. Read-only receipts may still resolve that uncertainty.
       // Other destinations retain their own membership/Guild ordering.
@@ -279,6 +289,7 @@ export class Decisions {
       const [job] = await tx`SELECT d.*, (${tx.unsafe(publicationRecovery("d", "c"))}) AS reconcile_only, NOT EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${tx.unsafe(newerThan("n", "c"))}) AS proof_only FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
         WHERE ((d.state IN ('pending', 'acknowledged') AND d.attempts < 8 AND c.expires_at > clock_timestamp()) OR (${tx.unsafe(publicationRecovery("d", "c"))}))
           AND d.available_at <= clock_timestamp() AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())
+          AND NOT (${tx.unsafe(relayAwaitingConcord("d", "c"))})
           AND ((${tx.unsafe(publicationRecovery("d", "c"))}) OR d.target <> 'concord' OR NOT EXISTS (
             SELECT 1 FROM moderation.decisions o JOIN moderation.deliveries od USING (decision_id)
               WHERE ${tx.unsafe(sameCommunity("o", "c"))} AND od.target = 'concord' AND ${tx.unsafe(inFlight("od"))}))
@@ -288,7 +299,7 @@ export class Decisions {
       if (!job) return undefined;
       const token = crypto.randomUUID();
       await tx`UPDATE moderation.deliveries SET token = ${token}, attempts = attempts + ${job.reconcile_only ? 0 : 1}, lease_until = clock_timestamp() + interval '60 seconds', updated_at = clock_timestamp(),
-        result_code = CASE WHEN result_code = 'concord_waiting_on_prior_publication' THEN NULL ELSE result_code END
+        result_code = CASE WHEN result_code IN ('concord_waiting_on_prior_publication', 'relay_awaiting_concord_state') THEN NULL ELSE result_code END
         WHERE decision_id = ${job.decision_id} AND target = ${job.target}`;
       const [row] = await tx`SELECT * FROM moderation.decisions WHERE decision_id = ${job.decision_id}`;
       return { decision: stored(row), target: job.target as DeliveryTarget, token, attempts: job.attempts + (job.reconcile_only ? 0 : 1), signedEvents: job.signed_events, publicationEventIds: job.publication_event_ids, publicationAttempted: job.publication_attempted, reconcileOnly: Boolean(job.reconcile_only), publicationProofOnly: Boolean(job.reconcile_only && job.proof_only) };

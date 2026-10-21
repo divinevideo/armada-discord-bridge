@@ -670,6 +670,9 @@ for (const [olderAction, newerAction] of [["ban_member", "unban_member"], ["unba
   const subject = await memberCase();
   const first = await decisions.acceptDecision(member(subject, olderAction), actor);
   await hold(first.decisionId, "divine_relay");
+  // The race concerns relay ordering, after each unban's Concord prerequisite.
+  const proveConcord = (id: string) => sql`UPDATE moderation.deliveries SET state = 'verified' WHERE decision_id = ${id} AND target = 'concord'`;
+  await proveConcord(first.decisionId);
   const selected = latch(), finishSelection = latch(), secondReady = latch(), startSecond = latch();
   const applicationName = `member-claim-race-${crypto.randomUUID()}`;
   const secondSql = postgres(process.env.DATABASE_URL!, { max: 1, connection: { application_name: applicationName }, onnotice: () => {} });
@@ -686,6 +689,7 @@ for (const [olderAction, newerAction] of [["ban_member", "unban_member"], ["unba
     // A new decision arrives before B's SKIP LOCKED selection skips the old row.
     const second = await decisions.acceptDecision(member(subject, newerAction), actor);
     await hold(second.decisionId, "divine_relay");
+    await proveConcord(second.decisionId);
     let secondFinished = false;
     void secondClaim.then(() => { secondFinished = true; });
     startSecond.resolve();
@@ -882,11 +886,11 @@ test("a canonical ban settled after expiry supplies a fresh reversal that unbans
   } finally { await h.cleanup(); }
 });
 
-async function otherCommunityMember(h: Awaited<ReturnType<typeof memberHarness>>) {
+async function otherCommunityMember(h: Awaited<ReturnType<typeof memberHarness>>, action: "ban_member" | "unban_member" = "unban_member") {
   const caseId = crypto.randomUUID();
   await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
     VALUES (${caseId}, ${h.staff.orgId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.f.bannedMember.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic other member")}, clock_timestamp() + interval '1 hour')`;
-  const status = await h.outbox.acceptDecision({ ...h.request("unban_member"), caseId }, h.staff);
+  const status = await h.outbox.acceptDecision({ ...h.request(action), caseId }, h.staff);
   await hold(status.decisionId, "concord");
   return status;
 }
@@ -950,7 +954,7 @@ test("a community publication fence leaves other communities and non-Concord des
     const first = await h.accept("ban_member");
     await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id <> ${first.decisionId}`;
     const sending = (await h.outbox.claim())!;
-    const second = await otherCommunityMember(h);
+    const second = await otherCommunityMember(h, "ban_member");
     const other = await independent.accept("ban_member");
     expect((await independent.outbox.claim())?.decision.decisionId).toBe(other.decisionId);
     for (const target of ["divine_relay", "discord"] as const) {
@@ -1034,14 +1038,106 @@ for (const uncertain of [false, true]) test(`expired relay-only reversal ${uncer
       expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator" });
     }
     await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${next.decisionId} AND target = 'divine_relay'`;
+    if (uncertain) {
+      expect(await operator.claim()).toBeUndefined();
+      expect((await sql`SELECT state, result_code, attempts FROM moderation.deliveries WHERE decision_id = ${next.decisionId} AND target = 'divine_relay'`)[0])
+        .toEqual({ state: "pending", result_code: "relay_awaiting_concord_state", attempts: 0 });
+      expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(true);
+      expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(0);
+      return;
+    }
     const relay = (await operator.claim())!;
     expect(relay.target).toBe("divine_relay"); expect(relay.decision.decisionId).toBe(next.decisionId);
     const context = createExecutionContext({ sql: operatorSql, store, actions: h.actions, claim: relay, assertCurrent: () => operator.renew(relay), decisions: operator,
       relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
     const applied = await executeDelivery(relay.decision, relay.target, context);
     await operator.complete(relay, applied.state, applied.code, applied.retryAfterSeconds);
-    expect(applied).toEqual(uncertain ? { state: "acknowledged", code: "relay_awaiting_concord_state" } : { state: "verified", code: "relay_member_policy_verified" });
+    expect(applied).toEqual({ state: "verified", code: "relay_member_policy_verified" });
     expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(uncertain);
     expect((await sql`SELECT case_id FROM moderation.cases WHERE case_id = ${caseId}`).length).toBe(0);
   } finally { await apiSql.end(); await operatorSql.end(); await h.cleanup(); }
+});
+
+test("relay unban waits through repeated Concord failures without consuming its own budget", async () => {
+  const h = await memberHarness("bannedMember"), store = new PolicyStore(sql);
+  try {
+    await store.setBan(h.f.community.idHex, h.who.pk, true);
+    const unban = await h.accept("unban_member"), concord = (await h.outbox.claim())!;
+    expect(concord.target).toBe("concord");
+    await h.outbox.complete(concord, "failed", "current_authority_or_delivery_unavailable");
+    for (let poll = 0; poll < 10; poll++) {
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`;
+      expect(await h.outbox.claim()).toBeUndefined();
+    }
+    expect((await sql`SELECT state, result_code, attempts FROM moderation.deliveries WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`)[0])
+      .toEqual({ state: "pending", result_code: "relay_awaiting_concord_state", attempts: 0 });
+    await h.outbox.retry(unban.decisionId, h.staff);
+    expect(await h.deliver((await h.outbox.claim())!)).toMatchObject({ state: "verified" });
+    const relay = (await h.outbox.claim())!;
+    expect(relay).toMatchObject({ target: "divine_relay", attempts: 1, decision: { decisionId: unban.decisionId } });
+    const context = createExecutionContext({ sql, store, actions: h.actions, claim: relay, assertCurrent: () => h.outbox.renew(relay), decisions: h.outbox,
+      relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+    const applied = await executeDelivery(relay.decision, relay.target, context);
+    await h.outbox.complete(relay, applied.state, applied.code);
+    expect(applied).toEqual({ state: "verified", code: "relay_member_policy_verified" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
+for (const superseded of [false, true]) test(`readback-settled unban ${superseded ? "cannot undo a newer ban" : "lifts its relay ban"}`, async () => {
+  const h = await memberHarness("bannedMember"), store = new PolicyStore(sql), limbo: NostrEvent[] = [];
+  try {
+    await store.setBan(h.f.community.idHex, h.who.pk, true);
+    const unban = await h.accept("unban_member");
+    for (let i = 0; i < 8; i++) {
+      const claim = (await h.outbox.claim())!;
+      expect(claim).toMatchObject({ target: "concord", decision: { decisionId: unban.decisionId } });
+      await h.deliver(claim, { ...h.relay, publish: async event => { limbo.push(event); throw new Error("lost acknowledgement"); } });
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'concord'`;
+    }
+    const otherCase = crypto.randomUUID();
+    await sql`INSERT INTO moderation.cases (case_id, org_id, community_id, channel_id, rumor_id, author, fingerprint, evidence, expires_at)
+      VALUES (${otherCase}, ${h.staff.orgId}, ${h.f.community.idHex}, ${h.f.channelId}, ${h.f.allowedRumorId}, ${h.f.member.pk}, ${crypto.randomUUID()}, ${Buffer.from("synthetic recovery trigger")}, clock_timestamp() + interval '1 hour')`;
+    const other = await h.outbox.acceptDecision({ ...h.request("ban_member"), caseId: otherCase }, h.staff);
+    await hold(other.decisionId, "concord");
+    const newer = superseded ? await h.accept("ban_member") : undefined;
+    if (newer) await hold(newer.decisionId);
+    h.published.push(...limbo);
+    const recovery = (await h.outbox.claim())!;
+    expect(recovery).toMatchObject({ reconcileOnly: true, decision: { decisionId: unban.decisionId } });
+    expect(await h.deliver(recovery)).toMatchObject({ state: "not_applicable", code: superseded ? "concord_superseded_publication_settled" : "concord_publication_settled" });
+    await hold(other.decisionId);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`;
+    if (superseded) {
+      expect(await h.outbox.claim()).toBeUndefined();
+      expect((await sql`SELECT state, result_code FROM moderation.deliveries WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`)[0])
+        .toEqual({ state: "failed", result_code: "superseded_by_newer_decision" });
+      expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(true);
+      return;
+    }
+    const relay = (await h.outbox.claim())!;
+    expect(relay).toMatchObject({ target: "divine_relay", decision: { decisionId: unban.decisionId } });
+    const context = createExecutionContext({ sql, store, actions: h.actions, claim: relay, assertCurrent: () => h.outbox.renew(relay), decisions: h.outbox,
+      relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+    expect(await executeDelivery(relay.decision, relay.target, context)).toEqual({ state: "verified", code: "relay_member_policy_verified" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
+for (const code of ["concord_publication_settled", "unrelated_not_applicable"]) test(`relay unban retains current ban despite receipt ${code}`, async () => {
+  const h = await memberHarness("bannedMember"), store = new PolicyStore(sql);
+  try {
+    await store.setBan(h.f.community.idHex, h.who.pk, true);
+    const unban = await h.accept("unban_member");
+    await hold(unban.decisionId);
+    await sql`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = ${code} WHERE decision_id = ${unban.decisionId} AND target = 'concord'`;
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`;
+    const relay = await h.outbox.claim();
+    if (code === "unrelated_not_applicable") { expect(relay).toBeUndefined(); return; }
+    expect(relay?.target).toBe("divine_relay");
+    const context = createExecutionContext({ sql, store, actions: h.actions, claim: relay!, assertCurrent: () => h.outbox.renew(relay!), decisions: h.outbox,
+      relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+    expect(await executeDelivery(relay!.decision, relay!.target, context)).toEqual({ state: "acknowledged", code: "relay_awaiting_concord_state" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(true);
+  } finally { await h.cleanup(); }
 });
