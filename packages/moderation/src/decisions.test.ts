@@ -1286,6 +1286,30 @@ for (const changed of ["deleted_channel", "promoted_target"] as const) test(`pro
   } finally { await h.cleanup(); }
 });
 
+for (const changed of ["deleted_channel", "promoted_target"] as const) test(`after ${changed}, only a relay unban skips the historical channel and rank checks`, async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql);
+  try {
+    await h.accept("ban_member");
+    const claim = (await h.outbox.claim())!;
+    if (changed === "deleted_channel") {
+      const head = controlState(await recoveryPolicy(h)).folded.heads.get(h.f.channelId)!;
+      h.published.push(await sealEdition(buildChannelEdition(Buffer.from(h.f.channelId, "hex"), { name: "general", private: false, deleted: true }, { actorPubkey: h.f.owner.pk, version: head.version + 1n, prevHash: head.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    } else {
+      h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: h.who.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    }
+    const contextFor = (target: typeof claim.target) => createExecutionContext({ sql, store, actions: h.actions, claim: { ...claim, target }, assertCurrent: () => h.outbox.renew(claim), decisions: h.outbox,
+      relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+    const ban = claim.decision, unban = { ...claim.decision, action: "unban_member" as const };
+    // Bans, Concord publication and Discord still need the decision's own
+    // channel and rank over the member; only lifting the relay override after
+    // a proved unban uses current community authority.
+    for (const [decision, target] of [[ban, "divine_relay"], [ban, "concord"], [ban, "discord"], [unban, "concord"], [unban, "discord"]] as const) {
+      await expect(contextFor(target).authorize(decision)).rejects.toThrow();
+    }
+    await expect(contextFor("divine_relay").authorize(unban)).resolves.toBeDefined();
+  } finally { await h.cleanup(); }
+});
+
 for (const code of ["concord_publication_settled", "unrelated_not_applicable"]) test(`relay unban retains current ban despite receipt ${code}`, async () => {
   const h = await memberHarness("bannedMember"), store = new PolicyStore(sql);
   try {
