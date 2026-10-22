@@ -16,7 +16,9 @@ export interface ModerationDecision { sourceOrder?: SourceOrder; caseId: string;
 /** `supersededBy` names the newer ban or unban for the same member that took
  * over this decision's undelivered targets (each reads failed /
  * superseded_by_newer_decision); null when nothing was superseded. */
-export interface DecisionStatus { publicationBlockers?: Awaited<ReturnType<typeof publicationBlockers>>; auditAvailable?: boolean; discordRestriction?: DiscordRestriction; executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
+/** Current durable relay override only, not a claim about Concord or Discord. */
+export interface RelayRestriction { state: "present" | "absent" | "not_applicable"; code: "fresh_ordered_unban_required" | "relay_override_present" | "relay_override_absent" | "not_applicable" }
+export interface DecisionStatus { relayRestriction?: RelayRestriction; publicationBlockers?: Awaited<ReturnType<typeof publicationBlockers>>; auditAvailable?: boolean; discordRestriction?: DiscordRestriction; executionId: string; sourceOrder: SourceOrder | null; decisionId: string; target: RoomTarget; action: RoomAction; discordGuildConfirmed: boolean; supersededBy: string | null; deliveries: { target: DeliveryTarget; state: DeliveryState; attempts: number; resultCode: string | null }[] }
 export interface StoredDecision { decisionId: string; orgId: string; caseId: string; target: RoomTarget; author: string; action: RoomAction; discordGuildConfirmed: boolean; expiresAt: Date }
 export interface DeliveryClaim { decision: StoredDecision; target: DeliveryTarget; token: string; attempts: number; signedEvents: unknown[] | null; publicationEventIds?: string[] | null; publicationAttempted?: boolean; reconcileOnly?: boolean; publicationProofOnly?: boolean; claimedState?: DeliveryState }
 /** Refusals staff can act on. The API returns `code` instead of the generic rejection. */
@@ -196,7 +198,19 @@ export class Decisions {
     if (!row || this.communities.get(row.community_id) !== actor.orgId || (!actor.permissions.includes("view") && !actor.permissions.includes(row.action))) throw new Error("Decision unavailable");
     const deliveries = await this.sql`SELECT target, state, attempts, result_code, superseded_by, discord_restriction_state, discord_restriction_checked_at, discord_restriction_code FROM moderation.deliveries WHERE decision_id = ${decisionId} ORDER BY target`;
     const supersededBy = deliveries.find((d) => d.superseded_by)?.superseded_by ?? null;
-    return { publicationBlockers: membership(row.action) ? (await publicationBlockers(this.sql, row.community_id)).filter(blocker => blocker.orgId === actor.orgId) : [], auditAvailable: row.audit !== null, discordRestriction: (() => { const d = deliveries.find(d => d.target === "discord"); return { state: d?.discord_restriction_state ?? "unknown", checkedAt: d?.discord_restriction_checked_at?.toISOString() ?? null, code: d?.discord_restriction_code ?? "not_checked" }; })(), executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
+    // Owner supersession cancels an uncertain publication; it is not an
+    // applied unban receipt. Expose the surviving override instead of making
+    // two not_applicable delivery rows look like enforcement was lifted.
+    let relayRestriction: RelayRestriction = { state: "not_applicable", code: "not_applicable" };
+    if (membership(row.action)) {
+      const [ban] = await this.sql`SELECT blocked FROM moderation.member_bans WHERE community_id = ${row.community_id} AND author = ${row.author}`;
+      const retiredUnban = row.action === "unban_member" && deliveries.some(d => d.target === "divine_relay" && d.state === "not_applicable" && d.result_code === "concord_operator_superseded");
+      const [newer] = retiredUnban ? await this.sql`SELECT 1 FROM moderation.decisions c WHERE c.decision_id = ${decisionId}
+        AND (EXISTS (SELECT 1 FROM moderation.decisions n WHERE ${this.sql.unsafe(newerThan("n", "c"))}) OR ${this.sql.unsafe(newerHead("c"))})` : [];
+      relayRestriction = ban?.blocked ? { state: "present", code: retiredUnban && !newer ? "fresh_ordered_unban_required" : "relay_override_present" }
+        : { state: "absent", code: "relay_override_absent" };
+    }
+    return { relayRestriction, publicationBlockers: membership(row.action) ? (await publicationBlockers(this.sql, row.community_id)).filter(blocker => blocker.orgId === actor.orgId) : [], auditAvailable: row.audit !== null, discordRestriction: (() => { const d = deliveries.find(d => d.target === "discord"); return { state: d?.discord_restriction_state ?? "unknown", checkedAt: d?.discord_restriction_checked_at?.toISOString() ?? null, code: d?.discord_restriction_code ?? "not_checked" }; })(), executionId: row.execution_id, sourceOrder: row.source_revision == null ? null : { version: 1, revision: String(row.source_revision) }, decisionId, target: stored(row).target, action: row.action, discordGuildConfirmed: row.discord_guild_confirmed, supersededBy, deliveries: deliveries.map((d) => ({ target: d.target as DeliveryTarget, state: d.state as DeliveryState, attempts: d.attempts, resultCode: d.result_code })) };
   }
   async getByExecution(executionId: string, actor: VerifiedCoopActor): Promise<DecisionStatus> {
     assertActor(actor);

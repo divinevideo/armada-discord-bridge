@@ -1404,6 +1404,14 @@ for (const scenario of ["different_content", "owner_rumor_first", "old_rumor_fir
       expect((await sql`SELECT state, result_code, attempts FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`)[0])
         .toEqual({ state: "not_applicable", result_code: "concord_operator_superseded", attempts: 0 });
       expect((await new PolicyStore(sql).getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(true);
+      const api = postgres(process.env.DATABASE_URL!, { max: 1, onnotice: () => {} });
+      try {
+        await api`SET ROLE moderation_api`;
+        const reader = new Decisions(api, cipher, new Map([[h.f.community.idHex, h.staff.orgId]]));
+        expect((await reader.get(first.decisionId, h.staff)).relayRestriction).toEqual({ state: "present", code: "fresh_ordered_unban_required" });
+        await expect(reader.get(first.decisionId, { ...h.staff, orgId: crypto.randomUUID() })).rejects.toThrow();
+        await expect(api`UPDATE moderation.member_bans SET blocked = false WHERE community_id = ${h.f.community.idHex}`.execute()).rejects.toThrow(/permission denied/);
+      } finally { await api.end(); }
     }
     const next = await otherCommunityMember(h);
     await h.drain();
@@ -1418,6 +1426,17 @@ for (const scenario of ["different_content", "owner_rumor_first", "old_rumor_fir
     floor.set(bytesToHex(candidate.entityId), { version: candidate.version, hash: candidate.selfHash });
     const tracked = foldControlState(state.editions, h.f.community.id, h.f.community.owner, floor);
     expect(tracked.incomplete).toEqual([]);
+    if (supersededUnban) {
+      const fresh = await h.accept("unban_member");
+      expect((await h.outbox.get(first.decisionId, h.staff)).relayRestriction).toEqual({ state: "present", code: "relay_override_present" });
+      await h.drain();
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${fresh.decisionId} AND target = 'divine_relay'`;
+      const relay = (await h.outbox.claim())!, store = new PolicyStore(sql);
+      const context = createExecutionContext({ sql, store, actions: h.actions, claim: relay, assertCurrent: () => h.outbox.renew(relay), decisions: h.outbox,
+        relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+      expect(await executeDelivery(relay.decision, relay.target, context)).toMatchObject({ state: "verified" });
+      expect((await h.outbox.get(first.decisionId, h.staff)).relayRestriction).toEqual({ state: "absent", code: "relay_override_absent" });
+    }
     expect(tracked.banned.has(h.f.bannedMember.pk)).toBe(false);
   } finally { await h.cleanup(); }
 });

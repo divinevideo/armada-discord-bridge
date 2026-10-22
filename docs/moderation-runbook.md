@@ -487,7 +487,14 @@ applied and does not qualify its relay unban. Submit fresh ordered intent if
 that member still needs a change. Later queued members can proceed on the
 proved canonical head. A superseded unban's undelivered relay leg is retired
 as not applicable in the same lease-fenced completion transaction, without
-changing relay enforcement or replenishing attempts. Supersession resolves
+changing relay enforcement or replenishing attempts. Decision status exposes
+`relayRestriction` as the current durable relay override (not Concord or
+Discord state). `present / fresh_ordered_unban_required` identifies a retired
+unban whose member is still blocked and has no newer ordered intent: submit a
+fresh authorized unban, not Retry of the canceled publication. If newer intent
+exists, the status reports only the current override, without telling staff to
+undo it. `absent` is not a guarantee of admission: the current Concord fold and
+other relay policy still apply. Supersession resolves
 publication uncertainty for lifecycle closure, but it is not enforcement
 proof: current applied Concord unban (verified send or exact canonical receipt),
 verified relay unban, Discord restriction observations,
