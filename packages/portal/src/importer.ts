@@ -101,7 +101,7 @@ import type { PortalEnv } from "./env";
 import { HISTORY_MESSAGE_CAP, buildImportPlan } from "./importPlan";
 import type { ImportPlan, OwnerSignTemplate, PlannedChannel, SignedSeal } from "./importPlan";
 import type { BridgeManager, BridgeRow } from "./manager";
-import { assertPublicRelays } from "./relayGuard";
+import { assertPublicRelays, filterPublicRelays } from "./relayGuard";
 import { seal, unseal } from "./seal";
 
 export interface ImportRow {
@@ -1055,8 +1055,17 @@ export class Importer {
         // FAILED lookup is not "no list" — delivering to the stock floor would
         // report success while the invite sat somewhere they never read.
         const inbox = await recipientInboxRelays(pool, community.owner);
-        const deliveryPool = guardEffects(this.poolFactory(inviteDeliveryRelays(inbox ?? [])), beforeEffect, new Set(["publish"]));
+        // That list is the owner's own published event: vet it like every
+        // other untrusted relay list (manager.ts). No stock fallback for
+        // a list that vets to nothing: the owner's client scans the list they
+        // published, so a stock delivery would read as sent and never arrive.
+        // The stock floor stays for an owner who published no list at all.
+        let deliveryPool: RelayLike | undefined;
         try {
+          if (inbox === null) throw new Error("owner inbox lookup unavailable");
+          const reachable = await filterPublicRelays(inbox, []);
+          if (inbox.length > 0 && reachable.length === 0) throw new Error("owner inbox relays are not publicly reachable");
+          deliveryPool = guardEffects(this.poolFactory(inviteDeliveryRelays(reachable)), beforeEffect, new Set(["publish"]));
           await deliveryPool.publish(wrap);
           cp.ownerChannelKeysSentAt = Date.now();
         } catch (error) {
@@ -1067,7 +1076,7 @@ export class Importer {
           // the keys are checkpointed, not re-minted).
           cp.ownerChannelKeysError = String(error);
         } finally {
-          await deliveryPool.close().catch(() => {});
+          await deliveryPool?.close().catch(() => {});
         }
         await save();
       }
