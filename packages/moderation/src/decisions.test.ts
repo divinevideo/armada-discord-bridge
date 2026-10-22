@@ -1213,6 +1213,40 @@ for (const superseded of [false, true]) test(`readback-settled unban ${supersede
   } finally { await h.cleanup(); }
 });
 
+for (const changed of ["deleted_channel", "promoted_target"] as const) test(`proved relay unban releases the member after ${changed}`, async () => {
+  const h = await memberHarness("bannedMember"), store = new PolicyStore(sql);
+  try {
+    await store.setBan(h.f.community.idHex, h.who.pk, true);
+    const unban = await h.accept("unban_member"), claim = (await h.outbox.claim())!;
+    const events = await h.actions.prepare(claim.decision);
+    await h.outbox.saveEvents(claim, events);
+    await h.deliver(claim, { ...h.relay, publish: async event => { h.published.push(event); throw new Error("lost acknowledgement"); } });
+    if (changed === "deleted_channel") {
+      const head = controlState(await recoveryPolicy(h)).folded.heads.get(h.f.channelId)!;
+      h.published.push(await sealEdition(buildChannelEdition(Buffer.from(h.f.channelId, "hex"), { name: "general", private: false, deleted: true }, { actorPubkey: h.f.owner.pk, version: head.version + 1n, prevHash: head.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    } else {
+      h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: h.who.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+      // Promotion can make the moderator's historical removal inadmissible
+      // in the current fold. The relay must still see a current unban, here
+      // independently established by the owner after the promotion.
+      const state = controlState(await recoveryPolicy(h)), head = state.folded.heads.get(bytesToHex(banlistLocator(h.f.community.id)))!;
+      h.published.push(await sealEdition(buildBanlistEdition(h.f.community.id, [...state.folded.banned].filter(pk => pk !== h.who.pk), { actorPubkey: h.f.owner.pk, version: head.version + 1n, prevHash: head.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    }
+    await expect(h.actions.authorize(claim.decision)).rejects.toThrow();
+    expect(await proveGeneration(h, unban.decisionId, events[0].id)).toMatchObject({ code: "concord_publication_settled" });
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${unban.decisionId} AND target = 'divine_relay'`;
+    const relay = (await h.outbox.claim())!;
+    expect(relay.target).toBe("divine_relay");
+    const context = createExecutionContext({ sql, store, actions: h.actions, claim: relay, assertCurrent: () => h.outbox.renew(relay), decisions: h.outbox,
+      relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+    // The target-specific relaxation must not become an expired-intent bypass.
+    expect(await executeDelivery({ ...relay.decision, expiresAt: new Date(0) }, relay.target, context)).toMatchObject({ state: "failed" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned).toContain(h.who.pk);
+    expect(await executeDelivery(relay.decision, relay.target, context)).toEqual({ state: "verified", code: "relay_member_policy_verified" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned).not.toContain(h.who.pk);
+  } finally { await h.cleanup(); }
+});
+
 for (const code of ["concord_publication_settled", "unrelated_not_applicable"]) test(`relay unban retains current ban despite receipt ${code}`, async () => {
   const h = await memberHarness("bannedMember"), store = new PolicyStore(sql);
   try {

@@ -468,7 +468,13 @@ does not execute that action: it requires current community moderation
 authority, the existing operator/action capability, complete fresh policy and
 revocation/rekey fences, but not a historical channel or the target's former
 rank. A deleted channel or promoted target therefore does not wedge unrelated
-members behind proof that can be safely observed.
+members behind proof that can be safely observed. For a still-live unban with
+an applied Concord receipt, the relay leg uses those same current community
+safeguards plus decision expiry rather than the historical channel/rank check.
+It releases the unbanned member's relay override only while the current fold
+also shows them unbanned. Newer intent, missing receipts, expiry, revocation
+and pending rekeys still prevent execution; Discord and replay retain their
+full original authorization.
 
 A request rejected before its initial proof is established writes no recovery
 audit. After the recovery audit/version commits, a later proof/lease failure
