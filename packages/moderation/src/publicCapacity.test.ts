@@ -121,8 +121,8 @@ test("during a pause a member can still retract their own message and leave, wit
    for (let i = 0; i < 3; i++) expect((await guarded.admit(await chat(g.member, 5, [["e", g.allowedRumorId]]))).action).toBe("accept");
    expect((await sql`SELECT 1 FROM moderation.tombstones WHERE community_id = ${group} AND rumor_id = ${g.allowedRumorId}`).length).toBe(1);
    expect((await guarded.admit(await motion(buildLeaveRumor(g.member.pk, Date.now())))).action).toBe("accept");
-   // Retractions add no control or rekey history, so the full reserve is still
-   // there for staff, and they still fit after staff exhaust it.
+   // Retractions add no control/rekey history. This fixture still has measured
+   // headroom after staff growth is refused; it is not the hard reserve limit.
    const actions = new ConcordActions(g.community, g.moderator, () => installer.getPolicy(group) as any), ban = { ...g.decision, action: "ban_member" as const };
    expect((await guarded.admit((await actions.prepare(ban))[0])).action).toBe("accept");
    expect((await guarded.admit((await actions.prepare({ ...ban, action: "unban_member" }))[0])).action).toBe("accept");
@@ -131,6 +131,13 @@ test("during a pause a member can still retract their own message and leave, wit
    // The allowance rides the staff gate, not around it: no measured contract, no admission.
    expect((await new PolicyStore(validator, { capacity: { communities: scope, contract: undefined } }).admit(await chat(g.member, 5, [["e", g.allowedRumorId]]))).msg).toBe(CAPACITY_REFUSAL);
    expect(Number((await sql`SELECT count(*) AS n FROM moderation.accepted_control WHERE community_id = ${group}`)[0].n)).toBe(2);
+   // Independently authorized owner history can consume the remaining margin.
+   // Even non-history member traffic must still pass that measured gate.
+   const current = (await installer.getPolicy(group))!;
+   const extra = await Promise.all(["a8", "a9"].map(id => sealEdition(buildRoleEdition(moderatorRole(id.repeat(32)), { actorPubkey: g.owner.pk, version: 1n }), currentControlWriteGroup(g.community), g.owner.signer)));
+   await installer.install({ ...current, revision: current.revision + 1, controlEvents: [...current.controlEvents, ...extra] }, [g.chatStream, g.controlStream, g.guestbookStream], current.revision);
+   await capacity.observeCurrent(org, group);
+   expect((await guarded.admit(await motion(buildLeaveRumor(g.member.pk, Date.now() + 2)))).msg).toBe(CAPACITY_REFUSAL);
  } finally { await validator.end(); await sql`DELETE FROM moderation.public_capacity_state WHERE community_id = ${group}`; await sql`DELETE FROM moderation.community_policy WHERE community_id = ${group}`; }
 });
 

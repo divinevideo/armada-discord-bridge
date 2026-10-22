@@ -63,6 +63,11 @@ or unavailable proof never releases the successor: the old target records
 clearing or a guessed successful outcome in SQL. Unknown legacy provenance is
 explicitly excluded there, not declared recovered. Read-only recovery uses the
 existing maximum retry backoff, not a tight loop.
+A failed unban can reconcile for its own waiting relay leg without another
+member creating work. An inconclusive upgrade readback preserves the original
+pending/acknowledged state and attempts for later guarded observation/retry.
+Publication refresh schedules failed receipt work only; it does not move a
+pending send's backoff merely because a peer might settle before the claim.
 
 Legacy unfenced expired rows with a conservative send marker but no surviving
 identity are quarantined as operator recovery only if they were claimed, not
@@ -276,6 +281,18 @@ review before the deadline; confirm a deliberate audited extension or release
 before it passes. An open appeal alone is not a reminder or an extension, and
 the service does not supply an automatic renewal/alert system.
 
+Post-expiry reversal uses retained community enforcement from Concord or the
+Divine relay, not a Discord-only Guild ban as its source. Guild administration
+remains separately scoped: adding explicit Guild scope to fresh intent requires
+the Guild action permission and a verified mapping. The old decision ID is
+provenance, not a promise to selectively undo only that decision's effects.
+
+Legacy holds without an approved policy snapshot do not acquire one merely
+because current configuration exists or staff extend the deadline. Their held
+access and audit cleanup remain conservatively unavailable until an explicitly
+approved reconciliation/migration supplies the missing policy; this release
+does not guess it or retroactively expose/erase that evidence.
+
 ## Durable public capacity
 
 Mount externally reviewed measurement JSON at MODERATION_CAPACITY_CONTRACT_FILE in the relay plugin, worker, portal and standalone public bridge. MODERATION_SOURCE_SHA is bound to the image build revision; validation compares the contract against that source and the actual native platform. MODERATION_COMMUNITY_ORGS supplies the existing approved organization/community scope. Missing, invalid, mismatched or stale evidence closes new public mutation. Legacy mode keeps its existing behavior. Do not convert synthetic calibration into a launch contract or claim a destination envelope from an emulated build.
@@ -288,6 +305,12 @@ per-member rate quota. Repeated authenticated leaves do not consume the
 control-history reserve, and the gate does not require a prior join for each
 leave. They still require policy admission and the measured gate's remaining
 bounds; do not interpret the pause as stopping all member writes.
+Not consuming history is not a reserve bypass: projected history and in-flight
+headroom still count in this conservative measured gate, and zero remaining
+headroom refuses even a leave or deletion. `urgentReserve` is a threshold, not
+a guarantee that exactly that many further mutations will be admitted. Native
+capacity review must account for the actual projection/in-flight margin and
+all other measured maxima, not infer an action quota from that field alone.
 
 A pause survives restart, low counts and missing samples. To observe or pause using the existing operator database connection, run `bun packages/moderation/src/capacityOperator.ts observe COMMUNITY_ID` or `bun packages/moderation/src/capacityOperator.ts pause COMMUNITY_ID REASON_CODE`. Explicit resume is `bun packages/moderation/src/capacityOperator.ts resume COMMUNITY_ID ACTOR_ID CONTRACT_HASH` and rechecks the current complete policy, measured contract and counts under the same lock. The read API and validator cannot clear the latch. Apply018 after repeated bootstrap too; its final grants remove broad replayed001 authority.
 
@@ -337,6 +360,12 @@ Proof-only maintenance uses a read-only control snapshot and cannot enable
 admission, even when authentic original provenance settles a legacy row. Exact
 replay instead checks the whole community's publication provenance before every
 installing authority refresh, while holding controller and execution ownership.
+It also refreshes the operator capacity observation, preserving the durable
+pause and contract hash, and registers stream keys for normal relay auth.
+The operator must mount the same reviewed capacity contract/source identity
+used by the worker and relay (`MODERATION_CAPACITY_CONTRACT_FILE` and
+`MODERATION_SOURCE_SHA`). Missing/changed contracts, unknown capability state,
+stale samples and exhausted measured bounds are not waived by recovery.
 An eligible pilot can refresh normal admission after an outage or policy expiry;
 an excluded community is refused before any installation. Restart the worker
 after successful recovery and preflight to resume normal processing.
@@ -358,8 +387,9 @@ Supply an operator audit identity JSON file with the mapped `orgId`, a nonempty
 
 The local operator database credential is the
 command's access boundary; the file records who authorized maintenance. The
-mounted member identity must still have current Concord authority over the
-subject. Use existing worker provisioning (`MODERATION_COMMUNITY_ENTRY_FILE`,
+mounted member identity must have current community moderation authority;
+replay additionally requires current mutation authority over the subject.
+Use existing worker provisioning (`MODERATION_COMMUNITY_ENTRY_FILE`,
 `MODERATION_MEMBER_KEY`, `MODERATION_LOCAL_RELAY_URL`) plus
 `MODERATION_EVIDENCE_KEY` for the encrypted actor/reason audit:
 
@@ -376,7 +406,15 @@ relay leaves uncertainty fenced; inspect status and make another deliberate
 request using the new recovery version after its lease clears.
 
 Use `operation: "prove"` after expiry, or for a losing generation. The command
-first accepts exact original canonical ancestry as a receipt. For an expired
+first accepts exact original canonical ancestry as a receipt. This identifies
+its publisher and rumor identity, not just an edition's
+content hash. A same-hash owner endorsement is structural supersession, not
+proof that the old publisher's action was applied. Ambiguous intermediate
+same-hash identities do not supply an applied receipt; use explicit owner
+proof where available. Alternate wraps of the same publisher/rumor are not a
+new action.
+
+For an expired
 legacy row with an ID but no structural metadata, an `originalEvent` object may
 be supplied; its signature and exact durable original ID are checked. Relay
 absence never releases a fence.
@@ -423,10 +461,13 @@ WHERE d.decision_id = 'DECISION_ID' AND d.target = 'concord';
 The endorsement must match the original version, predecessor and content hash.
 If content is lost, a non-owner edit made replay stale, or no complete safe
 owner branch can be established, keep the fence and use the documented fresh
-pilot fallback. Both operations also retain the current source-channel
-authority check: a missing, deleted or private source channel prevents in-place
-recovery. Do not weaken that boundary or change visibility just to release a
-delivery; treat it as another excluded in-place case.
+pilot fallback. Actual replay still requires the original execution window,
+an active public source channel and current authority over the target. Proof
+does not execute that action: it requires current community moderation
+authority, the existing operator/action capability, complete fresh policy and
+revocation/rekey fences, but not a historical channel or the target's former
+rank. A deleted channel or promoted target therefore does not wedge unrelated
+members behind proof that can be safely observed.
 
 A request rejected before its initial proof is established writes no recovery
 audit. After the recovery audit/version commits, a later proof/lease failure
@@ -441,7 +482,8 @@ proved canonical head. A superseded unban's undelivered relay leg is retired
 as not applicable in the same lease-fenced completion transaction, without
 changing relay enforcement or replenishing attempts. Supersession resolves
 publication uncertainty for lifecycle closure, but it is not enforcement
-proof: current verified unban, relay state, Discord restriction observations,
+proof: current applied Concord unban (verified send or exact canonical receipt),
+verified relay unban, Discord restriction observations,
 holds, appeals and independent retention must still satisfy every existing
 closure/erasure guard. Recovery actor/reason can then expire with that
 decision's audit; immutable opaque recovery ordering remains.
@@ -463,11 +505,14 @@ reach the local relay on loopback and the operator database, an explicit image
 invocation is:
 
 ```
-docker run --rm --network host --env-file "$RECOVERY_ENV_FILE" --mount "type=bind,src=$COMMUNITY_ENTRY_FILE,dst=/recovery/community.json,readonly" --mount "type=bind,src=$RECOVERY_REQUEST_FILE,dst=/recovery/request.json,readonly" --mount "type=bind,src=$RECOVERY_ACTOR_FILE,dst=/recovery/actor.json,readonly" --env MODERATION_COMMUNITY_ENTRY_FILE=/recovery/community.json --entrypoint bun "$MODERATION_IMAGE" packages/moderation/src/publicationOperator.ts recover "$COMMUNITY_ID" /recovery/request.json /recovery/actor.json
+docker run --rm --network host --env-file "$RECOVERY_ENV_FILE" --mount "type=bind,src=$COMMUNITY_ENTRY_FILE,dst=/recovery/community.json,readonly" --mount "type=bind,src=$RECOVERY_REQUEST_FILE,dst=/recovery/request.json,readonly" --mount "type=bind,src=$RECOVERY_ACTOR_FILE,dst=/recovery/actor.json,readonly" --mount "type=bind,src=$CAPACITY_CONTRACT_FILE,dst=/recovery/capacity.json,readonly" --env MODERATION_COMMUNITY_ENTRY_FILE=/recovery/community.json --env MODERATION_CAPACITY_CONTRACT_FILE=/recovery/capacity.json --entrypoint bun "$MODERATION_IMAGE" packages/moderation/src/publicationOperator.ts recover "$COMMUNITY_ID" /recovery/request.json /recovery/actor.json
 ```
 
 Use the reviewed image digest for `MODERATION_IMAGE`; use absolute, readable
-paths for the three mounted files. `RECOVERY_ENV_FILE` contains existing
+paths for all four mounted files, including the reviewed capacity contract.
+The image supplies its build source identity; a checkout invocation must use
+the same reviewed source identity and native contract rather than an old image's
+measurement. `RECOVERY_ENV_FILE` contains existing
 maintenance provisioning, including an operator-role database URL reachable
 from that host and `MODERATION_LOCAL_RELAY_URL` reachable on its loopback
 interface. It is not a copy of an API-only credential. If running remotely,
