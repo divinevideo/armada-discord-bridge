@@ -490,8 +490,11 @@ as not applicable in the same lease-fenced completion transaction, without
 changing relay enforcement or replenishing attempts. Decision status exposes
 `relayRestriction` as the current durable relay override (not Concord or
 Discord state). `present / fresh_ordered_unban_required` identifies a retired
-unban whose member is still blocked and has no newer ordered intent: submit a
-fresh authorized unban, not Retry of the canceled publication. If newer intent
+unban whose member is still blocked and has no newer ordered bridge intent.
+It does not inspect later owner decisions: first confirm the current Concord
+fold still shows the member unbanned and that release is still intended. Only
+then submit a fresh authorized unban, not Retry of the canceled publication;
+never use this status alone to reverse an owner's subsequent ban. If newer intent
 exists, the status reports only the current override, without telling staff to
 undo it. `absent` is not a guarantee of admission: the current Concord fold and
 other relay policy still apply. Supersession resolves
