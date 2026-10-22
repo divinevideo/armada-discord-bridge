@@ -1,5 +1,5 @@
 import { createPublicationRecoveryActions } from "./publicationOperator";
-import { buildBanlistEdition, buildGrantEdition, banlistLocator, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
+import { buildBanlistEdition, buildGrantEdition, buildChannelEdition, banlistLocator, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
 import { generateSecretKey } from "nostr-tools/pure";
 import { localIdentity } from "../../bridge/src/concord/signer";
 import { recoverPublication, assertPilotPublicationProvenance, publicationBlockers } from "./publicationRecovery";
@@ -1686,5 +1686,26 @@ test("background receipt readback cannot count an owner's same-hash endorsement 
     expect(claim.reconcileOnly).toBe(true);
     expect(await h.deliver(claim)).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
     expect(await concordRow(decision.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator" });
+  } finally { await h.cleanup(); }
+});
+
+for (const proof of ["canonical", "owner"] as const) for (const changed of ["deleted_channel", "promoted_target"] as const) test(`${proof} membership proof survives ${changed}, without granting replay`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, old } = await lostGeneration(h); h.published.push(old);
+    if (proof === "owner") {
+      h.published.push(await endorseGeneration(h, parseEdition(openWrap(old, h.f.controlStream.key))));
+      h.published.push(await advanceOwner(h));
+    }
+    if (changed === "deleted_channel") {
+      const channel = controlState(await recoveryPolicy(h)).folded.heads.get(h.f.channelId)!;
+      h.published.push(await sealEdition(buildChannelEdition(Buffer.from(h.f.channelId, "hex"), { name: "general", private: false, deleted: true }, { actorPubkey: h.f.owner.pk, version: channel.version + 1n, prevHash: channel.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    } else {
+      h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: decision.author, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    }
+    await expect(h.actions.authorize(decision)).rejects.toThrow(changed === "deleted_channel" ? /Current room authority unavailable/ : /Moderator lacks authority/);
+    const result = await proveGeneration(h, decision.decisionId, old.id);
+    expect(result).toMatchObject({ state: "not_applicable", code: proof === "owner" ? "concord_operator_superseded" : "concord_publication_settled" });
+    expect(h.published.filter(event => event.id === old.id)).toHaveLength(1);
   } finally { await h.cleanup(); }
 });

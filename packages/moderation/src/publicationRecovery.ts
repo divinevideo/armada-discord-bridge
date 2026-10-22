@@ -47,9 +47,11 @@ export async function recoverPublication(options: { sql: postgres.Sql; decisions
       FROM moderation.decisions c JOIN moderation.deliveries d USING (decision_id) WHERE c.decision_id = ${request.decisionId} AND c.org_id = ${actor.orgId} AND d.target = 'concord'`;
     if (!row || ["verified", "not_applicable"].includes(row.state) || row.recovery_version !== request.expectedVersion || row.lease_until > new Date() || row.publication_event_ids?.length !== 1 || row.publication_event_ids[0] !== request.eventId) throw new Error("Stale recovery or original publication identity unavailable");
     const decision: StoredDecision = { decisionId: row.decision_id, orgId: row.org_id, caseId: row.case_id, target: status.target, action: row.action, author: row.author, discordGuildConfirmed: row.discord_guild_confirmed, expiresAt: row.expires_at };
-    // Proof operations still require current room authority, without granting
-    // permission to execute an expired decision.
-    await actions.authorize({ ...decision, expiresAt: new Date(Date.now() + 60_000) });
+    // Refuse expired/erased replay before an installing authority refresh.
+    // Proof has current community authority, not historical mutation rights.
+    if (request.operation === "replay" && (!row.signed_events || decision.expiresAt <= new Date())) throw new Error("Exact retained unexpired publication required");
+    if (request.operation === "prove") await actions.authorizeProof(decision);
+    else await actions.authorize(decision);
     let events: NostrEvent[] | undefined = row.signed_events ?? (request.originalEvent ? [request.originalEvent] : undefined);
     if (events) {
       if (events.length !== 1 || verifiedEvent(events[0]).id !== request.eventId) throw new Error("Original publication identity mismatch");

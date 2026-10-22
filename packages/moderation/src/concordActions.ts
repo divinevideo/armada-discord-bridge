@@ -1,4 +1,4 @@
-import { banlistLocator, buildBanlistEdition, buildRumor, bytesToHex, canActOnMember, checkChannelBinding, channelBindingTags, channelsView, citationFromTags, citationSatisfied, citationToTag, currentControlWriteGroup, foldControlState, grantLocator, hex32, KIND_SEAL_ENCRYPTED, openWrap, parseEdition, Permissions, sealEdition, sealRumor, wrapSeal } from "@armada-bridge/concord-core";
+import { banlistLocator, buildBanlistEdition, buildRumor, bytesToHex, canActOnMember, isAuthorized, checkChannelBinding, channelBindingTags, channelsView, citationFromTags, citationSatisfied, citationToTag, currentControlWriteGroup, foldControlState, grantLocator, hex32, KIND_SEAL_ENCRYPTED, openWrap, parseEdition, Permissions, sealEdition, sealRumor, wrapSeal } from "@armada-bridge/concord-core";
 import type { CommunityV2, StreamSigner, ParsedEdition } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { CommunityPolicy } from "./contracts";
@@ -56,11 +56,26 @@ export class ConcordActions {
     if (bytesToHex(p.entityId) !== bytesToHex(banlistLocator(this.community.id)) || p.author !== this.identity.pk) throw new Error("Publication scope invalid");
     return { entityId: bytesToHex(p.entityId), version: p.version.toString(), prevHash: p.prevHash ? bytesToHex(p.prevHash) : null, selfHash: bytesToHex(p.selfHash), rumorId: bytesToHex(p.rumorId), author: p.author };
   }
+  /** Observing membership proof does not execute the old action. Retain
+   * current community moderation authority, revocation and rekey fences, but
+   * do not wedge every member behind a deleted report channel or a target
+   * whose rank changed. Actual replay still uses authorize() above. */
+  async authorizeProof(decision: StoredDecision) {
+    const policy = await this.refresh();
+    if (decision.action === "remove_message" || decision.target.communityId !== this.community.idHex || policy.communityId !== this.community.idHex || !policy.complete || policy.rekeyPending || policy.validUntil <= Date.now()) throw new Error("Current room authority unavailable");
+    const state = controlState(policy);
+    if (state.folded.incomplete.length || policy.banned.includes(this.identity.pk) || state.folded.banned.has(this.identity.pk) || !isAuthorized(state.folded.roster, this.identity.pk, policy.owner, Permissions.BAN)) throw new Error("Current room authority unavailable");
+    const entityId = grantLocator(this.community.id, hex32(this.identity.pk)), grant = state.folded.heads.get(bytesToHex(entityId));
+    if (!grant) throw new Error("Moderator grant missing");
+    const authority = { entityId, version: grant.version, editionHash: grant.hash };
+    if (!citationSatisfied(state.folded, this.community.id, this.identity.pk, authority)) throw new Error("Moderator citation invalid");
+    return { ...state, policy, authority };
+  }
   /** Owner sibling authority settles the standing-list walk before the old
    * moderator's sibling. A later owner head then rewrites the complete list.
    * Check the actual chain too: version superiority alone is insufficient. */
   async ownerSupersession(decision: StoredDecision, metadata: PublicationMetadata): Promise<boolean> {
-    const { editions, folded } = await this.authorize({ ...decision, expiresAt: new Date(Date.now() + 60_000) });
+    const { editions, folded } = await this.authorizeProof(decision);
     const eid = bytesToHex(banlistLocator(this.community.id));
     if (metadata.entityId !== eid || metadata.author !== this.identity.pk || !/^[1-9][0-9]*$/.test(metadata.version) || ![metadata.selfHash, metadata.rumorId, metadata.author, ...(metadata.prevHash ? [metadata.prevHash] : [])].every(id => /^[0-9a-f]{64}$/.test(id))) return false;
     const version = BigInt(metadata.version), head = folded.headEditions.get(eid);
