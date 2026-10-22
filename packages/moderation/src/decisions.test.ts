@@ -1,6 +1,6 @@
 import { createPublicationRecoveryActions } from "./publicationOperator";
-import { buildBanlistEdition, buildGrantEdition, buildChannelEdition, banlistLocator, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState } from "@armada-bridge/concord-core";
-import { generateSecretKey } from "nostr-tools/pure";
+import { buildBanlistEdition, buildGrantEdition, buildChannelEdition, banlistLocator, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState, streamPubkeysForRelay, signStreamAuths } from "@armada-bridge/concord-core";
+import { generateSecretKey, verifyEvent } from "nostr-tools/pure";
 import { localIdentity } from "../../bridge/src/concord/signer";
 import { recoverPublication, assertPilotPublicationProvenance, publicationBlockers } from "./publicationRecovery";
 import { runModerationWorker } from "./runtime";
@@ -1811,6 +1811,32 @@ test("non-owner hash equivalence refuses a delayed edition that changes ban-time
   } finally { await h.cleanup(); }
 });
 
+test("recovery registers scoped signable control keys before fetching and channel keys after replay refresh", async () => {
+  const h = await memberHarness("member"); let requests = 0;
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => { requests++; return new Response("unused test endpoint", { status: 503 }); } });
+  const url = `ws://127.0.0.1:${server.port}`, unrelated = "wss://unrelated.example/";
+  try {
+    const { decision, old } = await lostGeneration(h);
+    expect(streamPubkeysForRelay(url)).not.toContain(h.f.controlStream.key.pk);
+    expect(streamPubkeysForRelay(url)).not.toContain(h.f.chatStream.key.pk);
+    const relay = { ...h.relay, urls: [url], queryStrict: async (filters: { ids?: string[] }[]) => {
+      expect(streamPubkeysForRelay(url)).toContain(h.f.controlStream.key.pk);
+      const auth = signStreamAuths("synthetic-challenge", url, [h.f.controlStream.key.pk]);
+      expect(auth).toHaveLength(1); expect(verifyEvent(auth[0])).toBe(true);
+      return filters[0].ids ? h.published.filter(event => filters[0].ids!.includes(event.id)) : [...h.f.policy.controlEvents, ...h.published];
+    } };
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store: new PolicyStore(sql), relay: relay as never, operation: "replay",
+      capacity: { communities: new Map([[h.f.community.idHex, h.staff.orgId]]), contract: recoveryContract } });
+    expect(streamPubkeysForRelay(unrelated)).not.toContain(h.f.controlStream.key.pk);
+    expect(await recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never, actor: recoveryStaff(h),
+      request: { decisionId: decision.decisionId, expectedVersion: 0, eventId: old.id, operation: "replay", reason: "Synthetic auth setup" } })).toMatchObject({ state: "verified" });
+    expect(streamPubkeysForRelay(url)).toContain(h.f.chatStream.key.pk);
+    expect(streamPubkeysForRelay(unrelated)).not.toContain(h.f.chatStream.key.pk);
+    const chatAuth = signStreamAuths("synthetic-chat-challenge", url, [h.f.chatStream.key.pk]);
+    expect(chatAuth).toHaveLength(1); expect(verifyEvent(chatAuth[0])).toBe(true);
+    expect(requests).toBe(0);
+  } finally { server.stop(true); await h.cleanup(); }
+});
 
 for (const proof of ["canonical", "owner"] as const) for (const changed of ["deleted_channel", "promoted_target"] as const) test(`${proof} membership proof survives ${changed}, without granting replay`, async () => {
   const h = await memberHarness("member");
