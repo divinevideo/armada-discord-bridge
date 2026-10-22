@@ -267,6 +267,12 @@ export class Decisions {
       // that have already committed. This lock is never taken by acceptance,
       // Retry or execution, so their member/community locks cannot invert it.
       await tx`SELECT pg_advisory_xact_lock(483217, 1)`;
+      // Earlier maintenance acquisition wrote pending before it completed.
+      // Once that abandoned lease passes, its operator marker still owns the
+      // disposition; do not reinterpret an interrupted recovery as a retry.
+      await tx`UPDATE moderation.deliveries SET state = 'failed', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
+        WHERE target = 'concord' AND state IN ('pending','acknowledged') AND result_code = 'concord_recovery_requires_operator'
+          AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
       await tx`UPDATE moderation.deliveries SET state = 'failed', result_code = 'retry_budget_exhausted', token = NULL, lease_until = NULL, updated_at = clock_timestamp()
         WHERE state IN ('pending', 'acknowledged') AND attempts >= 8 AND (lease_until IS NULL OR lease_until <= clock_timestamp())`;
       // The superseded decision keeps its record; its unsent signed bytes have

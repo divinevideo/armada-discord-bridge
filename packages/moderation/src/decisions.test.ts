@@ -1701,6 +1701,18 @@ test("a recovery interrupted after its audit never reopens an operator-gated sen
   } finally { h.outbox.renew = renew; await h.cleanup(); }
 });
 
+test("an abandoned pre-fix pending operator marker is quarantined before claim selection", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision } = await lostGeneration(h);
+    await sql`UPDATE moderation.deliveries SET state = 'pending', result_code = 'concord_recovery_requires_operator', available_at = clock_timestamp(), token = NULL, lease_until = NULL WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
+    const before = (await sql`SELECT publication_event_ids, publication_metadata FROM moderation.deliveries WHERE decision_id = ${decision.decisionId} AND target = 'concord'`)[0];
+    expect(await h.outbox.claim()).toBeUndefined();
+    expect(await concordRow(decision.decisionId)).toMatchObject({ state: "failed", attempts: 1, result_code: "concord_recovery_requires_operator" });
+    expect((await sql`SELECT publication_event_ids, publication_metadata FROM moderation.deliveries WHERE decision_id = ${decision.decisionId} AND target = 'concord'`)[0]).toEqual(before);
+  } finally { await h.cleanup(); }
+});
+
 for (const provenance of ["retained", "supplied", "relay"] as const) test(`owner endorsement is supersession, not applied receipt, with ${provenance} original bytes`, async () => {
   const h = await memberHarness("member");
   try {
