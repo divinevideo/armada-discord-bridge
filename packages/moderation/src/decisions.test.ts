@@ -1,5 +1,5 @@
 import { createPublicationRecoveryActions } from "./publicationOperator";
-import { buildBanlistEdition, buildGrantEdition, buildChannelEdition, banlistLocator, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState, streamPubkeysForRelay, signStreamAuths } from "@armada-bridge/concord-core";
+import { buildBanlistEdition, buildGrantEdition, buildChannelEdition, banlistLocator, grantLocator, hex32, currentControlWriteGroup, sealEdition, parseEdition, openWrap, bytesToHex, foldControlState, streamPubkeysForRelay, signStreamAuths } from "@armada-bridge/concord-core";
 import { generateSecretKey, verifyEvent } from "nostr-tools/pure";
 import { localIdentity } from "../../bridge/src/concord/signer";
 import { recoverPublication, assertPilotPublicationProvenance, publicationBlockers } from "./publicationRecovery";
@@ -1267,6 +1267,20 @@ for (const changed of ["deleted_channel", "promoted_target"] as const) test(`pro
     // The target-specific relaxation must not become an expired-intent bypass.
     expect(await executeDelivery({ ...relay.decision, expiresAt: new Date(0) }, relay.target, context)).toMatchObject({ state: "failed" });
     expect((await store.getPolicy(h.f.community.idHex))!.banned).toContain(h.who.pk);
+    await store.setBan(h.f.community.idHex, h.f.moderator.pk, true);
+    expect(await executeDelivery(relay.decision, relay.target, context)).toMatchObject({ state: "failed" });
+    await store.setBan(h.f.community.idHex, h.f.moderator.pk, false);
+    const rekeyId = crypto.randomUUID().replaceAll("-", "").repeat(2);
+    await sql`INSERT INTO moderation.rekey_events (event_id, community_id, epoch, event) VALUES (${rekeyId}, ${h.f.community.idHex}, ${(h.f.community.rootEpoch + 1n).toString()}, ${sql.json({})})`;
+    expect(await executeDelivery(relay.decision, relay.target, context)).toMatchObject({ state: "failed" });
+    await sql`DELETE FROM moderation.rekey_events WHERE event_id = ${rekeyId}`;
+    const grantId = bytesToHex(grantLocator(h.f.community.id, hex32(h.f.moderator.pk))), grantHead = controlState(await recoveryPolicy(h)).folded.heads.get(grantId)!;
+    h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: h.f.moderator.pk, roleIds: [] }, { actorPubkey: h.f.owner.pk, version: grantHead.version + 1n, prevHash: grantHead.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    expect(controlState(await recoveryPolicy(h)).folded.incomplete).toEqual([]);
+    expect(await executeDelivery(relay.decision, relay.target, context)).toMatchObject({ state: "failed" });
+    expect((await store.getPolicy(h.f.community.idHex))!.banned).toContain(h.who.pk);
+    const revoked = controlState(await recoveryPolicy(h)).folded.heads.get(grantId)!;
+    h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: h.f.moderator.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: revoked.version + 1n, prevHash: revoked.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
     expect(await executeDelivery(relay.decision, relay.target, context)).toEqual({ state: "verified", code: "relay_member_policy_verified" });
     expect((await store.getPolicy(h.f.community.idHex))!.banned).not.toContain(h.who.pk);
   } finally { await h.cleanup(); }
