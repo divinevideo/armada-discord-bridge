@@ -1864,6 +1864,53 @@ test("non-owner hash equivalence refuses a delayed edition that changes ban-time
   } finally { await h.cleanup(); }
 });
 
+// Adding an already-held original changes nothing; only disagreement between
+// fresh and held views can refuse this receipt. An equal-ranked moderator's
+// ban survives only through a carried owner list, omitted by a held floor.
+test("non-owner hash equivalence refuses even a held original when a held floor drops a carried ban", async () => {
+  const h = await memberHarness("member");
+  try {
+    const other = localIdentity(generateSecretKey()), equal = localIdentity(generateSecretKey());
+    for (const who of [other, equal]) h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: who.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    const { folded } = controlState(await recoveryPolicy(h)), head = folded.heads.get(bytesToHex(banlistLocator(h.f.community.id)))!;
+    h.published.push(await sealEdition(buildBanlistEdition(h.f.community.id, [...folded.banned, equal.pk].sort(), { actorPubkey: h.f.owner.pk, version: head.version + 1n, prevHash: head.hash }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    const { decision, old, edition } = await lostGeneration(h), peer = new ConcordActions(h.f.community, other, () => recoveryPolicy(h));
+    const { authority } = await peer.authorize(decision);
+    h.published.push(await endorseGeneration(h, edition, other, authority), old);
+    h.published.push(...await peer.prepare({ ...decision, decisionId: crypto.randomUUID(), author: "ac".repeat(32) }));
+    const state = controlState(await recoveryPolicy(h));
+    expect(state.folded.banned.has(equal.pk)).toBe(true);
+    expect(foldControlState(state.editions, h.f.community.id, h.f.owner.pk, state.folded.heads).banned.has(equal.pk)).toBe(false);
+    expect(await h.actions.publicationInCurrentHistory(decision, [old])).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
+// Publisher timestamps can mask a sibling's ban-time change in a fresh fold.
+// A held floor omits that older owner history, exposing the semantic change.
+test("non-owner hash equivalence refuses a delayed edition that changes ban-time only under a held floor", async () => {
+  const h = await memberHarness("member");
+  try {
+    const ahead = Math.floor(Date.now() / 1000) + 600;
+    for (const [banned, skew] of [[[h.f.bannedMember.pk, h.who.pk], 0], [[h.f.bannedMember.pk], 1]] as const) {
+      const { folded } = controlState(await recoveryPolicy(h)), head = folded.heads.get(bytesToHex(banlistLocator(h.f.community.id)))!;
+      h.published.push(await sealEdition(buildBanlistEdition(h.f.community.id, [...banned].sort(), { actorPubkey: h.f.owner.pk, version: head.version + 1n, prevHash: head.hash, createdAtSecs: ahead + skew }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    }
+    const { decision, old, edition } = await lostGeneration(h, "7"), other = localIdentity(generateSecretKey());
+    h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: other.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    const { authority } = await new ConcordActions(h.f.community, other, () => recoveryPolicy(h)).authorize(decision); let sibling!: NostrEvent;
+    for (let i = 1; i <= 2000; i++) {
+      sibling = await sealEdition(buildBanlistEdition(h.f.community.id, JSON.parse(edition.content), { actorPubkey: other.pk, version: edition.version, prevHash: edition.prevHash, authority, createdAtSecs: edition.createdAt + i }), currentControlWriteGroup(h.f.community), other.signer);
+      if (bytesToHex(parseEdition(openWrap(sibling, h.f.controlStream.key)).rumorId) > bytesToHex(edition.rumorId)) break;
+    }
+    expect(bytesToHex(parseEdition(openWrap(sibling, h.f.controlStream.key)).rumorId) > bytesToHex(edition.rumorId)).toBe(true);
+    h.published.push(sibling);
+    const before = controlState(await recoveryPolicy(h)), floor = before.folded.heads;
+    expect(foldControlState([...before.editions, edition], h.f.community.id, h.f.owner.pk).bannedAt).toEqual(before.folded.bannedAt);
+    expect(foldControlState([...before.editions, edition], h.f.community.id, h.f.owner.pk, floor).bannedAt.get(decision.author)).not.toBe(foldControlState(before.editions, h.f.community.id, h.f.owner.pk, floor).bannedAt.get(decision.author));
+    expect(await h.actions.publicationInCurrentHistory(decision, [old])).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
 test("recovery registers scoped signable control keys before fetching and channel keys after replay refresh", async () => {
   const h = await memberHarness("member"); let requests = 0;
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => { requests++; return new Response("unused test endpoint", { status: 503 }); } });
