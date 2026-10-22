@@ -1054,8 +1054,19 @@ for (const state of ["pending", "acknowledged"] as const) test(`pre-upgrade ${st
     }
     expect([...ids].sort()).toEqual([first.decisionId, second.decisionId].sort());
     expect(sends).toBe(0);
-    expect(await concordRow(first.decisionId)).toMatchObject({ state: "failed", attempts: 2 });
-    expect(await concordRow(second.decisionId)).toMatchObject({ state: "failed", attempts: 2 });
+    expect(await concordRow(first.decisionId)).toMatchObject({ state, attempts: 2 });
+    expect(await concordRow(second.decisionId)).toMatchObject({ state, attempts: 2 });
+    const [schedule] = await sql`SELECT available_at FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    await h.outbox.refreshPublicationProof(first.decisionId, h.staff);
+    expect((await sql`SELECT available_at FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`)[0].available_at).toEqual(schedule.available_at);
+    // A later pass still observes both, rather than leaving two new failures
+    // ineligible until expiry or a third member happens to enqueue work.
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id IN ${sql([first.decisionId, second.decisionId])} AND target = 'concord'`;
+    const repeated = [await h.outbox.claim(), await h.outbox.claim()];
+    expect(repeated.map(claim => claim?.reconcileOnly)).toEqual([true, true]);
+    expect(repeated.map(claim => claim?.decision.decisionId).sort()).toEqual([first.decisionId, second.decisionId].sort());
+    for (const claim of repeated) await h.outbox.defer(claim!);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id IN ${sql([first.decisionId, second.decisionId])} AND target = 'concord'`;
     // Absence has not become a settled receipt or released new community work.
     const next = await h.accept("unban_member");
     expect(await h.outbox.claim()).toBeUndefined();

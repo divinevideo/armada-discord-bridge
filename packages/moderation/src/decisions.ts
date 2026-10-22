@@ -371,6 +371,10 @@ export class Decisions {
   }
   async complete(claim: DeliveryClaim, state: DeliveryState, resultCode: string, retryAfterSeconds = 0, connection: postgres.Sql | postgres.TransactionSql = this.sql): Promise<void> {
     if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds < 0 || !/^[a-z_]{1,64}$/.test(resultCode)) throw new Error("Invalid delivery result code");
+    // An inconclusive upgrade readback is not cancellation of the original
+    // retryable send. Retain its state so the next observation remains due
+    // while its peer is unsettled, or normal guarded retry can resume later.
+    if (claim.reconcileOnly && state === "failed" && resultCode === "concord_recovery_awaiting_proof" && (claim.claimedState === "pending" || claim.claimedState === "acknowledged")) state = claim.claimedState;
     if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
     // Failed observation cannot downgrade an operator-only outcome into a
     // Retry-able transport failure. Only the worker's proved resolution clears
@@ -409,8 +413,10 @@ export class Decisions {
       if (this.communities.get(decision.community_id) !== actor.orgId) throw new Error("Decision unavailable");
       // Wake the existing operator-owned readback path without changing state,
       // consuming a send attempt, disturbing a lease or reopening Retry.
+      // Pending upgrade reads keep the original send schedule: advancing it
+      // here could accelerate a normal resend if its peer settled meanwhile.
       await tx`UPDATE moderation.deliveries d SET available_at = clock_timestamp() FROM moderation.decisions c
-        WHERE c.decision_id = d.decision_id AND d.decision_id = ${decisionId} AND (${tx.unsafe(publicationRecovery("d", "c"))})
+        WHERE c.decision_id = d.decision_id AND d.decision_id = ${decisionId} AND d.state = 'failed' AND (${tx.unsafe(publicationRecovery("d", "c"))})
           AND (d.lease_until IS NULL OR d.lease_until <= clock_timestamp())`;
     });
     return this.get(decisionId, actor);
