@@ -138,9 +138,12 @@ export class Lifecycle {
     // the existing worker observer refreshes due records before cleanup.
     if (erasingAudit && guildHistory && discord.discord_restriction_checked_at < decision.audit_delete_after) return false;
     if (discord.discord_restriction_state !== "absent" && !(discord.discord_restriction_state === "not_applicable" && !guildHistory)) return false;
+    // Latest intent needs applied proof (settledConcordReceipt), not merely a
+    // resolved/superseded old action. Readback is as valid as a verified send.
     const [unban] = await tx`SELECT n.decision_id FROM moderation.member_order_heads h JOIN moderation.decisions n ON n.org_id = h.org_id AND n.community_id = h.community_id AND n.author = h.author AND n.source_revision = h.latest_revision AND n.execution_id = h.latest_execution_id::text
       WHERE h.org_id = ${decision.org_id} AND h.community_id = ${decision.community_id} AND h.author = ${decision.author} AND n.action = 'unban_member'
-        AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'concord' AND d.state = 'verified')
+        AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'concord' AND
+          (d.state = 'verified' OR (d.state = 'not_applicable' AND d.result_code IN ('concord_publication_settled','concord_superseded_publication_settled'))))
         AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'divine_relay' AND d.state = 'verified')`;
     if (!unban) return false;
     const policy = await new PolicyStore(tx as unknown as postgres.Sql).getPolicy(decision.community_id);

@@ -473,10 +473,11 @@ test("a case whose hold and journal cleanup fails does not stop later cases in t
   } finally { await client.end(); }
 });
 
-for (const code of ["concord_publication_settled", "concord_superseded_publication_settled", "concord_operator_superseded"]) test(`operator audit cleanup honors resolved receipt ${code} after independent retention and repeated boot`, async () => {
+for (const headState of ["verified", "settled"] as const) for (const code of ["concord_publication_settled", "concord_superseded_publication_settled", "concord_operator_superseded"]) test(`audit cleanup honors resolved ${code} with ${headState} latest unban after retention and repeated boot`, async () => {
   const author = randomBytes(32).toString("hex"), caseId = await memberCase(author);
   const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
   await settleMember(ban.decisionId); await settleMember(unban.decisionId);
+  if (headState === "settled") await sql`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = 'concord_publication_settled' WHERE decision_id = ${unban.decisionId} AND target = 'concord'`;
   await sql`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = ${code}, publication_event_ids = ARRAY[${randomBytes(32).toString("hex")}] WHERE decision_id = ${ban.decisionId} AND target = 'concord'`;
   const recoveryId = crypto.randomUUID();
   if (code === "concord_operator_superseded") {
@@ -528,4 +529,17 @@ for (const [state, code] of [["not_applicable", null], ["not_applicable", "conco
     await new Lifecycle(operator, undefined, memberScope, {}).expireAudit();
     expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban.decisionId}`)[0].audit).not.toBeNull();
   } finally { await operator.end(); }
+});
+
+for (const code of ["concord_operator_superseded", "concord_recovery_awaiting_proof", null]) test(`latest unban without applied proof ${code} cannot retire membership audit`, async () => {
+  const author = randomBytes(32).toString("hex"), caseId = await memberCase(author);
+  const ban = await memberDecision(caseId, "ban_member", "1"), unban = await memberDecision(caseId, "unban_member", "2");
+  await settleMember(ban.decisionId); await settleMember(unban.decisionId);
+  await sql`UPDATE moderation.deliveries SET state = 'not_applicable', result_code = ${code} WHERE decision_id = ${unban.decisionId} AND target = 'concord'`;
+  expect(await observeMember(ban.decisionId)).toBe(true);
+  await expect(new Lifecycle(sql, cipher, memberScope, memberPolicy).closeLifecycle({ decisionId: ban.decisionId, reason: "unproved head" }, memberActor)).rejects.toThrow(/not eligible/);
+  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '2 minutes', audit_retention_seconds = 60, audit_delete_after = clock_timestamp() - interval '1 minute' WHERE decision_id = ${ban.decisionId}`; });
+  const operator = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice() {} });
+  try { await expect(Promise.resolve(operator`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban.decisionId}`)).rejects.toThrow(/not eligible/); }
+  finally { await operator.end(); }
 });

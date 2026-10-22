@@ -36,7 +36,8 @@ BEGIN
       OR (OLD.action IN ('ban_member','unban_member') AND (
         NOT EXISTS (SELECT 1 FROM moderation.member_order_heads h JOIN moderation.decisions n ON n.org_id = h.org_id AND n.community_id = h.community_id AND n.author = h.author AND n.source_revision = h.latest_revision AND n.execution_id = h.latest_execution_id::text
           WHERE h.org_id = OLD.org_id AND h.community_id = OLD.community_id AND h.author = OLD.author AND n.action = 'unban_member'
-            AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'concord' AND d.state = 'verified')
+            AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'concord' AND
+              (d.state = 'verified' OR (d.state = 'not_applicable' AND d.result_code IN ('concord_publication_settled','concord_superseded_publication_settled'))))
             AND EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = n.decision_id AND d.target = 'divine_relay' AND d.state = 'verified'))
         OR EXISTS (SELECT 1 FROM moderation.member_bans b WHERE b.community_id = OLD.community_id AND b.author = OLD.author AND b.blocked)
         OR NOT EXISTS (SELECT 1 FROM moderation.deliveries d WHERE d.decision_id = OLD.decision_id AND d.target = 'discord' AND d.discord_restriction_checked_at >= d.available_at
