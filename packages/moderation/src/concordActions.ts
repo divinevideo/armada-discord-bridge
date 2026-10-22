@@ -138,7 +138,9 @@ export class ConcordActions {
     return [event];
   }
   /** Read-only publication receipt, not permission to execute an expired or
-   * superseded action. Only exact canonical ancestry settles uncertainty. */
+   * superseded action. Only canonical ancestry settles uncertainty: this exact
+   * publication, or a non-owner peer's same-hash edition once canonicalIncludes
+   * proves adding the delayed original changes none of its three checked views. */
   async publicationInCurrentHistory(decision: StoredDecision, events: NostrEvent[]): Promise<boolean> {
     const policy = await this.refresh();
     if (decision.action === "remove_message" || events.length !== 1 || decision.target.communityId !== this.community.idHex || policy.communityId !== this.community.idHex || !policy.complete || policy.rekeyPending || policy.validUntil <= Date.now()) return false;
@@ -171,7 +173,9 @@ export class ConcordActions {
       const current = folded.heads.get(bytesToHex(edition.entityId));
       // Readback may arrive after another valid edition extends ours. Follow
       // the canonical head's actual hashes, not just its current member set:
-      // matching intent alone would credit an unrelated moderator's edit.
+      // matching intent alone would credit an unrelated moderator's edit. A
+      // peer's same-hash edition is credited only under canonicalIncludes'
+      // convergence proof, never an owner endorsement of our content.
       if (canonicalIncludes(edition, { editions, folded }, this.community.id)) return;
       if (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash)))) throw new StalePreparedBanlistError("Prepared banlist would overwrite a concurrent edit");
       const next = foldControlState([...editions, edition], this.community.id, this.community.owner, folded.heads);

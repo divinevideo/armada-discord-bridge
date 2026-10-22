@@ -1,10 +1,12 @@
 -- Canonical readback records a settled observation, not a new send. Align
 -- audit erasure with the application's exact settled receipt codes while
 -- retaining all closure, retention, appeal, hold and restriction predicates.
--- The state/code pair must match resolvedConcordReceipt in src/concordDelivery.ts.
--- Owner supersession resolves uncertainty without proving the old action was
--- applied. All other closure, current unban, restriction and retention gates
--- still apply before erasure; relay/reversal proof uses the narrower predicate.
+-- The old decision's state/code pairs must match resolvedConcordReceipt in
+-- src/concordDelivery.ts. Owner supersession resolves uncertainty without
+-- proving the old action was applied, so the latest-unban clause, like relay
+-- and reversal proof, must match the narrower settledConcordReceipt. All other
+-- closure, current unban, restriction and retention gates still apply before
+-- erasure.
 -- No existing rows/deadlines are rewritten. 017 replays first on boot.
 CREATE OR REPLACE FUNCTION moderation.protect_decision_audit() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 BEGIN

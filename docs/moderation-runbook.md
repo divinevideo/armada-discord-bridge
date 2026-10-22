@@ -496,7 +496,8 @@ exists, the status reports only the current override, without telling staff to
 undo it. `absent` is not a guarantee of admission: the current Concord fold and
 other relay policy still apply. Supersession resolves
 publication uncertainty for lifecycle closure, but it is not enforcement
-proof: current applied Concord unban (verified send or exact canonical receipt),
+proof: current applied Concord unban (verified send or settled canonical
+receipt, including a converged non-owner logical receipt),
 verified relay unban, Discord restriction observations,
 holds, appeals and independent retention must still satisfy every existing
 closure/erasure guard. Recovery actor/reason can then expire with that
