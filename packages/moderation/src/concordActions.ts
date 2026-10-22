@@ -6,7 +6,7 @@ import type { StoredDecision } from "./decisions";
 import { controlState, verifiedEvent } from "./relayPolicy";
 export interface PublicationMetadata { entityId: string; version: string; prevHash: string | null; selfHash: string; rumorId: string; author: string }
 export class StalePreparedBanlistError extends Error {}
-function canonicalIncludes(edition: ParsedEdition, { editions, folded }: ReturnType<typeof controlState>): boolean {
+function canonicalIncludesHash(edition: ParsedEdition, { editions, folded }: ReturnType<typeof controlState>): boolean {
   const entity = bytesToHex(edition.entityId);
   const current = folded.heads.get(entity);
   const history = new Map(editions.filter((candidate) => bytesToHex(candidate.entityId) === entity).map((candidate) => [bytesToHex(candidate.selfHash), candidate]));
@@ -18,6 +18,18 @@ function canonicalIncludes(edition: ParsedEdition, { editions, folded }: ReturnT
     ancestor = previous;
   }
   return false;
+}
+function canonicalIncludes(edition: ParsedEdition, state: ReturnType<typeof controlState>): boolean {
+  if (!canonicalIncludesHash(edition, state)) return false;
+  const entity = bytesToHex(edition.entityId), hash = bytesToHex(edition.selfHash);
+  const samePublication = (candidate: ParsedEdition) => candidate.author === edition.author && bytesToHex(candidate.rumorId) === bytesToHex(edition.rumorId);
+  const head = state.folded.headEditions.get(entity);
+  // Content hashes deliberately omit publisher and rumor identity. The kernel
+  // tells us the exact winning head; intermediate same-hash siblings are not
+  // an exact publication receipt unless their identities are unambiguous.
+  // Owner endorsement remains a separate structural supersession proof below.
+  if (head?.version === edition.version) return samePublication(head);
+  return state.editions.filter(candidate => bytesToHex(candidate.entityId) === entity && bytesToHex(candidate.selfHash) === hash).every(samePublication);
 }
 export class ConcordActions {
   constructor(readonly community: CommunityV2, readonly identity: { pk: string; signer: StreamSigner }, private readonly refresh: () => Promise<CommunityPolicy>) {
@@ -53,7 +65,7 @@ export class ConcordActions {
     if (metadata.entityId !== eid || metadata.author !== this.identity.pk || !/^[1-9][0-9]*$/.test(metadata.version) || ![metadata.selfHash, metadata.rumorId, metadata.author, ...(metadata.prevHash ? [metadata.prevHash] : [])].every(id => /^[0-9a-f]{64}$/.test(id))) return false;
     const version = BigInt(metadata.version), head = folded.headEditions.get(eid);
     if (!head || head.author !== this.community.owner || head.version <= version) return false;
-    const sibling = editions.find(p => bytesToHex(p.entityId) === eid && p.author === this.community.owner && p.version === version && canonicalIncludes(p, { editions, folded }));
+    const sibling = editions.find(p => bytesToHex(p.entityId) === eid && p.author === this.community.owner && p.version === version && canonicalIncludesHash(p, { editions, folded }));
     if (!sibling || (sibling.prevHash ? bytesToHex(sibling.prevHash) : null) !== metadata.prevHash || bytesToHex(sibling.selfHash) !== metadata.selfHash) return false;
     // A client may already hold the lost edition's hash as its floor. A
     // different-content owner sibling cannot connect that client's chain,

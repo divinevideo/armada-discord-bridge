@@ -1660,3 +1660,31 @@ test("a recovery interrupted after its audit never reopens an operator-gated sen
     await expect(h.outbox.retry(decision.decisionId, h.staff)).rejects.toThrow();
   } finally { h.outbox.renew = renew; await h.cleanup(); }
 });
+
+for (const provenance of ["retained", "supplied", "relay"] as const) test(`owner endorsement is supersession, not applied receipt, with ${provenance} original bytes`, async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, old, edition } = await lostGeneration(h);
+    h.published.push(await endorseGeneration(h, edition)); h.published.push(await advanceOwner(h));
+    if (provenance !== "retained") await expireGeneration(h, decision.decisionId);
+    if (provenance === "relay") h.published.push(old);
+    expect(await h.actions.publicationInCurrentHistory(decision, [old])).toBe(false);
+    const result = await recoverPublication({ sql, decisions: h.outbox, cipher, actions: h.actions, relay: h.relay as never, actor: recoveryStaff(h),
+      request: { decisionId: decision.decisionId, expectedVersion: 0, eventId: old.id, operation: "prove", reason: "Synthetic publisher distinction", ...(provenance === "supplied" ? { originalEvent: old } : {}) } });
+    expect(result).toMatchObject({ state: "not_applicable", code: "concord_operator_superseded" });
+    await expect(h.outbox.getReversalContext(decision.decisionId, h.staff)).rejects.toThrow(/unavailable/);
+  } finally { await h.cleanup(); }
+});
+test("background receipt readback cannot count an owner's same-hash endorsement as the original publication", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, old, edition } = await lostGeneration(h);
+    h.published.push(await endorseGeneration(h, edition)); h.published.push(await advanceOwner(h)); h.published.push(old);
+    await expireGeneration(h, decision.decisionId);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
+    const claim = (await h.outbox.claim())!;
+    expect(claim.reconcileOnly).toBe(true);
+    expect(await h.deliver(claim)).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
+    expect(await concordRow(decision.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator" });
+  } finally { await h.cleanup(); }
+});
