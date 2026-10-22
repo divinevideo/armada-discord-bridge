@@ -1,7 +1,7 @@
 import postgres from "postgres";
 import type { CommunityV2 } from "@armada-bridge/concord-core";
 import type { LocalIdentity } from "../../bridge/src/concord/signer";
-import { rehydrateCommunity } from "@armada-bridge/concord-core";
+import { rehydrateCommunity, registerStreamKeys, controlGroups, guestbookGroups, baseRekeyGroupKey, channelsView } from "@armada-bridge/concord-core";
 import { localIdentity } from "../../bridge/src/concord/signer";
 import { RelayPool } from "../../bridge/src/concord/pool";
 import { loadCommunityOrgs } from "./config";
@@ -10,17 +10,35 @@ import { Decisions } from "./decisions";
 import { EvidenceCipher } from "./evidence";
 import { PolicyStore } from "./policyStore";
 import { PolicyWatcher } from "./policyWatcher";
+import { loadPublicCapacity, PublicCapacityStore } from "./publicCapacity";
+import { controlState } from "./relayPolicy";
 import { assertPilotPublicationProvenance, publicationBlockers, recoverPublication, type RecoveryRequest } from "./publicationRecovery";
 
 /** recoverPublication invokes authority only while holding controller and
  * execution ownership. Proof must not open admission; replay may refresh an
  * eligible pilot exactly as the ordinary worker does. Guard every refresh. */
-export function createPublicationRecoveryActions(options: { sql: postgres.Sql; community: CommunityV2; identity: LocalIdentity; store: PolicyStore; relay: Pick<RelayPool, "queryStrict">; operation: RecoveryRequest["operation"] }): ConcordActions {
+export function createPublicationRecoveryActions(options: { sql: postgres.Sql; community: CommunityV2; identity: LocalIdentity; store: PolicyStore; relay: Pick<RelayPool, "queryStrict"> & Partial<Pick<RelayPool, "urls">>; operation: RecoveryRequest["operation"]; capacity?: ReturnType<typeof loadPublicCapacity> }): ConcordActions {
   const { sql, community, identity, store, relay, operation } = options;
+  if (relay.urls?.length) registerStreamKeys([...controlGroups(community), ...guestbookGroups(community), ...community.heldRoots.map(root => baseRekeyGroupKey(root.key, community.id, root.epoch + 1n))], relay.urls);
   const watcher = new PolicyWatcher(community, store, relay, [identity.pk], identity, { readOnly: operation === "prove" });
   return new ConcordActions(community, identity, async () => {
-    if (operation === "replay") await assertPilotPublicationProvenance(sql, community.idHex);
-    return watcher.refresh();
+    const capacity = operation === "replay" ? options.capacity ?? loadPublicCapacity() : undefined;
+    const orgId = capacity?.communities.get(community.idHex);
+    if (operation === "replay") {
+      await assertPilotPublicationProvenance(sql, community.idHex);
+      if (!orgId) throw new Error("Capacity community scope unavailable");
+      if (!capacity?.contract) throw new Error("Reviewed capacity contract required for replay");
+    }
+    const policy = await watcher.refresh();
+    if (capacity && orgId) {
+      // The normal worker is stopped during maintenance. Reproduce its fresh
+      // observation under the same authority/ownership path; never waive the
+      // validator's sample-age check or clear its durable pause/contract hash.
+      const observed = await new PublicCapacityStore(sql, capacity.contract).observeCurrent(orgId, community.idHex);
+      if (observed.state === "unknown") throw new Error("Capacity observation unavailable");
+      if (relay.urls?.length) registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap(channel => channel.streams.map(stream => stream.group)), relay.urls);
+    }
+    return policy;
   });
 }
 

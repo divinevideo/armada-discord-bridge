@@ -21,11 +21,15 @@ import { PolicyStore } from "./policyStore";
 import { controlState } from "./relayPolicy";
 import { ModerationWorker, executeDelivery, type ExecutionContext } from "./worker";
 import { createExecutionContext } from "./executionContext";
+import { PublicCapacityStore } from "./publicCapacity";
+import type { PublicCapacityContract } from "./capacityContract";
 const sql = postgres(process.env.DATABASE_URL!, { onnotice: () => {} });
 const org = crypto.randomUUID(), caseId = crypto.randomUUID(), executionId = crypto.randomUUID();
 const actor = { orgId: org, actorId: "synthetic-reviewer", permissions: ["remove_message", "ban_member", "unban_member", "retry"] };
 const input = { caseId, executionId, action: "remove_message" as const, reason: "Synthetic removal", scope: "message" as const, discordGuildConfirmed: false };
 const cipher = new EvidenceCipher(randomBytes(32), 3600, 100_000);
+// Synthetic calibration for recovery/admission wiring, not a launch envelope.
+const recoveryContract = { sourceSha: "1".repeat(40), platform: "linux/amd64", maxima: { historyCount: 128, historyBytes: 1000000, rekeyCount: 16, streamCount: 64, inFlight: 4, innerAdmissionMs: 1000 }, thresholds: { warningHistoryCount: 32, pauseHistoryCount: 64, urgentReserve: 16 }, maxSampleAgeMs: 30000 } as PublicCapacityContract;
 let decisions: Decisions;
 beforeAll(async () => {
   await migrateModeration(sql);
@@ -303,6 +307,7 @@ async function memberHarness(subject: "member" | "bannedMember") {
     await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`DELETE FROM moderation.lifecycle_events WHERE org_id = ${orgId}`; });
     await sql`DELETE FROM moderation.decisions WHERE org_id = ${orgId}`;
     await sql`DELETE FROM moderation.cases WHERE org_id = ${orgId}`;
+    await sql`DELETE FROM moderation.public_capacity_state WHERE community_id = ${f.community.idHex}`;
     await sql`DELETE FROM moderation.community_policy WHERE community_id = ${f.community.idHex}`;
   };
   return { f, who, staff, outbox, relay, actions, published, request, accept, deliver, drain, banned, cleanup };
@@ -1414,6 +1419,10 @@ test("recovery refuses missing IDs, losing same-version editions, and concurrent
 
 test("operator exact replay refreshes expired persisted admission and the next member unban crosses real relay admission", async () => {
   const h = await memberHarness("member"), store = new PolicyStore(sql);
+  const capacity = { communities: new Map([[h.f.community.idHex, h.staff.orgId]]), contract: recoveryContract };
+  const observer = new PublicCapacityStore(sql, recoveryContract);
+  const validator = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_validator" }, onnotice() {} });
+  const guarded = new PolicyStore(validator, { capacity });
   try {
     const first = await h.accept("ban_member");
     let original!: NostrEvent;
@@ -1422,19 +1431,25 @@ test("operator exact replay refreshes expired persisted admission and the next m
       await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
     }
     const next = await otherCommunityMember(h);
+    await observer.observeCurrent(h.staff.orgId, h.f.community.idHex);
+    await sql`UPDATE moderation.public_capacity_state SET state = 'unknown' WHERE community_id = ${h.f.community.idHex}`;
+    expect((await guarded.admit(original)).action).toBe("reject");
+    await observer.pause({ orgId: h.staff.orgId, communityId: h.f.community.idHex, reasonCode: "synthetic_pause" });
+    await sql`UPDATE moderation.public_capacity_state SET observed_at = clock_timestamp() - interval '1 day' WHERE community_id = ${h.f.community.idHex}`;
+    expect((await guarded.admit(original)).action).toBe("reject");
     await store.invalidate(h.f.community.idHex);
     expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
     const admissions: string[] = [];
     const relay = {
       queryStrict: async (filters: { ids?: string[] }[]) => filters[0].ids ? h.published.filter(event => filters[0].ids!.includes(event.id)) : [...h.f.policy.controlEvents, ...h.published],
       publish: async (event: NostrEvent) => {
-        const result = await store.admit(event);
+        const result = await guarded.admit(event);
         admissions.push(result.action);
         if (result.action !== "accept") throw Error("Local relay admission rejected");
         await h.relay.publish(event);
       },
     };
-    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay" });
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay", capacity });
     const result = await recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never,
       actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
       request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, operation: "replay", reason: "Synthetic relay restored after policy expiry" } });
@@ -1445,6 +1460,31 @@ test("operator exact replay refreshes expired persisted admission and the next m
     expect((await concordRow(next.decisionId)).state).toBe("verified");
     expect(admissions).toEqual(["accept", "accept"]);
     expect(controlState((await store.getPolicy(h.f.community.idHex))!).folded.banned.has(h.f.bannedMember.pk)).toBe(false);
+    expect((await sql`SELECT state, contract_hash FROM moderation.public_capacity_state WHERE community_id = ${h.f.community.idHex}`)[0]).toMatchObject({ state: "paused", contract_hash: observer.contractHash });
+    // Proof-only maintenance must not perform that admission/capacity refresh.
+    const later = await h.accept("ban_member"); let lost!: NostrEvent;
+    await h.deliver((await h.outbox.claim())!, { ...relay, publish: async event => { lost = event; await relay.publish(event); throw Error("lost acknowledgment"); } });
+    await store.invalidate(h.f.community.idHex);
+    await sql`UPDATE moderation.public_capacity_state SET observed_at = clock_timestamp() - interval '1 day' WHERE community_id = ${h.f.community.idHex}`;
+    const [beforeProof] = await sql`SELECT * FROM moderation.public_capacity_state WHERE community_id = ${h.f.community.idHex}`;
+    expect(await recoverPublication({ sql, decisions: h.outbox, cipher, relay: relay as never,
+      actions: createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "prove", capacity }), actor: recoveryStaff(h),
+      request: { decisionId: later.decisionId, expectedVersion: 0, eventId: lost.id, operation: "prove", reason: "Synthetic read-only proof" } })).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
+    expect((await sql`SELECT * FROM moderation.public_capacity_state WHERE community_id = ${h.f.community.idHex}`)[0]).toEqual(beforeProof);
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
+  } finally { await validator.end(); await h.cleanup(); }
+});
+
+test("replay without a reviewed capacity contract cannot refresh admission", async () => {
+  const h = await memberHarness("member"), store = new PolicyStore(sql); let reads = 0;
+  try {
+    const { decision } = await lostGeneration(h); await store.invalidate(h.f.community.idHex);
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store,
+      relay: { queryStrict: async () => { reads++; return h.f.policy.controlEvents; } }, operation: "replay",
+      capacity: { communities: new Map([[h.f.community.idHex, h.staff.orgId]]), contract: undefined } });
+    await expect(actions.authorize(decision)).rejects.toThrow(/Reviewed capacity contract required/);
+    expect(reads).toBe(0); expect(h.published).toHaveLength(0);
+    expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
   } finally { await h.cleanup(); }
 });
 
@@ -1460,7 +1500,7 @@ for (const missingId of [false, true]) test(`excluded ${missingId ? "missing-ID"
     await store.invalidate(h.f.community.idHex);
     let reads = 0;
     const relay = { ...h.relay, queryStrict: async () => { reads++; return h.f.policy.controlEvents; } };
-    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay" });
+    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay", capacity: { communities: new Map([[h.f.community.idHex, h.staff.orgId]]), contract: recoveryContract } });
     await expect(recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never,
       actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
       request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, operation: "replay", reason: "Synthetic excluded community" } })).rejects.toThrow(/pilot_publication_provenance_required/);

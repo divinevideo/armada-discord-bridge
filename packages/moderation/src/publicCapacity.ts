@@ -82,7 +82,7 @@ export class PublicCapacityStore {
     if (projected.control && !policy.controlEvents.some(e => e.id === projected.control)) { snapshot.historyCount++; snapshot.historyBytes += projected.bytes; }
     if (projected.rekey && !(await tx`SELECT 1 FROM moderation.rekey_events WHERE event_id = ${projected.rekey}`).length) { snapshot.historyCount++; snapshot.rekeyCount++; snapshot.historyBytes += projected.bytes; }
     snapshot.innerAdmissionMs = gateElapsedMs;
-    if (!this.contract || !row || row.contract_hash !== this.contractHash) throw new CapacityRefusal("Capacity configuration unavailable");
+    if (!this.contract || !row || row.contract_hash !== this.contractHash || row.state === "unknown") throw new CapacityRefusal("Capacity configuration unavailable");
     const evaluated = evaluatePublicCapacity({ ...snapshot, observedAt: row.observed_at.getTime() }, this.contract, Date.now());
     if (urgent) {
       if (snapshot.historyBytes > this.contract.maxima.historyBytes || snapshot.rekeyCount > this.contract.maxima.rekeyCount || snapshot.streamCount > this.contract.maxima.streamCount || gateElapsedMs > this.contract.maxima.innerAdmissionMs || evaluated.remainingBudget <= 0) throw new CapacityRefusal("Moderation capacity reserve exhausted");
