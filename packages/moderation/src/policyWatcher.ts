@@ -10,11 +10,11 @@ import { controlState, verifiedEvent } from "./relayPolicy";
 export class PolicyWatcher {
   private generation = 0;
   private running?: Promise<CommunityPolicy>;
-  constructor(readonly community: CommunityV2, private readonly store: PolicyStore, private readonly source: Pick<RelayPool, "queryStrict">, private readonly publicAuthors: string[], private readonly identity?: LocalIdentity) {}
+  constructor(readonly community: CommunityV2, private readonly store: PolicyStore, private readonly source: Pick<RelayPool, "queryStrict">, private readonly publicAuthors: string[], private readonly identity?: LocalIdentity, private readonly options: { readOnly?: boolean } = {}) {}
   async disconnected(): Promise<void> {
     this.generation++;
     // DB failure cannot keep admission alive: the validator uses that same DB.
-    await this.store.invalidate(this.community.idHex).catch(() => {});
+    if (!this.options.readOnly) await this.store.invalidate(this.community.idHex).catch(() => {});
   }
   refresh(): Promise<CommunityPolicy> {
     if (this.running) return this.running;
@@ -48,6 +48,13 @@ export class PolicyWatcher {
       if (folded.incomplete.length) throw new Error("Control history incomplete");
       policy.banned = [...folded.banned];
       policy.publicAuthors = [...new Set([...policy.publicAuthors, ...folded.liveInviteLinks])];
+      // Maintenance needs fresh authority without publishing an admission
+      // grant: unsuccessful provenance recovery must leave exclusion intact.
+      if (this.options.readOnly) {
+        const snapshot = await this.store.snapshot(policy);
+        if (generation !== this.generation) throw new Error("Control disconnected during refresh");
+        return snapshot;
+      }
       const rekeys = this.community.heldRoots.map((root) => ({ ...descriptor("rekey", baseRekeyGroupKey(root.key, this.community.id, root.epoch + 1n), root.epoch + 1n), previousEpoch: root.epoch.toString(), previousCommit: bytesToHex(epochKeyCommitment(root.epoch, root.key)) }));
       const streams = [...controlStreams, ...rekeys, ...guestbookGroups(this.community).map((key, index) => descriptor("guestbook", key, this.community.heldRoots[index].epoch))];
       for (const channel of channelsView(this.community, folded).filter((c) => !folded.channels.get(c.idHex)?.metadata.private)) {

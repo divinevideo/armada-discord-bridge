@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import type postgres from "postgres";
-import { PublicCapacityStore } from "./publicCapacity";
+import { CAPACITY_REFUSAL, CapacityRefusal, PublicCapacityStore } from "./publicCapacity";
 import type { PublicCapacityContract } from "./capacityContract";
 import { openWrap, parseEdition, banlistLocator, hex32, isAuthorized, Permissions, citationFromTags, citationSatisfied } from "@armada-bridge/concord-core";
 import type { NostrEvent } from "nostr-tools/pure";
@@ -11,7 +11,7 @@ import { controlState, HEX_ID, inspectRelayEvent, MAX_EVENT_BYTES, verifiedEvent
 type Sql = postgres.Sql | postgres.TransactionSql;
 const LOCK_NAMESPACE = 483210;
 export async function migrateModeration(sql: postgres.Sql): Promise<void> {
-  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql", "014_carrier_references.sql", "015_publication_receipt_ids.sql", "016_guild_scope_order.sql", "017_moderation_lifecycle.sql", "018_public_capacity.sql", "019_audit_restriction_refresh.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
+  const bodies = await Promise.all(["001_moderation.sql", "002_reports.sql", "003_stream_retirement.sql", "004_pending_rekeys.sql", "005_observed_members.sql", "006_incoming_moderation.sql", "007_coop_handoff.sql", "008_api_role.sql", "009_api_case_lock.sql", "010_concord_publication_attempt.sql", "011_api_delivery_retry.sql", "012_member_decision_supersession.sql", "013_member_source_order.sql", "014_carrier_references.sql", "015_publication_receipt_ids.sql", "016_guild_scope_order.sql", "017_moderation_lifecycle.sql", "018_public_capacity.sql", "019_audit_restriction_refresh.sql", "020_audit_closure_guard.sql", "021_hold_extension.sql", "022_settled_publication_audit.sql", "023_publication_recovery.sql"].map((name) => readFile(new URL(`../db/migrations/${name}`, import.meta.url), "utf8")));
   await sql.begin(async (tx) => {
     await tx`SELECT pg_advisory_xact_lock(${LOCK_NAMESPACE}, 1)`;
     for (const body of bodies) await tx.unsafe(body);
@@ -75,16 +75,29 @@ export class PolicyStore {
     const [row] = await sql`SELECT revision, payload FROM moderation.community_policy WHERE community_id = ${communityId}`;
     if (!row) return undefined;
     const streams = await sql`SELECT * FROM moderation.streams WHERE community_id = ${communityId} AND plane = 'control'`;
+    return { ...row.payload, ...await this.overlay(sql, communityId, row.payload), revision: Number(row.revision), controlStreams: streams.map(streamOf) };
+  }
+
+  /** Installed and maintenance authority must see the same durable additions.
+   * Omitting a pending rekey or relay ban would make proof authorize a member
+   * the normal installed-policy path refuses. This helper only reads. */
+  private async overlay(sql: Sql, communityId: string, payload: Pick<CommunityPolicy, "controlEvents" | "banned" | "rootEpoch">) {
     const accepted = await sql`SELECT event FROM moderation.accepted_control WHERE community_id = ${communityId} LIMIT 4097`;
-    const controlEvents = [...new Map([...row.payload.controlEvents, ...accepted.map((entry) => entry.event)].map((event) => [event.id, event])).values()];
+    const controlEvents = [...new Map([...payload.controlEvents, ...accepted.map((entry) => entry.event)].map((event) => [event.id, event])).values()];
     if (controlEvents.length > 4096) throw new Error("Control history exceeds bound");
     const overrides = await sql`SELECT author, blocked FROM moderation.member_bans WHERE community_id = ${communityId}`;
-    const banned = new Set<string>(row.payload.banned);
+    const banned = new Set<string>(payload.banned);
     for (const override of overrides) {
       if (override.blocked) banned.add(override.author); else banned.delete(override.author);
     }
-    const pending = await sql`SELECT 1 FROM moderation.rekey_events WHERE community_id = ${communityId} AND epoch > ${row.payload.rootEpoch ?? "0"} LIMIT 1`;
-    return { ...row.payload, controlEvents, rekeyPending: pending.length > 0, banned: [...banned], revision: Number(row.revision), controlStreams: streams.map(streamOf) };
+    const pending = await sql`SELECT 1 FROM moderation.rekey_events WHERE community_id = ${communityId} AND epoch > ${payload.rootEpoch ?? "0"} LIMIT 1`;
+    return { controlEvents, rekeyPending: pending.length > 0, banned: [...banned] };
+  }
+
+  /** Apply installed-policy overlays without persisting an admission grant. */
+  async snapshot(policy: CommunityPolicy): Promise<CommunityPolicy> {
+    requireId(policy.communityId);
+    return { ...policy, ...await this.overlay(this.sql, policy.communityId, policy) };
   }
 
   async rekeyEvents(communityId: string): Promise<NostrEvent[]> {
@@ -146,7 +159,7 @@ export class PolicyStore {
           try { return await read(); }
           catch (error) { lookupFailures.push(error); throw error; }
         };
-        const { result, carrier, references, rekey, observedAuthor, control, removals } = await inspectRelayEvent(event, {
+        const { result, carrier, references, rekey, observedAuthor, control, removals, retraction } = await inspectRelayEvent(event, {
           policy, stream: row && streamOf(row), now: Date.now, publicAuthorKnown: known.length > 0,
           isRemoved: (target) => lookup(async () => (await tx`SELECT 1 FROM moderation.tombstones WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId}`).length > 0),
           authorOf: (target) => lookup(async () => (await tx`SELECT author FROM moderation.carriers WHERE community_id = ${target.communityId} AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} LIMIT 1`)[0]?.author as string | undefined),
@@ -166,6 +179,10 @@ export class PolicyStore {
             if (control) urgent = bytesToHex(parseEdition(opened).entityId) === bytesToHex(banlistLocator(hex32(communityId)));
             else if (opened.kind === 5 || opened.kind === 3309) urgent = isAuthorized(state.folded.roster, opened.author, policy!.owner, opened.kind === 5 ? Permissions.MANAGE_MESSAGES : Permissions.KICK) && citationSatisfied(state.folded, hex32(communityId), opened.author, citationFromTags(opened.tags));
           }
+          // Verified self-deletions and guestbook leaves use the same measured
+          // gate as staff actions. They add no control or rekey history, so
+          // they preserve the finite reserve for actions that grow history.
+          if (retraction && !control && !rekey) urgent = true;
           await this.capacity.assertAdmission(tx, policy!, org, urgent, { control: control?.id, rekey: rekey?.event.id, bytes: Buffer.byteLength(JSON.stringify(event)) }, performance.now() - admissionStart);
         }
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
@@ -186,7 +203,12 @@ export class PolicyStore {
         signal?.throwIfAborted();
         return result;
       });
-    } catch (error) { if (restoring) throw error; return rejected; }
+    } catch (error) {
+      if (restoring) throw error;
+      // Only the capacity gate's own refusal is named. It runs after policy
+      // accepted the event, so it says nothing about why anything else fails.
+      return error instanceof CapacityRefusal ? { id, action: "reject", msg: CAPACITY_REFUSAL } : rejected;
+    }
   }
 
   private assertRecoveryPolicy(policy: CommunityPolicy | undefined): asserts policy is CommunityPolicy {

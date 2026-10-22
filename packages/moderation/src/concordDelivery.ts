@@ -4,6 +4,17 @@ import { StalePreparedBanlistError, type ConcordActions } from "./concordActions
 import type { Decisions, DeliveryClaim } from "./decisions";
 import { RetryableDeliveryError, type DeliveryAttempt } from "./discordActions";
 import { verifiedEvent } from "./relayPolicy";
+/** A read-only canonical receipt is not a verified send. Keep every consumer
+ * on this state/code pair; the SQL predicates and migration 022 repeat it. */
+export function settledConcordReceipt(state: string, resultCode: string | null | undefined): boolean {
+  return state === "not_applicable" && (resultCode === "concord_publication_settled" || resultCode === "concord_superseded_publication_settled");
+}
+/** Resolution can permit lifecycle closure after every other guard passes,
+ * without proving the old action was applied. Never use this wider predicate
+ * to authorize a relay unban or supply a reversal's enforcement proof. */
+export function resolvedConcordReceipt(state: string, resultCode: string | null | undefined): boolean {
+  return settledConcordReceipt(state, resultCode) || (state === "not_applicable" && resultCode === "concord_operator_superseded");
+}
 export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActions, decisions: Pick<Decisions, "saveEvents" | "replaceUnattemptedEvents" | "markPublicationAttempted">, relay: Pick<RelayPool, "publish" | "queryStrict">, assertCurrent: () => Promise<void>): Promise<DeliveryAttempt> {
   if (claim.reconcileOnly) {
     const waiting: DeliveryAttempt = { state: "failed", code: "concord_recovery_awaiting_proof", retryAfterSeconds: 300 };
@@ -36,7 +47,7 @@ export async function deliverConcord(claim: DeliveryClaim, actions: ConcordActio
   for (const event of events) {
     await assertCurrent();
     await actions.authorize(claim.decision);
-    await decisions.markPublicationAttempted(claim, events);
+    await decisions.markPublicationAttempted(claim, events, claim.decision.action === "remove_message" ? undefined : actions.publicationMetadata(events));
     // Persisting intent is an await, not an authority or lease guarantee for
     // the following network effect. Recheck after the durable write settles.
     await actions.authorize(claim.decision);

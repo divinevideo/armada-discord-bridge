@@ -5,10 +5,12 @@ import { observeWorkerCapacity } from "./runtime";
 import { collectMetrics } from "./metrics";
 import { PolicyStore, migrateModeration } from "./policyStore";
 import { PublicCapacityGuard, PublicCapacityStore, evaluatePublicCapacity, assertPublicChatAllowed, type PublicCapacitySnapshot } from "./publicCapacity";
+const CAPACITY_REFUSAL = "rate-limited: room is at capacity, try again later";
+const OPAQUE = "blocked: room policy unavailable or event not permitted";
 import { ConcordActions } from "./concordActions";
 import { controlState } from "./relayPolicy";
 import { buildRoleEdition, moderatorRole, sealEdition, currentControlWriteGroup, buildRumor, channelBindingTags, sealRumor, KIND_SEAL_ENCRYPTED } from "@armada-bridge/concord-core";
-import { wrapSeal } from "@armada-bridge/concord-core";
+import { wrapSeal, buildJoinRumor, buildLeaveRumor, currentGuestbookGroup } from "@armada-bridge/concord-core";
 import type { PublicCapacityContract } from "./capacityContract";
 const contract = { sourceSha: "1".repeat(40), platform: "linux/amd64", maxima: { historyCount: 128, historyBytes: 1000000, rekeyCount: 16, streamCount: 64, inFlight: 4, innerAdmissionMs: 1000 }, thresholds: { warningHistoryCount: 32, pauseHistoryCount: 64, urgentReserve: 16 }, maxSampleAgeMs: 30000 } as PublicCapacityContract;
 const org = crypto.randomUUID(), f = await moderationFixture(), communities = new Map([[f.community.idHex, org]]);
@@ -38,9 +40,14 @@ test("native admission fails closed before carrier mutation; finite reserve keep
  const guarded = new PolicyStore(sql, { capacity: { communities, contract } });
  expect((await guarded.admit(f.allowed)).action).toBe("accept");
  await capacity.pause({ orgId: org, communityId: f.community.idHex, reasonCode: "operator_pause" });
- const extra = wrapSeal(f.allowedSeal, f.chatKey); expect((await guarded.admit(extra)).action).toBe("reject");
+ // A pause reads as capacity, not as moderation; a policy refusal stays opaque.
+ const extra = wrapSeal(f.allowedSeal, f.chatKey); expect(await guarded.admit(extra)).toEqual({ id: extra.id, action: "reject", msg: CAPACITY_REFUSAL });
  expect((await sql`SELECT 1 FROM moderation.carriers WHERE event_id = ${extra.id}`).length).toBe(0);
- expect((await new PolicyStore(sql, { capacity: { communities, contract: undefined } }).admit(f.allowed)).action).toBe("reject");
+ expect((await guarded.admit(f.banned)).msg).toBe(OPAQUE);
+ // A failure that is not the capacity gate's own refusal is never named as one.
+ expect((await guarded.admit(wrapSeal(f.allowedSeal, f.chatKey), AbortSignal.abort())).msg).toBe(OPAQUE);
+ expect((await new PolicyStore(sql, { capacity: { communities, contract: undefined } }).admit(f.allowed)).msg).toBe(CAPACITY_REFUSAL);
+ expect((await new PolicyStore(sql, { capacity: { communities: new Map(), contract } }).admit(wrapSeal(f.allowedSeal, f.chatKey))).msg).toBe(OPAQUE);
 });
 
 test("worker observes counts with operator authority, validator is read-only after repeated bootstrap", async () => {
@@ -65,7 +72,7 @@ test("public producers stop at the durable latch and missing scope before any ex
  await expect(new PublicCapacityGuard(sql, { communities, contract: undefined }).assertPublicProducer(f.community.idHex)).rejects.toThrow();
 });
 
-test("actual validator permits cited moderation in reserve, blocks elective control and self-delete, then exhausts reserve", async () => {
+test("actual validator permits cited moderation and member self-delete in reserve, blocks elective control, then exhausts reserve", async () => {
  const g = await moderationFixture(), group = g.community.idHex, scope = new Map([[group, org]]), installer = new PolicyStore(sql);
  const n = g.policy.controlEvents.length;
  const bounded = { ...contract, maxima: { ...contract.maxima, inFlight: 1 }, thresholds: { warningHistoryCount: n, pauseHistoryCount: n + 2, urgentReserve: 2 } };
@@ -81,13 +88,56 @@ test("actual validator permits cited moderation in reserve, blocks elective cont
    const elective = await sealEdition(buildRoleEdition(moderatorRole(g.roleId), { actorPubkey: g.owner.pk, version: head.version + 1n, prevHash: head.hash }), currentControlWriteGroup(g.community), g.owner.signer);
    expect((await guarded.admit(elective)).action).toBe("reject"); expect((await sql`SELECT 1 FROM moderation.accepted_control WHERE event_id = ${elective.id}`).length).toBe(0);
    const selfDelete = wrapSeal(await sealRumor(buildRumor({ pubkey: g.member.pk, kind: 5, content: "", tags: [...channelBindingTags(g.channelId, BigInt(g.chatStream.epoch)), ["e", g.allowedRumorId]], ms: Date.now() }), KIND_SEAL_ENCRYPTED, g.chatKey, g.member.signer), g.chatKey);
-   expect((await guarded.admit(selfDelete)).action).toBe("reject");
+   expect((await guarded.admit(selfDelete)).action).toBe("accept");
    const ban = { ...g.decision, action: "ban_member" as const };
    const first = (await actions.prepare(ban))[0]; expect((await guarded.admit(first)).action).toBe("accept");
    const second = (await actions.prepare({ ...ban, action: "unban_member" }))[0]; expect((await guarded.admit(second)).action).toBe("accept");
    const third = (await actions.prepare(ban))[0]; expect((await guarded.admit(third)).action).toBe("reject");
    expect((await sql`SELECT 1 FROM moderation.accepted_control WHERE event_id = ${third.id}`).length).toBe(0);
    expect((await sql`SELECT state FROM moderation.public_capacity_state WHERE org_id = ${org} AND community_id = ${group}`)[0].state).toBe("paused");
+ } finally { await validator.end(); await sql`DELETE FROM moderation.public_capacity_state WHERE community_id = ${group}`; await sql`DELETE FROM moderation.community_policy WHERE community_id = ${group}`; }
+});
+
+test("during a pause a member can still retract their own message and leave, without drawing on the staff reserve", async () => {
+ const g = await moderationFixture(), group = g.community.idHex, scope = new Map([[group, org]]), installer = new PolicyStore(sql);
+ const n = g.policy.controlEvents.length, guestbook = currentGuestbookGroup(g.community);
+ const bounded = { ...contract, maxima: { ...contract.maxima, inFlight: 1 }, thresholds: { warningHistoryCount: n, pauseHistoryCount: n + 2, urgentReserve: 2 } };
+ const validator = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_validator" }, onnotice() {} });
+ const chat = async (author: typeof g.member, kind: number, tags: string[][] = []) => wrapSeal(await sealRumor(buildRumor({ pubkey: author.pk, kind, content: kind === 9 ? "synthetic" : "", tags: [...channelBindingTags(g.channelId, BigInt(g.chatStream.epoch)), ...tags], ms: Date.now() + Math.floor(Math.random() * 1000) }), KIND_SEAL_ENCRYPTED, g.chatKey, author.signer), g.chatKey);
+ const motion = async (rumor: ReturnType<typeof buildLeaveRumor>) => wrapSeal(await sealRumor(rumor, KIND_SEAL_ENCRYPTED, guestbook, g.member.signer), guestbook);
+ try {
+   await installer.install(g.policy, [g.chatStream, g.controlStream, g.guestbookStream], 0);
+   const capacity = new PublicCapacityStore(sql, bounded), guarded = new PolicyStore(validator, { capacity: { communities: scope, contract: bounded } });
+   await capacity.observeCurrent(org, group);
+   const ownersMessage = await chat(g.owner, 9); expect((await guarded.admit(ownersMessage)).action).toBe("accept");
+   expect((await guarded.admit(g.allowed)).action).toBe("accept");
+   await capacity.pause({ orgId: org, communityId: group, reasonCode: "operator_pause" });
+   expect((await guarded.admit(await chat(g.member, 9))).msg).toBe(CAPACITY_REFUSAL);
+   expect((await guarded.admit(await motion(buildJoinRumor(g.member.pk, Date.now())))).msg).toBe(CAPACITY_REFUSAL);
+   // The allowance is for the deleter's own content; policy still refuses the rest.
+   const ownersRumorId = (await sql`SELECT rumor_id FROM moderation.carriers WHERE event_id = ${ownersMessage.id}`)[0].rumor_id;
+   expect((await guarded.admit(await chat(g.member, 5, [["e", ownersRumorId]]))).msg).toBe(OPAQUE);
+   expect((await guarded.admit(await chat(g.member, 5, [["e", g.allowedRumorId], ["e", ownersRumorId]]))).msg).toBe(OPAQUE);
+   for (let i = 0; i < 3; i++) expect((await guarded.admit(await chat(g.member, 5, [["e", g.allowedRumorId]]))).action).toBe("accept");
+   expect((await sql`SELECT 1 FROM moderation.tombstones WHERE community_id = ${group} AND rumor_id = ${g.allowedRumorId}`).length).toBe(1);
+   expect((await guarded.admit(await motion(buildLeaveRumor(g.member.pk, Date.now())))).action).toBe("accept");
+   // Retractions add no control/rekey history. This fixture still has measured
+   // headroom after staff growth is refused; it is not the hard reserve limit.
+   const actions = new ConcordActions(g.community, g.moderator, () => installer.getPolicy(group) as any), ban = { ...g.decision, action: "ban_member" as const };
+   expect((await guarded.admit((await actions.prepare(ban))[0])).action).toBe("accept");
+   expect((await guarded.admit((await actions.prepare({ ...ban, action: "unban_member" }))[0])).action).toBe("accept");
+   expect((await guarded.admit((await actions.prepare(ban))[0])).msg).toBe(CAPACITY_REFUSAL);
+   expect((await guarded.admit(await motion(buildLeaveRumor(g.member.pk, Date.now() + 1)))).action).toBe("accept");
+   // The allowance rides the staff gate, not around it: no measured contract, no admission.
+   expect((await new PolicyStore(validator, { capacity: { communities: scope, contract: undefined } }).admit(await chat(g.member, 5, [["e", g.allowedRumorId]]))).msg).toBe(CAPACITY_REFUSAL);
+   expect(Number((await sql`SELECT count(*) AS n FROM moderation.accepted_control WHERE community_id = ${group}`)[0].n)).toBe(2);
+   // Independently authorized owner history can consume the remaining margin.
+   // Even non-history member traffic must still pass that measured gate.
+   const current = (await installer.getPolicy(group))!;
+   const extra = await Promise.all(["a8", "a9"].map(id => sealEdition(buildRoleEdition(moderatorRole(id.repeat(32)), { actorPubkey: g.owner.pk, version: 1n }), currentControlWriteGroup(g.community), g.owner.signer)));
+   await installer.install({ ...current, revision: current.revision + 1, controlEvents: [...current.controlEvents, ...extra] }, [g.chatStream, g.controlStream, g.guestbookStream], current.revision);
+   await capacity.observeCurrent(org, group);
+   expect((await guarded.admit(await motion(buildLeaveRumor(g.member.pk, Date.now() + 2)))).msg).toBe(CAPACITY_REFUSAL);
  } finally { await validator.end(); await sql`DELETE FROM moderation.public_capacity_state WHERE community_id = ${group}`; await sql`DELETE FROM moderation.community_policy WHERE community_id = ${group}`; }
 });
 

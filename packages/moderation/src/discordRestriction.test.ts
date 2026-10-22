@@ -50,7 +50,7 @@ test("fresh absent observation permits settled ban audit closure; source changes
  const next = await stored("unban_member", "3", false), [nextRow] = await sql`SELECT execution_id FROM moderation.decisions WHERE decision_id = ${next}`;
  await sql`UPDATE moderation.member_order_heads SET latest_revision = 3, latest_execution_id = ${nextRow.execution_id} WHERE org_id = ${org}`;
  await sql.begin(async tx => { await tx`SET LOCAL session_replication_role = replica`; await tx`UPDATE moderation.decisions SET lifecycle_closed_at = clock_timestamp() - interval '2 minutes', audit_delete_after = clock_timestamp() - interval '1 minute' WHERE decision_id = ${ban}`; await tx`UPDATE moderation.lifecycle_events SET recorded_at = clock_timestamp() - interval '2 minutes' WHERE decision_id = ${ban}`; });
- await expect(Promise.resolve(apiSql`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban}`)).rejects.toThrow(/audit/i);
+ await expect(Promise.resolve(apiSql`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban}`)).rejects.toThrow(/permission denied/); await expect(Promise.resolve(operatorSql`UPDATE moderation.decisions SET audit = NULL WHERE decision_id = ${ban}`)).rejects.toThrow(/audit/i);
  const cleanup = new Lifecycle(operatorSql, undefined, communities, {}); await cleanup.expireAudit();
  expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id = ${ban}`)[0].audit).not.toBeNull();
  await lifecycle.setAppeal({ decisionId: ban, state: "open", reason: "reopen" }, staff); await lifecycle.setAppeal({ decisionId: ban, state: "closed", reason: "resolve" }, staff);
@@ -145,7 +145,7 @@ test("native settled reversal closes after evidence deletion using the productio
    expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id=${ban}`)[0].audit).not.toBeNull();
    await sql.begin(async tx=>{await tx`SET LOCAL session_replication_role=replica`;await tx`UPDATE moderation.decisions SET lifecycle_closed_at=clock_timestamp()-interval '2 minutes', audit_delete_after=clock_timestamp()-interval '1 minute' WHERE decision_id=${ban}`;await tx`UPDATE moderation.lifecycle_events SET recorded_at=clock_timestamp()-interval '2 minutes' WHERE decision_id=${ban}`;});
    await sql`UPDATE moderation.deliveries SET state='not_applicable',result_code='operator_unknown' WHERE decision_id=${ban} AND target='concord'`;
-   await expect(Promise.resolve(apiSql`UPDATE moderation.decisions SET audit=NULL WHERE decision_id=${ban}`)).rejects.toThrow(/audit/i);
+   await expect(Promise.resolve(apiSql`UPDATE moderation.decisions SET audit=NULL WHERE decision_id=${ban}`)).rejects.toThrow(/permission denied/);await expect(Promise.resolve(operatorSql`UPDATE moderation.decisions SET audit=NULL WHERE decision_id=${ban}`)).rejects.toThrow(/audit/i);
    await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id=${ban}`)[0].audit).not.toBeNull();
    await sql`UPDATE moderation.deliveries SET state='verified',result_code='concord_enforcement_verified' WHERE decision_id=${ban} AND target='concord'`;
    await cleanup.expireAudit(); expect((await sql`SELECT audit FROM moderation.decisions WHERE decision_id=${ban}`)[0].audit).toBeNull();

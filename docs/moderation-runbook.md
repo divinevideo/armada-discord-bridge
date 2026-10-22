@@ -18,6 +18,29 @@ Keep pre-016 outbox workers stopped as well as old API writers: their scope-blin
 
 `member_decision_superseded` from Retry is not proof that every target was superseded. A community moderator without Guild authority also receives it when only a Guild target survives and no community target can resume. Inspect the individual delivery rows and escalate that surviving target to authorized Guild staff; do not issue a replacement community action to retry it. More precise consumer refusal/display behavior remains a consumer-contract follow-up.
 
+Concord membership delivery is serialized across the whole community, because
+all members share one banlist generation. An uncertain publication therefore
+holds Concord bans and unbans for every member in that community, not just the
+member named by the original action. Divine relay and Discord deliveries, and
+other communities, can continue; inspect each destination rather than assuming
+their enforcement states agree. Canonical proof releases the fence. A losing
+noncanonical generation or a legacy generation with no surviving identity can
+remain operator-gated indefinitely. There is no automatic release or ordinary
+Retry that resolves those cases; retain the uncertainty and escalate for an
+authorized recovery decision instead of clearing the marker. The supported
+public-pilot procedure and its limits are in
+[Public pilot publication recovery](#public-pilot-publication-recovery).
+
+Before upgrading from per-member ordering, stop accepting new membership
+decisions and let the current compatible worker settle attempted Concord
+deliveries where proof is available. Do not equate an unproved generation with
+a drained outbox or resume an incompatible worker to force it through.
+Leftover attempted generations for different members may coexist. They may
+reconcile by read-only canonical
+readback even before expiry, without spending send attempts or publishing over
+one another. Missing proof keeps them unresolved; this is not an operator
+release for an event that never landed or whose identity is gone.
+
 Concord retries preserve signed event bytes once publication may have begun.
 An older, superseded action is never prepared again by Retry. A live failed
 Concord target with retained attempted bytes and send attempts remaining may
@@ -35,12 +58,16 @@ target proceed. This read-only check does not reset or spend the send budget and
 can settle an expired action without executing it. Missing, invalid, noncanonical
 or unavailable proof never releases the successor: the old target records
 `concord_recovery_awaiting_proof`, and waiting targets report
-`concord_waiting_on_prior_publication`. A missing-proof/expired-generation
-operator release procedure (including legacy rows whose identities were already
-erased before this migration) and its broader proof-retention policy remain part of the
-unresolved case/audit lifecycle contract; do not clear markers or guess a
-successful outcome in SQL. Read-only recovery uses the existing maximum retry
-backoff, not a tight loop.
+`concord_waiting_on_prior_publication`. For public pilots, use the supported
+[operator recovery procedure](#public-pilot-publication-recovery), not marker
+clearing or a guessed successful outcome in SQL. Unknown legacy provenance is
+explicitly excluded there, not declared recovered. Read-only recovery uses the
+existing maximum retry backoff, not a tight loop.
+A failed unban can reconcile for its own waiting relay leg without another
+member creating work. An inconclusive upgrade readback preserves the original
+pending/acknowledged state and attempts for later guarded observation/retry.
+Publication refresh schedules failed receipt work only; it does not move a
+pending send's backoff merely because a peer might settle before the claim.
 
 Legacy unfenced expired rows with a conservative send marker but no surviving
 identity are quarantined as operator recovery only if they were claimed, not
@@ -231,9 +258,9 @@ Report cases are per reporter. A fresh authenticated duplicate from the same rep
 
 Evidence expires independently of immutable staff action audit and ordering/execution facts. Set explicitly approved positive MODERATION_AUDIT_RETENTION_SECONDS and MODERATION_HOLD_MAX_SECONDS together with the existing evidence policy; there are no audit/hold defaults. Missing policy permits startup, reads, exact accepted replay, reconciliation and hold release, while new dependent writes return policy_configuration_required before allocation. /readyz is service health; /write-readyz exposes this policy capability separately.
 
-Signed manage_moderation_records permits timed hold/release, appeal and eligible explicit lifecycle closure. Separate view_held_evidence permits reasoned audited access; ordinary views never regain expired content. Holds preserve the existing original/selected-edit ciphertext without extending its original expiry. A new hold cannot revive expired evidence. Held access commits its encrypted access audit before decryption. After relevant holds end, operator cleanup schedules and purges hold/access journals using the approved persisted interval. Legacy holds without such a snapshot cannot invent one.
+Signed manage_moderation_records permits timed hold/release, appeal and eligible explicit lifecycle closure. Separate view_held_evidence permits reasoned audited access; ordinary views never regain expired content. Holds preserve the existing original/selected-edit ciphertext without extending its original expiry. A new hold cannot revive expired evidence. A later hold request on a case with an active hold extends that hold (audited as `hold_extended`), including after the case's natural expiry; it never shortens one, and each request is capped at MODERATION_HOLD_MAX_SECONDS from the request, so renewal past that window is a deliberate, audited staff action. Opening an appeal places or extends a hold on the decision's case to that maximum; an appeal on evidence that has already expired unheld opens without one. The hold outlives the appeal and blocks lifecycle closure until it lapses or staff release it. Held access commits its encrypted access audit before decryption. After relevant holds end, operator cleanup schedules and purges hold/access journals using the approved persisted interval. Legacy holds without such a snapshot cannot invent one.
 
-Use GET /v1/decisions/:id/reversal-context and a NEW POST /v1/decisions/:id/reversals execution/revision to reverse a stored verified ban after report expiry. The bridge derives the target; Coop supplies the durable new source revision. This creates a fresh configured execution window without recreating report evidence or reopening old Retry. Legacy audit already erased remains unavailable. Deleted-message restoration is unsupported.
+Use GET /v1/decisions/:id/reversal-context and a NEW POST /v1/decisions/:id/reversals execution/revision to reverse a retained ban after report expiry when either destination verified enforcement or canonical Concord readback settled its publication. The bridge derives the target; Coop supplies the durable new source revision. This creates a fresh configured execution window without recreating report evidence or reopening old Retry. Legacy audit already erased remains unavailable. A relay-only ban with a known-unsent Concord leg can reverse through fresh Concord verification and relay unban. An actually uncertain prior publication remains operator-gated until canonical proof settles it; accepting fresh reversal intent does not bypass that fence or promise immediate release. Deleted-message restoration is unsupported.
 
 A community unban does not send a Discord Guild unban and does not claim the Guild restriction disappeared. Decision status reports a separate restriction observation with checkedAt. POST restriction-refresh and publication-refresh schedule read-only operator proof work and return current status; they do not grant mutation authority, resend an expired action or claim synchronous success. Only verified puppet mapping/binding supplies a Discord identity. Missing historic mapping, permission/rate/transport errors or wrong response identity remain unknown. Only the explicit Discord unknown-ban code proves absence; not_applicable is not successful enforcement.
 
@@ -242,12 +269,276 @@ Explicit closure is available after evidence expiry/deletion for settled actions
 Apply the additive schema with incompatible writers drained. After any lifecycle/hold/reversal/source fence exists, retain its safety records and use a compatible build or roll forward. Never resume audit-at-evidence-expiry cleanup, reset heads, recycle executions, recreate evidence or downgrade to an unfenced writer. Restore the ordering ledgers and execution facts together. Public admission remains closed until a source-matched measured capacity contract and reviewed destination/controller envelope exist; implementation and synthetic calibration do not certify a public launch.
 
 
+Currently, an open appeal does not independently extend evidence retention
+past its timed hold. Staff must renew that hold before it lapses if evidence
+must remain; expiry or explicit release can erase the evidence while the
+appeal stays open. Held access still requires an active hold. An appeal-based
+retention or access override requires a separate policy decision.
+
+When opening an appeal, record its case, actual `holdUntil`, and the staff
+owner responsible for renewal in the operational handoff. Schedule that owner's
+review before the deadline; confirm a deliberate audited extension or release
+before it passes. An open appeal alone is not a reminder or an extension, and
+the service does not supply an automatic renewal/alert system.
+
+Post-expiry reversal uses retained community enforcement from Concord or the
+Divine relay, not a Discord-only Guild ban as its source. Guild administration
+remains separately scoped: adding explicit Guild scope to fresh intent requires
+the Guild action permission and a verified mapping. The old decision ID is
+provenance, not a promise to selectively undo only that decision's effects.
+
+Legacy holds without an approved policy snapshot do not acquire one merely
+because current configuration exists or staff extend the deadline. Their held
+access and audit cleanup remain conservatively unavailable until an explicitly
+approved reconciliation/migration supplies the missing policy; this release
+does not guess it or retroactively expose/erase that evidence.
+
 ## Durable public capacity
 
 Mount externally reviewed measurement JSON at MODERATION_CAPACITY_CONTRACT_FILE in the relay plugin, worker, portal and standalone public bridge. MODERATION_SOURCE_SHA is bound to the image build revision; validation compares the contract against that source and the actual native platform. MODERATION_COMMUNITY_ORGS supplies the existing approved organization/community scope. Missing, invalid, mismatched or stale evidence closes new public mutation. Legacy mode keeps its existing behavior. Do not convert synthetic calibration into a launch contract or claim a destination envelope from an emulated build.
 
-The worker observes actual complete history, bytes, rekeys and streams under its operator database authority. The validator can only read the durable018 state; it repeats current counts under the admission policy lock before mutation. Ordinary chat and managed elective control warn at the warning bound and stop at the pause bound. Only already-verified staff deletion, banlist control and rekey authority can use the finite measured reserve; no caller emergency flag exists. Exhaustion, unavailable policy and unknown configuration fail closed. Independently authorized external churn remains a controller-model release assumption.
+The worker observes actual complete history, bytes, rekeys and streams under its operator database authority. The validator can only read the durable018 state; it repeats current counts under the admission policy lock before mutation. Ordinary chat and managed elective control warn at the warning bound and stop at the pause bound. Only already-verified staff deletion, banlist control and rekey authority can use the finite measured reserve; no caller emergency flag exists. Relay-side self-deletions whose every target the member authored, and authenticated guestbook leaves, use that same measured capacity gate after policy admission; ordinary chat, edits and joins remain paused. Exhaustion, unavailable policy and unknown configuration fail closed. A capacity refusal (pause, unknown or missing contract, exhausted reserve) reaches clients as `rate-limited: room is at capacity, try again later`; all other refusals retain the opaque `blocked:` message. Independently authorized external churn remains a controller-model release assumption.
+
+Member self-deletions and leaves newly remain admissible during a capacity pause.
+This is a control-history growth gate, not a complete traffic shutdown or a
+per-member rate quota. Repeated authenticated leaves do not consume the
+control-history reserve, and the gate does not require a prior join for each
+leave. They still require policy admission and the measured gate's remaining
+bounds; do not interpret the pause as stopping all member writes.
+Not consuming history is not a reserve bypass: projected history and in-flight
+headroom still count in this conservative measured gate, and zero remaining
+headroom refuses even a leave or deletion. `urgentReserve` is a threshold, not
+a guarantee that exactly that many further mutations will be admitted. Native
+capacity review must account for the actual projection/in-flight margin and
+all other measured maxima, not infer an action quota from that field alone.
 
 A pause survives restart, low counts and missing samples. To observe or pause using the existing operator database connection, run `bun packages/moderation/src/capacityOperator.ts observe COMMUNITY_ID` or `bun packages/moderation/src/capacityOperator.ts pause COMMUNITY_ID REASON_CODE`. Explicit resume is `bun packages/moderation/src/capacityOperator.ts resume COMMUNITY_ID ACTOR_ID CONTRACT_HASH` and rechecks the current complete policy, measured contract and counts under the same lock. The read API and validator cannot clear the latch. Apply018 after repeated bootstrap too; its final grants remove broad replayed001 authority.
 
 Capacity metrics contain only aggregate counts/states and observation age. Full settled inner-admission latency is unknown in the counts-only operator snapshot. gate_elapsed_ms is an optional partial monotonic pressure signal through the admission gate, not full latency. Set MODERATION_CAPACITY_TIMING=1 to emit aggregate settled inner-admission timing to plugin stderr for measurement; stdout remains the existing relay decision protocol. Existing SQL1500ms/plugin2000ms/external3000ms fences and commit/cancellation settlement remain mandatory. Neither missing telemetry nor a synthetic timing value is a measured launch proof.
+
+## Public pilot publication recovery
+
+This release supports a fresh, separately scoped **public pilot** community. It
+is not an in-place conversion of a private or multiple-community bridge. Those
+bridges keep their compatible path. Before admitting a pilot, run:
+
+```
+bun packages/moderation/src/publicationOperator.ts preflight COMMUNITY_ID
+bun packages/moderation/src/publicationOperator.ts status COMMUNITY_ID
+```
+
+Use the existing operator database connection and the single-community
+`MODERATION_COMMUNITY_ORGS` mapping. Worker startup performs the same provenance
+preflight and invalidates admission policy if it fails. A legacy publication with neither retained signed bytes nor verified structural
+metadata, including an identity-less marker, is **excluded**, not declared recovered. Restore authentic original
+publication provenance from an existing trusted record/backup, or provision a
+fresh separate pilot community and mapping. Preserve the old decisions and audit.
+An operator assertion, an ordinary grant revocation, or a root rekey cannot
+establish that an unknown delayed edition is impossible; do not clear its marker.
+The preflight establishes local publication provenance, not deployment history or
+production acceptance.
+
+A pre-023 attempted row may still have authentic bytes but no structural
+metadata. Status names it `replay_before_expiry_or_recover_original_event`:
+it is eligible while those bytes survive, not guaranteed eligible after they
+expire. Preserve authentic original provenance or recover before its execution
+window ends. After expiry, missing metadata excludes that community on the next
+worker preflight; it is not a reason to extend the payload lifetime or invent
+metadata in SQL.
+
+Decision status includes `publicationBlockers`, naming the holding decision,
+original event ID when known, recovery version, lease and available recovery
+class. This survives the waiting decision's expiry. Use the operator status
+command for maintenance, including non-Coop diagnostics.
+Status also reports `executionExpiresAt` and `executionWindowExpired` for each
+blocker. Assign an operator to inspect exhausted deliveries before that
+deadline: an unexpired window is necessary for replay, not sufficient authority
+or proof that the old head still permits it. Do not defer an outage handoff
+until the retained bytes have already expired.
+
+Proof-only maintenance uses a read-only control snapshot and cannot enable
+admission, even when authentic original provenance settles a legacy row. Exact
+replay instead checks the whole community's publication provenance before every
+installing authority refresh, while holding controller and execution ownership.
+It also refreshes the operator capacity observation, preserving the durable
+pause and contract hash, and registers stream keys for normal relay auth.
+The operator must mount the same reviewed capacity contract/source identity
+used by the worker and relay (`MODERATION_CAPACITY_CONTRACT_FILE` and
+`MODERATION_SOURCE_SHA`). Missing/changed contracts, unknown capability state,
+stale samples and exhausted measured bounds are not waived by recovery.
+An eligible pilot can refresh normal admission after an outage or policy expiry;
+an excluded community is refused before any installation. Restart the worker
+after successful recovery and preflight to resume normal processing.
+
+Stop the community worker before recovery. The command checks both controller
+and execution locks; no force option exists. Supply a request JSON file:
+
+```
+{"decisionId":"00000000-0000-4000-8000-000000000001","expectedVersion":0,"eventId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation":"replay","reason":"Relay restored; replay original publication"}
+```
+
+Supply an operator audit identity JSON file with the mapped `orgId`, a nonempty
+`actorId`, and permissions `view`, `recover_publication`, and the decision's action
+(`ban_member` or `unban_member`). For example (all identifiers synthetic):
+
+```
+{"orgId":"synthetic-pilot","actorId":"synthetic-operator","permissions":["view","recover_publication","ban_member","unban_member"]}
+```
+
+The local operator database credential is the
+command's access boundary; the file records who authorized maintenance. The
+mounted member identity must have current community moderation authority;
+replay additionally requires current mutation authority over the subject.
+Use existing worker provisioning (`MODERATION_COMMUNITY_ENTRY_FILE`,
+`MODERATION_MEMBER_KEY`, `MODERATION_LOCAL_RELAY_URL`) plus
+`MODERATION_EVIDENCE_KEY` for the encrypted actor/reason audit:
+
+```
+bun packages/moderation/src/publicationOperator.ts recover COMMUNITY_ID request.json actor.json
+```
+
+`replay` is one deliberate attempt of the **exact retained, unexpired original
+signed event**. It never prepares replacement bytes or replenishes the normal
+eight-attempt budget. Current authority and the original generation are checked
+before sending and after readback. The audit and incremented recovery version
+commit before network I/O. Repeating a stale request is refused. An unavailable
+relay leaves uncertainty fenced; inspect status and make another deliberate
+request using the new recovery version after its lease clears.
+
+Use `operation: "prove"` after expiry, or for a losing generation. The command
+first accepts canonical ancestry as a receipt. An owner endorsement of the same
+content hash is structural supersession, not the old publisher's applied
+receipt. Same-publisher/rumor alternate wraps remain one action. Non-owner
+moderators can race on the same logical edition hash; that common intent may
+settle only when adding the actual old edition changes no head, ban or ban-time
+in a fresh view, the current held view, or the original edition's held view.
+This does not claim which carrier/publisher won. If those semantic projections
+do not converge, keep the fence and use explicit owner proof where available.
+
+For an expired
+legacy row with an ID but no structural metadata, an `originalEvent` object may
+be supplied; its signature and exact durable original ID are checked. Relay
+absence never releases a fence.
+
+A losing generation can instead be released only with this narrow existing
+protocol proof: the canonical banlist history contains an **owner-authored
+sibling at the original version and predecessor with the exact original
+content hash**, followed by an
+**owner-authored canonical head at a strictly greater version**. The command
+checks actual kernel folds with the old sibling present for a fresh client,
+the bridge's current tracking floor, and a client holding the original
+edition's own floor; all must retain the canonical head and member set. This
+includes the chain check as well as owner authority, because a greater version
+alone does not establish supersession. Owner-authorized publication/advancement
+is an external prerequisite, not something this CLI signs or performs. If the
+proof fails, do not merely advance a different-content sibling branch: it
+cannot connect a client already tracking the original hash. The owner must
+endorse the exact authentic original content at its original version and
+predecessor, then advance that common hash with a new complete list. Edition
+identity hashes exact content bytes but not signer or rumor ID, so this
+connects both sibling orders without grinding hashes or changing the kernel.
+This connects the lost edition and its exact-content endorsement only. Another
+competing content hash at that version can still win the chain walk and make
+an advance on the endorsement incomplete. Before any owner-authorized advance,
+verify that the served complete history actually connects through the intended
+endorsement. Do not advance an incompatible branch merely because its owner
+signature passes the authority gate. Any change to those kernel fork/chain
+semantics belongs in CORD, not in this maintenance command.
+If that content cannot be recovered and verified against the retained hash,
+keep the fence and use a fresh separate pilot community. Owner signing remains
+an external authorized prerequisite; this CLI never performs it. No
+same-community bypass is available.
+
+Before owner proof, inspect the original structural metadata using the existing
+operator database access (no publication or key material is needed for this
+read):
+
+```sql
+SELECT publication_metadata, c.expires_at
+FROM moderation.deliveries d JOIN moderation.decisions c USING (decision_id)
+WHERE d.decision_id = 'DECISION_ID' AND d.target = 'concord';
+```
+
+The endorsement must match the original version, predecessor and content hash.
+If content is lost, a non-owner edit made replay stale, or no complete safe
+owner branch can be established, keep the fence and use the documented fresh
+pilot fallback. Actual replay still requires the original execution window,
+an active public source channel and current authority over the target. Proof
+does not execute that action: it requires current community moderation
+authority, the existing operator/action capability, complete fresh policy and
+revocation/rekey fences, but not a historical channel or the target's former
+rank. A deleted channel or promoted target therefore does not wedge unrelated
+members behind proof that can be safely observed. For a still-live unban with
+an applied Concord receipt, the relay leg uses those same current community
+safeguards plus decision expiry rather than the historical channel/rank check.
+It releases the unbanned member's relay override only while the current fold
+also shows them unbanned. Newer intent, missing receipts, expiry, revocation
+and pending rekeys still prevent execution; Discord and replay retain their
+full original authorization.
+
+A request rejected before its initial proof is established writes no recovery
+audit. After the recovery audit/version commits, a later proof/lease failure
+does retain that attempt and its lease. Inspect status before retrying; do not
+assume every refusal leaves `expectedVersion` unchanged.
+
+Successful owner supersession records `not_applicable /
+concord_operator_superseded`. It is **not** proof that the old ban/unban was
+applied and does not qualify its relay unban. Submit fresh ordered intent if
+that member still needs a change. Later queued members can proceed on the
+proved canonical head. A superseded unban's undelivered relay leg is retired
+as not applicable in the same lease-fenced completion transaction, without
+changing relay enforcement or replenishing attempts. Decision status exposes
+`relayRestriction` as the current durable relay override (not Concord or
+Discord state). `present / fresh_ordered_unban_required` identifies a retired
+unban whose member is still blocked and has no newer ordered bridge intent.
+It does not inspect later owner decisions: first confirm the current Concord
+fold still shows the member unbanned and that release is still intended. Only
+then submit a fresh authorized unban, not Retry of the canceled publication;
+never use this status alone to reverse an owner's subsequent ban. If newer intent
+exists, the status reports only the current override, without telling staff to
+undo it. `absent` is not a guarantee of admission: the current Concord fold and
+other relay policy still apply. Supersession resolves
+publication uncertainty for lifecycle closure, but it is not enforcement
+proof: current applied Concord unban (verified send or settled canonical
+receipt, including a converged non-owner logical receipt),
+verified relay unban, Discord restriction observations,
+holds, appeals and independent retention must still satisfy every existing
+closure/erasure guard. Recovery actor/reason can then expire with that
+decision's audit; immutable opaque recovery ordering remains.
+
+Decisions that expired while waiting are not revived by recovery or by a fresh
+community. Submit fresh ordered intent for each member still needing a change.
+
+Exact event IDs and verified structural metadata
+(entity/version/predecessor/hash/rumor/signer) survive signed-payload expiry;
+actor/reason use existing deliberate lifecycle audit retention. Recovery
+ordering records remain immutable. Restart the worker only after inspecting
+status and rerunning preflight. Upgrade/rollback must preserve migration 023
+and its records; rolling back application code does not erase recovery history.
+
+The released moderation image already contains the CLI at
+/app/packages/moderation/src/publicationOperator.ts (the runtime image copies
+the whole moderation package). From an approved Linux maintenance host that can
+reach the local relay on loopback and the operator database, an explicit image
+invocation is:
+
+```
+docker run --rm --network host --env-file "$RECOVERY_ENV_FILE" --mount "type=bind,src=$COMMUNITY_ENTRY_FILE,dst=/recovery/community.json,readonly" --mount "type=bind,src=$RECOVERY_REQUEST_FILE,dst=/recovery/request.json,readonly" --mount "type=bind,src=$RECOVERY_ACTOR_FILE,dst=/recovery/actor.json,readonly" --mount "type=bind,src=$CAPACITY_CONTRACT_FILE,dst=/recovery/capacity.json,readonly" --env MODERATION_COMMUNITY_ENTRY_FILE=/recovery/community.json --env MODERATION_CAPACITY_CONTRACT_FILE=/recovery/capacity.json --entrypoint bun "$MODERATION_IMAGE" packages/moderation/src/publicationOperator.ts recover "$COMMUNITY_ID" /recovery/request.json /recovery/actor.json
+```
+
+Use the reviewed image digest for `MODERATION_IMAGE`; use absolute, readable
+paths for all four mounted files, including the reviewed capacity contract.
+The image supplies its build source identity; a checkout invocation must use
+the same reviewed source identity and native contract rather than an old image's
+measurement. `RECOVERY_ENV_FILE` contains existing
+maintenance provisioning, including an operator-role database URL reachable
+from that host and `MODERATION_LOCAL_RELAY_URL` reachable on its loopback
+interface. It is not a copy of an API-only credential. If running remotely,
+establish approved local port forwarding for the relay WebSocket and database
+first, then point these two URLs at their forwarded loopback ports. Do not
+publish ports or change relay authentication to make recovery work. The same
+CLI is supported from a checkout of the reviewed release with Bun 1.3.10 and
+`bun install --ignore-scripts --frozen-lockfile`, using
+`bun --env-file "$RECOVERY_ENV_FILE" packages/moderation/src/publicationOperator.ts status "$COMMUNITY_ID"`.
+The image/network commands above are maintenance instructions; this release
+work does not execute them against a deployed service.

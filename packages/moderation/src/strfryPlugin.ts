@@ -1,7 +1,7 @@
 import postgres from "postgres";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { AdmissionResult } from "./contracts";
-import { loadPublicCapacity } from "./publicCapacity";
+import { CAPACITY_REFUSAL, loadPublicCapacity } from "./publicCapacity";
 import { PolicyStore } from "./policyStore";
 import { HEX_ID, MAX_EVENT_BYTES } from "./relayPolicy";
 
@@ -42,8 +42,10 @@ export async function runPlugin(
       // callback cannot settle, strfry's external timeout stops this process.
       result = completed ?? await admission;
       if (result.id !== id || !["accept", "reject"].includes(result.action)) result = reject(id);
-      // Only fixed public reasons cross the process boundary.
-      result = result.action === "accept" ? { id, action: "accept" } : reject(id);
+      // Only fixed public reasons cross the process boundary: the capacity
+      // refusal (a transient room limit, which must not read as a ban) by exact
+      // match, and the opaque policy refusal for everything else.
+      result = result.action === "accept" ? { id, action: "accept" } : result.msg === CAPACITY_REFUSAL ? { id, action: "reject", msg: CAPACITY_REFUSAL } : reject(id);
     } catch { result = reject(id); }
     finally { if (timer) clearTimeout(timer); }
     await output(JSON.stringify(result) + "\n");

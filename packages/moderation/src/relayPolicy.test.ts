@@ -107,3 +107,23 @@ test("authorized base rekey chunks remain admissible while public chat is suspen
   expect((await evaluateRelayEvent(f.allowed, { ...context, stream: f.chatStream })).action).toBe("reject");
   expect((await evaluateRelayEvent(event, { ...context, stream: { ...stream, previousCommit: "f".repeat(64) } })).action).toBe("reject");
 });
+
+import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
+import { ConcordActions } from "./concordActions";
+import { inspectRelayEvent } from "./relayPolicy";
+import { buildJoinRumor, buildLeaveRumor, currentGuestbookGroup } from "@armada-bridge/concord-core";
+test("only a delete of the deleter's own content, or a Leave, is marked as a retraction", async () => {
+  const g = await moderationFixture(), guestbook = currentGuestbookGroup(g.community);
+  const chat = (stream = g.chatStream, authorOf = async () => g.member.pk as string | undefined): AdmissionContext => ({ policy: g.policy, stream, now: Date.now, isRemoved: async () => false, authorOf });
+  const rumor = async (kind: number) => wrapSeal(await sealRumor(buildRumor({ pubkey: g.member.pk, kind, content: kind === 3302 ? "edited" : "", tags: [...channelBindingTags(g.channelId, BigInt(g.chatStream.epoch)), ["e", g.allowedRumorId]], ms: Date.now() }), KIND_SEAL_ENCRYPTED, g.chatKey, g.member.signer), g.chatKey);
+  const own = await inspectRelayEvent(await rumor(5), chat());
+  expect(own.result.action).toBe("accept"); expect(own.retraction).toBe(true);
+  // A moderator's cited removal of someone else's message is staff authority, not a retraction.
+  const removal = await inspectRelayEvent((await new ConcordActions(g.community, g.moderator, async () => g.policy).prepare(g.decision))[0], chat());
+  expect(removal.result.action).toBe("accept"); expect(removal.retraction).toBe(false);
+  const edit = await inspectRelayEvent(await rumor(3302), chat());
+  expect(edit.result.action).toBe("accept"); expect(edit.retraction).toBe(false);
+  const motion = async (r: ReturnType<typeof buildLeaveRumor>) => inspectRelayEvent(wrapSeal(await sealRumor(r, KIND_SEAL_ENCRYPTED, guestbook, g.member.signer), guestbook), chat(g.guestbookStream));
+  expect((await motion(buildLeaveRumor(g.member.pk, Date.now())))).toMatchObject({ result: { action: "accept" }, retraction: true });
+  expect((await motion(buildJoinRumor(g.member.pk, Date.now())))).toMatchObject({ result: { action: "accept" }, retraction: false });
+});
