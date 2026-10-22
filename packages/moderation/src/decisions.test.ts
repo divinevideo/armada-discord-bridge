@@ -1422,6 +1422,8 @@ test("operator exact replay refreshes expired persisted admission and the next m
   const capacity = { communities: new Map([[h.f.community.idHex, h.staff.orgId]]), contract: recoveryContract };
   const observer = new PublicCapacityStore(sql, recoveryContract);
   const validator = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_validator" }, onnotice() {} });
+  const operatorSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_operator" }, onnotice() {} });
+  const operatorStore = new PolicyStore(operatorSql), operatorDecisions = new Decisions(operatorSql, cipher, capacity.communities);
   const guarded = new PolicyStore(validator, { capacity });
   try {
     const first = await h.accept("ban_member");
@@ -1449,8 +1451,8 @@ test("operator exact replay refreshes expired persisted admission and the next m
         await h.relay.publish(event);
       },
     };
-    const actions = createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "replay", capacity });
-    const result = await recoverPublication({ sql, decisions: h.outbox, cipher, actions, relay: relay as never,
+    const actions = createPublicationRecoveryActions({ sql: operatorSql, community: h.f.community, identity: h.f.moderator, store: operatorStore, relay: relay as never, operation: "replay", capacity });
+    const result = await recoverPublication({ sql: operatorSql, decisions: operatorDecisions, cipher, actions, relay: relay as never,
       actor: { ...h.staff, permissions: [...h.staff.permissions, "recover_publication"] },
       request: { decisionId: first.decisionId, expectedVersion: 0, eventId: original.id, operation: "replay", reason: "Synthetic relay restored after policy expiry" } });
     expect(result).toMatchObject({ state: "verified", code: "concord_enforcement_verified" });
@@ -1467,12 +1469,12 @@ test("operator exact replay refreshes expired persisted admission and the next m
     await store.invalidate(h.f.community.idHex);
     await sql`UPDATE moderation.public_capacity_state SET observed_at = clock_timestamp() - interval '1 day' WHERE community_id = ${h.f.community.idHex}`;
     const [beforeProof] = await sql`SELECT * FROM moderation.public_capacity_state WHERE community_id = ${h.f.community.idHex}`;
-    expect(await recoverPublication({ sql, decisions: h.outbox, cipher, relay: relay as never,
-      actions: createPublicationRecoveryActions({ sql, community: h.f.community, identity: h.f.moderator, store, relay: relay as never, operation: "prove", capacity }), actor: recoveryStaff(h),
+    expect(await recoverPublication({ sql: operatorSql, decisions: operatorDecisions, cipher, relay: relay as never,
+      actions: createPublicationRecoveryActions({ sql: operatorSql, community: h.f.community, identity: h.f.moderator, store: operatorStore, relay: relay as never, operation: "prove", capacity }), actor: recoveryStaff(h),
       request: { decisionId: later.decisionId, expectedVersion: 0, eventId: lost.id, operation: "prove", reason: "Synthetic read-only proof" } })).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
     expect((await sql`SELECT * FROM moderation.public_capacity_state WHERE community_id = ${h.f.community.idHex}`)[0]).toEqual(beforeProof);
     expect(await store.getPolicy(h.f.community.idHex)).toMatchObject({ complete: false, validUntil: 0 });
-  } finally { await validator.end(); await h.cleanup(); }
+  } finally { await validator.end(); await operatorSql.end(); await h.cleanup(); }
 });
 
 test("replay without a reviewed capacity contract cannot refresh admission", async () => {
@@ -1738,6 +1740,20 @@ test("background receipt readback cannot count an owner's same-hash endorsement 
     expect(claim.reconcileOnly).toBe(true);
     expect(await h.deliver(claim)).toMatchObject({ state: "failed", code: "concord_recovery_awaiting_proof" });
     expect(await concordRow(decision.decisionId)).toMatchObject({ state: "failed", result_code: "concord_recovery_requires_operator" });
+  } finally { await h.cleanup(); }
+});
+
+test("normal delivery cannot verify the old publisher after an owner endorses its content", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, edition } = await lostGeneration(h);
+    h.published.push(await endorseGeneration(h, edition)); h.published.push(await advanceOwner(h));
+    const before = h.published.map(event => event.id);
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${decision.decisionId} AND target = 'concord'`;
+    const claim = (await h.outbox.claim())!;
+    expect(claim.reconcileOnly).toBe(false);
+    expect(await h.deliver(claim)).toEqual({ state: "failed", code: "concord_recovery_requires_operator" });
+    expect(h.published.map(event => event.id)).toEqual(before);
   } finally { await h.cleanup(); }
 });
 

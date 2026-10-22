@@ -383,8 +383,8 @@ export class Decisions {
     if (claim.reconcileOnly && state === "failed" && resultCode === "concord_recovery_awaiting_proof" && (claim.claimedState === "pending" || claim.claimedState === "acknowledged")) state = claim.claimedState;
     if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
     // Failed observation cannot downgrade an operator-only outcome into a
-    // Retry-able transport failure. Only the worker's proved resolution clears
-    // it; preserve both marker and terminal state in this lease-fenced write.
+    // Retry-able transport failure. Only a proved publication resolution
+    // clears it; preserve both marker and state in this lease-fenced write.
     // Ordinary marked rows only observe proof. Explicit maintenance recovery
     // can also verify an exact replay; neither path may clear the marker on a
     // transport/ownership failure or an unproved not-applicable outcome.
