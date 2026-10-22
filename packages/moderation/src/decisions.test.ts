@@ -1570,9 +1570,15 @@ const recoveryPolicy = async (h: RecoveryHarness) => {
   const policy = (await new PolicyStore(sql).getPolicy(h.f.community.idHex))!;
   return refreshPolicy({ ...policy, controlEvents: [...policy.controlEvents, ...h.published] });
 };
-async function lostGeneration(h: RecoveryHarness) {
+async function lostGeneration(h: RecoveryHarness, prefix?: string) {
   await h.accept("ban_member");
   const claim = (await h.outbox.claim())!;
+  if (prefix) {
+    const prepared = parseEdition(openWrap((await h.actions.prepare(claim.decision))[0], h.f.controlStream.key));
+    let timestamp = Math.floor(Date.now() / 1000), rumor;
+    do { rumor = buildBanlistEdition(h.f.community.id, JSON.parse(prepared.content), { actorPubkey: h.f.moderator.pk, version: prepared.version, prevHash: prepared.prevHash, authority: prepared.authority, createdAtSecs: timestamp-- }); } while (!rumor.id.startsWith(prefix));
+    await h.outbox.saveEvents(claim, [await sealEdition(rumor, currentControlWriteGroup(h.f.community), h.f.moderator.signer)]);
+  }
   let old!: NostrEvent;
   await h.deliver(claim, { ...h.relay, publish: async event => { old = event; throw Error("synthetic outage"); } });
   return { decision: claim.decision, old, edition: parseEdition(openWrap(old, h.f.controlStream.key)) };
@@ -1756,6 +1762,55 @@ test("normal delivery cannot verify the old publisher after an owner endorses it
     expect(h.published.map(event => event.id)).toEqual(before);
   } finally { await h.cleanup(); }
 });
+
+for (const action of ["ban_member", "unban_member"] as const) test(`a convergent non-owner duplicate settles ${action} without an owner endorsement`, async () => {
+  const h = await memberHarness(action === "ban_member" ? "member" : "bannedMember"), store = new PolicyStore(sql);
+  try {
+    if (action === "unban_member") await store.setBan(h.f.community.idHex, h.who.pk, true);
+    const first = await h.accept(action), claim = (await h.outbox.claim())!; let old!: NostrEvent;
+    await h.deliver(claim, { ...h.relay, publish: async event => { old = event; throw Error("lost acknowledgment"); } });
+    const edition = parseEdition(openWrap(old, h.f.controlStream.key)), other = localIdentity(generateSecretKey());
+    h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: other.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    const peer = new ConcordActions(h.f.community, other, () => recoveryPolicy(h));
+    const { authority } = await peer.authorize(claim.decision);
+    h.published.push(await endorseGeneration(h, edition, other, authority), old);
+    // A later non-owner head makes the old publisher identity ambiguous while
+    // the logical hash and every semantic projection still converge.
+    h.published.push(...await peer.prepare({ ...claim.decision, decisionId: crypto.randomUUID(), action: "ban_member", author: "ac".repeat(32) }));
+    expect(await h.actions.publicationInCurrentHistory(claim.decision, [old])).toBe(true);
+    expect(await proveGeneration(h, first.decisionId, old.id)).toMatchObject({ state: "not_applicable", code: "concord_publication_settled" });
+    if (action === "unban_member") {
+      await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'divine_relay'`;
+      const relay = (await h.outbox.claim())!; expect(relay.target).toBe("divine_relay");
+      const context = createExecutionContext({ sql, store, actions: h.actions, claim: relay, assertCurrent: () => h.outbox.renew(relay), decisions: h.outbox,
+        relay: h.relay as never, discord: {} as never, purger: {} as never, driver: { barrier: work => work() } });
+      expect(await executeDelivery(relay.decision, relay.target, context)).toEqual({ state: "verified", code: "relay_member_policy_verified" });
+      expect((await store.getPolicy(h.f.community.idHex))!.banned.includes(h.who.pk)).toBe(false);
+    }
+  } finally { await h.cleanup(); }
+});
+
+test("non-owner hash equivalence refuses a delayed edition that changes ban-time semantics", async () => {
+  const h = await memberHarness("member");
+  try {
+    const { decision, old, edition } = await lostGeneration(h, "7"), other = localIdentity(generateSecretKey());
+    h.published.push(await sealEdition(buildGrantEdition(h.f.community.id, { member: other.pk, roleIds: [h.f.roleId] }, { actorPubkey: h.f.owner.pk, version: 1n }), currentControlWriteGroup(h.f.community), h.f.owner.signer));
+    const peer = new ConcordActions(h.f.community, other, () => recoveryPolicy(h));
+    const { authority } = await peer.authorize(decision); let sibling!: NostrEvent;
+    for (let i = 1; i <= 2000; i++) {
+      sibling = await sealEdition(buildBanlistEdition(h.f.community.id, JSON.parse(edition.content), { actorPubkey: other.pk, version: edition.version, prevHash: edition.prevHash, authority, createdAtSecs: edition.createdAt + i }), currentControlWriteGroup(h.f.community), other.signer);
+      if (bytesToHex(parseEdition(openWrap(sibling, h.f.controlStream.key)).rumorId) > bytesToHex(edition.rumorId)) break;
+    }
+    const alternate = parseEdition(openWrap(sibling, h.f.controlStream.key));
+    expect(bytesToHex(alternate.rumorId) > bytesToHex(edition.rumorId)).toBe(true);
+    h.published.push(sibling);
+    const before = controlState(await recoveryPolicy(h)), after = foldControlState([...before.editions, edition], h.f.community.id, h.f.owner.pk);
+    expect([...after.banned].sort()).toEqual([...before.folded.banned].sort());
+    expect(after.bannedAt.get(decision.author)).not.toBe(before.folded.bannedAt.get(decision.author));
+    expect(await h.actions.publicationInCurrentHistory(decision, [old])).toBe(false);
+  } finally { await h.cleanup(); }
+});
+
 
 for (const proof of ["canonical", "owner"] as const) for (const changed of ["deleted_channel", "promoted_target"] as const) test(`${proof} membership proof survives ${changed}, without granting replay`, async () => {
   const h = await memberHarness("member");

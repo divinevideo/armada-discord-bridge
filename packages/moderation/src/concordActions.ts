@@ -19,17 +19,34 @@ function canonicalIncludesHash(edition: ParsedEdition, { editions, folded }: Ret
   }
   return false;
 }
-function canonicalIncludes(edition: ParsedEdition, state: ReturnType<typeof controlState>): boolean {
+function canonicalIncludes(edition: ParsedEdition, state: ReturnType<typeof controlState>, communityId: Uint8Array): boolean {
   if (!canonicalIncludesHash(edition, state)) return false;
   const entity = bytesToHex(edition.entityId), hash = bytesToHex(edition.selfHash);
   const samePublication = (candidate: ParsedEdition) => candidate.author === edition.author && bytesToHex(candidate.rumorId) === bytesToHex(edition.rumorId);
   const head = state.folded.headEditions.get(entity);
-  // Content hashes deliberately omit publisher and rumor identity. The kernel
-  // tells us the exact winning head; intermediate same-hash siblings are not
-  // an exact publication receipt unless their identities are unambiguous.
-  // Owner endorsement remains a separate structural supersession proof below.
-  if (head?.version === edition.version) return samePublication(head);
-  return state.editions.filter(candidate => bytesToHex(candidate.entityId) === entity && bytesToHex(candidate.selfHash) === hash).every(samePublication);
+  const peers = state.editions.filter(candidate => bytesToHex(candidate.entityId) === entity && bytesToHex(candidate.selfHash) === hash);
+  if (head?.version === edition.version && samePublication(head)) return true;
+  // An owner endorsement is an explicit authority barrier, not the old
+  // publisher's applied receipt. Non-owner races can share the protocol's
+  // content identity: permit that logical receipt only if adding the actual
+  // old edition cannot change any head, ban or ban-time in any held view.
+  if (peers.some(candidate => candidate.author === state.folded.ownerHex && !samePublication(candidate))) return false;
+  if (peers.every(samePublication)) return true;
+  const projection = (folded: ReturnType<typeof controlState>["folded"], withTimes = true) => JSON.stringify({
+    heads: [...folded.heads].map(([id, h]) => [id, h.version.toString(), bytesToHex(h.hash)]).sort((a, b) => a[0].localeCompare(b[0])),
+    banned: [...folded.banned].sort(), ...(withTimes ? { bannedAt: [...folded.bannedAt].sort(([a], [b]) => a.localeCompare(b)) } : {}),
+  });
+  const expected = projection(state.folded, false), originalFloor = new Map(state.folded.heads);
+  originalFloor.set(entity, { version: edition.version, hash: edition.selfHash });
+  for (const prior of [undefined, state.folded.heads, originalFloor]) {
+    const before = foldControlState(state.editions, communityId, state.folded.ownerHex, prior);
+    const next = foldControlState([...state.editions, edition], communityId, state.folded.ownerHex, prior);
+    // A held floor can omit older ban-time history. Compare time semantics
+    // before/after within each view, while all views must share current heads
+    // and bans; do not confuse that existing truncation with a new effect.
+    if (before.incomplete.length || next.incomplete.length || projection(before, false) !== expected || projection(next) !== projection(before)) return false;
+  }
+  return true;
 }
 export class ConcordActions {
   constructor(readonly community: CommunityV2, readonly identity: { pk: string; signer: StreamSigner }, private readonly refresh: () => Promise<CommunityPolicy>) {
@@ -133,7 +150,7 @@ export class ConcordActions {
     if (!stream || "sk" in stream.key) return false;
     const edition = parseEdition(openWrap(event, stream.key));
     if (bytesToHex(edition.entityId) !== bytesToHex(banlistLocator(this.community.id))) return false;
-    return canonicalIncludes(edition, state) && policy.validUntil > Date.now();
+    return canonicalIncludes(edition, state, this.community.id) && policy.validUntil > Date.now();
   }
   async validatePrepared(decision: StoredDecision, events: NostrEvent[]): Promise<void> {
     const { editions, folded } = await this.authorize(decision);
@@ -155,7 +172,7 @@ export class ConcordActions {
       // Readback may arrive after another valid edition extends ours. Follow
       // the canonical head's actual hashes, not just its current member set:
       // matching intent alone would credit an unrelated moderator's edit.
-      if (canonicalIncludes(edition, { editions, folded })) return;
+      if (canonicalIncludes(edition, { editions, folded }, this.community.id)) return;
       if (edition.version !== (current?.version ?? 0n) + 1n || (current && (!edition.prevHash || bytesToHex(edition.prevHash) !== bytesToHex(current.hash)))) throw new StalePreparedBanlistError("Prepared banlist would overwrite a concurrent edit");
       const next = foldControlState([...editions, edition], this.community.id, this.community.owner, folded.heads);
       const head = next.headEditions.get(bytesToHex(edition.entityId));

@@ -406,13 +406,14 @@ relay leaves uncertainty fenced; inspect status and make another deliberate
 request using the new recovery version after its lease clears.
 
 Use `operation: "prove"` after expiry, or for a losing generation. The command
-first accepts exact original canonical ancestry as a receipt. This identifies
-its publisher and rumor identity, not just an edition's
-content hash. A same-hash owner endorsement is structural supersession, not
-proof that the old publisher's action was applied. Ambiguous intermediate
-same-hash identities do not supply an applied receipt; use explicit owner
-proof where available. Alternate wraps of the same publisher/rumor are not a
-new action.
+first accepts canonical ancestry as a receipt. An owner endorsement of the same
+content hash is structural supersession, not the old publisher's applied
+receipt. Same-publisher/rumor alternate wraps remain one action. Non-owner
+moderators can race on the same logical edition hash; that common intent may
+settle only when adding the actual old edition changes no head, ban or ban-time
+in a fresh view, the current held view, or the original edition's held view.
+This does not claim which carrier/publisher won. If those semantic projections
+do not converge, keep the fence and use explicit owner proof where available.
 
 For an expired
 legacy row with an ID but no structural metadata, an `originalEvent` object may
