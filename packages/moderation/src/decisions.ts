@@ -394,7 +394,11 @@ export class Decisions {
     // An inconclusive upgrade readback is not cancellation of the original
     // retryable send. Retain its state so the next observation remains due
     // while its peer is unsettled, or normal guarded retry can resume later.
-    if (claim.reconcileOnly && state === "failed" && resultCode === "concord_recovery_awaiting_proof" && (claim.claimedState === "pending" || claim.claimedState === "acknowledged")) state = claim.claimedState;
+    // A context or renewal failure also says nothing about the original send.
+    // Turning both overlapping generations into ordinary failures wedges their
+    // next observation. Readback spends no attempts, so back off persistent
+    // worker failures just as we back off missing proof.
+    if (claim.reconcileOnly && state === "failed" && (claim.claimedState === "pending" || claim.claimedState === "acknowledged")) { state = claim.claimedState; retryAfterSeconds = Math.max(retryAfterSeconds, 300); }
     if (claim.attempts >= 8 && (state === "pending" || state === "acknowledged")) { state = "failed"; resultCode = "retry_budget_exhausted"; }
     // Failed observation cannot downgrade an operator-only outcome into a
     // Retry-able transport failure. Only a proved publication resolution

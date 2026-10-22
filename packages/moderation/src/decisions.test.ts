@@ -1096,6 +1096,31 @@ for (const state of ["pending", "acknowledged"] as const) test(`deferring pre-up
   } finally { await h.cleanup(); }
 });
 
+for (const state of ["pending", "acknowledged"] as const) for (const failure of ["context", "renewal", "transient_renewal"] as const) test(`a pre-upgrade ${state} readback whose worker fails on ${failure} keeps its state and backs off`, async () => {
+  const h = await memberHarness("member"), renew = h.outbox.renew.bind(h.outbox);
+  try {
+    const first = await h.accept("ban_member"), second = await otherCommunityMember(h, "ban_member");
+    for (const [index, id] of [first.decisionId, second.decisionId].entries()) await sql`UPDATE moderation.deliveries SET state = ${state}, attempts = 2, publication_attempted = true,
+      publication_event_ids = ARRAY[${String(index + 1).repeat(64)}], result_code = 'concord_transport_unavailable', available_at = clock_timestamp()
+      WHERE decision_id = ${id} AND target = 'concord'`;
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() + interval '1 hour' WHERE decision_id = ${second.decisionId}`;
+    let renewals = 0;
+    if (failure !== "context") h.outbox.renew = async (claim) => { if (failure === "renewal" || renewals++ === 0) throw Error("synthetic renewal failure"); return renew(claim); };
+    const worker = new ModerationWorker(sql, h.outbox, async (claim, assertCurrent) => {
+      if (failure === "context") throw Error("synthetic context failure");
+      return { reconcileOnly: claim.reconcileOnly, assertCurrent, authorize: async () => { throw Error("Readback must not authorize"); },
+        executeConcord: () => deliverConcord(claim, h.actions, h.outbox, { queryStrict: async () => [], publish: async () => { throw Error("Readback must not publish"); } } as never, assertCurrent),
+        setRelayBan: async () => { throw Error("unreachable"); }, removeFromRelay: async () => { throw Error("unreachable"); }, discord: { execute: async () => { throw Error("unreachable"); } } };
+    });
+    expect(await worker.tick()).toBe(true);
+    h.outbox.renew = renew;
+    const [row] = await sql`SELECT state, attempts, token, available_at > clock_timestamp() + interval '250 seconds' AS backed_off FROM moderation.deliveries WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(row).toMatchObject({ state, attempts: 2, token: null, backed_off: true });
+    await sql`UPDATE moderation.deliveries SET available_at = clock_timestamp() WHERE decision_id = ${first.decisionId} AND target = 'concord'`;
+    expect(await h.outbox.claim()).toMatchObject({ reconcileOnly: true, claimedState: state, attempts: 2, decision: { decisionId: first.decisionId } });
+  } finally { h.outbox.renew = renew; await h.cleanup(); }
+});
+
 for (const uncertain of [false, true]) test(`expired relay-only reversal ${uncertain ? "retains publication uncertainty" : "verifies Concord and lifts the relay ban"}`, async () => {
   const h = await memberHarness("member");
   const apiSql = postgres(process.env.DATABASE_URL!, { connection: { options: "-c role=moderation_api" }, onnotice() {} });
