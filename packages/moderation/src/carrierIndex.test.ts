@@ -87,24 +87,119 @@ test("a blocked success record is canceled and cannot become verified after barr
   expect(reachedAfterUpdate).toBe(false);
 });
 
-test("carrier overflow fails closed without partial deletion or verification", async () => {
-  const overflowTarget = { ...target, rumorId: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0") };
+async function removalFixture(count: number) {
+  const subject = { ...target, rumorId: crypto.randomUUID().replaceAll("-", "").padEnd(64, "0") };
   const decisionId = crypto.randomUUID();
-  await sql`INSERT INTO moderation.carriers (community_id, channel_id, rumor_id, event_id, author, kind, policy_revision)
-    SELECT ${target.communityId}, ${target.channelId}, ${overflowTarget.rumorId},
-      md5(${decisionId} || i::text) || md5(i::text || ${decisionId}), ${"d".repeat(64)}, 1059, 1
-    FROM generate_series(1, 129) AS i`;
-  let deleted = 0, queried = 0;
+  const rows = await sql`INSERT INTO moderation.carriers (community_id, channel_id, rumor_id, event_id, author, kind, policy_revision, target_rumor_ids, targets_indexed)
+    SELECT ${subject.communityId}, ${subject.channelId},
+      CASE WHEN i % 2 = 0 THEN md5(i::text) || md5(i::text) ELSE ${subject.rumorId} END,
+      md5(${decisionId}) || lpad(to_hex(i), 32, '0'), ${"d".repeat(64)},
+      CASE WHEN i % 2 = 0 THEN 7 ELSE 9 END, 1,
+      CASE WHEN i % 2 = 0 THEN ARRAY[${subject.rumorId}]::text[] ELSE '{}'::text[] END, true
+    FROM generate_series(1, ${count}::integer) AS i RETURNING event_id`;
+  const ids = rows.map(row => row.event_id as string).sort();
+  return { subject, decisionId, ids, live: new Set([...ids, "f".repeat(64)]) };
+}
+
+test("removal deletes and verifies 257 message and reaction carriers in bounded batches", async () => {
+  const { subject, decisionId, ids, live } = await removalFixture(257);
+  const batches: number[] = [], verified: number[] = [];
   const driver: PurgeDriver = {
     async barrier(work) { return work(); },
-    async delete() { deleted++; },
-    async remaining() { queried++; return []; },
+    async delete(batch) {
+      expect(batch.length).toBeLessThanOrEqual(128);
+      batches.push(batch.length);
+      for (const id of batch) live.delete(id);
+    },
+    async remaining(batch) { verified.push(batch.length); return batch.filter(id => live.has(id)); },
   };
-  const result = await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(overflowTarget, decisionId);
-  expect(result).toMatchObject({ state: "failed", stage: "index", carrierIds: [] });
-  expect(deleted).toBe(0); expect(queried).toBe(0);
-  const [row] = await sql`SELECT state, verified_at FROM moderation.removals WHERE decision_id = ${decisionId}`;
-  expect(row.state).toBe("failed"); expect(row.verified_at).toBeNull();
-  const [count] = await sql`SELECT count(*) AS count FROM moderation.carriers WHERE rumor_id = ${overflowTarget.rumorId}`;
-  expect(Number(count.count)).toBe(129);
+  const result = await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId);
+  expect(result).toMatchObject({ state: "verified", stage: "complete", removedCount: 257 });
+  expect(batches).toEqual([128, 128, 1]); expect(verified).toEqual([128, 128, 1]);
+  expect([...live]).toEqual(["f".repeat(64)]);
+  // Keep the index for evidence and restore reconciliation after relay deletion.
+  expect(await new CarrierIndex(sql).ids(subject)).toEqual(ids);
+  const [row] = await sql`SELECT state, verified_at, verified_through FROM moderation.removals WHERE decision_id = ${decisionId}`;
+  expect(row.state).toBe("verified"); expect(row.verified_at).not.toBeNull();
+  expect(row.verified_through).toBe(ids[256]);
+});
+
+test("a new purger resumes from committed verified progress after a later batch fails", async () => {
+  const { subject, decisionId, ids, live } = await removalFixture(257);
+  let calls = 0;
+  const driver: PurgeDriver = {
+    async barrier(work) { return work(); },
+    async delete(batch) {
+      if (++calls === 2) throw new Error("Synthetic interrupted deletion");
+      for (const id of batch) live.delete(id);
+    },
+    async remaining(batch) { return batch.filter(id => live.has(id)); },
+  };
+  const first = await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId);
+  expect(first).toMatchObject({ state: "failed", stage: "delete", removedCount: 128 });
+  const [progress] = await sql`SELECT state, verified_through FROM moderation.removals WHERE decision_id = ${decisionId}`;
+  expect(progress.state).toBe("failed"); expect(progress.verified_through).toBe(ids[127]);
+  const retried: string[] = [];
+  driver.delete = async batch => { retried.push(...batch); for (const id of batch) live.delete(id); };
+  expect((await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId)).state).toBe("verified");
+  expect(retried).toEqual(ids.slice(128));
+  expect([...live]).toEqual(["f".repeat(64)]);
+  const [tombstone] = await sql`SELECT 1 FROM moderation.tombstones WHERE community_id = ${subject.communityId} AND channel_id = ${subject.channelId} AND rumor_id = ${subject.rumorId}`;
+  expect(tombstone).toBeDefined();
+});
+
+test("a batch that remains on the relay never advances retry progress", async () => {
+  const { subject, decisionId, ids, live } = await removalFixture(129);
+  const driver: PurgeDriver = {
+    async barrier(work) { return work(); },
+    async delete() {},
+    async remaining(batch) { return batch.filter(id => live.has(id)); },
+  };
+  expect(await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId)).toMatchObject({ state: "failed", stage: "carriers_remain" });
+  const [progress] = await sql`SELECT state, verified_through FROM moderation.removals WHERE decision_id = ${decisionId}`;
+  expect(progress.state).toBe("failed"); expect(progress.verified_through).toBeNull();
+  const retried: string[] = [];
+  driver.delete = async batch => { retried.push(...batch); for (const id of batch) live.delete(id); };
+  expect((await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId)).state).toBe("verified");
+  expect(retried).toEqual(ids);
+});
+
+test("batch checkpoints preserve the original deadline and settle before releasing admission", async () => {
+  const { subject, decisionId, ids, live } = await removalFixture(257);
+  const now = Date.now, started = now();
+  let verified = 0, released = false;
+  const driver: PurgeDriver = {
+    async barrier(work) { try { return await work(); } finally { released = true; } },
+    async delete(batch) { for (const id of batch) live.delete(id); },
+    async remaining(batch) {
+      const remaining = batch.filter(id => live.has(id));
+      const elapsed = ++verified === 1 ? 20_000 : 31_000;
+      Date.now = () => started + elapsed;
+      return remaining;
+    },
+  };
+  try {
+    expect(await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId)).toMatchObject({ state: "failed", stage: "checkpoint", removedCount: 128 });
+  } finally { Date.now = now; }
+  expect(released).toBe(true);
+  const [progress] = await sql`SELECT state, verified_at, verified_through FROM moderation.removals WHERE decision_id = ${decisionId}`;
+  expect(progress.state).toBe("failed"); expect(progress.verified_at).toBeNull();
+  expect(progress.verified_through).toBe(ids[127]);
+});
+
+test("retrying a completed removal re-verifies the relay instead of trusting the old cursor", async () => {
+  const { subject, decisionId, ids, live } = await removalFixture(129);
+  let checks = 0;
+  const driver: PurgeDriver = {
+    async barrier(work) { return work(); },
+    async delete(batch) { for (const id of batch) live.delete(id); },
+    async remaining(batch) { checks++; return batch.filter(id => live.has(id)); },
+  };
+  expect((await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId)).state).toBe("verified");
+  live.add(ids[0]);
+  checks = 0;
+  const retried = await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId);
+  expect(retried).toMatchObject({ state: "verified", removedCount: 129 });
+  expect(checks).toBe(2);
+  expect([...live]).toEqual(["f".repeat(64)]);
 });
