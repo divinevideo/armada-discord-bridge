@@ -121,11 +121,17 @@ before starting new workers. Do not mix versions across that transition: all
 publishers must record intent before sending. This is a deployment prerequisite,
 not permission to deploy.
 
-Relay purge accepts up to 128 indexed carriers per removal. Overflow, SQL work
-exceeding its 1.5-second statement limit, or exhausted barrier database budget
-(30 seconds) fails the removal rather than reporting a partial purge as verified.
-Keep the tombstone and escalate an overflow for controlled reconciliation; do
-not remove the admission barrier to increase throughput. Discord visibility
+Relay purge deletes and verifies at most 128 indexed carriers per batch. Migration
+024 adds an initially empty checkpoint to existing removal records. A verified
+batch commits its checkpoint while the tombstone and admission barrier remain in
+force; carrier metadata is retained. Retry the same decision ID to resume after
+its last verified batch. The 1.5-second SQL statement limit and 30-second barrier
+database budget apply across the entire attempt, including batch commits. Timeout,
+lost admission or failed verification leaves the removal failed and retryable;
+only an exhausted carrier scan can produce verified completion. The CLI returns
+the most recent batch's carrier IDs and an aggregate `removedCount` for verified
+batches in that attempt. Do not advance checkpoints manually or remove the
+admission barrier to increase throughput. Discord visibility
 reads use a process-local, bot-scoped queue (64 pending reads, four attempts,
 30-second wait budget). Provider delays beyond that budget defer the effect;
 there is no successful-authorization cache shared between effects.

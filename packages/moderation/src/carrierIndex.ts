@@ -3,7 +3,7 @@ import type { RoomTarget } from "./contracts";
 import { policyLock } from "./policyStore";
 import type { PurgeDriver, RemovalIndex } from "./relayPurge";
 // Match admission's SQL timeout and the local driver's existing command/batch
-// bounds. Overflow is a failed purge, never a truncated successful deletion.
+// bounds. All batches in one barrier share a deadline, including their commits.
 const SQL_TIMEOUT_MS = 1500, BARRIER_DB_MS = 30_000, MAX_CARRIERS = 128;
 export class CarrierIndex implements RemovalIndex {
   constructor(private readonly sql: postgres.Sql) {}
@@ -19,39 +19,69 @@ export class CarrierIndex implements RemovalIndex {
       await session.unsafe(`SET LOCAL lock_timeout = '${SQL_TIMEOUT_MS}ms'`);
       return await driver.barrier(async (signal) => {
         const deadline = Date.now() + BARRIER_DB_MS;
-        const run = async <R extends postgres.Row[]>(query: postgres.PendingQuery<R>): Promise<R> => {
-          const left = deadline - Date.now();
-          if (left <= 0 || signal?.aborted) {
-            query.cancel();
-            await query.catch(() => {});
-            throw new Error("Purge database deadline or barrier lost");
-          }
-          // Let the server enforce the bound and await its response, including
-          // on barrier loss. A client cancel can arrive after statement_timeout
-          // and cancel an unrelated query when this session returns to the pool.
-          await session.unsafe(`SET LOCAL statement_timeout = '${Math.min(left, SQL_TIMEOUT_MS)}ms'`);
-          const result = await query;
+        const assertActive = () => {
           if (signal?.aborted || Date.now() >= deadline) throw new Error("Purge database deadline or barrier lost");
+        };
+        const run = async <R extends postgres.Row[]>(query: () => postgres.PendingQuery<R>): Promise<R> => {
+          assertActive();
+          // Build lazy queries only after these checks. Dispatching a canceled
+          // unstarted query can strand a reserved connection before rollback.
+          if (open) await session.unsafe(`SET LOCAL statement_timeout = '${Math.min(deadline - Date.now(), SQL_TIMEOUT_MS)}ms'`);
+          assertActive();
+          // Server timeouts settle dispatched work before releasing the barrier;
+          // a late client cancel could instead hit the pool's next borrower.
+          const result = await query();
+          assertActive();
           return result;
         };
+        const readIds = async (target: RoomTarget, after: string, limit: number) => {
+          const legacy = await run(() => session`SELECT 1 FROM moderation.carriers WHERE community_id = ${target.communityId}
+              AND channel_id = ${target.channelId} AND kind IN (3302, 7) AND NOT targets_indexed LIMIT 1`);
+          if (legacy.length) throw new Error("Carrier references require verified reindexing");
+          const rows = await run(() => session`SELECT event_id FROM moderation.carriers WHERE community_id = ${target.communityId}
+              AND channel_id = ${target.channelId} AND event_id > ${after}
+              AND (rumor_id = ${target.rumorId} OR target_rumor_ids @> ARRAY[${target.rumorId}]::text[])
+              ORDER BY event_id LIMIT ${limit}`);
+          return rows.map((row) => row.event_id as string);
+        };
+        let selected: { decisionId: string; ids: string[] } | undefined;
         const index: RemovalIndex = {
           start: () => { throw new Error("Tombstone must precede barrier"); },
           ids: async (target) => {
-            const legacy = await run(session`SELECT 1 FROM moderation.carriers WHERE community_id = ${target.communityId}
-              AND channel_id = ${target.channelId} AND kind IN (3302, 7) AND NOT targets_indexed LIMIT 1`);
-            if (legacy.length) throw new Error("Carrier references require verified reindexing");
-            const rows = await run(session`SELECT event_id FROM moderation.carriers WHERE community_id = ${target.communityId}
-              AND channel_id = ${target.channelId} AND (rumor_id = ${target.rumorId} OR target_rumor_ids @> ARRAY[${target.rumorId}]::text[]) ORDER BY event_id LIMIT ${MAX_CARRIERS + 1}`);
-            if (rows.length > MAX_CARRIERS) throw new Error("Carrier index overflow");
-            return rows.map((row) => row.event_id as string);
+            const ids = await readIds(target, "", MAX_CARRIERS + 1);
+            if (ids.length > MAX_CARRIERS) throw new Error("Carrier index overflow");
+            return ids;
+          },
+          batch: async (target, decisionId) => {
+            const [progress] = await run(() => session`SELECT verified_through FROM moderation.removals
+              WHERE decision_id = ${decisionId} AND community_id = ${target.communityId}
+                AND channel_id = ${target.channelId} AND rumor_id = ${target.rumorId} AND state = 'pending' FOR UPDATE`);
+            if (!progress) throw new Error("Pending removal target unavailable");
+            const ids = await readIds(target, progress.verified_through ?? "", MAX_CARRIERS);
+            selected = { decisionId, ids };
+            return ids;
+          },
+          checkpoint: async (decisionId) => {
+            if (!selected || selected.decisionId !== decisionId || !selected.ids.length) throw new Error("Removal batch unavailable");
+            const lastId = selected.ids.at(-1)!;
+            // The tombstone and writer barrier prevent new related carriers.
+            // Commit only after raw-relay verification; keep the carrier index
+            // itself for evidence and offline restore reconciliation.
+            await run(() => session`UPDATE moderation.removals SET verified_through = ${lastId} WHERE decision_id = ${decisionId}`);
+            await run(() => session`COMMIT`);
+            open = false;
+            await run(() => session`BEGIN`);
+            open = true;
+            await run(() => session.unsafe(`SET LOCAL lock_timeout = '${SQL_TIMEOUT_MS}ms'`));
+            selected = undefined;
           },
           finish: async (decisionId, state) => {
-            await run(session`UPDATE moderation.removals SET state = ${state}, verified_at = ${state === "verified" ? new Date() : null} WHERE decision_id = ${decisionId}`);
+            await run(() => session`UPDATE moderation.removals SET state = ${state}, verified_at = ${state === "verified" ? new Date() : null} WHERE decision_id = ${decisionId}`);
           },
         };
         try {
           const result = await work(index, signal);
-          await run(session`COMMIT`);
+          await run(() => session`COMMIT`);
           open = false;
           return result;
         } catch (error) {
