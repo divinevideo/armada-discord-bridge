@@ -125,7 +125,8 @@ Relay purge deletes and verifies at most 128 indexed carriers per batch. Migrati
 024 adds an initially empty checkpoint to existing removal records. A verified
 batch commits its checkpoint while the tombstone and admission barrier remain in
 force; carrier metadata is retained. Retry the same decision ID to resume after
-its last verified batch. The 1.5-second SQL statement limit and 30-second barrier
+its last verified batch. Retrying an already completed removal restarts the full
+relay verification rather than relying on its old checkpoint. The 1.5-second SQL statement limit and 30-second barrier
 database budget apply across the entire attempt, including batch commits. Timeout,
 lost admission or failed verification leaves the removal failed and retryable;
 only an exhausted carrier scan can produce verified completion. The CLI returns

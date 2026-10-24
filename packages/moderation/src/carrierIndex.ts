@@ -20,13 +20,15 @@ export class CarrierIndex implements RemovalIndex {
       return await driver.barrier(async (signal) => {
         const deadline = Date.now() + BARRIER_DB_MS;
         const assertActive = () => {
-          if (signal?.aborted || Date.now() >= deadline) throw new Error("Purge database deadline or barrier lost");
+          const left = deadline - Date.now();
+          if (signal?.aborted || left <= 0) throw new Error("Purge database deadline or barrier lost");
+          return left;
         };
         const run = async <R extends postgres.Row[]>(query: () => postgres.PendingQuery<R>): Promise<R> => {
-          assertActive();
+          const left = assertActive();
           // Build lazy queries only after these checks. Dispatching a canceled
           // unstarted query can strand a reserved connection before rollback.
-          if (open) await session.unsafe(`SET LOCAL statement_timeout = '${Math.min(deadline - Date.now(), SQL_TIMEOUT_MS)}ms'`);
+          if (open) await session.unsafe(`SET LOCAL statement_timeout = '${Math.min(left, SQL_TIMEOUT_MS)}ms'`);
           assertActive();
           // Server timeouts settle dispatched work before releasing the barrier;
           // a late client cancel could instead hit the pool's next borrower.
@@ -109,7 +111,9 @@ export class CarrierIndex implements RemovalIndex {
       const [row] = await tx`UPDATE moderation.community_policy SET revision = revision + 1 WHERE community_id = ${target.communityId} RETURNING revision`;
       await tx`INSERT INTO moderation.removals (decision_id, community_id, channel_id, rumor_id, policy_revision)
         VALUES (${decisionId}, ${target.communityId}, ${target.channelId}, ${target.rumorId}, ${row.revision})
-        ON CONFLICT (decision_id) DO UPDATE SET state = 'pending', attempts = moderation.removals.attempts + 1, policy_revision = EXCLUDED.policy_revision, verified_at = NULL`;
+        ON CONFLICT (decision_id) DO UPDATE SET state = 'pending', attempts = moderation.removals.attempts + 1,
+          policy_revision = EXCLUDED.policy_revision, verified_at = NULL,
+          verified_through = CASE WHEN moderation.removals.state = 'verified' THEN NULL ELSE moderation.removals.verified_through END`;
       return Number(row.revision);
     });
   }

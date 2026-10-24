@@ -186,3 +186,20 @@ test("batch checkpoints preserve the original deadline and settle before releasi
   expect(progress.state).toBe("failed"); expect(progress.verified_at).toBeNull();
   expect(progress.verified_through).toBe(ids[127]);
 });
+
+test("retrying a completed removal re-verifies the relay instead of trusting the old cursor", async () => {
+  const { subject, decisionId, ids, live } = await removalFixture(129);
+  let checks = 0;
+  const driver: PurgeDriver = {
+    async barrier(work) { return work(); },
+    async delete(batch) { for (const id of batch) live.delete(id); },
+    async remaining(batch) { checks++; return batch.filter(id => live.has(id)); },
+  };
+  expect((await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId)).state).toBe("verified");
+  live.add(ids[0]);
+  checks = 0;
+  const retried = await new RelayPurger(new CarrierIndex(sql), driver).removeFromRelay(subject, decisionId);
+  expect(retried).toMatchObject({ state: "verified", removedCount: 129 });
+  expect(checks).toBe(2);
+  expect([...live]).toEqual(["f".repeat(64)]);
+});
