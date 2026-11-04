@@ -63,8 +63,8 @@ export async function communityInteropParts() {
   // and binds like any chat event, so the moderation predicate is the only
   // thing that can keep the message.
   const chat = channelsView(f.community, folded).find(c => c.idHex === f.channelId)!.current;
-  const deleteBy = async (who: { pk: string; signer: Parameters<typeof sealRumor>[3] }, extraTags: string[][] = []) => wrapSeal(await sealRumor(buildRumor({
-    pubkey: who.pk, kind: 5, content: '', tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId], ...extraTags], ms: Date.now(),
+  const deleteBy = async (who: { pk: string; signer: Parameters<typeof sealRumor>[3] }, extraTags: string[][] = [], target = f.allowedRumorId) => wrapSeal(await sealRumor(buildRumor({
+    pubkey: who.pk, kind: 5, content: '', tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', target], ...extraTags], ms: Date.now(),
   }), KIND_SEAL_ENCRYPTED, chat.group, who.signer), chat.group);
   // A member with no Grant: a canDelete that allows anyone removes the message.
   const bystander = localIdentity(generateSecretKey());
@@ -82,6 +82,13 @@ export async function communityInteropParts() {
   const managerHead = folded.heads.get(bytesToHex(managerGrant))!;
   const citedUnprivilegedDeleteEvent = await deleteBy(channelManager,
     [citationToTag({ entityId: managerGrant, version: managerHead.version, editionHash: managerHead.hash })]);
+  // The moderator, citing their Grant and holding MANAGE_MESSAGES, deleting a
+  // message the owner wrote. Citation and permission both hold, but nobody
+  // outranks the owner, so only canActOnMember's rank check keeps it.
+  const ownerRumor = buildRumor({ pubkey: f.owner.pk, kind: 9, content: 'Synthetic owner message', tags: channelBindingTags(f.channelId, chat.epoch), ms: Date.now() });
+  const ownerChatEvent = wrapSeal(await sealRumor(ownerRumor, KIND_SEAL_ENCRYPTED, chat.group, f.owner.signer), chat.group);
+  const moderatorDeletesOwnerEvent = await deleteBy(f.moderator,
+    [citationToTag({ entityId: moderatorGrant, version: grantHead.version, editionHash: grantHead.hash })], ownerRumor.id);
   // Chat carriers the read path must refuse though openWrap opens them: the
   // member's message under a plaintext seal (chat seals must be encrypted,
   // CORD-02 §5), one sealed under this channel's key but bound to the
@@ -111,12 +118,13 @@ export async function communityInteropParts() {
     revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, revokedToken, f.community.relays),
     revokedLiveBundleEvent, revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent, citedUnprivilegedDeleteEvent,
+    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent, citedUnprivilegedDeleteEvent, ownerChatEvent, moderatorDeletesOwnerEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk, channelManager: channelManager.pk,
       channels: channelsView(f.community, folded).map(projectChannel),
       message: { id: f.allowedRumorId, channelId: f.channelId, content: 'Synthetic relay message' },
+      ownerMessageId: ownerRumor.id,
     },
   };
   return { f, link, token, bundle, controls, fixture };

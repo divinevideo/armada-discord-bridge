@@ -111,6 +111,16 @@ test('shared moderation carriers remove cached messages only with current author
   const citationOnly = { ...moderation, canDelete: (actor: string, _author: string, action: any) =>
     citationSatisfied(folded, community.id, actor, action?.citation) };
   expect(ids([message, citedUnprivilegedDelete], citationOnly)).toEqual([]);
+  // The moderator's cited deletion of the owner's message: citation and
+  // permission hold, so only the rank check keeps it. A predicate that checks
+  // the permission with isAuthorized instead of canActOnMember loses it.
+  const [ownerMessage, moderatorDeletesOwner] = await openChatBatch([f.ownerChatEvent, f.moderatorDeletesOwnerEvent], channel);
+  expect(ownerMessage.author).toBe(community.owner);
+  expect(citationSatisfied(folded, community.id, moderatorDeletesOwner.author, citationFromTags(moderatorDeletesOwner.tags))).toBe(true);
+  expect(ids([ownerMessage, moderatorDeletesOwner])).toEqual([f.expected.ownerMessageId]);
+  const noRank = { ...moderation, canDelete: (actor: string, _author: string, action: any) =>
+    citationSatisfied(folded, community.id, actor, action?.citation) && isAuthorized(folded.roster, actor, community.owner, Permissions.MANAGE_MESSAGES) };
+  expect(ids([ownerMessage, moderatorDeletesOwner], noRank)).toEqual([]);
   // With its citation, the same moderator's deletion removes the message.
   expect(ids([message, banned, moderatorDelete])).toEqual([]);
 });
