@@ -54,3 +54,5 @@ Web and native pin these bridge-generated files. Each is the output of the gener
 - `test-fixtures/concord/community-interop.json`, from `scripts/fixtures/community-interop.ts`: the live community. Invite and bundle, owner-rooted control history, public channels and streams, chat and moderation carriers, and the rejected-edition vectors.
 - `test-fixtures/concord/community-lifecycle.json`, from `scripts/fixtures/community-lifecycle.ts`: owner rotation, dissolution tombstones and the refreshed invite, for a community of its own.
 - `test-fixtures/concord/control-parity.json`, from `scripts/fixtures/control-parity.ts`: differential control-fold cases for a native fold.
+
+`community-moderation.json` is retired: its carriers are in `community-interop.json`, a different community. Copying the new files leaves the old one in place, so delete it and repoint the tests that import it: divine-web `src/lib/chat/community.test.ts` and divine-mobile `mobile/packages/concord_repository/test/community_moderation_test.dart`.
