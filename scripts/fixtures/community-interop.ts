@@ -53,14 +53,22 @@ export async function communityInteropParts() {
     actorPubkey: f.moderator.pk, version: channelHead.version + 1n, prevHash: channelHead.hash,
     authority: { entityId: moderatorGrant, version: grantHead.version, editionHash: grantHead.hash },
   }), currentControlWriteGroup(f.community), f.moderator.signer)];
-  // A deletion of the allowed message by a member with no Grant. It opens and
-  // binds like any chat event, so the moderation predicate is the only thing
-  // that can keep the message; a client whose canDelete allows anyone fails.
-  const bystander = localIdentity(generateSecretKey());
+  // Deletions of the allowed message that a client must not honour. Each opens
+  // and binds like any chat event, so the moderation predicate is the only
+  // thing that can keep the message.
   const chat = channelsView(f.community, folded).find(c => c.idHex === f.channelId)!.current;
-  const unprivilegedDeleteEvent = wrapSeal(await sealRumor(buildRumor({ pubkey: bystander.pk, kind: 5, content: '',
-    tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId]], ms: Date.now() }),
-    KIND_SEAL_ENCRYPTED, chat.group, bystander.signer), chat.group);
+  const deleteBy = async (who: { pk: string; signer: Parameters<typeof sealRumor>[3] }) => wrapSeal(await sealRumor(buildRumor({
+    pubkey: who.pk, kind: 5, content: '', tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId]], ms: Date.now(),
+  }), KIND_SEAL_ENCRYPTED, chat.group, who.signer), chat.group);
+  // A member with no Grant: a canDelete that allows anyone removes the message.
+  const bystander = localIdentity(generateSecretKey());
+  const unprivilegedDeleteEvent = await deleteBy(bystander);
+  // The moderator, who does hold MANAGE_MESSAGES, without citing their Grant.
+  // A non-owner moderation delete with no resolvable citation parks
+  // (ChatModeration.canDelete): the permission alone would honour a moderator
+  // whose demotion this client has not synced yet. A canDelete that checks
+  // only the permission, or only that the deleter is staff, removes it.
+  const uncitedModeratorDeleteEvent = await deleteBy(f.moderator);
   // A second invite whose signer has re-posted its coordinate as a revocation
   // tombstone (and which the owner's registry no longer lists).
   const revokedLink = mintLinkSigner();
@@ -73,7 +81,7 @@ export async function communityInteropParts() {
     revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, mintToken(), f.community.relays),
     revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent,
+    chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk,

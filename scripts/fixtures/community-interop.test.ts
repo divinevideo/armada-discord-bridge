@@ -76,10 +76,11 @@ test('shared moderation carriers remove cached messages only with current author
   const { community, folded } = bootstrapFixture(f);
   expect(folded.incomplete).toEqual([]);
   const channel = channelsView(community, folded).find(c => c.idHex === f.expected.message.channelId)!;
-  const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent, f.unprivilegedDeleteEvent], channel);
-  expect(opened).toHaveLength(4);
-  const [message, banned, moderatorDelete, unprivilegedDelete] = opened;
+  const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent, f.unprivilegedDeleteEvent, f.uncitedModeratorDeleteEvent], channel);
+  expect(opened).toHaveLength(5);
+  const [message, banned, moderatorDelete, unprivilegedDelete, uncitedModeratorDelete] = opened;
   expect(unprivilegedDelete.author).toBe(f.expected.bystander);
+  expect(uncitedModeratorDelete.author).toBe(f.expected.moderator);
   const moderation = { banned: folded.banned, canDelete: (actor: string, author: string, action: any) =>
     citationSatisfied(folded, community.id, actor, action?.citation) && canActOnMember(folded.roster, actor, community.owner, author, Permissions.MANAGE_MESSAGES) };
   const ids = (events: typeof opened, m = moderation) => foldTimeline(events, m).messages.map(e => e.rumorId);
@@ -88,5 +89,12 @@ test('shared moderation carriers remove cached messages only with current author
   expect(ids([message, banned, unprivilegedDelete])).toEqual([f.expected.message.id]);
   // ...and only the predicate keeps it: a client that lets anyone delete loses it.
   expect(ids([message, unprivilegedDelete], { ...moderation, canDelete: () => true })).toEqual([]);
+  // The moderator's deletion without a citation parks; a predicate that checks
+  // only the permission honours it, so this vector is what catches that.
+  expect(ids([message, uncitedModeratorDelete])).toEqual([f.expected.message.id]);
+  const permissionOnly = { ...moderation, canDelete: (actor: string, author: string) =>
+    canActOnMember(folded.roster, actor, community.owner, author, Permissions.MANAGE_MESSAGES) };
+  expect(ids([message, uncitedModeratorDelete], permissionOnly)).toEqual([]);
+  // With its citation, the same moderator's deletion removes the message.
   expect(ids([message, banned, moderatorDelete])).toEqual([]);
 });
