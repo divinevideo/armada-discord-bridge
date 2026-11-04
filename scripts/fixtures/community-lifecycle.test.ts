@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { bytesToHex, channelsView, baseRekeyGroupKey, checkContinuity, groupRotations, isDissolved, openWrap, parseRekey } from '@armada-bridge/concord-core';
+import { dissolvedGroupKey, bytesToHex, channelsView, baseRekeyGroupKey, checkContinuity, groupRotations, isDissolved, openWrap, parseRekey } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-lifecycle.json';
 import { bootstrapFixture } from './community-bootstrap';
 
@@ -17,6 +17,14 @@ test('shared lifecycle carriers authenticate owner rotation and dissolution', ()
   expect(checkContinuity(rotation, community.rootEpoch, community.root)).toEqual({ ok: true });
   expect(isDissolved(fixture.dissolvedEvents, community.id, community.owner)).toBe(true);
   expect(isDissolved(fixture.impostorDissolvedEvents, community.id, community.owner)).toBe(false);
+  // Each of these isolates one check, so a client missing it accepts that one.
+  const dissolvedAt = dissolvedGroupKey(community.id);
+  expect(() => openWrap(fixture.forgedAuthorDissolvedEvents[0], dissolvedAt)).toThrow('rumor author does not match');
+  expect(isDissolved(fixture.forgedAuthorDissolvedEvents, community.id, community.owner)).toBe(false);
+  const replayed = openWrap(fixture.replayedDissolvedEvents[0], dissolvedAt);
+  expect(replayed.author).toBe(community.owner);
+  expect(replayed.tags.find(t => t[0] === 'eid')![1]).not.toBe(community.idHex);
+  expect(isDissolved(fixture.replayedDissolvedEvents, community.id, community.owner)).toBe(false);
   expect(fixture.refreshedBundleEvent.created_at).toBeGreaterThan(fixture.bundleEvent.created_at);
   const { community: refreshed, folded: restored } = bootstrapFixture({
     inviteUrl: fixture.inviteUrl, bundleEvent: fixture.refreshedBundleEvent, controlEvents: fixture.nextEpochControlEvents,

@@ -6,7 +6,9 @@
  *
  *   bun scripts/fixtures/community-lifecycle.ts > test-fixtures/concord/community-lifecycle.json
  */
-import { random32, controlSignerGroupKey, openWrap, baseRekeyGroupKey, buildRekeyRumors, epochKeyCommitment, KIND_SEAL_ENCRYPTED, sealDissolved, sealRumor, wrapSeal, buildBundleEvent, bytesToHex, controlGroups, currentControlWriteGroup, sealEdition } from '@armada-bridge/concord-core';
+import { buildDissolvedRumor, dissolvedGroupKey, KIND_SEAL_PLAINTEXT, mintCommunity, random32, controlSignerGroupKey, openWrap, baseRekeyGroupKey, buildRekeyRumors, epochKeyCommitment, KIND_SEAL_ENCRYPTED, sealDissolved, sealRumor, wrapSeal, buildBundleEvent, bytesToHex, controlGroups, currentControlWriteGroup, sealEdition } from '@armada-bridge/concord-core';
+import { generateSecretKey } from 'nostr-tools/pure';
+import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { communityInteropParts } from './community-interop';
 
 export async function communityLifecycleFixture() {
@@ -23,6 +25,21 @@ export async function communityLifecycleFixture() {
     await sealRumor(rumor, KIND_SEAL_ENCRYPTED, rekeyGroup, f.owner.signer), rekeyGroup)));
   const dissolvedEvents = [await sealDissolved(f.community.id, f.owner.pk, f.owner.signer)];
   const impostorDissolvedEvents = [await sealDissolved(f.community.id, f.member.pk, f.member.signer)];
+  // The member's tombstone above honestly names its signer, so it only catches
+  // a client that checks no authorship at all. Each of these defeats exactly
+  // one check instead. forgedAuthor names the owner inside but is sealed by a
+  // stranger: only openWrap's seal-signer/author match refuses it. replayed is
+  // the owner's genuine tombstone for another community the owner runs, lifted
+  // and re-wrapped at this community's dissolved address (anyone can derive it
+  // from the public community id): only the eid binding refuses it, and
+  // control.ts calls accepting it "the vulnerability itself".
+  const dissolvedAt = dissolvedGroupKey(f.community.id);
+  const stranger = localIdentity(generateSecretKey());
+  const forgedAuthorDissolvedEvents = [wrapSeal(await sealRumor(buildDissolvedRumor(f.owner.pk, f.community.id),
+    KIND_SEAL_PLAINTEXT, dissolvedAt, stranger.signer), dissolvedAt)];
+  const { community: sibling } = mintCommunity('Synthetic sibling community', f.owner.pk, f.community.relays);
+  const replayedDissolvedEvents = [wrapSeal(await sealRumor(buildDissolvedRumor(f.owner.pk, sibling.id),
+    KIND_SEAL_PLAINTEXT, dissolvedGroupKey(sibling.id), f.owner.signer), dissolvedAt)];
   const nextRoot = random32(), nextControlRoot = random32();
   const nextControlPk = controlSignerGroupKey(nextControlRoot, f.community.id, nextEpoch).pk;
   const nextCommunity = { ...f.community, root: nextRoot, rootEpoch: nextEpoch, controlRoot: nextControlRoot, controlPk: nextControlPk };
@@ -39,7 +56,8 @@ export async function communityLifecycleFixture() {
   const { description, sourceRevision, inviteUrl, bundleEvent, controlEvents, expected } = fixture;
   return {
     refreshedBundleEvent, nextEpochControlEvents,
-    baseRekeyEvents, dissolvedEvents, impostorDissolvedEvents, nextEpoch: Number(nextEpoch),
+    baseRekeyEvents, dissolvedEvents, impostorDissolvedEvents, forgedAuthorDissolvedEvents, replayedDissolvedEvents,
+    nextEpoch: Number(nextEpoch),
     description, sourceRevision, inviteUrl, bundleEvent, controlEvents,
     // The expected block clients already read from this file (native's session
     // test reads member and channels), not whatever the live fixture adds later.
