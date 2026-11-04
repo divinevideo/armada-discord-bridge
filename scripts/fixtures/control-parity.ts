@@ -10,6 +10,7 @@ export async function controlParityFixture() {
   const c1 = await parsed(buildChannelEdition(ch, {name:'old',private:false},owner));
   const c2 = await parsed(buildChannelEdition(ch, {name:'middle',private:false},{...owner,version:2n,prevHash:c1.selfHash}));
   const c3 = await parsed(buildChannelEdition(ch, {name:'new',private:false},{...owner,version:3n,prevHash:c2.selfHash}));
+  const m1 = await parsed(buildMetadataEdition(f.community.id,{name:'original',relays:[]},owner));
   const m3 = await parsed(buildMetadataEdition(f.community.id,{name:'snapshot',relays:[]},{...owner,version:3n,prevHash:hex32('34'.repeat(32))}));
   const role = adminRole('56'.repeat(32));
   const r = await parsed(buildRoleEdition(role,owner));
@@ -26,6 +27,14 @@ export async function controlParityFixture() {
     vector('singleton-compacted-v3',[c3]),
     vector('mixed-snapshot-entities',[c1,c3,m3],undefined,new Set([bytesToHex(m3.rumorId)])),
     vector('ban-refold-with-prior-floor',[r,g,memberChannel,ban],first.heads),
+    // Each attribution input decides one of these, so a native fold that ignores
+    // it fails. Without the snapshot, m3 cannot chain to m1 and the fold seats
+    // v1 with metadata incomplete. Without the floor, c3 cannot chain to c1 (c2
+    // is withheld) and the fold seats v1 with the channel incomplete; the floor
+    // already vouches for c3. Every prior head is an edition in `opened`, since
+    // native's parity harness resolves floors from the served editions.
+    vector('snapshot-head-over-older-edition',[m1,m3],undefined,new Set([bytesToHex(m3.rumorId)])),
+    vector('prior-floor-vouches-for-unchained-head',[c1,c3],new Map([[bytesToHex(ch),{version:c3.version,hash:c3.selfHash}]])),
   ]};
 }
 if(import.meta.main) console.log(JSON.stringify(await controlParityFixture(),null,2));
