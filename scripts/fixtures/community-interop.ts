@@ -71,11 +71,13 @@ export async function communityInteropParts() {
   const uncitedModeratorDeleteEvent = await deleteBy(f.moderator);
   // Chat carriers the read path must refuse though openWrap opens them: the
   // member's message under a plaintext seal (chat seals must be encrypted,
-  // CORD-02 §5), and one sealed under this channel's key but bound to the
-  // introductions channel. Only openChatBatch's seal and binding checks catch them.
+  // CORD-02 §5), one sealed under this channel's key but bound to the
+  // introductions channel, and one bound to this channel at an epoch the key
+  // does not belong to. Only openChatBatch's seal and binding checks catch them.
   const memberSays = (tags: string[][]) => buildRumor({ pubkey: f.member.pk, kind: 9, content: 'Synthetic relay message', tags, ms: Date.now() });
   const plaintextChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags(f.channelId, chat.epoch)), KIND_SEAL_PLAINTEXT, chat.group, f.member.signer), chat.group);
   const misboundChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags('cd'.repeat(32), chat.epoch)), KIND_SEAL_ENCRYPTED, chat.group, f.member.signer), chat.group);
+  const epochMisboundChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags(f.channelId, chat.epoch + 1n)), KIND_SEAL_ENCRYPTED, chat.group, f.member.signer), chat.group);
   // A second invite whose signer has re-posted its coordinate as a revocation
   // tombstone (and which the owner's registry no longer lists). Its earlier live
   // bundle ships too, a second older and openable with the URL's token: the
@@ -96,7 +98,7 @@ export async function communityInteropParts() {
     revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, revokedToken, f.community.relays),
     revokedLiveBundleEvent, revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
+    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk,

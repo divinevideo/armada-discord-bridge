@@ -20,12 +20,11 @@ test('shared client fixture resolves real public channels', async () => {
   expect(opened[0].rumorId).toBe(fixture.expected.message.id);
   expect(opened[0].content).toBe(fixture.expected.message.content);
   expect(opened[0].author).toBe(fixture.expected.member);
-  // Both negatives open with a bare openWrap, so only those read-path checks
-  // keep them out; a client that skips either admits one.
-  for (const carrier of [fixture.plaintextChatEvent, fixture.misboundChatEvent]) {
-    expect(openWrap(carrier, channel.current.group).author).toBe(fixture.expected.member);
-  }
-  expect(await openChatBatch([fixture.plaintextChatEvent, fixture.misboundChatEvent], channel)).toEqual([]);
+  // Each negative opens with a bare openWrap, so only those read-path checks
+  // keep them out; a client that skips any one of them admits a carrier.
+  const negatives = [fixture.plaintextChatEvent, fixture.misboundChatEvent, fixture.epochMisboundChatEvent];
+  for (const carrier of negatives) expect(openWrap(carrier, channel.current.group).author).toBe(fixture.expected.member);
+  expect(await openChatBatch(negatives, channel)).toEqual([]);
 });
 
 test('the shared invite is live and a revoked one never opens', () => {
