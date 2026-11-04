@@ -85,9 +85,10 @@ export async function communityLifecycleFixture() {
     description, sourceRevision, inviteUrl, bundleEvent, controlEvents,
     // The expected block clients already read from this file (native's session
     // test reads member and channels), not whatever the live fixture adds later.
+    // No `message`: this file carries no chat event for it to describe.
     expected: {
       communityId: expected.communityId, owner: expected.owner, member: expected.member, moderator: expected.moderator,
-      bannedMember: expected.bannedMember, channels: expected.channels, message: expected.message,
+      bannedMember: expected.bannedMember, channels: expected.channels,
     },
   };
 }
