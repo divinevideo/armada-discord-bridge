@@ -4,14 +4,11 @@ import fixture from '../../test-fixtures/concord/community-interop.json';
 import moderationFixture from '../../test-fixtures/concord/community-moderation.json';
 import { bootstrapFixture, projectChannel } from './community-bootstrap';
 
-test('shared client fixture resolves real public channels and rejects the unauthorized rename', async () => {
-  const { community, folded, fold } = bootstrapFixture(fixture);
+test('shared client fixture resolves real public channels', async () => {
+  const { community, folded } = bootstrapFixture(fixture);
   expect(community.idHex).toBe(fixture.expected.communityId);
   expect(community.controlRoot).toBeUndefined();
   expect(folded.incomplete).toEqual([]);
-  const rejected = fold([...fixture.controlEvents, ...fixture.rejectedControlEvents]);
-  expect(rejected.incomplete.length).toBeGreaterThan(0);
-  expect(channelsView(community, rejected).map(c => c.name)).not.toContain("changed");
   const channels = channelsView(community, folded);
   expect(channels.map(projectChannel)).toEqual(fixture.expected.channels);
   expect(channels.map(c => c.name).sort()).toEqual(['general', 'introductions']);
@@ -28,7 +25,21 @@ test('shared client fixture resolves real public channels and rejects the unauth
   expect(opened[0].author).toBe(fixture.expected.member);
 });
 
- test('shared moderation carriers remove cached messages only with current authority', async () => {
+test('a rename that skips the chain is held back as incomplete, whoever signed it', () => {
+  // rejectedControlEvents is a data-availability vector, not an authority one.
+  // Its v2 names no previous edition, so the fold cannot link it to the v1 it
+  // holds and reports the channel incomplete. An owner-signed v2 built the same
+  // way is refused identically, so this says nothing about who may rename. And
+  // `incomplete` is not an authorization signal: FoldedControl deliberately
+  // leaves authority-rejected entities out of it, so an unauthorized edition
+  // that does chain is refused with `incomplete` empty.
+  const { community, fold } = bootstrapFixture(fixture);
+  const gapped = fold([...fixture.controlEvents, ...fixture.rejectedControlEvents]);
+  expect(gapped.incomplete).toEqual([fixture.expected.message.channelId]);
+  expect(channelsView(community, gapped).map(c => c.name)).not.toContain('changed');
+});
+
+test('shared moderation carriers remove cached messages only with current authority', async () => {
   const f = moderationFixture;
   const { community, folded } = bootstrapFixture(f);
   expect(folded.incomplete).toEqual([]);
