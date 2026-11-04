@@ -34,6 +34,11 @@ test('the shared invite is live and a revoked one never opens', () => {
   // the link signer appearing in the owner's folded invite registry.
   expect(folded.liveInviteLinks.has(invite.linkSigner)).toBe(true);
   const revoked = parseInviteLink(fixture.revokedInviteUrl)!;
+  // The link was real: the live bundle the revocation replaced opens with the
+  // URL's token. The tombstone is the newer event at the same coordinate, so it
+  // is what a client must act on, and it must refuse for the stated reason.
+  expect(parseBundleEvent(fixture.revokedLiveBundleEvent, revoked.linkSigner, revoked.token, Date.now()).community_id).toBe(fixture.expected.communityId);
+  expect(fixture.revokedBundleEvent.created_at).toBeGreaterThan(fixture.revokedLiveBundleEvent.created_at);
   let refusal: unknown;
   try { parseBundleEvent(fixture.revokedBundleEvent, revoked.linkSigner, revoked.token, Date.now()); } catch (e) { refusal = e; }
   expect(refusal).toBeInstanceOf(InviteError);

@@ -77,16 +77,24 @@ export async function communityInteropParts() {
   const plaintextChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags(f.channelId, chat.epoch)), KIND_SEAL_PLAINTEXT, chat.group, f.member.signer), chat.group);
   const misboundChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags('cd'.repeat(32), chat.epoch)), KIND_SEAL_ENCRYPTED, chat.group, f.member.signer), chat.group);
   // A second invite whose signer has re-posted its coordinate as a revocation
-  // tombstone (and which the owner's registry no longer lists).
-  const revokedLink = mintLinkSigner();
+  // tombstone (and which the owner's registry no longer lists). Its earlier live
+  // bundle ships too, a second older and openable with the URL's token: the
+  // coordinate is replaceable, so a client that does not act on the newest
+  // event there opens a revoked invite. (One that does act on it refuses even
+  // without checking the marker, since the empty payload cannot decrypt; only
+  // asserting the "revoked" reason pins the marker itself.)
+  const revokedLink = mintLinkSigner(), revokedToken = mintToken();
+  const revokedLive = buildBundleEvent(bundle, revokedToken, revokedLink.sk);
+  const revokedLiveBundleEvent = finalizeEvent({ kind: revokedLive.kind, tags: revokedLive.tags,
+    content: revokedLive.content, created_at: revokedLive.created_at - 1 }, revokedLink.sk);
   const [moderatorDeleteEvent] = await new ConcordActions(f.community, f.moderator, async () => ({ ...f.policy, controlEvents: controls })).prepare(f.decision);
   const fixture = {
     description: 'Synthetic signed bridge-kernel vectors. Contains disposable public read material only. Never use for deployment.',
     sourceRevision: '3febf95aef198828fc156b08e2bda4b873e55f2a',
     inviteUrl: buildInviteUrl('https://chat.example', link.pk, token, f.community.relays),
     bundleEvent,
-    revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, mintToken(), f.community.relays),
-    revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
+    revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, revokedToken, f.community.relays),
+    revokedLiveBundleEvent, revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
     chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
     expected: {
