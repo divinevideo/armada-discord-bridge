@@ -1,5 +1,6 @@
 /** Generate only synthetic cross-client vectors; never accesses a relay or production secrets. */
 import { buildBundleEvent, buildInviteUrl, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { ConcordActions } from '../../packages/moderation/src/concordActions';
 import { moderationFixture } from './moderation-events';
 
 export async function communityInteropFixture() {
@@ -12,7 +13,6 @@ export async function communityInteropFixture() {
     await sign(buildChannelEdition(hex32('cd'.repeat(32)), { name: 'introductions', private: false }, common)),
     await sign(buildChannelEdition(hex32('ef'.repeat(32)), { name: 'private-support', private: true }, common)),
     await sign(buildRegistryEdition(f.community.id, f.owner.pk, [link.pk], common)),
-    f.unauthorizedControl,
   ];
   const bundle = {
     community_id: f.community.idHex, owner: f.owner.pk,
@@ -21,12 +21,13 @@ export async function communityInteropFixture() {
     name: 'Synthetic shared community', creator_npub: f.owner.pk,
   };
   const folded = foldControlState(openControlWraps(controls, controlGroups(f.community)), f.community.id, f.owner.pk);
+  const [moderatorDeleteEvent] = await new ConcordActions(f.community, f.moderator, async () => ({ ...f.policy, controlEvents: controls })).prepare(f.decision);
   return {
     description: 'Synthetic signed bridge-kernel vectors. Contains disposable public read material only. Never use for deployment.',
     sourceRevision: '3febf95aef198828fc156b08e2bda4b873e55f2a',
     inviteUrl: buildInviteUrl('https://chat.example', link.pk, token, f.community.relays),
-    bundleEvent: buildBundleEvent(bundle, token, link.sk), controlEvents: controls,
-    chatEvent: f.allowed,
+    bundleEvent: buildBundleEvent(bundle, token, link.sk), controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl],
+    chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk,
