@@ -61,7 +61,7 @@ export async function communityInteropFixture() {
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk,
-      channels: channelsView(f.community, folded).filter(c => !c.isPrivate).map(c => ({
+      channels: channelsView(f.community, folded).map(c => ({
         id: c.idHex, name: c.name, streams: c.streams.map(s => ({ pubkey: s.group.pk, epoch: Number(s.epoch) })),
       })),
       message: { id: f.allowedRumorId, channelId: f.channelId, content: 'Synthetic relay message' },
