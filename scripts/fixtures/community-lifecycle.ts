@@ -48,8 +48,12 @@ export async function communityLifecycleFixture() {
   // stranger: only openWrap's seal-signer/author match refuses it. replayed is
   // the owner's genuine tombstone for another community the owner runs, lifted
   // and re-wrapped at this community's dissolved address (anyone can derive it
-  // from the public community id): only the eid binding refuses it, and
-  // control.ts calls accepting it "the vulnerability itself".
+  // from the public community id): only the eid binding refuses it, which
+  // buildDissolvedRumor exists to provide ("a seal minted for X fail[s] the
+  // check at Y"). zeroEid is the owner's own tombstone with the frozen all-zero
+  // eid, which names no community: isDissolvedOpened refuses it rather than
+  // grandfathering it and calls accepting it "the vulnerability itself", since
+  // such a seal could be replayed at every community the owner runs.
   const dissolvedAt = dissolvedGroupKey(f.community.id);
   const stranger = localIdentity(generateSecretKey());
   const forgedAuthorDissolvedEvents = [wrapSeal(await sealRumor(buildDissolvedRumor(f.owner.pk, f.community.id),
@@ -57,6 +61,8 @@ export async function communityLifecycleFixture() {
   const { community: sibling } = mintCommunity('Synthetic sibling community', f.owner.pk, f.community.relays);
   const replayedDissolvedEvents = [wrapSeal(await sealRumor(buildDissolvedRumor(f.owner.pk, sibling.id),
     KIND_SEAL_PLAINTEXT, dissolvedGroupKey(sibling.id), f.owner.signer), dissolvedAt)];
+  const zeroEidDissolvedEvents = [wrapSeal(await sealRumor(buildDissolvedRumor(f.owner.pk, new Uint8Array(32)),
+    KIND_SEAL_PLAINTEXT, dissolvedAt, f.owner.signer), dissolvedAt)];
   const nextRoot = random32(), nextControlRoot = random32();
   const nextControlPk = controlSignerGroupKey(nextControlRoot, f.community.id, nextEpoch).pk;
   const nextCommunity = { ...f.community, root: nextRoot, rootEpoch: nextEpoch, controlRoot: nextControlRoot, controlPk: nextControlPk };
@@ -74,7 +80,7 @@ export async function communityLifecycleFixture() {
   return {
     refreshedBundleEvent, nextEpochControlEvents,
     baseRekeyEvents, impostorRekeyEvents, halfPublishedRekeyEvents,
-    dissolvedEvents, impostorDissolvedEvents, forgedAuthorDissolvedEvents, replayedDissolvedEvents,
+    dissolvedEvents, impostorDissolvedEvents, forgedAuthorDissolvedEvents, replayedDissolvedEvents, zeroEidDissolvedEvents,
     nextEpoch: Number(nextEpoch),
     description, sourceRevision, inviteUrl, bundleEvent, controlEvents,
     // The expected block clients already read from this file (native's session

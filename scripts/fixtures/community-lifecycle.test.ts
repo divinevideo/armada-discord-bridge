@@ -46,6 +46,10 @@ test('shared lifecycle carriers authenticate owner rotation and dissolution', ()
   expect(replayed.author).toBe(community.owner);
   expect(replayed.tags.find(t => t[0] === 'eid')![1]).not.toBe(community.idHex);
   expect(isDissolved(fixture.replayedDissolvedEvents, community.id, community.owner)).toBe(false);
+  const zeroEid = openWrap(fixture.zeroEidDissolvedEvents[0], dissolvedAt);
+  expect(zeroEid.author).toBe(community.owner);
+  expect(zeroEid.tags.find(t => t[0] === 'eid')![1]).toBe('0'.repeat(64));
+  expect(isDissolved(fixture.zeroEidDissolvedEvents, community.id, community.owner)).toBe(false);
   expect(fixture.refreshedBundleEvent.created_at).toBeGreaterThan(fixture.bundleEvent.created_at);
   const { community: refreshed, folded: restored } = bootstrapFixture({
     inviteUrl: fixture.inviteUrl, bundleEvent: fixture.refreshedBundleEvent, controlEvents: fixture.nextEpochControlEvents,
