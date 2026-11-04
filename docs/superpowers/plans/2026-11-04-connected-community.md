@@ -45,8 +45,16 @@ Bridge source and runtime CI pass at 686cdbb, including all 996 tests with Postg
 
 The operational authority is the [production runbook](https://github.com/divinevideo/divine-iac-coreconfig/blob/main/docs/how-to/services/concord-production.md). Production hosts, paths, private provisioning evidence and credentials are not copied into this public plan.
 
+## Shared fixtures
+
+Web and native pin these bridge-generated files. Each is the output of the generator beside it: regenerate it rather than editing it, and re-copy all of them together.
+
+- `test-fixtures/concord/community-interop.json`, from `scripts/fixtures/community-interop.ts`: the live community. Invite and bundle, owner-rooted control history, public channels and streams, chat and moderation carriers, and the rejected-edition vectors.
+- `test-fixtures/concord/community-lifecycle.json`, from `scripts/fixtures/community-lifecycle.ts`: owner rotation, dissolution tombstones and the refreshed invite, for a community of its own.
+- `test-fixtures/concord/control-parity.json`, from `scripts/fixtures/control-parity.ts`: differential control-fold cases for a native fold.
+
 ## Workspaces
 
-Bridge worktree is the existing task workspace. Web and native use isolated branches named fix/chat-real-community-20261104. Their shared fixture is test-fixtures/concord/community-interop.json. No production data is included.
+Bridge worktree is the existing task workspace. Web and native use isolated branches named fix/chat-real-community-20261104. No production data is included.
 
 Native now has an owner-rooted authority fold verified against shared kernel outputs. Source verification remains distinct from production membership, device and staff acceptance.

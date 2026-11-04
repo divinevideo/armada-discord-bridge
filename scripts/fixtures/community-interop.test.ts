@@ -1,7 +1,6 @@
 import { expect, test } from 'bun:test';
 import { bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, Permissions } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-interop.json';
-import moderationFixture from '../../test-fixtures/concord/community-moderation.json';
 import { bootstrapFixture, projectChannel } from './community-bootstrap';
 
 test('shared client fixture resolves real public channels', async () => {
@@ -61,7 +60,7 @@ test('a rename by staff without MANAGE_CHANNELS changes nothing, though it chain
 });
 
 test('shared moderation carriers remove cached messages only with current authority', async () => {
-  const f = moderationFixture;
+  const f = fixture;
   const { community, folded } = bootstrapFixture(f);
   expect(folded.incomplete).toEqual([]);
   const channel = channelsView(community, folded).find(c => c.idHex === f.expected.message.channelId)!;
