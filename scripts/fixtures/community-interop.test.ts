@@ -1,21 +1,19 @@
 import { expect, test } from 'bun:test';
-import { canActOnMember, citationSatisfied, foldTimeline, openChatBatch, Permissions, bundleToEntry, channelsView, controlGroups, foldControlState, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, rehydrateCommunity } from '@armada-bridge/concord-core';
+import { canActOnMember, citationSatisfied, foldTimeline, openChatBatch, Permissions, channelsView, openWrap } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-interop.json';
 import moderationFixture from '../../test-fixtures/concord/community-moderation.json';
+import { bootstrapFixture, projectChannel } from './community-bootstrap';
 
 test('shared client fixture resolves real public channels and rejects the unauthorized rename', () => {
-  const invite = parseInviteLink(fixture.inviteUrl)!;
-  const bundle = parseBundleEvent(fixture.bundleEvent, invite.linkSigner, invite.token, Date.now());
-  const community = rehydrateCommunity(bundleToEntry(bundle))!;
+  const { community, folded, fold } = bootstrapFixture(fixture);
   expect(community.idHex).toBe(fixture.expected.communityId);
   expect(community.controlRoot).toBeUndefined();
-  const folded = foldControlState(openControlWraps(fixture.controlEvents, controlGroups(community)), community.id, community.owner);
   expect(folded.incomplete).toEqual([]);
-  const rejected = foldControlState(openControlWraps([...fixture.controlEvents, ...fixture.rejectedControlEvents], controlGroups(community)), community.id, community.owner);
+  const rejected = fold([...fixture.controlEvents, ...fixture.rejectedControlEvents]);
   expect(rejected.incomplete.length).toBeGreaterThan(0);
   expect(channelsView(community, rejected).map(c => c.name)).not.toContain("changed");
   const channels = channelsView(community, folded);
-  expect(channels.map(c => ({ id: c.idHex, name: c.name, streams: c.streams.map(s => ({ pubkey: s.group.pk, epoch: Number(s.epoch) })) }))).toEqual(fixture.expected.channels);
+  expect(channels.map(projectChannel)).toEqual(fixture.expected.channels);
   expect(channels.map(c => c.name).sort()).toEqual(['general', 'introductions']);
   expect(folded.banned.has(fixture.expected.bannedMember)).toBe(true);
   const channel = channels.find(c => c.idHex === fixture.expected.message.channelId)!;
@@ -27,10 +25,7 @@ test('shared client fixture resolves real public channels and rejects the unauth
 
  test('shared moderation carriers remove cached messages only with current authority', async () => {
   const f = moderationFixture;
-  const invite = parseInviteLink(f.inviteUrl)!;
-  const bundle = parseBundleEvent(f.bundleEvent, invite.linkSigner, invite.token, Date.now());
-  const community = rehydrateCommunity(bundleToEntry(bundle))!;
-  const folded = foldControlState(openControlWraps(f.controlEvents, controlGroups(community)), community.id, community.owner);
+  const { community, folded } = bootstrapFixture(f);
   expect(folded.incomplete).toEqual([]);
   const channel = channelsView(community, folded).find(c => c.idHex === f.expected.message.channelId)!;
   const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent], channel);

@@ -3,6 +3,7 @@ import { random32, controlSignerGroupKey, openWrap, baseRekeyGroupKey, buildReke
 import { finalizeEvent } from 'nostr-tools/pure';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
 import { moderationFixture } from './moderation-events';
+import { projectChannel } from './community-bootstrap';
 
 export async function communityInteropFixture() {
   const f = await moderationFixture();
@@ -61,9 +62,7 @@ export async function communityInteropFixture() {
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk,
-      channels: channelsView(f.community, folded).map(c => ({
-        id: c.idHex, name: c.name, streams: c.streams.map(s => ({ pubkey: s.group.pk, epoch: Number(s.epoch) })),
-      })),
+      channels: channelsView(f.community, folded).map(projectChannel),
       message: { id: f.allowedRumorId, channelId: f.channelId, content: 'Synthetic relay message' },
     },
   };
