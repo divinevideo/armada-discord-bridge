@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { baseRekeyGroupKey, bundleToEntry, checkContinuity, controlGroups, foldControlState, groupRotations, isDissolved, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, parseRekey, rehydrateCommunity, validateBundle } from '@armada-bridge/concord-core';
+import { bytesToHex, channelsView, baseRekeyGroupKey, bundleToEntry, checkContinuity, controlGroups, foldControlState, groupRotations, isDissolved, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, parseRekey, rehydrateCommunity, validateBundle } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-lifecycle.json';
 
 test('shared lifecycle carriers authenticate owner rotation and dissolution', () => {
@@ -19,4 +19,15 @@ test('shared lifecycle carriers authenticate owner rotation and dissolution', ()
   expect(checkContinuity(rotation, community.rootEpoch, community.root)).toEqual({ ok: true });
   expect(isDissolved(fixture.dissolvedEvents, community.id, community.owner)).toBe(true);
   expect(isDissolved(fixture.impostorDissolvedEvents, community.id, community.owner)).toBe(false);
+  expect(fixture.refreshedBundleEvent.created_at).toBeGreaterThan(fixture.bundleEvent.created_at);
+  const refreshedBundle = validateBundle(parseBundleEvent(fixture.refreshedBundleEvent, invite.linkSigner, invite.token, Date.now()));
+  const refreshed = rehydrateCommunity(bundleToEntry(refreshedBundle))!;
+  expect(refreshed.idHex).toBe(community.idHex);
+  expect(refreshed.rootEpoch).toBe(rotation.newEpoch);
+  expect(bytesToHex(refreshed.root)).not.toBe(bytesToHex(community.root));
+  expect(refreshed.controlRoot).toBeUndefined();
+  const restored = foldControlState(openControlWraps(fixture.nextEpochControlEvents, controlGroups(refreshed)), refreshed.id, refreshed.owner, folded.heads);
+  expect(restored.incomplete).toEqual([]);
+  expect(restored.heads).toEqual(folded.heads);
+  expect(channelsView(refreshed, restored).map(c => c.idHex)).toEqual(channelsView(community, folded).map(c => c.idHex));
 });
