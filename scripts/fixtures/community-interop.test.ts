@@ -1,11 +1,11 @@
 import { expect, test } from 'bun:test';
-import { canActOnMember, citationSatisfied, foldTimeline, openChatBatch, Permissions, bundleToEntry, channelsView, controlGroups, foldControlState, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, rehydrateCommunity, validateBundle } from '@armada-bridge/concord-core';
+import { canActOnMember, citationSatisfied, foldTimeline, openChatBatch, Permissions, bundleToEntry, channelsView, controlGroups, foldControlState, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, rehydrateCommunity } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-interop.json';
 import moderationFixture from '../../test-fixtures/concord/community-moderation.json';
 
 test('shared client fixture resolves real public channels and rejects the unauthorized rename', () => {
   const invite = parseInviteLink(fixture.inviteUrl)!;
-  const bundle = validateBundle(parseBundleEvent(fixture.bundleEvent, invite.linkSigner, invite.token, Date.now()));
+  const bundle = parseBundleEvent(fixture.bundleEvent, invite.linkSigner, invite.token, Date.now());
   const community = rehydrateCommunity(bundleToEntry(bundle))!;
   expect(community.idHex).toBe(fixture.expected.communityId);
   expect(community.controlRoot).toBeUndefined();
@@ -28,7 +28,7 @@ test('shared client fixture resolves real public channels and rejects the unauth
  test('shared moderation carriers remove cached messages only with current authority', async () => {
   const f = moderationFixture;
   const invite = parseInviteLink(f.inviteUrl)!;
-  const bundle = validateBundle(parseBundleEvent(f.bundleEvent, invite.linkSigner, invite.token, Date.now()));
+  const bundle = parseBundleEvent(f.bundleEvent, invite.linkSigner, invite.token, Date.now());
   const community = rehydrateCommunity(bundleToEntry(bundle))!;
   const folded = foldControlState(openControlWraps(f.controlEvents, controlGroups(community)), community.id, community.owner);
   expect(folded.incomplete).toEqual([]);

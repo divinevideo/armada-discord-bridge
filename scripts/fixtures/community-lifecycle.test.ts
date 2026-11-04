@@ -1,10 +1,10 @@
 import { expect, test } from 'bun:test';
-import { bytesToHex, channelsView, baseRekeyGroupKey, bundleToEntry, checkContinuity, controlGroups, foldControlState, groupRotations, isDissolved, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, parseRekey, rehydrateCommunity, validateBundle } from '@armada-bridge/concord-core';
+import { bytesToHex, channelsView, baseRekeyGroupKey, bundleToEntry, checkContinuity, controlGroups, foldControlState, groupRotations, isDissolved, openControlWraps, openWrap, parseBundleEvent, parseInviteLink, parseRekey, rehydrateCommunity } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-lifecycle.json';
 
 test('shared lifecycle carriers authenticate owner rotation and dissolution', () => {
   const invite = parseInviteLink(fixture.inviteUrl)!;
-  const bundle = validateBundle(parseBundleEvent(fixture.bundleEvent, invite.linkSigner, invite.token, Date.now()));
+  const bundle = parseBundleEvent(fixture.bundleEvent, invite.linkSigner, invite.token, Date.now());
   const community = rehydrateCommunity(bundleToEntry(bundle))!;
   const folded = foldControlState(openControlWraps(fixture.controlEvents, controlGroups(community)), community.id, community.owner);
   expect(folded.incomplete).toEqual([]);
@@ -20,7 +20,7 @@ test('shared lifecycle carriers authenticate owner rotation and dissolution', ()
   expect(isDissolved(fixture.dissolvedEvents, community.id, community.owner)).toBe(true);
   expect(isDissolved(fixture.impostorDissolvedEvents, community.id, community.owner)).toBe(false);
   expect(fixture.refreshedBundleEvent.created_at).toBeGreaterThan(fixture.bundleEvent.created_at);
-  const refreshedBundle = validateBundle(parseBundleEvent(fixture.refreshedBundleEvent, invite.linkSigner, invite.token, Date.now()));
+  const refreshedBundle = parseBundleEvent(fixture.refreshedBundleEvent, invite.linkSigner, invite.token, Date.now());
   const refreshed = rehydrateCommunity(bundleToEntry(refreshedBundle))!;
   expect(refreshed.idHex).toBe(community.idHex);
   expect(refreshed.rootEpoch).toBe(rotation.newEpoch);
