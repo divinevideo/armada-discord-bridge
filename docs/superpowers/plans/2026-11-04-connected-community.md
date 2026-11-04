@@ -52,7 +52,7 @@ The operational authority is the [production runbook](https://github.com/divinev
 Web and native pin these bridge-generated files. Each is the output of the generator beside it: regenerate it rather than editing it, and re-copy all of them together.
 
 - `test-fixtures/concord/community-interop.json`, from `scripts/fixtures/community-interop.ts`: the live community. Invite and bundle, owner-rooted control history, public channels and streams, chat and moderation carriers, and the rejected-edition vectors.
-- `test-fixtures/concord/community-lifecycle.json`, from `scripts/fixtures/community-lifecycle.ts`: owner rotation, dissolution tombstones and the refreshed invite, for a community of its own.
+- `test-fixtures/concord/community-lifecycle.json`, from `scripts/fixtures/community-lifecycle.ts`: owner rotation, dissolution tombstones and the refreshed invite, with the impostors a client must refuse, for a community of its own. Group each rotation key (`baseRekeyEvents`, `impostorRekeyEvents`, `halfPublishedRekeyEvents`) on its own: the half-published rotation shares the owner rotation's grouping key, so grouping them together lets arrival order decide whether it reads as complete.
 - `test-fixtures/concord/control-parity.json`, from `scripts/fixtures/control-parity.ts`: differential control-fold cases for a native fold.
 
 `community-moderation.json` is retired: its carriers are in `community-interop.json`, a different community. Copying the new files leaves the old one in place, so delete it and repoint the tests that import it: divine-web `src/lib/chat/community.test.ts` and divine-mobile `mobile/packages/concord_repository/test/community_moderation_test.dart`.
