@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { InviteError, parseBundleEvent, parseInviteLink, bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, openWrap, Permissions } from '@armada-bridge/concord-core';
+import { citationFromTags, InviteError, parseBundleEvent, parseInviteLink, bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, openWrap, Permissions } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-interop.json';
 import { bootstrapFixture, projectChannel } from './community-bootstrap';
 
@@ -84,9 +84,9 @@ test('shared moderation carriers remove cached messages only with current author
   const { community, folded } = bootstrapFixture(f);
   expect(folded.incomplete).toEqual([]);
   const channel = channelsView(community, folded).find(c => c.idHex === f.expected.message.channelId)!;
-  const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent, f.unprivilegedDeleteEvent, f.uncitedModeratorDeleteEvent], channel);
-  expect(opened).toHaveLength(5);
-  const [message, banned, moderatorDelete, unprivilegedDelete, uncitedModeratorDelete] = opened;
+  const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent, f.unprivilegedDeleteEvent, f.uncitedModeratorDeleteEvent, f.citedUnprivilegedDeleteEvent], channel);
+  expect(opened).toHaveLength(6);
+  const [message, banned, moderatorDelete, unprivilegedDelete, uncitedModeratorDelete, citedUnprivilegedDelete] = opened;
   expect(unprivilegedDelete.author).toBe(f.expected.bystander);
   expect(uncitedModeratorDelete.author).toBe(f.expected.moderator);
   const moderation = { banned: folded.banned, canDelete: (actor: string, author: string, action: any) =>
@@ -103,6 +103,14 @@ test('shared moderation carriers remove cached messages only with current author
   const permissionOnly = { ...moderation, canDelete: (actor: string, author: string) =>
     canActOnMember(folded.roster, actor, community.owner, author, Permissions.MANAGE_MESSAGES) };
   expect(ids([message, uncitedModeratorDelete], permissionOnly)).toEqual([]);
+  // Staff whose role lacks MANAGE_MESSAGES, with a citation that holds: only
+  // the permission keeps the message, so a citation-only predicate loses it.
+  expect(citedUnprivilegedDelete.author).toBe(f.expected.channelManager);
+  expect(citationSatisfied(folded, community.id, citedUnprivilegedDelete.author, citationFromTags(citedUnprivilegedDelete.tags))).toBe(true);
+  expect(ids([message, citedUnprivilegedDelete])).toEqual([f.expected.message.id]);
+  const citationOnly = { ...moderation, canDelete: (actor: string, _author: string, action: any) =>
+    citationSatisfied(folded, community.id, actor, action?.citation) };
+  expect(ids([message, citedUnprivilegedDelete], citationOnly)).toEqual([]);
   // With its citation, the same moderator's deletion removes the message.
   expect(ids([message, banned, moderatorDelete])).toEqual([]);
 });

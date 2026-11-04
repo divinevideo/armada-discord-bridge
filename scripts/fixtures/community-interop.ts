@@ -8,7 +8,7 @@
  *
  *   bun scripts/fixtures/community-interop.ts > test-fixtures/concord/community-interop.json
  */
-import { KIND_SEAL_PLAINTEXT, buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { KIND_SEAL_PLAINTEXT, Permissions, buildGrantEdition, buildRoleEdition, citationToTag, buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
 import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
 import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
@@ -21,11 +21,17 @@ export async function communityInteropParts() {
   const link = mintLinkSigner(), token = mintToken();
   const common = { actorPubkey: f.owner.pk, version: 1n };
   const sign = (rumor: Parameters<typeof sealEdition>[0]) => sealEdition(rumor, currentControlWriteGroup(f.community), f.owner.signer);
+  // Staff whose role holds MANAGE_CHANNELS but not MANAGE_MESSAGES, for the
+  // cited-deletion vector below.
+  const channelManager = localIdentity(generateSecretKey()), channelManagerRole = 'c4'.repeat(32);
   const controls = [...f.policy.controlEvents,
     await sign(buildMetadataEdition(f.community.id, { name: 'Synthetic shared community', relays: f.community.relays }, common)),
     await sign(buildChannelEdition(hex32('cd'.repeat(32)), { name: 'introductions', private: false }, common)),
     await sign(buildChannelEdition(hex32('ef'.repeat(32)), { name: 'private-support', private: true }, common)),
     await sign(buildRegistryEdition(f.community.id, f.owner.pk, [link.pk], common)),
+    await sign(buildRoleEdition({ roleId: channelManagerRole, name: 'Channel manager', position: 3,
+      permissions: Permissions.MANAGE_CHANNELS, scope: { kind: 'server' }, color: 0 }, common)),
+    await sign(buildGrantEdition(f.community.id, { member: channelManager.pk, roleIds: [channelManagerRole] }, common)),
   ];
   const bundle = {
     community_id: f.community.idHex, owner: f.owner.pk,
@@ -57,8 +63,8 @@ export async function communityInteropParts() {
   // and binds like any chat event, so the moderation predicate is the only
   // thing that can keep the message.
   const chat = channelsView(f.community, folded).find(c => c.idHex === f.channelId)!.current;
-  const deleteBy = async (who: { pk: string; signer: Parameters<typeof sealRumor>[3] }) => wrapSeal(await sealRumor(buildRumor({
-    pubkey: who.pk, kind: 5, content: '', tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId]], ms: Date.now(),
+  const deleteBy = async (who: { pk: string; signer: Parameters<typeof sealRumor>[3] }, extraTags: string[][] = []) => wrapSeal(await sealRumor(buildRumor({
+    pubkey: who.pk, kind: 5, content: '', tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId], ...extraTags], ms: Date.now(),
   }), KIND_SEAL_ENCRYPTED, chat.group, who.signer), chat.group);
   // A member with no Grant: a canDelete that allows anyone removes the message.
   const bystander = localIdentity(generateSecretKey());
@@ -69,6 +75,13 @@ export async function communityInteropParts() {
   // whose demotion this client has not synced yet. A canDelete that checks
   // only the permission, or only that the deleter is staff, removes it.
   const uncitedModeratorDeleteEvent = await deleteBy(f.moderator);
+  // The channel manager, citing their own current Grant, whose role lacks
+  // MANAGE_MESSAGES. The citation holds, so only the permission refuses it: a
+  // canDelete that checks just the citation, or just "is staff", removes it.
+  const managerGrant = grantLocator(f.community.id, hex32(channelManager.pk));
+  const managerHead = folded.heads.get(bytesToHex(managerGrant))!;
+  const citedUnprivilegedDeleteEvent = await deleteBy(channelManager,
+    [citationToTag({ entityId: managerGrant, version: managerHead.version, editionHash: managerHead.hash })]);
   // Chat carriers the read path must refuse though openWrap opens them: the
   // member's message under a plaintext seal (chat seals must be encrypted,
   // CORD-02 §5), one sealed under this channel's key but bound to the
@@ -98,10 +111,10 @@ export async function communityInteropParts() {
     revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, revokedToken, f.community.relays),
     revokedLiveBundleEvent, revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
+    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent, citedUnprivilegedDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
-      moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk,
+      moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk, channelManager: channelManager.pk,
       channels: channelsView(f.community, folded).map(projectChannel),
       message: { id: f.allowedRumorId, channelId: f.channelId, content: 'Synthetic relay message' },
     },
