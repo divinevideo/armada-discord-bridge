@@ -8,7 +8,7 @@
  *
  *   bun scripts/fixtures/community-interop.ts > test-fixtures/concord/community-interop.json
  */
-import { buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { KIND_SEAL_PLAINTEXT, buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
 import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
 import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
@@ -69,6 +69,13 @@ export async function communityInteropParts() {
   // whose demotion this client has not synced yet. A canDelete that checks
   // only the permission, or only that the deleter is staff, removes it.
   const uncitedModeratorDeleteEvent = await deleteBy(f.moderator);
+  // Chat carriers the read path must refuse though openWrap opens them: the
+  // member's message under a plaintext seal (chat seals must be encrypted,
+  // CORD-02 §5), and one sealed under this channel's key but bound to the
+  // introductions channel. Only openChatBatch's seal and binding checks catch them.
+  const memberSays = (tags: string[][]) => buildRumor({ pubkey: f.member.pk, kind: 9, content: 'Synthetic relay message', tags, ms: Date.now() });
+  const plaintextChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags(f.channelId, chat.epoch)), KIND_SEAL_PLAINTEXT, chat.group, f.member.signer), chat.group);
+  const misboundChatEvent = wrapSeal(await sealRumor(memberSays(channelBindingTags('cd'.repeat(32), chat.epoch)), KIND_SEAL_ENCRYPTED, chat.group, f.member.signer), chat.group);
   // A second invite whose signer has re-posted its coordinate as a revocation
   // tombstone (and which the owner's registry no longer lists).
   const revokedLink = mintLinkSigner();
@@ -81,7 +88,7 @@ export async function communityInteropParts() {
     revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, mintToken(), f.community.relays),
     revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
+    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk,

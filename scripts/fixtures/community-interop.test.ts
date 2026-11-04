@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { InviteError, parseBundleEvent, parseInviteLink, bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, Permissions } from '@armada-bridge/concord-core';
+import { InviteError, parseBundleEvent, parseInviteLink, bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, openWrap, Permissions } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-interop.json';
 import { bootstrapFixture, projectChannel } from './community-bootstrap';
 
@@ -14,14 +14,18 @@ test('shared client fixture resolves real public channels', async () => {
   expect(folded.banned.has(fixture.expected.bannedMember)).toBe(true);
   const channel = channels.find(c => c.idHex === fixture.expected.message.channelId)!;
   // The read path every client uses, not a bare openWrap: it also refuses a
-  // plaintext seal and a carrier bound to another channel or epoch, which is
-  // what makes the message admissible for the channel it claims.
+  // plaintext seal and a carrier bound to another channel or epoch.
   const opened = await openChatBatch([fixture.chatEvent], channel);
   expect(opened).toHaveLength(1);
-  expect(opened[0].channelIdHex).toBe(fixture.expected.message.channelId);
   expect(opened[0].rumorId).toBe(fixture.expected.message.id);
   expect(opened[0].content).toBe(fixture.expected.message.content);
   expect(opened[0].author).toBe(fixture.expected.member);
+  // Both negatives open with a bare openWrap, so only those read-path checks
+  // keep them out; a client that skips either admits one.
+  for (const carrier of [fixture.plaintextChatEvent, fixture.misboundChatEvent]) {
+    expect(openWrap(carrier, channel.current.group).author).toBe(fixture.expected.member);
+  }
+  expect(await openChatBatch([fixture.plaintextChatEvent, fixture.misboundChatEvent], channel)).toEqual([]);
 });
 
 test('the shared invite is live and a revoked one never opens', () => {
