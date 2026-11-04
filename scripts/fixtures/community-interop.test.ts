@@ -64,11 +64,17 @@ test('shared moderation carriers remove cached messages only with current author
   const { community, folded } = bootstrapFixture(f);
   expect(folded.incomplete).toEqual([]);
   const channel = channelsView(community, folded).find(c => c.idHex === f.expected.message.channelId)!;
-  const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent], channel);
-  expect(opened).toHaveLength(3);
+  const opened = await openChatBatch([f.chatEvent, f.bannedChatEvent, f.moderatorDeleteEvent, f.unprivilegedDeleteEvent], channel);
+  expect(opened).toHaveLength(4);
+  const [message, banned, moderatorDelete, unprivilegedDelete] = opened;
+  expect(unprivilegedDelete.author).toBe(f.expected.bystander);
   const moderation = { banned: folded.banned, canDelete: (actor: string, author: string, action: any) =>
     citationSatisfied(folded, community.id, actor, action?.citation) && canActOnMember(folded.roster, actor, community.owner, author, Permissions.MANAGE_MESSAGES) };
-  expect(foldTimeline(opened.slice(0, 2), moderation).messages.map(m => m.rumorId)).toEqual([f.expected.message.id]);
-  expect(foldTimeline(opened, moderation).messages).toEqual([]);
-  expect(foldTimeline(opened, { ...moderation, canDelete: () => false }).messages).toHaveLength(1);
+  const ids = (events: typeof opened, m = moderation) => foldTimeline(events, m).messages.map(e => e.rumorId);
+  expect(ids([message, banned])).toEqual([f.expected.message.id]);
+  // A signed deletion by a member with no Grant leaves the message...
+  expect(ids([message, banned, unprivilegedDelete])).toEqual([f.expected.message.id]);
+  // ...and only the predicate keeps it: a client that lets anyone delete loses it.
+  expect(ids([message, unprivilegedDelete], { ...moderation, canDelete: () => true })).toEqual([]);
+  expect(ids([message, banned, moderatorDelete])).toEqual([]);
 });

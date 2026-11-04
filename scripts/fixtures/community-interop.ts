@@ -8,8 +8,9 @@
  *
  *   bun scripts/fixtures/community-interop.ts > test-fixtures/concord/community-interop.json
  */
-import { buildBundleEvent, buildInviteUrl, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
-import { finalizeEvent } from 'nostr-tools/pure';
+import { buildBundleEvent, buildInviteUrl, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
+import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
 import { moderationFixture } from './moderation-events';
 import { projectChannel } from './community-bootstrap';
@@ -52,16 +53,24 @@ export async function communityInteropParts() {
     actorPubkey: f.moderator.pk, version: channelHead.version + 1n, prevHash: channelHead.hash,
     authority: { entityId: moderatorGrant, version: grantHead.version, editionHash: grantHead.hash },
   }), currentControlWriteGroup(f.community), f.moderator.signer)];
+  // A deletion of the allowed message by a member with no Grant. It opens and
+  // binds like any chat event, so the moderation predicate is the only thing
+  // that can keep the message; a client whose canDelete allows anyone fails.
+  const bystander = localIdentity(generateSecretKey());
+  const chat = channelsView(f.community, folded).find(c => c.idHex === f.channelId)!.current;
+  const unprivilegedDeleteEvent = wrapSeal(await sealRumor(buildRumor({ pubkey: bystander.pk, kind: 5, content: '',
+    tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId]], ms: Date.now() }),
+    KIND_SEAL_ENCRYPTED, chat.group, bystander.signer), chat.group);
   const [moderatorDeleteEvent] = await new ConcordActions(f.community, f.moderator, async () => ({ ...f.policy, controlEvents: controls })).prepare(f.decision);
   const fixture = {
     description: 'Synthetic signed bridge-kernel vectors. Contains disposable public read material only. Never use for deployment.',
     sourceRevision: '3febf95aef198828fc156b08e2bda4b873e55f2a',
     inviteUrl: buildInviteUrl('https://chat.example', link.pk, token, f.community.relays),
     bundleEvent, controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent,
+    chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
-      moderator: f.moderator.pk, bannedMember: f.bannedMember.pk,
+      moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk,
       channels: channelsView(f.community, folded).map(projectChannel),
       message: { id: f.allowedRumorId, channelId: f.channelId, content: 'Synthetic relay message' },
     },
