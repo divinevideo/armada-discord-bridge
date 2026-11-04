@@ -1,5 +1,5 @@
 /** Generate only synthetic cross-client vectors; never accesses a relay or production secrets. */
-import { buildBundleEvent, buildInviteUrl, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { baseRekeyGroupKey, buildRekeyRumors, epochKeyCommitment, KIND_SEAL_ENCRYPTED, sealDissolved, sealRumor, wrapSeal, buildBundleEvent, buildInviteUrl, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
 import { moderationFixture } from './moderation-events';
 
@@ -22,7 +22,20 @@ export async function communityInteropFixture() {
   };
   const folded = foldControlState(openControlWraps(controls, controlGroups(f.community)), f.community.id, f.owner.pk);
   const [moderatorDeleteEvent] = await new ConcordActions(f.community, f.moderator, async () => ({ ...f.policy, controlEvents: controls })).prepare(f.decision);
+  // These carriers prove lifecycle stop detection without gifting a client any
+  // next-epoch key. Rejoining a rotated community is a separate invite flow.
+  const nextEpoch = f.community.rootEpoch + 1n;
+  const rekeyGroup = baseRekeyGroupKey(f.community.root, f.community.id, nextEpoch);
+  const rekeys = buildRekeyRumors(f.owner.pk, {
+    scope: { kind: 'root' }, newEpoch: nextEpoch, prevEpoch: f.community.rootEpoch,
+    prevCommit: bytesToHex(epochKeyCommitment(f.community.rootEpoch, f.community.root)),
+  }, [], Date.now());
+  const baseRekeyEvents = await Promise.all(rekeys.map(async rumor => wrapSeal(
+    await sealRumor(rumor, KIND_SEAL_ENCRYPTED, rekeyGroup, f.owner.signer), rekeyGroup)));
+  const dissolvedEvents = [await sealDissolved(f.community.id, f.owner.pk, f.owner.signer)];
+  const impostorDissolvedEvents = [await sealDissolved(f.community.id, f.member.pk, f.member.signer)];
   return {
+    baseRekeyEvents, dissolvedEvents, impostorDissolvedEvents, nextEpoch: Number(nextEpoch),
     description: 'Synthetic signed bridge-kernel vectors. Contains disposable public read material only. Never use for deployment.',
     sourceRevision: '3febf95aef198828fc156b08e2bda4b873e55f2a',
     inviteUrl: buildInviteUrl('https://chat.example', link.pk, token, f.community.relays),
