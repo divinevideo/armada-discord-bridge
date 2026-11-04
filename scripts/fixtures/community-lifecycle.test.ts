@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { dissolvedGroupKey, bytesToHex, channelsView, baseRekeyGroupKey, checkContinuity, groupRotations, isDissolved, openWrap, parseRekey } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-lifecycle.json';
+import { refoundGate } from '../../packages/portal/src/severance';
 import { bootstrapFixture } from './community-bootstrap';
 
 test('shared lifecycle carriers authenticate owner rotation and dissolution', () => {
@@ -15,6 +16,26 @@ test('shared lifecycle carriers authenticate owner rotation and dissolution', ()
   expect(rotation.newEpoch).toBe(community.rootEpoch + 1n);
   expect(rotation.scopeIdHex).toBe('0'.repeat(64));
   expect(checkContinuity(rotation, community.rootEpoch, community.root)).toEqual({ ok: true });
+  // The bridge's Refounding gate, which mirrors rekeyRecovery's, rather than a
+  // rotator === owner comparison that tests the fixture instead of a client.
+  const gate = refoundGate(folded, community);
+  expect(gate(rotation.rotator, rotation.authority)).toBe(true);
+  const rotationOf = (events: typeof fixture.baseRekeyEvents) => {
+    const sets = groupRotations(events.map(event => parseRekey(openWrap(event, group))));
+    expect(sets).toHaveLength(1);
+    return sets[0];
+  };
+  // Complete and continuous, so only the authority gate can refuse it.
+  const impostor = rotationOf(fixture.impostorRekeyEvents);
+  expect(impostor.complete).toBe(true);
+  expect(checkContinuity(impostor, community.rootEpoch, community.root)).toEqual({ ok: true });
+  expect(gate(impostor.rotator, impostor.authority)).toBe(false);
+  // Authorized and continuous, so only completeness can refuse it.
+  const halfPublished = rotationOf(fixture.halfPublishedRekeyEvents);
+  expect(gate(halfPublished.rotator, halfPublished.authority)).toBe(true);
+  expect(checkContinuity(halfPublished, community.rootEpoch, community.root)).toEqual({ ok: true });
+  expect(halfPublished.chunkCount).toBe(2);
+  expect(halfPublished.complete).toBe(false);
   expect(isDissolved(fixture.dissolvedEvents, community.id, community.owner)).toBe(true);
   expect(isDissolved(fixture.impostorDissolvedEvents, community.id, community.owner)).toBe(false);
   // Each of these isolates one check, so a client missing it accepts that one.

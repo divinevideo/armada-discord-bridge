@@ -6,8 +6,9 @@
  *
  *   bun scripts/fixtures/community-lifecycle.ts > test-fixtures/concord/community-lifecycle.json
  */
-import { buildDissolvedRumor, dissolvedGroupKey, KIND_SEAL_PLAINTEXT, mintCommunity, random32, controlSignerGroupKey, openWrap, baseRekeyGroupKey, buildRekeyRumors, epochKeyCommitment, KIND_SEAL_ENCRYPTED, sealDissolved, sealRumor, wrapSeal, buildBundleEvent, bytesToHex, controlGroups, currentControlWriteGroup, sealEdition } from '@armada-bridge/concord-core';
-import { generateSecretKey } from 'nostr-tools/pure';
+import { REKEY_BLOBS_PER_EVENT, buildDissolvedRumor, dissolvedGroupKey, KIND_SEAL_PLAINTEXT, mintCommunity, random32, controlSignerGroupKey, openWrap, baseRekeyGroupKey, buildRekeyRumors, epochKeyCommitment, KIND_SEAL_ENCRYPTED, sealDissolved, sealRumor, wrapSeal, buildBundleEvent, bytesToHex, controlGroups, currentControlWriteGroup, sealEdition } from '@armada-bridge/concord-core';
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { encrypt as nip44Encrypt, getConversationKey } from 'nostr-tools/nip44';
 import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { communityInteropParts } from './community-interop';
 
@@ -17,12 +18,28 @@ export async function communityLifecycleFixture() {
   // public invite; a client must not interpret stop detection as key adoption.
   const nextEpoch = f.community.rootEpoch + 1n;
   const rekeyGroup = baseRekeyGroupKey(f.community.root, f.community.id, nextEpoch);
-  const rekeys = buildRekeyRumors(f.owner.pk, {
-    scope: { kind: 'root' }, newEpoch: nextEpoch, prevEpoch: f.community.rootEpoch,
+  const rotation = {
+    scope: { kind: 'root' as const }, newEpoch: nextEpoch, prevEpoch: f.community.rootEpoch,
     prevCommit: bytesToHex(epochKeyCommitment(f.community.rootEpoch, f.community.root)),
-  }, [], Date.now());
-  const baseRekeyEvents = await Promise.all(rekeys.map(async rumor => wrapSeal(
-    await sealRumor(rumor, KIND_SEAL_ENCRYPTED, rekeyGroup, f.owner.signer), rekeyGroup)));
+  };
+  const rotateAs = async (rotator: typeof f.owner, blobs: Parameters<typeof buildRekeyRumors>[2]) =>
+    Promise.all(buildRekeyRumors(rotator.pk, rotation, blobs, Date.now()).map(async rumor => wrapSeal(
+      await sealRumor(rumor, KIND_SEAL_ENCRYPTED, rekeyGroup, rotator.signer), rekeyGroup)));
+  const baseRekeyEvents = await rotateAs(f.owner, []);
+  // Rotation negatives. The base rekey address derives from community_root,
+  // which every invite holder has, so anyone can publish a complete rotation
+  // that chains off the current key: only the Refounding gate (unbanned, holds
+  // BAN, cites a Grant the fold confirms) refuses a member's. The other is the
+  // owner's own rotation with its second chunk never published, which is
+  // authorized and continuous but must not be acted on while incomplete.
+  // portal/severance.ts names both as negatives the reference has to refuse.
+  // Fold each set on its own: the half-published one shares the owner
+  // rotation's key, as a partly published copy of it would.
+  const impostorRekeyEvents = await rotateAs(f.member, []);
+  const decoyBlob = () => ({ locator: bytesToHex(random32()),
+    wrapped: nip44Encrypt(bytesToHex(random32()), getConversationKey(generateSecretKey(), getPublicKey(generateSecretKey()))) });
+  const [firstOfTwoChunks] = await rotateAs(f.owner, Array.from({ length: REKEY_BLOBS_PER_EVENT + 1 }, decoyBlob));
+  const halfPublishedRekeyEvents = [firstOfTwoChunks];
   const dissolvedEvents = [await sealDissolved(f.community.id, f.owner.pk, f.owner.signer)];
   const impostorDissolvedEvents = [await sealDissolved(f.community.id, f.member.pk, f.member.signer)];
   // The member's tombstone above honestly names its signer, so it only catches
@@ -56,7 +73,8 @@ export async function communityLifecycleFixture() {
   const { description, sourceRevision, inviteUrl, bundleEvent, controlEvents, expected } = fixture;
   return {
     refreshedBundleEvent, nextEpochControlEvents,
-    baseRekeyEvents, dissolvedEvents, impostorDissolvedEvents, forgedAuthorDissolvedEvents, replayedDissolvedEvents,
+    baseRekeyEvents, impostorRekeyEvents, halfPublishedRekeyEvents,
+    dissolvedEvents, impostorDissolvedEvents, forgedAuthorDissolvedEvents, replayedDissolvedEvents,
     nextEpoch: Number(nextEpoch),
     description, sourceRevision, inviteUrl, bundleEvent, controlEvents,
     // The expected block clients already read from this file (native's session
