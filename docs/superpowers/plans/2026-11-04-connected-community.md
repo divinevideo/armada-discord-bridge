@@ -4,7 +4,7 @@ Goal: Divine web, native Rooms and Discord exchange messages through the same re
 
 Architecture: resolve a configured standard Concord public invite, verify its bundle and owner-rooted control state, and derive channels/epochs from that state. The bridge's unchanged concord-core is the protocol reference. Existing signers remain the user identity. Public configuration failures never select synthetic POC keys.
 
-The user approved this direction after the source/live-state investigation. This is implementation authorization; production admission still follows the existing release runbook. One channel proves the first round trip; delivery scope remains all approved public channels, excluding private support and Tickets.
+Production admission follows the existing release runbook. One channel proves the first round trip; delivery scope remains all approved public channels, excluding private support and Tickets.
 
 ## Constraints
 
@@ -35,6 +35,8 @@ The implementation is tracked in these pull requests. Their current checks and r
 
 Bridge source and runtime CI pass at 686cdbb, including all 996 tests with PostgreSQL enabled and no skips. Independent reviews verified the fixture deltas. The production source changes remain unmerged and no live Discord exchange has been claimed.
 
+Native now has an owner-rooted authority fold verified against shared kernel outputs. Source verification remains distinct from production membership, device and staff acceptance.
+
 ## Release sequence still required
 
 1. Complete required source reviews and merges. Use the same approved public invite/community and actual channel mapping across both clients and the bridge; exclude Tickets and private support.
@@ -52,9 +54,3 @@ Web and native pin these bridge-generated files. Each is the output of the gener
 - `test-fixtures/concord/community-interop.json`, from `scripts/fixtures/community-interop.ts`: the live community. Invite and bundle, owner-rooted control history, public channels and streams, chat and moderation carriers, and the rejected-edition vectors.
 - `test-fixtures/concord/community-lifecycle.json`, from `scripts/fixtures/community-lifecycle.ts`: owner rotation, dissolution tombstones and the refreshed invite, for a community of its own.
 - `test-fixtures/concord/control-parity.json`, from `scripts/fixtures/control-parity.ts`: differential control-fold cases for a native fold.
-
-## Workspaces
-
-Bridge worktree is the existing task workspace. Web and native use isolated branches named fix/chat-real-community-20261104. No production data is included.
-
-Native now has an owner-rooted authority fold verified against shared kernel outputs. Source verification remains distinct from production membership, device and staff acceptance.
