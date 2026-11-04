@@ -121,6 +121,15 @@ test('shared moderation carriers remove cached messages only with current author
   const noRank = { ...moderation, canDelete: (actor: string, _author: string, action: any) =>
     citationSatisfied(folded, community.id, actor, action?.citation) && isAuthorized(folded.roster, actor, community.owner, Permissions.MANAGE_MESSAGES) };
   expect(ids([ownerMessage, moderatorDeletesOwner], noRank)).toEqual([]);
+  // The same against an Admin, who outranks the Moderator: rank between roles,
+  // so a predicate that only special-cases the owner as target loses it too.
+  const [adminMessage, moderatorDeletesAdmin] = await openChatBatch([f.adminChatEvent, f.moderatorDeletesAdminEvent], channel);
+  expect(adminMessage.author).toBe(f.expected.admin);
+  expect(ids([adminMessage, moderatorDeletesAdmin])).toEqual([f.expected.adminMessageId]);
+  const ownerOnlyRank = { ...noRank, canDelete: (actor: string, author: string, action: any) =>
+    author !== community.owner && noRank.canDelete(actor, author, action) };
+  expect(ids([ownerMessage, moderatorDeletesOwner], ownerOnlyRank)).toEqual([f.expected.ownerMessageId]);
+  expect(ids([adminMessage, moderatorDeletesAdmin], ownerOnlyRank)).toEqual([]);
   // With its citation, the same moderator's deletion removes the message.
   expect(ids([message, banned, moderatorDelete])).toEqual([]);
 });

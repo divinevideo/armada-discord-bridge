@@ -8,7 +8,7 @@
  *
  *   bun scripts/fixtures/community-interop.ts > test-fixtures/concord/community-interop.json
  */
-import { KIND_SEAL_PLAINTEXT, Permissions, buildGrantEdition, buildRoleEdition, citationToTag, buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { KIND_SEAL_PLAINTEXT, Permissions, adminRole, buildGrantEdition, buildRoleEdition, citationToTag, buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
 import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
 import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
@@ -24,6 +24,9 @@ export async function communityInteropParts() {
   // Staff whose role holds MANAGE_CHANNELS but not MANAGE_MESSAGES, for the
   // cited-deletion vector below.
   const channelManager = localIdentity(generateSecretKey()), channelManagerRole = 'c4'.repeat(32);
+  // An Admin (position 1) who outranks the Moderator (position 2), for the
+  // rank vector below.
+  const admin = localIdentity(generateSecretKey()), adminRoleId = 'a1'.repeat(32);
   const controls = [...f.policy.controlEvents,
     await sign(buildMetadataEdition(f.community.id, { name: 'Synthetic shared community', relays: f.community.relays }, common)),
     await sign(buildChannelEdition(hex32('cd'.repeat(32)), { name: 'introductions', private: false }, common)),
@@ -32,6 +35,8 @@ export async function communityInteropParts() {
     await sign(buildRoleEdition({ roleId: channelManagerRole, name: 'Channel manager', position: 3,
       permissions: Permissions.MANAGE_CHANNELS, scope: { kind: 'server' }, color: 0 }, common)),
     await sign(buildGrantEdition(f.community.id, { member: channelManager.pk, roleIds: [channelManagerRole] }, common)),
+    await sign(buildRoleEdition(adminRole(adminRoleId), common)),
+    await sign(buildGrantEdition(f.community.id, { member: admin.pk, roleIds: [adminRoleId] }, common)),
   ];
   const bundle = {
     community_id: f.community.idHex, owner: f.owner.pk,
@@ -87,8 +92,13 @@ export async function communityInteropParts() {
   // outranks the owner, so only canActOnMember's rank check keeps it.
   const ownerRumor = buildRumor({ pubkey: f.owner.pk, kind: 9, content: 'Synthetic owner message', tags: channelBindingTags(f.channelId, chat.epoch), ms: Date.now() });
   const ownerChatEvent = wrapSeal(await sealRumor(ownerRumor, KIND_SEAL_ENCRYPTED, chat.group, f.owner.signer), chat.group);
-  const moderatorDeletesOwnerEvent = await deleteBy(f.moderator,
-    [citationToTag({ entityId: moderatorGrant, version: grantHead.version, editionHash: grantHead.hash })], ownerRumor.id);
+  const moderatorCitation = citationToTag({ entityId: moderatorGrant, version: grantHead.version, editionHash: grantHead.hash });
+  const moderatorDeletesOwnerEvent = await deleteBy(f.moderator, [moderatorCitation], ownerRumor.id);
+  // The same, against an Admin's message: rank between roles, not just the
+  // owner special case. A predicate that only refuses owner targets loses it.
+  const adminRumor = buildRumor({ pubkey: admin.pk, kind: 9, content: 'Synthetic admin message', tags: channelBindingTags(f.channelId, chat.epoch), ms: Date.now() });
+  const adminChatEvent = wrapSeal(await sealRumor(adminRumor, KIND_SEAL_ENCRYPTED, chat.group, admin.signer), chat.group);
+  const moderatorDeletesAdminEvent = await deleteBy(f.moderator, [moderatorCitation], adminRumor.id);
   // Chat carriers the read path must refuse though openWrap opens them: the
   // member's message under a plaintext seal (chat seals must be encrypted,
   // CORD-02 §5), one sealed under this channel's key but bound to the
@@ -118,13 +128,13 @@ export async function communityInteropParts() {
     revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, revokedToken, f.community.relays),
     revokedLiveBundleEvent, revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
     controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
-    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent, citedUnprivilegedDeleteEvent, ownerChatEvent, moderatorDeletesOwnerEvent,
+    chatEvent: f.allowed, plaintextChatEvent, misboundChatEvent, epochMisboundChatEvent, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent, uncitedModeratorDeleteEvent, citedUnprivilegedDeleteEvent, ownerChatEvent, moderatorDeletesOwnerEvent, adminChatEvent, moderatorDeletesAdminEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
       moderator: f.moderator.pk, bannedMember: f.bannedMember.pk, bystander: bystander.pk, channelManager: channelManager.pk,
       channels: channelsView(f.community, folded).map(projectChannel),
       message: { id: f.allowedRumorId, channelId: f.channelId, content: 'Synthetic relay message' },
-      ownerMessageId: ownerRumor.id,
+      ownerMessageId: ownerRumor.id, admin: admin.pk, adminMessageId: adminRumor.id,
     },
   };
   return { f, link, token, bundle, controls, fixture };
