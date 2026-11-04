@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, Permissions } from '@armada-bridge/concord-core';
+import { InviteError, parseBundleEvent, parseInviteLink, bytesToHex, canActOnMember, channelsView, citationSatisfied, controlGroups, foldTimeline, isAuthorized, openChatBatch, openControlWraps, Permissions } from '@armada-bridge/concord-core';
 import fixture from '../../test-fixtures/concord/community-interop.json';
 import { bootstrapFixture, projectChannel } from './community-bootstrap';
 
@@ -22,6 +22,18 @@ test('shared client fixture resolves real public channels', async () => {
   expect(opened[0].rumorId).toBe(fixture.expected.message.id);
   expect(opened[0].content).toBe(fixture.expected.message.content);
   expect(opened[0].author).toBe(fixture.expected.member);
+});
+
+test('the shared invite is live and a revoked one never opens', () => {
+  const { invite, folded } = bootstrapFixture(fixture);
+  // Decrypting a bundle is not the same as its link being live: liveness is
+  // the link signer appearing in the owner's folded invite registry.
+  expect(folded.liveInviteLinks.has(invite.linkSigner)).toBe(true);
+  const revoked = parseInviteLink(fixture.revokedInviteUrl)!;
+  let refusal: unknown;
+  try { parseBundleEvent(fixture.revokedBundleEvent, revoked.linkSigner, revoked.token, Date.now()); } catch (e) { refusal = e; }
+  expect(refusal).toBeInstanceOf(InviteError);
+  expect((refusal as InviteError).code).toBe('revoked');
 });
 
 test('a rename that skips the chain is held back as incomplete, whoever signed it', () => {

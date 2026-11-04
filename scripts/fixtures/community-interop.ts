@@ -8,7 +8,7 @@
  *
  *   bun scripts/fixtures/community-interop.ts > test-fixtures/concord/community-interop.json
  */
-import { buildBundleEvent, buildInviteUrl, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
+import { buildBundleEvent, buildInviteUrl, buildRevocationEvent, buildRumor, channelBindingTags, KIND_SEAL_ENCRYPTED, sealRumor, wrapSeal, buildMetadataEdition, buildChannelEdition, buildRegistryEdition, bytesToHex, channelsView, controlGroups, currentControlWriteGroup, foldControlState, grantLocator, hex32, mintLinkSigner, mintToken, openControlWraps, sealEdition } from '@armada-bridge/concord-core';
 import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
 import { localIdentity } from '../../packages/bridge/src/concord/signer';
 import { ConcordActions } from '../../packages/moderation/src/concordActions';
@@ -61,12 +61,18 @@ export async function communityInteropParts() {
   const unprivilegedDeleteEvent = wrapSeal(await sealRumor(buildRumor({ pubkey: bystander.pk, kind: 5, content: '',
     tags: [...channelBindingTags(f.channelId, chat.epoch), ['e', f.allowedRumorId]], ms: Date.now() }),
     KIND_SEAL_ENCRYPTED, chat.group, bystander.signer), chat.group);
+  // A second invite whose signer has re-posted its coordinate as a revocation
+  // tombstone (and which the owner's registry no longer lists).
+  const revokedLink = mintLinkSigner();
   const [moderatorDeleteEvent] = await new ConcordActions(f.community, f.moderator, async () => ({ ...f.policy, controlEvents: controls })).prepare(f.decision);
   const fixture = {
     description: 'Synthetic signed bridge-kernel vectors. Contains disposable public read material only. Never use for deployment.',
     sourceRevision: '3febf95aef198828fc156b08e2bda4b873e55f2a',
     inviteUrl: buildInviteUrl('https://chat.example', link.pk, token, f.community.relays),
-    bundleEvent, controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
+    bundleEvent,
+    revokedInviteUrl: buildInviteUrl('https://chat.example', revokedLink.pk, mintToken(), f.community.relays),
+    revokedBundleEvent: buildRevocationEvent(revokedLink.sk),
+    controlEvents: controls, rejectedControlEvents: [f.unauthorizedControl], unauthorizedControlEvents,
     chatEvent: f.allowed, bannedChatEvent: f.banned, moderatorDeleteEvent, unprivilegedDeleteEvent,
     expected: {
       communityId: f.community.idHex, owner: f.owner.pk, member: f.member.pk,
