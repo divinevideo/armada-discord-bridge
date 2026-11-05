@@ -7,11 +7,16 @@ import { REPLAY_MAX_IDS, ReplayWindowLimitError } from './reconciliation';
 export type DeliveredChat = OpenedChat & { sourceWrapCreatedAt: number };
 export interface ReplayBatch { chats: DeliveredChat[]; newestWrapAt?: number }
 export interface ReplayWindow { since: number; until: number }
+/** Cancellation bounds the replay wait, not the external operation. Callers
+ * must retain in-flight callbacks in the same serial delivery lane until they
+ * settle, and fence every later effect/checkpoint with current authority and
+ * durable lifecycle/lease/version predicates. A rejected replay is not drain. */
+export interface ReplayCallbackContext { readonly signal: AbortSignal }
 export interface ReplayOptions {
   signal?: AbortSignal;
-  onBatch?: (batch: ReplayBatch) => Promise<void>;
+  onBatch?: (batch: ReplayBatch, context: ReplayCallbackContext) => Promise<void>;
   /** Only this callback certifies coverage, after every payload batch settled. */
-  onWindowComplete?: (window: ReplayWindow) => Promise<void>;
+  onWindowComplete?: (window: ReplayWindow, context: ReplayCallbackContext) => Promise<void>;
 }
 export interface ReplayResult extends ReplayBatch { certifiedUntil?: number }
 const MAX_DECODED_BYTES = 16 * 1024 * 1024;
@@ -20,6 +25,28 @@ const encoder = new TextEncoder();
 function decodedBytes(chat: DeliveredChat): number { return encoder.encode(JSON.stringify([chat.content, chat.tags, chat.seal])).length + 512; }
 
 class MissingInventoryError extends Error {}
+
+async function awaitReplayCallback<T>(callback: (value: T, context: ReplayCallbackContext) => Promise<void>, value: T, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (failed: boolean, error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', aborted);
+      failed ? reject(error) : resolve();
+    };
+    const aborted = () => finish(true, signal.reason);
+    signal.addEventListener('abort', aborted, { once: true });
+    // Keep a rejection handler attached even after abort wins: the callback
+    // may still run in its caller-owned lane, but cannot resume this replay.
+    void Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return callback(value, { signal });
+    }).then(() => finish(false), error => finish(true, error));
+  });
+  signal.throwIfAborted();
+}
 
 /** Wrap-time windows progress oldest first; rumor-ms order is preserved within
  * each window. Arbitrarily backdated rumors cannot be globally ordered across
@@ -102,7 +129,7 @@ export async function replayChannel(pool: RelayLike, channel: ChannelV2, sinceSe
       for (let i = 0; i < batch.chats.length; i += batchSize) {
         signal.throwIfAborted();
         const chats = batch.chats.slice(i, i + batchSize);
-        await opts.onBatch({ chats, newestWrapAt: Math.max(...chats.map(chat => chat.sourceWrapCreatedAt)) });
+        await awaitReplayCallback(opts.onBatch, { chats, newestWrapAt: Math.max(...chats.map(chat => chat.sourceWrapCreatedAt)) }, signal);
       }
     } else {
       for (const chat of batch.chats) {
@@ -112,7 +139,8 @@ export async function replayChannel(pool: RelayLike, channel: ChannelV2, sinceSe
       }
     }
     signal.throwIfAborted();
-    await opts?.onWindowComplete?.({ since, until });
+    if (opts?.onWindowComplete) await awaitReplayCallback(opts.onWindowComplete, { since, until }, signal);
+    signal.throwIfAborted();
     certifiedUntil = until;
     if (batch.newestWrapAt !== undefined) newestWrapAt = Math.max(newestWrapAt ?? batch.newestWrapAt, batch.newestWrapAt);
   };

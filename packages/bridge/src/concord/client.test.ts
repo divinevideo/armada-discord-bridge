@@ -571,3 +571,51 @@ it('splits decoded byte overflow and fails closed when one second still exceeds 
   await expect(oversized.backfillChannel(channel, at, 500, { onBatch: async () => {}, onWindowComplete: async () => { completed = true; } })).rejects.toThrow('second exceeds');
   expect(completed).toBe(false);
 }, 30_000);
+
+for (const phase of ['payload', 'window'] as const) it(`aborts replay while its ${phase} callback remains pending without certifying late work`, async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
+  const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+  const at = Math.floor(Date.now() / 1000), author = localIdentity(generateSecretKey());
+  const { wrap } = await writer.sendChat(channel, { content: 'cancel pending callback', author, ms: at * 1000 });
+  const client = new ConcordClient(community, new FakePool([finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk)]), localIdentity(generateSecretKey()));
+  const controller = new AbortController(), cancelled = new Error('synthetic replay cancellation');
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let callbackSignal: AbortSignal | undefined, lateEffects = 0, windows = 0;
+  const hold = async (context?: { signal: AbortSignal }) => {
+    callbackSignal = context?.signal;
+    enter(); await held;
+    // Task3 retains this callback in its existing lane and uses the signal
+    // plus durable lifecycle/lease/version predicates before further effects.
+    callbackSignal?.throwIfAborted();
+    lateEffects++;
+  };
+  const replay = client.backfillChannel(channel, at, 500, {
+    signal: controller.signal,
+    onBatch: async (_batch, context) => { if (phase === 'payload') await hold(context); },
+    onWindowComplete: async (_window, context) => { windows++; if (phase === 'window') await hold(context); },
+  });
+  const outcome = replay.then(result => ({ status: 'completed', result }), error => ({ status: 'rejected', error }));
+  try {
+    await entered; controller.abort(cancelled);
+    const observed = await Promise.race([outcome, Bun.sleep(100).then(() => ({ status: 'still waiting' }))]);
+    expect(observed).toEqual({ status: 'rejected', error: cancelled });
+    expect(callbackSignal?.aborted).toBe(true);
+    expect(windows).toBe(phase === 'window' ? 1 : 0);
+    release();
+    await Bun.sleep(0); // late callback rejection must be consumed, not unhandled
+    expect(lateEffects).toBe(0);
+    expect(await outcome).toEqual({ status: 'rejected', error: cancelled });
+  } finally { release(); await outcome; }
+});
+
+it('does not return a certified endpoint when its completion callback synchronously cancels replay', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community);
+  const client = new ConcordClient(community, new FakePool(), localIdentity(generateSecretKey()));
+  const controller = new AbortController(), cancelled = new Error('cancel during completion');
+  await expect(client.backfillChannel(channel, Math.floor(Date.now() / 1000), 500, {
+    signal: controller.signal,
+    onWindowComplete: async () => { controller.abort(cancelled); },
+  })).rejects.toThrow('cancel during completion');
+});

@@ -58,7 +58,7 @@ import type { NostrEvent } from "nostr-tools/pure";
 import type { RelayLike } from "./pool";
 import { replayChannel } from "./replay";
 import type { DeliveredChat, ReplayOptions, ReplayResult } from "./replay";
-export type { DeliveredChat, ReplayOptions, ReplayResult, ReplayWindow, ReplayBatch } from "./replay";
+export type { DeliveredChat, ReplayOptions, ReplayResult, ReplayWindow, ReplayBatch, ReplayCallbackContext } from "./replay";
 import type { LocalIdentity } from "./signer";
 
 /**
