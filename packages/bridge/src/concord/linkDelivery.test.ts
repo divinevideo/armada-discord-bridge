@@ -157,7 +157,7 @@ it('resumes a certified prefix after an interrupted replay', async () => {
   } };
   await expect(delivery.repair(options)).rejects.toThrow('attempt deadline');
   await delivery.repair(options);
-  expect(floors).toEqual([40, 280]);
+  expect(floors).toEqual([100, 340]);
   expect(repairFloor).toBeUndefined();
 });
 
@@ -282,4 +282,17 @@ it('suppresses ordinary historical carriers below previously completed stream co
     await opts.onBatch!({chats},{signal:new AbortController().signal});
   }});
   expect(delivered).toEqual(['old deletion','new ordinary']);
+});
+
+it('advances a dense one-second historical prefix across repeated short attempts', async () => {
+  let version=0, repairFloor:number|undefined=100, coverage:Record<string,number>={};
+  const store={deliverySnapshot:async()=>({ownerId:'owner',epoch:'epoch',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version,activationFloor:100,recoveryFloor:100,repairFloor,coverage,ordinaryCoverage:{},legacyBoundaries:{}}),
+    certifyDelivery:async(expected:number,until:number,next:Record<string,number>)=>{if(expected!==version)return false;version++;coverage=next;repairFloor=until+1;return true;}};
+  const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2, floors:number[]=[];
+  const delivery=new LinkDelivery({onError:()=>{}});
+  const options={store,channel:()=>channel,deliver:async()=>{},replay:async(_channel:ChannelV2,since:number,opts:ReplayOptions)=>{
+    floors.push(since); await opts.onWindowComplete!({since,until:since,runUntil:1000},{signal:new AbortController().signal}); throw new Error('budget');
+  }};
+  for(let i=0;i<3;i++) await expect(delivery.repair(options)).rejects.toThrow('budget');
+  expect(floors).toEqual([100,101,102]);
 });

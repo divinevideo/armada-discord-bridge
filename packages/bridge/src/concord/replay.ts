@@ -59,7 +59,7 @@ export async function replayChannel(pool: RelayLike, channel: ChannelV2, sinceSe
   const enumerate = pool.enumerateRelay.bind(pool), fetchIds = pool.fetchRelay.bind(pool);
   const signal = AbortSignal.any([AbortSignal.timeout(5 * 60_000), ...(opts?.signal ? [opts.signal] : [])]);
   // Captured once, never inferred from an untrusted/future-dated event.
-  const upper = Math.floor(Date.now() / 1000), batchSize = Math.min(limit, 100);
+  const upper = Math.max(0, Math.floor(Date.now() / 1000) - 60), batchSize = Math.min(limit, 100);
   const accumulated: DeliveredChat[] = [];
   let accumulatedBytes = 0, newestWrapAt: number | undefined, certifiedUntil: number | undefined;
   const collect = async (since: number, until: number): Promise<ReplayBatch> => {
@@ -144,7 +144,7 @@ export async function replayChannel(pool: RelayLike, channel: ChannelV2, sinceSe
     certifiedUntil = until;
     if (batch.newestWrapAt !== undefined) newestWrapAt = Math.max(newestWrapAt ?? batch.newestWrapAt, batch.newestWrapAt);
   };
-  for (let since = sinceSec; since <= upper; since += 300) await visit(since, Math.min(since + 299, upper));
+  if (sinceSec <= upper) await visit(sinceSec, upper);
   accumulated.sort((a, b) => a.ms - b.ms);
   return { chats: accumulated, newestWrapAt, certifiedUntil };
 }

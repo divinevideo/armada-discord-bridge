@@ -363,12 +363,12 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     await writer.sendChat(channel, { content: "older", author, ms: now - 60_000 });
     await writer.sendChat(channel, { content: "newer", author, ms: now });
 
-    const pool = new FakePool([...scratch.published].reverse()); // relay order: newest first
+    const pool = new FakePool([...scratch.published].reverse().map(e => finalizeEvent({ ...e, created_at: Math.floor(now / 1000) - 120 }, channel.current.group.sk))); // relay order: newest first
     const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
-    const { chats, newestWrapAt } = await client.backfillChannel(channel, Math.min(...scratch.published.map(e => e.created_at)));
+    const { chats, newestWrapAt } = await client.backfillChannel(channel, Math.floor(now / 1000) - 120);
 
     expect(chats.map((c) => c.content)).toEqual(["older", "newer"]);
-    expect(newestWrapAt).toBe(Math.max(...scratch.published.map((e) => e.created_at)));
+    expect(newestWrapAt).toBe(Math.floor(now / 1000) - 120);
   });
 });
 
@@ -468,7 +468,7 @@ describe('durable delivery cursor', () => {
   it('fully recovers same-second ties instead of advancing past a truncated bucket', async () => {
     const { community } = makeCommunity(); const channel = makeChannel(community);
     const scratch = new FakePool(); const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
-    const author = localIdentity(generateSecretKey()); const at = Math.floor(Date.now() / 1000);
+    const author = localIdentity(generateSecretKey()); const at = Math.floor(Date.now() / 1000) - 120;
     const wraps: NostrEvent[] = [];
     for (let i = 0; i < 6; i++) {
       const { wrap } = await writer.sendChat(channel, { content: `tie ${i}`, author, ms: at * 1000 + i });
@@ -526,7 +526,7 @@ describe('durable delivery cursor', () => {
 for (const cap of [4, 8, 300, 400]) it(`recovers a same-second inventory beyond a relay cap of ${cap}`, async () => {
   const { community } = makeCommunity(); const channel = makeChannel(community);
   const scratch = new FakePool(), writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
-  const author = localIdentity(generateSecretKey()), at = Math.floor(Date.now() / 1000);
+  const author = localIdentity(generateSecretKey()), at = Math.floor(Date.now() / 1000) - 120;
   const wraps: NostrEvent[] = [];
   for (let i = 0; i < cap + 3; i++) {
     const { wrap } = await writer.sendChat(channel, { content: `capped ${i}`, author, ms: at * 1000 + i });
@@ -536,13 +536,13 @@ for (const cap of [4, 8, 300, 400]) it(`recovers a same-second inventory beyond 
   const runStart = Math.floor(Date.now() / 1000);
   const result = await client.backfillChannel(channel, at);
   expect(result.chats).toHaveLength(cap + 3);
-  expect(result.certifiedUntil).toBe(runStart);
+  expect(result.certifiedUntil).toBe(runStart - 60);
 }, 15000);
 
 it('does not certify a window until all payload batches finish and preserves verified source time', async () => {
   const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
   const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
-  const at = Math.floor(Date.now() / 1000), author = localIdentity(generateSecretKey());
+  const at = Math.floor(Date.now() / 1000) - 120, author = localIdentity(generateSecretKey());
   const { wrap } = await writer.sendChat(channel, { content: 'old rumor, newer wrap', author, ms: (at - 100) * 1000 });
   const verified = finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk);
   const client = new ConcordClient(community, new FakePool([verified]), localIdentity(generateSecretKey()));
@@ -557,7 +557,7 @@ it('does not certify a window until all payload batches finish and preserves ver
 it('splits decoded byte overflow and fails closed when one second still exceeds the budget', async () => {
   const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
   const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey())), author = localIdentity(generateSecretKey());
-  const at = Math.floor(Date.now() / 1000) - 10, wraps: NostrEvent[] = [];
+  const at = Math.floor(Date.now() / 1000) - 120, wraps: NostrEvent[] = [];
   // Signed payloads: the decoded content plus retained seal exceeds 16 MiB in
   // one combined window, while each half fits. No mocked byte estimator.
   for (let i = 0; i < 240; i++) {
@@ -578,7 +578,7 @@ it('splits decoded byte overflow and fails closed when one second still exceeds 
 for (const phase of ['payload', 'window'] as const) it(`aborts replay while its ${phase} callback remains pending without certifying late work`, async () => {
   const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
   const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
-  const at = Math.floor(Date.now() / 1000), author = localIdentity(generateSecretKey());
+  const at = Math.floor(Date.now() / 1000) - 120, author = localIdentity(generateSecretKey());
   const { wrap } = await writer.sendChat(channel, { content: 'cancel pending callback', author, ms: at * 1000 });
   const client = new ConcordClient(community, new FakePool([finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk)]), localIdentity(generateSecretKey()));
   const controller = new AbortController(), cancelled = new Error('synthetic replay cancellation');
@@ -617,7 +617,7 @@ it('does not return a certified endpoint when its completion callback synchronou
   const { community } = makeCommunity(), channel = makeChannel(community);
   const client = new ConcordClient(community, new FakePool(), localIdentity(generateSecretKey()));
   const controller = new AbortController(), cancelled = new Error('cancel during completion');
-  await expect(client.backfillChannel(channel, Math.floor(Date.now() / 1000), 500, {
+  await expect(client.backfillChannel(channel, Math.floor(Date.now() / 1000) - 120, 500, {
     signal: controller.signal,
     onWindowComplete: async () => { controller.abort(cancelled); },
   })).rejects.toThrow('cancel during completion');

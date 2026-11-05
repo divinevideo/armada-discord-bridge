@@ -121,8 +121,11 @@ export class LinkDelivery {
     const channel = options.channel();
     const streams = channel.streams.map(stream => stream.group.pk);
     const missing = streams.filter(pk => snapshot.coverage[pk] === undefined);
-    const floor = Math.max(0, Math.min(snapshot.repairFloor ?? snapshot.certifiedUntil ?? snapshot.activationFloor,
-      ...(missing.length ? [snapshot.recoveryFloor, ...missing.flatMap(pk => snapshot.legacyBoundaries[pk] === undefined ? [] : [snapshot.legacyBoundaries[pk]])] : [])) - 60);
+    // An incomplete historical prefix resumes at the exact next second;
+    // overlap applies only to a settled tail or newly discovered stream.
+    const tail = snapshot.repairFloor ?? Math.max(0, (snapshot.certifiedUntil ?? snapshot.activationFloor) - 60);
+    const introductions = missing.length ? [snapshot.recoveryFloor, ...missing.flatMap(pk => snapshot.legacyBoundaries[pk] === undefined ? [] : [snapshot.legacyBoundaries[pk]])].map(at => snapshot.repairFloor === undefined ? Math.max(0, at - 60) : at) : [];
+    const floor = Math.min(tail, ...introductions);
     const attempt = new AbortController();
     this.attempt = attempt;
     const signal = AbortSignal.any([this.controller.signal, attempt.signal]);
