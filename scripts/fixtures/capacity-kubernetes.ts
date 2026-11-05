@@ -300,6 +300,12 @@ export class KubernetesCapacity {
     // An interrupt can run this while the measurement is still awaiting a Pod
     // creation. Refuse new Pods afterwards so one cannot appear after the sweep.
     this.closed = true;
+    // The interrupt handler exits the process the moment this resolves, so a
+    // creation still in flight must finish (and remove its own Pod, see
+    // createPod) before then; a process that has exited cannot clean up after
+    // a `kubectl create` the API server went on to complete. Bounded by the
+    // 30 s request timeout every kubectl call carries.
+    await Promise.allSettled([...this.creations]);
     try { await this.close(); } finally { this.databaseForward?.stop(); this.databaseForward = undefined; }
   }
   private async owned(name: string) {
@@ -315,24 +321,34 @@ export class KubernetesCapacity {
     const data = await readFile(join(directory, 'calibration.json'), 'utf8');
     for (const name of this.pods.keys()) await this.upload(name, '/capacity/calibration.json', data);
   }
-  async start(name: string, config: string, directory: string, contract?: string, communities: [string, string][] = []) {
-    need(!this.closed, 'Capacity backend already finished');
-    const manifest = benchmarkPod(this.config, this.matrix, name);
-    if (contract) (manifest.spec.containers[0].env as Json[]).push({ name: 'MODERATION_COMMUNITY_ORGS', value: JSON.stringify(Object.fromEntries(communities)) });
+  private creations = new Set<Promise<void>>();
+  /**
+   * Create the Pod and register it, in one tracked step. If shutdown began
+   * while `create` was in flight, finish() swept a map that did not yet hold
+   * this Pod; the only place left that can remove it is here. The `closed`
+   * check and the map insert run in one synchronous step, so the Pod is either
+   * in the sweep's snapshot or removed here. (A Ctrl-C also signals the
+   * `kubectl create` child; if it dies after the server accepted the request
+   * the UID is never learned and the Pod cannot be tracked. The Pod deadline is
+   * the backstop for that residual case.)
+   */
+  private async createPod(name: string, manifest: Json) {
     // create, never apply/adopt an existing Pod; cleanup is restricted to its returned UID.
     const created = JSON.parse(await this.execute([...this.args(), 'create', '-f', '-', '-o', 'json'], JSON.stringify(manifest)));
     need(created.metadata?.uid, 'Created benchmark Pod has no UID');
     this.pods.set(name, { uid: created.metadata.uid });
-    // finish() sets `closed` before it sweeps, and this check and the set above
-    // run in one synchronous step. So either the Pod was already tracked when
-    // the sweep took its snapshot (and is removed there), or `create` was still
-    // in flight, the sweep saw an empty map, and this is the only place left
-    // that can remove it. Without it an interrupt during creation left a Pod
-    // running that nothing deleted.
     if (this.closed) {
       try { await this.remove(name); } catch { throw new SafeDiagnostic('A Pod created during shutdown could not be removed; inspect the dedicated namespace'); }
       throw new SafeDiagnostic('Capacity backend already finished');
     }
+  }
+  async start(name: string, config: string, directory: string, contract?: string, communities: [string, string][] = []) {
+    need(!this.closed, 'Capacity backend already finished');
+    const manifest = benchmarkPod(this.config, this.matrix, name);
+    if (contract) (manifest.spec.containers[0].env as Json[]).push({ name: 'MODERATION_COMMUNITY_ORGS', value: JSON.stringify(Object.fromEntries(communities)) });
+    const creation = this.createPod(name, manifest);
+    this.creations.add(creation);
+    try { await creation; } finally { this.creations.delete(creation); }
     await this.execute([...this.args(), 'wait', '--for=jsonpath={.status.phase}=Running', `pod/${name}`, '--timeout=180s']);
     const pod = await this.owned(name);
     const identity = JSON.parse(await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'bun', '-e', "console.log(JSON.stringify({sourceSha:process.env.MODERATION_SOURCE_SHA,platform:process.platform+'/'+(process.arch==='x64'?'amd64':process.arch)}))"]));

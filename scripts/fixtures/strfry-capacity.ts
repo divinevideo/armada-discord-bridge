@@ -370,6 +370,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     }
     let relaySequence = 0;
     async function start(mode: string) {
+      if (interrupted) throw new SafeDiagnostic("Interrupted");
       const name = capacityRelayName(label, mode, relaySequence++);
       const plugin = mode === "plugin_failure" || mode === "external_timeout" ? `/capacity/${mode}.sh` : calibration ? "/capacity/plugin.sh" : "/usr/local/bin/relay-policy";
       if (mode === "plugin_failure" || mode === "external_timeout") await writeFile(join(directory, mode + ".sh"), "#!/bin/sh\n" + (mode === "plugin_failure" ? "exit 1\n" : "sleep 10\n"), { mode: 0o755 });

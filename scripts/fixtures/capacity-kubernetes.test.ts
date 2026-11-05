@@ -490,7 +490,7 @@ test('destination timing records follow the deployed emitter: verified lowercase
   expect(line({ innerAdmissionMs: 2, eventId: 'abc' })).toBe('');
 });
 
-test('a Pod whose creation is still in flight when shutdown begins is removed, not stranded', async () => {
+test('a Pod whose creation is still in flight when shutdown begins is removed before finish() resolves', async () => {
   const calls: string[][] = [];
   let releaseCreate!: () => void;
   const created = new Promise<void>(resolve => { releaseCreate = resolve; });
@@ -504,15 +504,47 @@ test('a Pod whose creation is still in flight when shutdown begins is removed, n
   const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, execute);
   const starting = backend.start('capacity-synthetic-1', '/missing', '/missing').catch((e: Error) => e);
   while (!calls.some(c => c.includes('create'))) await Bun.sleep(1);
-  await backend.finish();                       // sweeps an empty map while create is in flight
+  let finished = false;
+  const finishing = backend.finish().then(() => { finished = true; });   // the sweep sees an empty map
+  await Bun.sleep(20);
+  // The interrupt handler exits the process as soon as finish() resolves, so it must not
+  // resolve while a creation could still produce a Pod nobody removes.
+  expect(finished).toBe(false);
   expect(calls.some(c => c.includes('delete'))).toBe(false);
   releaseCreate();
-  const error = await starting;
-  expect(String(error)).toContain('already finished');
-  const removal = calls.find(c => c.includes('delete'))!;
-  expect(removal).toBeDefined();
+  await finishing;
+  expect(calls.some(c => c.includes('delete'))).toBe(true);
+  expect(String(await starting)).toContain('already finished');
   expect(calls.some(c => c.includes('wait') && c.includes('--for=jsonpath={.status.phase}=Running'))).toBe(false);
   expect((backend as any).pods.size).toBe(0);
+});
+
+test('through the real interrupt handler, the process does not exit until a Pod created mid-signal is gone', async () => {
+  const events: string[] = [];
+  let releaseCreate!: () => void;
+  const created = new Promise<void>(resolve => { releaseCreate = resolve; });
+  const pod = { metadata: { name: 'capacity-synthetic-1', uid: 'late-uid' } };
+  const execute = async (args: string[]) => {
+    if (args.includes('create')) { events.push('create-sent'); await created; events.push('create-returned'); return JSON.stringify(pod); }
+    if (args.includes('delete')) { events.push('delete'); return ''; }
+    if (args.includes('get') && args.includes('pod')) return JSON.stringify(pod);
+    return '';
+  };
+  const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, execute);
+  // Same shape as measureCapacity: the handler runs the cleanup list, which ends with finish(),
+  // and exits when that settles.
+  const exited = new Promise<number>(resolve => {
+    const stop = cleanupOnInterrupt(() => finalizeCapacityMeasurement(async () => {}, [() => {}, () => backend.finish()]), code => { events.push('exit'); stop(); resolve(code); }, () => {});
+  });
+  const starting = backend.start('capacity-synthetic-1', '/missing', '/missing').catch((e: Error) => e);
+  while (!events.includes('create-sent')) await Bun.sleep(1);
+  process.emit('SIGTERM', 'SIGTERM');
+  await Bun.sleep(30);
+  expect(events).toEqual(['create-sent']);      // the old code had already exited by now
+  releaseCreate();
+  expect(await exited).toBe(143);
+  await starting;
+  expect(events).toEqual(['create-sent', 'create-returned', 'delete', 'exit']);
 });
 
 test('concurrent removals of one Pod share a single delete and neither reports a false failure', async () => {
