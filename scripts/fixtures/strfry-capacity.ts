@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, realpath } from "node:f
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import postgres from "postgres";
-import { KubernetesCapacity, SafeDiagnostic, capacityRelayName, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
+import { KubernetesCapacity, SafeDiagnostic, capacityRelayName, childEnvironment, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { encrypt } from "nostr-tools/nip44";
 import { getEventHash, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -87,7 +87,7 @@ export function capacityFixture(historyCount: number, options: { label?: string;
 }
 
 async function command(args: string[]): Promise<string> {
-  const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(args, { stdout: "pipe", stderr: "pipe", env: childEnvironment() });
   const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   if (code !== 0) throw new Error(`${args[0]} ${args[1]} failed: ${err}`);
   return (args[0] === "docker" && args[1] === "logs" ? out + "\n" + err : out).trim();

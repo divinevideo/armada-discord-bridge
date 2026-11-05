@@ -135,9 +135,23 @@ export function destinationTimingLog(text: string): string {
     } catch { return []; }
   }).join('\n');
 }
+/**
+ * The environment handed to kubectl, git and docker. The harness's own
+ * CAPACITY_* settings (above all CAPACITY_DATABASE_URL, which carries the
+ * benchmark password) are for this process only: none of those tools reads
+ * them, but all of them, and the exec-credential plugins and helper processes
+ * kubectl launches, would otherwise inherit the password where same-user
+ * process listings and plugin crash dumps can expose it. Only the harness's
+ * own prefix is removed: kubectl's auth plugins legitimately need PATH, HOME,
+ * KUBECONFIG, CLOUDSDK_*, GOOGLE_*, proxy settings and more, so an allowlist
+ * would break real clusters.
+ */
+export function childEnvironment(env: Record<string, string | undefined> = process.env): Record<string, string> {
+  return Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined && !entry[0].startsWith('CAPACITY_')));
+}
 export async function capacityCommand(args: string[], input?: string): Promise<string> {
   try {
-    const child = Bun.spawn(args, { stdin: input === undefined ? 'ignore' : new Blob([input]), stdout: 'pipe', stderr: 'pipe' });
+    const child = Bun.spawn(args, { stdin: input === undefined ? 'ignore' : new Blob([input]), stdout: 'pipe', stderr: 'pipe', env: childEnvironment() });
     const [out, code] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
     if (code !== 0) throw new Error('process failure');
     return out.trim();
@@ -153,7 +167,7 @@ async function discard(reader: ReadableStreamDefaultReader<Uint8Array>) {
   try { while (!(await reader.read()).done); } catch { /* the process is gone */ }
 }
 export async function forward(args: string[], remotePort = 7777): Promise<Forward> {
-  const child = Bun.spawn([...args.slice(0, -1).map(arg => arg.startsWith('--request-timeout=') ? '--request-timeout=0' : arg), 'port-forward', args.at(-1)!, '--address=127.0.0.1', `:${remotePort}`], { stdout: 'pipe', stderr: 'pipe' });
+  const child = Bun.spawn([...args.slice(0, -1).map(arg => arg.startsWith('--request-timeout=') ? '--request-timeout=0' : arg), 'port-forward', args.at(-1)!, '--address=127.0.0.1', `:${remotePort}`], { stdout: 'pipe', stderr: 'pipe', env: childEnvironment() });
   let exited = false; void child.exited.then(() => { exited = true; });
   // kubectl writes "Handling connection for N" to stdout and connection errors
   // to stderr for as long as the forward lives. Nothing read either pipe after

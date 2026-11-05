@@ -394,3 +394,23 @@ test('a dead forward is reported with a readable reason before any sample runs',
   (backend as any).pods.set('capacity-synthetic-1', { uid: 'u', forward: { url: 'ws://127.0.0.1:2', stop() {}, alive: () => false } });
   expect(() => backend.assertTransportAlive()).toThrow('relay transport exited');
 });
+
+import { childEnvironment } from './capacity-kubernetes';
+test('kubectl, git and docker children never inherit the benchmark credential or other harness settings', async () => {
+  const before = { url: process.env.CAPACITY_DATABASE_URL, config: process.env.CAPACITY_KUBERNETES_CONFIG };
+  process.env.CAPACITY_DATABASE_URL = 'postgres://synthetic:private-password@db.example/benchmark';
+  process.env.CAPACITY_KUBERNETES_CONFIG = '/synthetic/destination.json';
+  try {
+    const env = childEnvironment();
+    expect(Object.keys(env).filter(key => key.startsWith('CAPACITY_'))).toEqual([]);
+    // Everything else, including what kubectl's credential plugins need, passes through.
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(childEnvironment({ KUBECONFIG: '/k', CLOUDSDK_CONFIG: '/c', CAPACITY_DATABASE_URL: 'x', UNSET: undefined })).toEqual({ KUBECONFIG: '/k', CLOUDSDK_CONFIG: '/c' });
+    // The real spawn path, as the driver uses it.
+    const seen = await capacityCommand(['bun', '-e', 'console.log(JSON.stringify(Object.keys(process.env).filter(k => k.startsWith("CAPACITY_"))))']);
+    expect(JSON.parse(seen)).toEqual([]);
+    expect(seen).not.toContain('private-password');
+  } finally {
+    for (const [key, value] of [['CAPACITY_DATABASE_URL', before.url], ['CAPACITY_KUBERNETES_CONFIG', before.config]] as const) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+  }
+});
