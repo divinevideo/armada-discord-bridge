@@ -5,13 +5,57 @@
 
 import type postgres from "postgres";
 
-import type { ChannelLink, MappingStore, MessageMappingRow, ReactionMappingRow } from "../router";
+import { deletionLinkKey, MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR } from "../router";
+import type { PendingConcordDelete, ChannelLink, MappingStore, MessageMappingRow, ReactionMappingRow } from "../router";
 
 export class PostgresMappingStore implements MappingStore {
   constructor(
     private readonly sql: postgres.Sql,
     private readonly tenantId = "default",
   ) {}
+
+  async saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<void> {
+    if (!rows.length) return;
+    await this.sql.begin(async tx => {
+      // Serialize capacity decisions for this link across workers. Count and
+      // insertion must share a transaction or two writers can both pass the cap.
+      await tx`SELECT pg_advisory_xact_lock(hashtextextended(${this.tenantId + deletionLinkKey(link)}, 19306))`;
+      const held = await tx`SELECT delete_rumor_id, target_rumor_id, author FROM pending_concord_deletes
+        WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId}
+          AND concord_channel_id = ${link.concordChannelIdHex} AND discord_guild_id = ${link.discordGuildId}
+          AND discord_channel_id = ${link.discordChannelId}`;
+      const existing = new Set(held.map(row => `${row.delete_rumor_id}:${row.target_rumor_id}`));
+      const fresh = [...new Map(rows.map(row => [`${row.deleteRumorId}:${row.targetRumorId}`, row])).values()]
+        .filter(row => !existing.has(`${row.deleteRumorId}:${row.targetRumorId}`));
+      if (held.length + fresh.length > MAX_PENDING_DELETES_PER_LINK || fresh.some(row =>
+        held.filter(other => other.author === row.author).length + fresh.filter(other => other.author === row.author).length > MAX_PENDING_DELETES_PER_ACTOR)) {
+        throw new Error("Pending Concord deletion capacity exceeded");
+      }
+      for (const row of fresh) await tx`INSERT INTO pending_concord_deletes
+        (tenant_id, community_id, concord_channel_id, discord_guild_id, discord_channel_id,
+         delete_rumor_id, target_rumor_id, author, citation, created_at_ms)
+        VALUES (${this.tenantId}, ${link.communityId}, ${link.concordChannelIdHex}, ${link.discordGuildId}, ${link.discordChannelId},
+          ${row.deleteRumorId}, ${row.targetRumorId}, ${row.author}, ${row.citation ? tx.json(row.citation) : null}, ${row.createdAtMs})
+        ON CONFLICT DO NOTHING`;
+    });
+  }
+
+  async pendingDeletes(link: ChannelLink, target?: string): Promise<PendingConcordDelete[]> {
+    const rows = await this.sql`SELECT delete_rumor_id, target_rumor_id, author, citation, created_at_ms
+      FROM pending_concord_deletes WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId}
+        AND concord_channel_id = ${link.concordChannelIdHex} AND discord_guild_id = ${link.discordGuildId}
+        AND discord_channel_id = ${link.discordChannelId}
+        ${target ? this.sql`AND target_rumor_id = ${target}` : this.sql``}
+      ORDER BY created_at_ms, delete_rumor_id, target_rumor_id LIMIT ${MAX_PENDING_DELETES_PER_LINK}`;
+    return rows.map(row => ({ deleteRumorId: row.delete_rumor_id as string, targetRumorId: row.target_rumor_id as string,
+      author: row.author as string, createdAtMs: Number(row.created_at_ms), ...(row.citation ? { citation: row.citation as string[] } : {}) }));
+  }
+
+  async completeDelete(link: ChannelLink, deletion: string, target: string): Promise<void> {
+    await this.sql`DELETE FROM pending_concord_deletes WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId}
+      AND concord_channel_id = ${link.concordChannelIdHex} AND discord_guild_id = ${link.discordGuildId}
+      AND discord_channel_id = ${link.discordChannelId} AND delete_rumor_id = ${deletion} AND target_rumor_id = ${target}`;
+  }
 
   async insert(row: MessageMappingRow): Promise<void> {
     await this.sql`

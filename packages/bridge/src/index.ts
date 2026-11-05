@@ -38,7 +38,7 @@ import { PostgresMappingStore, ensureLink } from "./db/store";
 import { DiscordAdapter } from "./discord/adapter";
 import { Kind0ProfileResolver } from "./profiles";
 import { PuppetCache } from "./puppets";
-import { BridgeRouter } from "./router";
+import { DELETION_RETRY_MS, BridgeRouter } from "./router";
 import type { ChannelLink } from "./router";
 
 function primarySk(value: string): Uint8Array {
@@ -225,13 +225,16 @@ router = new BridgeRouter(
 );
 console.log("bridge: discord gateway up");
 
-const onChat = (chat: OpenedChat): void => {
-  void router.onConcordChat(chat, link).catch((error) => console.error("bridge: concord->discord failed", error));
-};
+const retryDeletes = () => router.retryPendingDeletes(link).catch(error => console.error("bridge: pending deletion retry failed", error));
+await retryDeletes();
+const deletionRetryTimer = setInterval(() => void retryDeletes(), DELETION_RETRY_MS);
+cleanup.push(() => clearInterval(deletionRetryTimer));
+const onChat = (chat: OpenedChat) => router.onConcordChat(chat, link);
 const onSubError = (relayUrl: string, error: unknown): void =>
   console.error(`bridge: chat subscription ${relayUrl}:`, error);
-const onCursor = (streamPk: string, wrapAt: number): void => {
-  void store.cursorSet(community.idHex, streamPk, wrapAt).catch(() => {});
+const onCursor = (streamPk: string, wrapAt: number) => {
+  router.assertDeletionDeliveryDurable();
+  return store.cursorSet(community.idHex, streamPk, wrapAt);
 };
 let currentChannel = channel;
 
@@ -243,12 +246,11 @@ let currentChannel = channel;
   if (cursor !== undefined) {
     const { chats, newestWrapAt } = await client.backfillChannel(channel, cursor - 60);
     for (const chat of chats) {
-      await router.onConcordChat(chat, link).catch((error) =>
-        console.warn(`bridge: backfill mirror failed for ${chat.rumorId}:`, error),
-      );
+      await router.onConcordChat(chat, link);
     }
     if (newestWrapAt !== undefined) {
-      for (const pk of streamPks) await store.cursorSet(community.idHex, pk, newestWrapAt).catch(() => {});
+      router.assertDeletionDeliveryDurable();
+      for (const pk of streamPks) await store.cursorSet(community.idHex, pk, newestWrapAt);
     }
     if (chats.length > 0) console.log(`bridge: backfilled ${chats.length} wraps missed while down`);
   }
@@ -259,6 +261,7 @@ cleanup.push(() => unsubscribe());
 // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
 // goes silent while publishes (fresh channel lookup) keep working.
 const unsubControl = client.subscribeControl(() => {
+  void retryDeletes();
   const fresh = client.channel(link.concordChannelIdHex);
   if (!fresh) return;
   const keys = (c: typeof channel) => c.streams.map((s) => s.group.pk).join(",");

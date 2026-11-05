@@ -3,6 +3,7 @@ import { createCipheriv, randomBytes } from "node:crypto";
 
 import { sha256 } from "@noble/hashes/sha2.js";
 import {
+  foldControlState,
   KIND_JOIN_LEAVE,
   KIND_TYPING,
   KIND_WRAP_EPHEMERAL,
@@ -137,6 +138,8 @@ function discordMsg(overrides: Partial<DiscordInboundMessage> = {}): DiscordInbo
 function concordChat(overrides: Partial<OpenedChat> = {}): OpenedChat {
   return {
     rumorId: "r".repeat(64),
+    channelIdHex: "07".repeat(32),
+    epoch: 0n,
     author: "f".repeat(64),
     kind: 9,
     content: "hello discord",
@@ -612,9 +615,11 @@ describe("BridgeRouter: deletes", () => {
   it("Concord moderator deletes propagate", async () => {
     const { router, webhooks, client, link } = harness();
     const ids = await router.onConcordChat(concordChat(), link);
-    client.isModerator = () => true;
+    // The proven owner needs no Grant citation; a permission-bit stub would
+    // hide the exact citation/rank mismatch this router must prevent.
+    client.folded = foldControlState([], client.community.id, client.community.owner);
     await router.onConcordChat(
-      concordChat({ rumorId: "d3".repeat(32), kind: 5, author: "a".repeat(64), content: "", tags: [["e", "r".repeat(64)]] }),
+      concordChat({ rumorId: "d3".repeat(32), kind: 5, author: client.community.owner, content: "", tags: [["e", "r".repeat(64)]] }),
       link,
     );
     expect(webhooks.deleted).toEqual(ids);

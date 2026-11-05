@@ -12,7 +12,7 @@
 
 - Do not change kernel admission or the popup contract. Self-deletes need no moderator citation; every other action requires `citationSatisfied` and `canActOnMember(..., MANAGE_MESSAGES)` in the current fold.
 - Discord-origin authors resolve through this router's puppet identity; reaction targets must resolve to a message mapping in this exact link.
-- Store minimal public deletion metadata, not content, keys or tokens. Bound outstanding records at 4096 per link and 256 per actor. Enqueue all targets transactionally or fail; never evict unprocessed actions or silently advance the cursor over a storage failure.
+- Store minimal public deletion metadata, not content, keys or tokens. Bound outstanding records at 4096 per link and 1024 per actor (so one valid sealed multi-target deletion fits). Enqueue all targets transactionally or fail; never evict unprocessed actions or silently advance the cursor over a storage failure.
 - Retain actions whose citations or permissions may become resolvable later. Missing non-owner citations can never acquire authority; unknown targets remain bounded and retry when mappings arrive.
 - Retries use fresh authority, visibility and lease checks. Partial effects are idempotent, and a failed reaction removal must retain the mapping needed to retry it.
 - Await durable dispatch before cursor advancement in both entry points. A failed dispatch pins that subscription's cursor until a fresh catch-up, rather than allowing a later event to skip it.

@@ -357,3 +357,36 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     expect(newestWrapAt).toBe(Math.max(...scratch.published.map((e) => e.created_at)));
   });
 });
+
+describe('durable delivery cursor', () => {
+  it('does not advance past an opened wrap while its handler is still persisting it', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    let entered!: () => void, release!: () => void, advanced!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const done = new Promise<void>(resolve => { advanced = resolve; });
+    const cursors: number[] = [];
+    client.subscribeChannel(channel, async () => { entered(); await pending; }, undefined, (_pk, at) => { cursors.push(at); advanced(); });
+    const { wrap } = await client.sendChat(channel, { content: 'persist me', author: localIdentity(generateSecretKey()) });
+    pool.emit(wrap); await started;
+    expect(cursors).toEqual([]);
+    release(); await done;
+    expect(cursors).toEqual([wrap.created_at]);
+  });
+
+  it('pins the cursor after a storage failure rather than advancing on a later success', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    let calls = 0, finish!: () => void;
+    const handled = new Promise<void>(resolve => { finish = resolve; });
+    const cursors: number[] = []; const errors: unknown[] = [];
+    client.subscribeChannel(channel, async () => { if (++calls === 1) throw new Error('storage unavailable'); finish(); }, (_url, error) => errors.push(error), (_pk, at) => cursors.push(at));
+    const author = localIdentity(generateSecretKey());
+    pool.emit((await client.sendChat(channel, { content: 'fails', author })).wrap);
+    pool.emit((await client.sendChat(channel, { content: 'later', author })).wrap);
+    await handled;
+    expect(errors).toHaveLength(1);
+    expect(cursors).toEqual([]);
+  });
+});

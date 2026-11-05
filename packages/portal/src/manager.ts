@@ -39,7 +39,7 @@ import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
 import { DiscordAdapter, isMissingPermissions, parseBotCommand } from "@armada-bridge/bridge/src/discord/adapter";
 import { Kind0ProfileResolver } from "@armada-bridge/bridge/src/profiles";
 import { PuppetCache } from "@armada-bridge/bridge/src/puppets";
-import { BridgeRouter } from "@armada-bridge/bridge/src/router";
+import { DELETION_RETRY_MS, BridgeRouter } from "@armada-bridge/bridge/src/router";
 import type { ChannelLink, DiscordInboundMessage } from "@armada-bridge/bridge/src/router";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { generateSecretKey } from "nostr-tools/pure";
@@ -85,6 +85,8 @@ interface Running {
   link: ChannelLink;
   primary: ReturnType<typeof localIdentity>;
   router?: BridgeRouter;
+  deletionRetryTimer?: ReturnType<typeof setInterval>;
+  concordCatchupReady?: boolean;
   status: "pending_confirm" | "active";
   unsubChat: () => void;
   unsubControl: () => void;
@@ -703,17 +705,15 @@ export class BridgeManager {
         unsubSeverance: () => {},
       };
 
-      cleanup.push(() => { rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance(); });
+      cleanup.push(() => { if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer); rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance(); });
       rb.unsubChat = client.subscribeChannel(
         channel,
-        (chat) => {
-          void this.onConcordChat(rb, chat, row.confirm_code ?? "").catch((error) =>
-            console.error(`bridge ${rb.id}: concord handler failed`, error),
-          );
-        },
+        (chat) => this.onConcordChat(rb, chat, row.confirm_code ?? ""),
         (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
         (streamPk, wrapAt) => {
-          void this.store.cursorSet(community.idHex, streamPk, wrapAt).catch(() => {});
+          if (!rb.concordCatchupReady || !rb.router) return;
+          rb.router.assertDeletionDeliveryDurable();
+          return this.store.cursorSet(community.idHex, streamPk, wrapAt);
         },
       );
       // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
@@ -738,6 +738,7 @@ export class BridgeManager {
         );
       };
       rb.unsubControl = client.subscribeControl((folded) => {
+        void rb.router?.retryPendingDeletes(rb.link).catch(error => console.warn(`bridge ${rb.id}: pending deletion retry failed`, error));
         this.refreshChatSubscription(rb, row.confirm_code ?? "");
         checkSeverance(folded);
       });
@@ -764,9 +765,6 @@ export class BridgeManager {
       if (rb.status === "active") {
         const liveFromMs = Date.now();
         this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
-        this.backfillMissed(rb).catch((error) =>
-          console.warn(`bridge ${rb.id}: catch-up backfill failed:`, error),
-        );
         this.catchUpDiscord(rb, liveFromMs).catch((error) =>
           console.warn(`bridge ${rb.id}: Discord catch-up failed:`, error),
         );
@@ -799,26 +797,21 @@ export class BridgeManager {
   private async backfillMissed(rb: Running): Promise<void> {
     const streamPks = rb.channel.streams.map((s) => s.group.pk);
     const cursor = await this.store.cursorGet(rb.link.communityId, streamPks);
-    if (cursor === undefined) return;
+    if (cursor === undefined) { rb.concordCatchupReady = true; return; }
     // Small overlap absorbs relay/pool clock skew; dedupe eats the rest.
     const { chats, newestWrapAt } = await rb.client.backfillChannel(rb.channel, cursor - 60);
     let mirrored = 0;
     for (const chat of chats) {
-      if (!rb.router) break;
-      const ids = await rb.router
-        .onConcordChat(chat, rb.link)
-        .catch((error) => {
-          if (isMissingPermissions(error)) void this.alertMissingWebhookPermission(rb);
-          else console.warn(`bridge ${rb.id}: backfill mirror failed for ${chat.rumorId}:`, error);
-          return [];
-        });
+      if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
+      const ids = await rb.router.onConcordChat(chat, rb.link);
       mirrored += ids.length > 0 ? 1 : 0;
     }
+    if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
+    rb.router.assertDeletionDeliveryDurable();
     if (newestWrapAt !== undefined) {
-      for (const pk of streamPks) {
-        await this.store.cursorSet(rb.link.communityId, pk, newestWrapAt).catch(() => {});
-      }
+      for (const pk of streamPks) await this.store.cursorSet(rb.link.communityId, pk, newestWrapAt);
     }
+    rb.concordCatchupReady = true;
     if (mirrored > 0) console.log(`bridge ${rb.id}: backfilled ${mirrored} missed messages`);
   }
 
@@ -905,11 +898,14 @@ export class BridgeManager {
     rb.unsubChat = rb.client.subscribeChannel(
       fresh,
       (chat) => {
-        void this.onConcordChat(rb, chat, confirmCode).catch((error) =>
-          console.error(`bridge ${rb.id}: concord handler failed`, error),
-        );
+        return this.onConcordChat(rb, chat, confirmCode);
       },
       (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
+      (streamPk, wrapAt) => {
+        if (!rb.concordCatchupReady || !rb.router) return;
+        rb.router.assertDeletionDeliveryDurable();
+        return this.store.cursorSet(rb.link.communityId, streamPk, wrapAt);
+      },
     );
     console.log(`bridge ${rb.id}: stream keys rotated; chat subscription refreshed`);
   }
@@ -946,7 +942,7 @@ export class BridgeManager {
         .catch(() => {});
       return;
     }
-    if (!rb.router) return;
+    if (!rb.router) throw new Error("Bridge routing is not ready");
     try {
       await rb.router.onConcordChat(chat, rb.link);
     } catch (error) {
@@ -999,6 +995,8 @@ export class BridgeManager {
     // that races the gateway being down. Throwing — never severing — is the
     // whole point: a missing gateway is not the community going away.
     if (!this.adapter) throw new GatewayUnavailableError();
+    if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer);
+    rb.concordCatchupReady = false;
     rb.router = new BridgeRouter(
       rb.client,
       new PuppetCache(masterSecretHex),
@@ -1013,6 +1011,10 @@ export class BridgeManager {
         klipy: this.env.klipyApiKey ? new KlipyClient(this.env.klipyApiKey) : undefined,
       },
     );
+    const retryDeletes = () => rb.router?.retryPendingDeletes(rb.link).catch(error => console.warn(`bridge ${rb.id}: pending deletion retry failed`, error));
+    void retryDeletes();
+    void this.backfillMissed(rb).catch(error => console.warn(`bridge ${rb.id}: catch-up backfill failed; cursor remains pinned`, error));
+    rb.deletionRetryTimer = setInterval(() => void retryDeletes(), DELETION_RETRY_MS);
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);
     this.announceBridge(rb).catch(() => {});
   }
@@ -1053,6 +1055,7 @@ export class BridgeManager {
     if (this.byDiscordChannel.get(rb.link.discordChannelId) === rb.id) {
       this.byDiscordChannel.delete(rb.link.discordChannelId);
     }
+    if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer);
     rb.router = undefined;
     try { rb.unsubChat(); } catch {}
     try { rb.unsubControl(); } catch {}

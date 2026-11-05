@@ -335,12 +335,14 @@ export class ConcordClient {
    */
   subscribeChannel(
     channel: ChannelV2,
-    onChat: (chat: OpenedChat) => void,
+    onChat: (chat: OpenedChat) => unknown,
     onError?: (relayUrl: string, error: unknown) => void,
     /** Called per durable wrap that opened; feeds the catch-up cursor. */
-    onCursor?: (streamPk: string, wrapCreatedAt: number) => void,
+    onCursor?: (streamPk: string, wrapCreatedAt: number) => unknown,
   ): () => void {
     const seenRumors = new Set<string>();
+    let deliveries: Promise<void> = Promise.resolve();
+    let cursorHealthy = true;
     // Live tail only: without a floor, relays replay stored history into the
     // router on every (re)subscribe. Catch-up after downtime is cursor work,
     // not replay-everything. Small overlap absorbs clock skew.
@@ -357,16 +359,22 @@ export class ConcordClient {
       {
         onError,
         onEvent: (wrap) => {
-          void openChatBatch([wrap], channel).then((opened) => {
+          deliveries = deliveries.then(async () => {
+            const opened = await openChatBatch([wrap], channel);
             for (const chat of opened) {
               if (seenRumors.has(chat.rumorId)) continue;
+              await onChat(chat);
               if (seenRumors.size >= 65_536) seenRumors.clear();
               seenRumors.add(chat.rumorId);
-              onChat(chat);
             }
-            if (opened.length > 0 && wrap.kind === KIND_WRAP) {
-              onCursor?.(wrap.pubkey, wrap.created_at);
+            if (cursorHealthy && opened.length > 0 && wrap.kind === KIND_WRAP) {
+              await onCursor?.(wrap.pubkey, wrap.created_at);
             }
+          }).catch(error => {
+            // A later success must not move the cursor past an action that
+            // failed before durable storage. A fresh catch-up can retry it.
+            cursorHealthy = false;
+            onError?.("dispatch", error);
           });
         },
       },

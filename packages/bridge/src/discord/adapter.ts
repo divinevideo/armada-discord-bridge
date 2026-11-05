@@ -390,15 +390,22 @@ export class DiscordAdapter implements WebhookSender {
    * mirrors; user-authored posts (moderator delete from the Armada side)
    * need the bot's Manage Messages permission.
    */
-  async delete(link: ChannelLink, discordMessageId: string): Promise<void> {
+  async delete(link: ChannelLink, discordMessageId: string, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<void> {
     const webhook = await this.webhookFor(link.discordChannelId);
+    await this.beforeEffect(link.discordChannelId);
+    await beforeDispatch?.();
+    authorize?.();
     try {
-      await this.beforeEffect(link.discordChannelId);
       await webhook.deleteMessage(discordMessageId);
-    } catch {
+    } catch (error) {
+      // A webhook reports Unknown Message for a real user-authored post too.
+      // Only the bot endpoint can distinguish that from an already-gone target.
       const channel = await this.textChannel(link.discordChannelId);
       await this.beforeEffect(link.discordChannelId);
-      await channel.messages.delete(discordMessageId);
+      await beforeDispatch?.();
+      authorize?.();
+      try { await channel.messages.delete(discordMessageId); }
+      catch (failure) { if ((failure as { code?: number })?.code !== 10008) throw failure; }
     }
   }
 
@@ -425,14 +432,18 @@ export class DiscordAdapter implements WebhookSender {
    * emoji names can hold anything. `.+` against a 60KB string is a quadratic
    * backtrack for a capture we do not use.
    */
-  async unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void> {
+  async unreact(link: ChannelLink, discordMessageId: string, emoji: string, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<void> {
     const custom = /^\w{2,32}:(\d{1,25})$/.exec(emoji);
     if (custom) emoji = custom[1];
     const channel = await this.textChannel(link.discordChannelId);
-    const message = await channel.messages.fetch(discordMessageId);
+    let message;
+    try { message = await channel.messages.fetch(discordMessageId); }
+    catch (error) { if ((error as { code?: number })?.code === 10008) return; throw error; }
     const botId = this.client.user?.id;
-    if (!botId) return;
+    if (!botId) throw new Error("Discord bot identity is unavailable for reaction removal");
     await this.beforeEffect(link.discordChannelId);
+    await beforeDispatch?.();
+    authorize?.();
     await message.reactions.resolve(emoji)?.users.remove(botId);
   }
 }
