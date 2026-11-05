@@ -18,10 +18,53 @@ import {
 } from "@armada-bridge/concord-core";
 import { NRelay1 } from "@nostrify/nostrify";
 import type { NostrClientMsg, NostrEvent, NostrFilter } from "@nostrify/nostrify";
+import { enumerateInventory, fetchInventory, ReplayAuthError } from "./reconciliation";
 import { finalizeEvent, generateSecretKey, getEventHash, verifyEvent } from "nostr-tools/pure";
 
 /** NRelay1 keeps `send` protected; the AUTH fan-out needs it. */
 class AuthedNRelay1 extends NRelay1 {
+  private readonly authResults = new Map<string, boolean | undefined>();
+  constructor(...args: ConstructorParameters<typeof NRelay1>) {
+    super(...args);
+    this.socket.addEventListener("close", () => this.authResults.clear());
+    this.socket.addEventListener("message", (_socket, incoming) => {
+      let frame: unknown;
+      try { frame = JSON.parse(String(incoming.data)); } catch { return; }
+      if (Array.isArray(frame) && frame[0] === "OK" && this.authResults.has(frame[1])) this.authResults.set(frame[1], frame[2] === true);
+    });
+  }
+  beginAuthChallenge(): void { this.authResults.clear(); }
+  protected override send(msg: NostrClientMsg): void {
+    if (msg[0] === "AUTH") this.authResults.set(msg[1].id, undefined);
+    super.send(msg);
+  }
+  /** NEG-OPEN is outside NRelay1's automatic REQ auth retry. Wait for the
+   * existing stream and identity AUTHs, then retry once on this same socket. */
+  async waitForAuth(signal: AbortSignal): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        this.socket.removeEventListener("message", check);
+        this.socket.removeEventListener("close", closed);
+        this.socket.removeEventListener("error", closed);
+        signal.removeEventListener("abort", aborted);
+      };
+      const finish = (error?: Error) => { cleanup(); error ? reject(error) : resolve(); };
+      const closed = () => finish(new Error("Relay disconnected during authentication"));
+      const aborted = () => finish(new Error("Relay authentication timed out or aborted"));
+      const check = () => {
+        if (signal.aborted) return aborted();
+        if (this.socket.readyState !== WebSocket.OPEN) return closed();
+        const results = [...this.authResults.values()];
+        if (results.some(result => result === false)) finish(new Error("Relay authentication refused"));
+        else if (results.length && results.every(result => result === true)) finish();
+      };
+      this.socket.addEventListener("message", check);
+      this.socket.addEventListener("close", closed);
+      this.socket.addEventListener("error", closed);
+      signal.addEventListener("abort", aborted, { once: true });
+      check();
+    });
+  }
   /** Publications never enter websocket-ts's reconnect queue or NRelay1's
    * automatic AUTH replay. A caller must retry through its current guard. */
   override async event(event: NostrEvent, opts?: { signal?: AbortSignal }): Promise<void> {
@@ -64,6 +107,11 @@ export interface SubscriptionHandlers {
 }
 
 export interface RelayLike {
+  /** Configured sources, each of which must independently certify replay. */
+  readonly replayRelays?: readonly string[];
+  enumerateRelay?(url: string, filter: NostrFilter, opts?: { signal?: AbortSignal }): Promise<string[]>;
+  /** Exact-ID fetch on one source. A short response does NOT certify missing IDs. */
+  fetchRelay?(url: string, ids: string[], filter: NostrFilter, opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
   query(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
   /** Complete replay requires every configured relay, not a partial successful subset. */
   queryStrict?(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
@@ -190,7 +238,7 @@ export class RelayPool implements RelayLike {
   private sendStreamAuths(url: string, pks: Iterable<string>): void {
     const challenge = this.challenges.get(url);
     const conn = this.conns.get(url);
-    if (!challenge || !conn) return;
+    if (!challenge || !conn || conn.socket.readyState !== WebSocket.OPEN) return;
     let done = this.authed.get(url);
     if (!done) this.authed.set(url, (done = new Set()));
     const todo = [...pks].filter((pk) => !done.has(pk));
@@ -204,8 +252,17 @@ export class RelayPool implements RelayLike {
 
   private relay(url: string): AuthedNRelay1 {
     let conn = this.conns.get(url);
+    // NRelay1 permanently closes an idle socket after a remote disconnect.
+    // Raw replay sessions are not in its REQ registry, so explicitly replace
+    // that connection before a later attempt; old sessions already failed.
+    if (conn?.socket.closedByUser) {
+      void conn.close();
+      this.conns.delete(url); this.challenges.delete(url); this.authed.delete(url);
+      conn = undefined;
+    }
     if (!conn) {
       conn = new AuthedNRelay1(url, {
+        idleTimeout: false,
         verifyEvent: verifyOnce,
         auth: async (challenge) => {
           // A challenge is per socket: a reconnect earns a fresh one on which
@@ -213,6 +270,7 @@ export class RelayPool implements RelayLike {
           // hand NRelay1 the identity auth it awaits an OK for. Keep the
           // challenge — it stays valid for the socket's lifetime — so keys
           // wanted later can AUTH on this socket too.
+          conn?.beginAuthChallenge();
           this.challenges.set(url, challenge);
           this.authed.set(url, new Set());
           this.sendStreamAuths(url, this.wanted);
@@ -232,6 +290,35 @@ export class RelayPool implements RelayLike {
       this.conns.set(url, conn);
     }
     return conn;
+  }
+
+  get replayRelays(): readonly string[] { return this.urls; }
+
+  async enumerateRelay(url: string, filter: NostrFilter, opts?: { signal?: AbortSignal }): Promise<string[]> {
+    if (!this.urls.includes(url)) throw new Error("Unknown replay relay");
+    this.want([filter]);
+    const conn = this.relay(url);
+    const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(opts?.signal ? [opts.signal] : [])]);
+    try { return await enumerateInventory(conn.socket, filter, { signal }); }
+    catch (error) {
+      if (!(error instanceof ReplayAuthError)) throw error;
+      await conn.waitForAuth(signal);
+      return enumerateInventory(conn.socket, filter, { signal });
+    }
+  }
+
+  async fetchRelay(url: string, ids: string[], filter: NostrFilter, opts?: { signal?: AbortSignal }): Promise<NostrEvent[]> {
+    if (!this.urls.includes(url)) throw new Error("Unknown replay relay");
+    if (!ids.length || ids.length > 100 || ids.some(id => !/^[0-9a-f]{64}$/.test(id))) throw new Error("Invalid exact-ID replay batch");
+    const signal = AbortSignal.any([AbortSignal.timeout(QUERY_TIMEOUT_MS), ...(opts?.signal ? [opts.signal] : [])]);
+    this.want([filter]);
+    const conn = this.relay(url);
+    try { return await fetchInventory(conn.socket, ids, filter, verifyOnce, { signal }); }
+    catch (error) {
+      if (!(error instanceof ReplayAuthError)) throw error;
+      await conn.waitForAuth(signal);
+      return fetchInventory(conn.socket, ids, filter, verifyOnce, { signal });
+    }
   }
 
   /** A policy snapshot is incomplete if any configured source failed. */

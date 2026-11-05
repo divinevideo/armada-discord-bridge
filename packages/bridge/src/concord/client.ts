@@ -56,6 +56,9 @@ import type {
 import type { NostrEvent } from "nostr-tools/pure";
 
 import type { RelayLike } from "./pool";
+import { replayChannel } from "./replay";
+import type { DeliveredChat, ReplayOptions, ReplayResult } from "./replay";
+export type { DeliveredChat, ReplayOptions, ReplayResult, ReplayWindow, ReplayBatch } from "./replay";
 import type { LocalIdentity } from "./signer";
 
 /**
@@ -341,7 +344,7 @@ export class ConcordClient {
    */
   subscribeChannel(
     channel: ChannelV2,
-    onChat: (chat: OpenedChat) => unknown,
+    onChat: (chat: DeliveredChat) => unknown,
     onError?: (relayUrl: string, error: unknown) => void,
     /** Called per durable wrap that opened; feeds the catch-up cursor. */
     onCursor?: (streamPk: string, wrapCreatedAt: number) => unknown,
@@ -380,7 +383,7 @@ export class ConcordClient {
             const opened = await openChatBatch([wrap], channel);
             for (const chat of opened) {
               if (seenRumors.has(chat.rumorId)) continue;
-              await onChat(chat);
+              await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });
               if (seenRumors.size >= 65_536) seenRumors.clear();
               seenRumors.add(chat.rumorId);
             }
@@ -398,53 +401,9 @@ export class ConcordClient {
     );
   }
 
-  /** Replay oldest-first in bounded complete time windows; callers may commit each batch. */
-  async backfillChannel(
-    channel: ChannelV2,
-    sinceSec: number,
-    limit = 500,
-    opts?: { signal?: AbortSignal; onBatch?: (batch: { chats: OpenedChat[]; newestWrapAt?: number }) => Promise<void> },
-  ): Promise<{ chats: OpenedChat[]; newestWrapAt?: number }> {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 16_384) throw new Error("Invalid Concord replay page size");
-    const accumulated: OpenedChat[] = [];
-    let newestWrapAt: number | undefined;
-    const query = (since: number, until: number | undefined, pageSize: number) =>
-      (this.pool.queryStrict ?? this.pool.query).call(this.pool, [{
-        kinds: [KIND_WRAP], authors: channel.streams.map(s => s.group.pk), since,
-        ...(until === undefined ? {} : { until }), limit: pageSize,
-      }], { signal: opts?.signal });
-    const visit = async (since: number, until: number, pageSize: number, known?: NostrEvent[]): Promise<void> => {
-      opts?.signal?.throwIfAborted();
-      const wraps = known ?? await query(since, until, pageSize);
-      if (wraps.length >= pageSize) {
-        if (since < until) {
-          // Inclusive since/until cannot page safely by oldestTimestamp - 1:
-          // more than one page may share that second. Split disjoint windows.
-          const middle = since + Math.floor((until - since) / 2);
-          await visit(since, middle, limit);
-          await visit(middle + 1, until, limit);
-        } else {
-          // Nostr has no within-second offset. Expand only this collision
-          // bucket, with a memory ceiling; never certify a truncated second.
-          if (pageSize >= 16_384) throw new Error("Concord replay second exceeds 16384 wraps; checkpoint remains before that second");
-          await visit(since, until, Math.min(pageSize * 2, 16_384));
-        }
-        return;
-      }
-      const chats = await openChatBatch(wraps, channel);
-      chats.sort((a, b) => a.ms - b.ms);
-      const at = wraps.reduce<number | undefined>((max, wrap) => max === undefined ? wrap.created_at : Math.max(max, wrap.created_at), undefined);
-      // The batch callback persists effects before any later window is read.
-      // On failure, previously committed windows are a safe restart floor.
-      if (opts?.onBatch) await opts.onBatch({ chats, newestWrapAt: at });
-      else accumulated.push(...chats);
-      if (at !== undefined) newestWrapAt = newestWrapAt === undefined ? at : Math.max(newestWrapAt, at);
-    };
-    const first = await query(sinceSec, undefined, limit);
-    const upper = first.reduce((max, wrap) => Math.max(max, wrap.created_at), sinceSec);
-    await visit(sinceSec, upper, limit, first);
-    accumulated.sort((a, b) => a.ms - b.ms);
-    return { chats: accumulated, newestWrapAt };
+  /** Payload batches are not coverage; only completed windows may checkpoint. */
+  async backfillChannel(channel: ChannelV2, sinceSec: number, limit = 500, opts?: ReplayOptions): Promise<ReplayResult> {
+    return replayChannel(this.pool, channel, sinceSec, limit, opts);
   }
 
   /**

@@ -24,6 +24,9 @@ class HistoryAndTail implements RelayLike {
     .filter(event => matches(filter, event)).sort((a, b) => b.created_at - a.created_at)
     .slice(0, filter.limit ?? Infinity)).map(event => [event.id, event])).values()];
   queryStrict = this.query;
+  readonly replayRelays = ['fake'];
+  async enumerateRelay(_url: string, filter: NostrFilter) { return this.events.filter(event => matches(filter, event)).map(event => event.id); }
+  async fetchRelay(_url: string, ids: string[]) { return this.events.filter(event => ids.includes(event.id)); }
   async publish(event: NostrEvent) {
     this.events.push(event);
     for (const sub of this.subscriptions) if (sub.filters.some(filter => matches(filter, event))) sub.onEvent(event);

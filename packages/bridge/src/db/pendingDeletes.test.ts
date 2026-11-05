@@ -111,21 +111,25 @@ describe('durable pending Concord deletions', () => {
 
   it('persists full-link replay floors across restart and rekey without inheriting another link progress', async () => {
     const testTenant = tenant + '-checkpoint';
+    const legacyFloor = fixture.moderatorDeleteEvent.created_at - 60;
     let connection = postgres(url, { max: 1 });
     let store = new PostgresMappingStore(connection, testTenant);
-    await store.cursorSet(link.communityId, 'legacy-old', 100);
-    await store.cursorSet(link.communityId, 'legacy-new', 220);
+    await store.cursorSet(link.communityId, 'legacy-old', legacyFloor);
+    await store.cursorSet(link.communityId, 'legacy-new', legacyFloor + 120);
     // Inherit the low watermark, never the fastest legacy stream.
-    expect(await store.channelCursorStart(link, ['legacy-old', 'legacy-new'])).toBe(100);
+    expect(await store.channelCursorStart(link, ['legacy-old', 'legacy-new'])).toBe(legacyFloor);
     const other = { ...link, discordChannelId: 'another-link' };
     await store.channelCursorStart(other, []);
     await store.channelCursorSet(other, Math.floor(Date.now() / 1000) + 120);
     await connection.end();
     connection = postgres(url, { max: 1 }); store = new PostgresMappingStore(connection, testTenant);
-    expect(await store.channelCursorStart(link, ['rotated-stream'])).toBe(100);
+    expect(await store.channelCursorStart(link, ['rotated-stream'])).toBe(legacyFloor);
     const { community, folded } = bootstrapFixture(fixture);
     const channel = channelsView(community, folded)[0];
-    const client = new ConcordClient(community, { query: async () => [fixture.moderatorDeleteEvent], publish: async () => {}, subscribe: () => () => {}, close: async () => {} }, localIdentity(generateSecretKey()));
+    const client = new ConcordClient(community, { replayRelays: ['synthetic'],
+      enumerateRelay: async (_url, filter) => fixture.moderatorDeleteEvent.created_at >= filter.since! && fixture.moderatorDeleteEvent.created_at <= filter.until! ? [fixture.moderatorDeleteEvent.id] : [],
+      fetchRelay: async (_url, ids) => ids.includes(fixture.moderatorDeleteEvent.id) ? [fixture.moderatorDeleteEvent] : [],
+      query: async () => [fixture.moderatorDeleteEvent], publish: async () => {}, subscribe: () => () => {}, close: async () => {} }, localIdentity(generateSecretKey()));
     client.folded = folded;
     const deleted: string[] = [];
     const router = new BridgeRouter(client, new PuppetCache('ab'.repeat(32)), store, {
@@ -137,8 +141,8 @@ describe('durable pending Concord deletions', () => {
     for (const chat of replay.chats) await router.onConcordChat(chat, link);
     expect(deleted).toEqual(['checkpoint-target']);
 
-    await store.channelCursorSet(link, 160);
-    expect(await store.channelCursorStart(link, ['rotated-stream'])).toBe(160);
+    await store.channelCursorSet(link, legacyFloor + 60);
+    expect(await store.channelCursorStart(link, ['rotated-stream'])).toBe(legacyFloor + 60);
     const fresh = { ...link, discordGuildId: 'fresh-guild' };
     const floor = await store.channelCursorStart(fresh, []);
     expect(floor).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) - 1);
