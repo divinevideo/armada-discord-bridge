@@ -144,16 +144,18 @@ test.skipIf(!reachable)('a stale boot severance cannot terminate a replacement w
 
 test.skipIf(!reachable)('a stale seven-day failure cannot sever a replacement lifecycle',async()=>{
  const owner=crypto.randomUUID(),scope={...link,discordChannelId:`failure-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;m.scheduleStartRetry=()=>{};
  try {
   await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
     VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId})`;
+  await sql`UPDATE bridges SET options=${sql.json({startFailedAt:'2020-01-01T00:00:00.000Z'})} WHERE bridge_id=${owner}`;
   const [row]=await sql`SELECT * FROM bridges WHERE bridge_id=${owner}`;
   const old=await store.activateDelivery(scope,owner,[],1000);await store.terminateDelivery(scope,owner,old.epoch);
   const next=await store.activateDelivery(scope,owner,[],2000);
-  await m.markSevered(owner,'synthetic old failure',row,old.epoch);
+  await m.handleStartFailure(row,'synthetic old failure',0,old.epoch,lease);
   expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('active');
   expect((await store.inspectDelivery(scope))?.epoch).toBe(next.epoch);
- } finally {await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
 });
 
 test('shutdown prevents a new worker arming transaction from starting',async()=>{
@@ -186,10 +188,11 @@ test.skipIf(!reachable)('seven-day start failure suspends accepted deletions unt
  try {
   await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id,confirm_code)
     VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId},'deadbeef')`;
+  await sql`UPDATE bridges SET options=${sql.json({startFailedAt:'2020-01-01T00:00:00.000Z'})} WHERE bridge_id=${owner}`;
   const [row]=await sql`SELECT * FROM bridges WHERE bridge_id=${owner}`;
   const state=await store.activateDelivery(scope,owner,[],1000),opened=await store.openDelivery(scope,owner,lease);
   await opened.store.saveDeletes(scope,[{deleteRumorId:'d',targetRumorId:'t',author:'a',createdAtMs:Date.now(),sourceWrapCreatedAt:1,actionClass:'actionable'}]);
-  await m.markSevered(owner,'synthetic seven-day outage',row,state.epoch);
+  await m.handleStartFailure(row,'synthetic seven-day outage',0,state.epoch,lease);
   expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('severed');
   expect((await store.inspectDelivery(scope))?.suspended).toBe(true);expect(await store.pendingDeletes(scope)).toHaveLength(1);
   await expect(opened.store.assertDeliveryCurrent()).rejects.toThrow();
@@ -208,7 +211,7 @@ test.skipIf(!reachable)('a bridge ban suspends accepted deletions and authorized
     VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId},'deadbeef')`;
   const state=await store.activateDelivery(scope,owner,[],1000),opened=await store.openDelivery(scope,owner,lease);
   await opened.store.saveDeletes(scope,[{deleteRumorId:'d',targetRumorId:'t',author:'a',createdAtMs:Date.now(),sourceWrapCreatedAt:1,actionClass:'actionable'}]);
-  const rb:any={id:owner,status:'active',link:scope,deliveryEpoch:state.epoch,lease:{release:async()=>{}},pool:{close:async()=>{}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};m.running.set(owner,rb);
+  const rb:any={id:owner,status:'active',link:scope,deliveryEpoch:state.epoch,deliveryStore:opened.store,lease:{release:async()=>{}},pool:{close:async()=>{}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};m.running.set(owner,rb);
   await m.applySeverance(owner,{reason:'banned',pubkey:'c'.repeat(64),bannedAtMs:1000},{idHex:scope.communityId},rb);
   expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('severed');
   expect((await store.inspectDelivery(scope))?.suspended).toBe(true);expect(await store.pendingDeletes(scope)).toHaveLength(1);
@@ -231,4 +234,107 @@ test.skipIf(!reachable)('a delayed severance cannot overwrite an operator pause'
   expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('paused');
   expect((await store.inspectDelivery(scope))?.suspended).toBe(true);
  } finally {await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
+
+test.skipIf(!reachable)('stale workers cannot claim permission or welcome announcements',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,discordChannelId:`notice-${suffix}`};
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ const m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;let sends=0;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+   VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId})`;
+  const state=await store.activateDelivery(scope,owner,[],1000), view=(await store.openDelivery(scope,owner,lease)).store;
+  const rb:any={id:owner,link:scope,channel:{},primary:{},deliveryStore:view,client:{sendChat:async()=>{sends++;}},assertMayForward:()=>view.assertDeliveryCurrent()};
+  m.adapter={notice:async()=>{sends++;},send:async()=>{sends++;}};
+  await m.alertDiscordPermission(rb,'Manage Messages');await m.announceBridge(rb);
+  expect(sends).toBe(4);
+  await sql`UPDATE bridges SET perm_alerted_at=NULL,announced_at=NULL,status_detail=NULL WHERE bridge_id=${owner}`;
+  sends=0;
+  await store.suspendDelivery(scope,owner,state.epoch);
+  await expect(m.alertDiscordPermission(rb,'Manage Messages')).rejects.toThrow();
+  await expect(m.announceBridge(rb)).rejects.toThrow();
+  const [row]=await sql`SELECT perm_alerted_at,announced_at,status_detail FROM bridges WHERE bridge_id=${owner}`;
+  expect(row.perm_alerted_at).toBeNull();expect(row.announced_at).toBeNull();expect(row.status_detail).toBeNull();expect(sends).toBe(0);
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
+
+test.skipIf(!reachable)('a stale worker cannot clear newer lifecycle metadata',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,communityId:`metadata-${suffix}`,discordChannelId:`metadata-${suffix}`};
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ const m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id,options,status_detail)
+   VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId},${sql.json({startFailedAt:'2020-01-01T00:00:00.000Z'})},'new failure')`;
+  const state=await store.activateDelivery(scope,owner,[],1000), view=(await store.openDelivery(scope,owner,lease)).store;
+  const [row]=await sql`SELECT * FROM bridges WHERE bridge_id=${owner}`;
+  const rb:any={id:owner,link:scope,status:'active',lease,deliveryStore:view};m.running.set(owner,rb);
+  await sql`INSERT INTO communities(tenant_id,community_id,relays,severed_reason) VALUES ('default',${scope.communityId},ARRAY[]::text[],'banned')`;
+  await m.clearSeveredReason(row,rb);
+  expect((await sql`SELECT severed_reason FROM communities WHERE community_id=${scope.communityId}`)[0].severed_reason).toBeNull();
+  await sql`UPDATE communities SET severed_reason='banned' WHERE community_id=${scope.communityId}`;
+  await store.suspendDelivery(scope,owner,state.epoch);
+  await expect(m.clearSeveredReason(row,rb)).rejects.toThrow();
+  expect((await sql`SELECT severed_reason FROM communities WHERE community_id=${scope.communityId}`)[0].severed_reason).toBe('banned');
+  await expect(m.clearStartFailure(row,rb)).rejects.toThrow();
+  const [current]=await sql`SELECT options,status_detail FROM bridges WHERE bridge_id=${owner}`;
+  expect(current.options.startFailedAt).toBeDefined();expect(current.status_detail).toBe('new failure');
+ } finally {m.running.delete(owner);await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;await sql`DELETE FROM communities WHERE community_id=${scope.communityId}`;}
+});
+
+test.skipIf(!reachable)('a stale session cannot sever a replacement of the same lifecycle',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,discordChannelId:`session-sever-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+   VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId})`;
+  const state=await store.activateDelivery(scope,owner,[],1000),old=await store.openDelivery(scope,owner,lease);
+  const rb:any={id:owner,status:'active',link:scope,deliveryEpoch:state.epoch,deliveryStore:old.store,lease,pool:{close:async()=>{}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};
+  m.running.set(owner,rb);const fresh=await store.openDelivery(scope,owner,lease);
+  await expect(m.applySeverance(owner,{reason:'banned',pubkey:'c'.repeat(64),bannedAtMs:1000},{idHex:scope.communityId},rb)).rejects.toThrow();
+  expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('active');
+  await fresh.store.assertDeliveryCurrent();
+ } finally {m.running.delete(owner);await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
+
+test.skipIf(!reachable)('an expired startup lease cannot alter a replacement failure streak',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,discordChannelId:`start-stale-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ const leases=new BridgeLeases(sql),old=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;let fresh:any;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+   VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId})`;
+  const state=await store.activateDelivery(scope,owner,[],1000),[row]=await sql`SELECT * FROM bridges WHERE bridge_id=${owner}`;
+  await old.release();fresh=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+  await expect(m.handleStartFailure(row,'old failure',0,state.epoch,old)).rejects.toThrow();
+  const [current]=await sql`SELECT status,status_detail,options FROM bridges WHERE bridge_id=${owner}`;
+  expect(current.status).toBe('active');expect(current.status_detail).toBeNull();expect(current.options.startFailedAt).toBeUndefined();
+ } finally {await old.release();await fresh?.release();await sql`DELETE FROM bridge_leases WHERE resource=${old.resource}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
+
+test('start bookkeeping never borrows a replacement worker',async()=>{
+ const m=new BridgeManager({} as postgres.Sql,{} as PortalEnv) as any;
+ const old={id:'owner'},replacement={id:'owner'};let cleared=0;
+ m.start=async()=>{m.running.set('owner',replacement);return old;};
+ m.clearStartFailure=async()=>{cleared++;};m.clearSeveredReason=async()=>{cleared++;};
+ await m.startTracked({bridge_id:'owner',status:'active'});
+ expect(cleared).toBe(0);expect(m.running.get('owner')).toBe(replacement);
+});
+
+test.skipIf(!reachable)('severance cannot commit after its captured lease expires',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,communityId:`lease-expiry-${suffix}`,discordChannelId:`lease-expiry-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ let release!:()=>void,entered!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;}),locked=new Promise<void>(resolve=>{entered=resolve;});let blocker:Promise<unknown>|undefined;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+   VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId})`;
+  await sql`INSERT INTO communities(tenant_id,community_id,relays) VALUES ('default',${scope.communityId},ARRAY[]::text[])`;
+  const state=await store.activateDelivery(scope,owner,[],1000),opened=await store.openDelivery(scope,owner,lease);
+  const rb:any={id:owner,status:'active',link:scope,deliveryEpoch:state.epoch,deliveryStore:opened.store,lease,pool:{close:async()=>{}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};m.running.set(owner,rb);
+  blocker=sql.begin(async tx=>{await tx`UPDATE communities SET name='held' WHERE community_id=${scope.communityId}`;entered();await held;});await locked;
+  await sql`UPDATE bridge_leases SET expires_at=clock_timestamp()+interval '150 milliseconds' WHERE resource=${lease.resource}`;
+  const sever=m.applySeverance(owner,{reason:'banned',pubkey:'c'.repeat(64),bannedAtMs:1000},{idHex:scope.communityId},rb);
+  await new Promise(resolve=>setTimeout(resolve,250));release();await blocker;
+  await expect(sever).rejects.toThrow();
+  expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('active');
+  expect((await store.inspectDelivery(scope))?.suspended).toBe(false);
+ } finally {release();await blocker; m.running.delete(owner);await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;await sql`DELETE FROM communities WHERE community_id=${scope.communityId}`;}
 });

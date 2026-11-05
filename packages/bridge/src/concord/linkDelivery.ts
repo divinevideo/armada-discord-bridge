@@ -134,6 +134,15 @@ export class LinkDelivery {
     assertRelays();
     const channel = options.channel();
     const streams = channel.streams.map(stream => stream.group.pk);
+    const capturedStreams = [...new Set(streams)].sort();
+    const assertContext = () => {
+      assertRelays();
+      const current = options.channel();
+      if (!current || JSON.stringify([...new Set(current.streams.map(stream => stream.group.pk))].sort()) !== JSON.stringify(capturedStreams)) {
+        this.markGap(snapshot.recoveryFloor);
+        throw new Error('Channel stream inventory changed during replay');
+      }
+    };
     const missing = streams.filter(pk => snapshot.coverage[pk] === undefined);
     // An incomplete historical prefix resumes at the exact next second;
     // overlap applies only to a settled tail or newly discovered stream.
@@ -148,7 +157,7 @@ export class LinkDelivery {
         signal,
         onBatch: async ({ chats }, context) => this.run(async () => {
           for (const chat of chats) {
-            signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
+            signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
             if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
             if (!filterEpochCutoff([chat], options.channel()).length) continue;
             const known = [snapshot.legacyBoundaries[chat.streamPk], snapshot.ordinaryCoverage[chat.streamPk], snapshot.coverage[chat.streamPk]].filter((at): at is number => at !== undefined);
@@ -166,24 +175,24 @@ export class LinkDelivery {
           }
         }),
         onWindowComplete: async (window, context) => this.run(async () => {
-          signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
           if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
           if (snapshot.repairFloor !== undefined && snapshot.repairFloor > window.until) return;
           const coverage = { ...snapshot.coverage };
           for (const pk of streams) coverage[pk] = Math.max(coverage[pk] ?? 0, window.until);
           const committed = await this.certify(async () => {
-            signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
+            signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
             return options.store.certifyDelivery(snapshot.version, window.until, coverage, window.until === window.runUntil);
           }, window.until === window.runUntil);
-          signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
           if (!committed || generation !== this.generation) throw new Error('Delivery checkpoint lost its fence');
           if (this.gapFloor !== undefined) this.gapFloor = window.until === window.runUntil ? undefined : window.until + 1;
           snapshot = await options.store.deliverySnapshot();
-          signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
           if (generation !== this.generation) throw new Error('Delivery gap changed after checkpoint');
         }),
       });
-      signal.throwIfAborted(); assertRelays();
+      signal.throwIfAborted(); assertContext();
     } finally {
       if (this.attempt === attempt) this.attempt = undefined;
     }

@@ -324,3 +324,17 @@ it('rechecks the relay set after an awaited checkpoint', async () => {
   await started;relays=['wss://b.example'];release();
   await expect(repair).rejects.toThrow('relay');await lane.flushGaps();expect(floors).toEqual([0]);
 });
+
+it('rechecks the stream inventory after an awaited checkpoint', async () => {
+  let entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>{entered=resolve;}), blocked=new Promise<void>(resolve=>{release=resolve;});
+  const snapshot={ownerId:'owner',epoch:'epoch',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version:0,activationFloor:100,recoveryFloor:80,repairFloor:80,coverage:{},ordinaryCoverage:{},legacyBoundaries:{}};
+  const store={deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{entered();await blocked;return true;}};
+  let channel={streams:[{group:{pk:'first'}}]} as unknown as ChannelV2; const floors:number[]=[];
+  const lane=new LinkDelivery({onError:()=>{},onGap:async floor=>{floors.push(floor);}});
+  const repair=lane.repair({store,channel:()=>channel,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+    await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
+  }});
+  await started;channel={streams:[{group:{pk:'first'}},{group:{pk:'second'}}]} as unknown as ChannelV2;release();
+  await expect(repair).rejects.toThrow('stream');await lane.flushGaps();expect(floors).toEqual([80]);
+});

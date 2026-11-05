@@ -384,7 +384,7 @@ export class ConcordClient {
               onError?.("dispatch", error);
               throw error;
             }
-            };
+          };
           if (wrap.kind === KIND_WRAP_EPHEMERAL) lane.typing(work);
           else void lane.admit(wrap.created_at, work)?.catch(() => {});
         },

@@ -396,6 +396,21 @@ export class PostgresMappingStore implements MappingStore {
       return deliverySnapshot(row);
     });
   }
+  /** Lock this worker's immutable fence inside a caller-owned transaction. */
+  async lockDeliveryFence(tx: postgres.TransactionSql): Promise<void> {
+    if (!this.bound) throw new Error('Delivery view required');
+    await lockDelivery(tx,this.tenantId,this.bound.link,this.bound.fence);
+  }
+  /** Recheck the locked lease after an intentional lifecycle transition. */
+  async assertDeliveryLease(tx: postgres.TransactionSql): Promise<void> {
+    if (!this.bound) throw new Error('Delivery view required');
+    await assertLockedLease(tx,this.bound.fence.lease);
+  }
+  /** Serialize a worker-owned portal mutation with lifecycle and lease changes. */
+  async withDeliveryFence<T>(work: (tx: postgres.TransactionSql) => Promise<T>): Promise<T> {
+    if (!this.bound) throw new Error('Delivery view required');
+    return this.write(work);
+  }
   /** Operational guards call this again immediately before external dispatch. */
   async assertDeliveryCurrent():Promise<void> { await this.deliverySnapshot(); }
   async markDeliveryGap(floor:number):Promise<DeliverySnapshot> {

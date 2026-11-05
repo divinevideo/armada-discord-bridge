@@ -39,6 +39,7 @@ import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyInt
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
 import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
+import { assertLockedLease, lockDelivery } from "@armada-bridge/bridge/src/db/deliveryState";
 import { DiscordAdapter, isMissingPermissions, parseBotCommand } from "@armada-bridge/bridge/src/discord/adapter";
 import { Kind0ProfileResolver } from "@armada-bridge/bridge/src/profiles";
 import { PuppetCache } from "@armada-bridge/bridge/src/puppets";
@@ -127,7 +128,7 @@ const GATEWAY_RETRY_MAX_MS = 10 * 60 * 1000;
  * gateway is down. It is deliberately its OWN error type, not a start failure:
  * the gateway being unreachable is a process-wide, transient condition that
  * says NOTHING about the community, so it must never advance the seven-day
- * sever streak or reach markSevered. Treating it as a start failure once
+ * sever streak or trigger automatic severance. Treating it as a start failure once
  * severed every active bridge on a boot that raced a Discord API blip
  * (2026-08-27, ~378 bridges). Bridges that throw this defer and retry; the
  * gateway heals via connectAdapter() and onAdapterConnected() brings them up.
@@ -190,6 +191,7 @@ export const BRIDGE_COMMANDS = [
 ];
 
 class PublicPolicyUnavailableError extends Error {}
+class StartFailureRecordedError extends Error {}
 
 async function settleWithin(work: Promise<unknown>, timeoutMs = 1_000): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -540,14 +542,18 @@ export class BridgeManager {
     const confirmCode = randomBytes(4).toString("hex");
     const masterSecretSealed = await this.sharedMasterSecret(row.community_id, row.discord_guild_id);
 
-    await this.sql`
+    const changed = await this.sql`
       UPDATE bridges SET
         master_secret_sealed = ${masterSecretSealed},
         primary_sk_sealed = ${seal(this.env.sealKeyHex, bytesToHex(primarySk))},
         primary_pk = ${primary.pk},
         confirm_code = ${confirmCode},
         status = 'pending_confirm', status_detail = NULL, updated_at = now()
-      WHERE bridge_id = ${row.bridge_id}`;
+      WHERE bridge_id = ${row.bridge_id} AND status=${row.status}
+        AND community_id IS NOT DISTINCT FROM ${row.community_id} AND concord_channel_id IS NOT DISTINCT FROM ${row.concord_channel_id}
+        AND discord_guild_id IS NOT DISTINCT FROM ${row.discord_guild_id} AND discord_channel_id IS NOT DISTINCT FROM ${row.discord_channel_id}
+      RETURNING bridge_id`;
+    if (!changed.length) throw new Error('Bridge changed during activation');
 
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${row.bridge_id}`;
     await this.start(fresh);
@@ -601,7 +607,7 @@ export class BridgeManager {
     await this.start(await this.provisionImported(row));
   }
 
-  private async start(row: BridgeRow): Promise<void> {
+  private async start(row: BridgeRow, observedEpoch?: string | null, attempt = 0): Promise<Running | undefined> {
     if (this.shuttingDown) throw new Error("Portal is shutting down");
     if (this.running.has(row.bridge_id)) return;
     // An active bridge mirrors in both directions through the shared gateway,
@@ -627,14 +633,21 @@ export class BridgeManager {
     if (this.shuttingDown) { await lease.release(); throw new Error("Portal is shutting down"); }
     this.startingLeases.add(lease);
     try {
-      await this.startOwned(row, lease);
+      const started = await this.startOwned(row, lease);
       starting = false;
       if (lost) {
         await this.onLeaseLost(row.bridge_id, lease);
         throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
       }
+      return started;
     } catch (error) {
       starting = false;
+      if (!lost && !this.shuttingDown && observedEpoch !== undefined && !(error instanceof SeveredError) && !(error instanceof GatewayUnavailableError) && !(error instanceof BridgeLeaseUnavailableError) && !(error instanceof PublicPolicyUnavailableError)) {
+        try { await this.handleStartFailure(row,String(error),attempt,observedEpoch,lease); }
+        catch (bookkeepingError) { console.warn(`bridge ${row.bridge_id}: could not record start failure`,bookkeepingError); this.scheduleStartRetry(row.bridge_id,attempt); }
+        await lease.release().catch(() => {});
+        throw new StartFailureRecordedError(String(error));
+      }
       await lease.release().catch(() => {});
       if (lost) {
         this.scheduleStartRetry(row.bridge_id, 0, true);
@@ -644,7 +657,7 @@ export class BridgeManager {
     } finally { this.startingLeases.delete(lease); }
   }
 
-  private async startOwned(row: BridgeRow, lease: BridgeLease): Promise<void> {
+  private async startOwned(row: BridgeRow, lease: BridgeLease): Promise<Running> {
     const cleanup: Array<() => void | Promise<void>> = [];
     try {
       const observedLink = row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id
@@ -719,8 +732,10 @@ export class BridgeManager {
         try {
           await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
         } catch (error) {
-          await lease.assertCurrent();
-          await this.sql`UPDATE bridges SET status_detail = 'Forwarding blocked: public visibility unavailable', updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
+          if (runningRef?.status === 'active' && runningRef.deliveryStore) await runningRef.deliveryStore.withDeliveryFence(async tx => {
+            await tx`UPDATE bridges SET status_detail = 'Forwarding blocked: public visibility unavailable', updated_at = now()
+              WHERE bridge_id = ${row.bridge_id} AND status = 'active'`;
+          });
           throw error;
         }
         const current = row.concord_channel_id && rawClient.channel(row.concord_channel_id);
@@ -731,8 +746,10 @@ export class BridgeManager {
         if (state.status === "active") await runningRef!.deliveryStore!.assertDeliveryCurrent();
         const [latest] = await this.sql`SELECT status FROM bridges WHERE bridge_id=${row.bridge_id}`;
         if (!latest || latest.status !== state.status) throw new Error("Bridge status changed");
-        if (state.status === "active") await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
-          AND status_detail = 'Forwarding blocked: public visibility unavailable'`;
+        if (state.status === "active") await runningRef!.deliveryStore!.withDeliveryFence(async tx => {
+          await tx`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id} AND status='active'
+            AND status_detail = 'Forwarding blocked: public visibility unavailable'`;
+        });
       };
       const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
 
@@ -751,7 +768,7 @@ export class BridgeManager {
       // planes plus the fold we already hold decides it (see ./severance.ts for
       // the three cases); a throw below lands in startTracked as a SeveredError
       // and is not retried.
-      await this.detectSeveranceAtBoot(row, community, pool, rawClient.folded, primary, observedEpoch);
+      await this.detectSeveranceAtBoot(row, community, pool, rawClient.folded, primary, observedEpoch, lease);
       // Refresh display names each start: renames heal on the next boot, and
       // rows from before the name columns existed backfill themselves. The two
       // lookups hit different Discord endpoints and neither reads the other, so
@@ -767,11 +784,6 @@ export class BridgeManager {
       // blanked the dashboard for bridges nothing was wrong with. Keep what we
       // knew unless Discord actually answered; a real rename still heals,
       // because a rename answers.
-      await this.sql`
-        UPDATE bridges SET concord_channel_name = ${channel.name},
-          discord_channel_name = coalesce(${discordName ?? null}, discord_channel_name),
-          discord_guild_name = coalesce(${guildName ?? null}, discord_guild_name)
-        WHERE bridge_id = ${row.bridge_id}`;
       const link: ChannelLink = {
         discordGuildId: row.discord_guild_id ?? "",
         discordChannelId: row.discord_channel_id ?? "",
@@ -805,6 +817,11 @@ export class BridgeManager {
         rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance();
         if (this.running.get(rb.id) === rb) this.running.delete(rb.id);
       });
+      await this.withWorkerFence(rb, async tx => { await tx`
+        UPDATE bridges SET concord_channel_name=${channel.name},
+          discord_channel_name=coalesce(${discordName ?? null},discord_channel_name),
+          discord_guild_name=coalesce(${guildName ?? null},discord_guild_name)
+        WHERE bridge_id=${rb.id} AND status=${rb.status}`; });
       if (rb.status === "active") {
         this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
       }
@@ -897,6 +914,7 @@ export class BridgeManager {
       }
       await lease.assertCurrent();
       this.startingPools.delete(pool);
+      return rb;
     } catch (error) {
       for (const close of cleanup.reverse()) await Promise.resolve().then(close).catch(() => {});
       const current = this.running.get(row.bridge_id);
@@ -1078,16 +1096,39 @@ export class BridgeManager {
    * webhooks don't). The bridge stays active; mirroring resumes on its own
    * once the permission is granted.
    */
+  /** Pending confirmation has a lease but deliberately no delivery session. */
+  private async withWorkerFence<T>(rb: Running, work: (tx: postgres.TransactionSql) => Promise<T>): Promise<T> {
+    if (this.running.get(rb.id) !== rb || rb.stopped) throw new Error('Bridge worker is no longer current');
+    if (rb.status === 'active') {
+      if (!rb.deliveryStore) throw new Error('Delivery session is not ready');
+      return rb.deliveryStore.withDeliveryFence(work);
+    }
+    return this.sql.begin(async tx => {
+      await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
+      await tx`SELECT 1 FROM bridge_leases WHERE resource=${rb.lease.resource} FOR UPDATE`;
+      await assertLockedLease(tx,rb.lease);
+      const [row]=await tx`SELECT 1 FROM bridges WHERE bridge_id=${rb.id} AND status='pending_confirm'
+        AND community_id=${rb.link.communityId} AND concord_channel_id=${rb.link.concordChannelIdHex}
+        AND discord_guild_id=${rb.link.discordGuildId} AND discord_channel_id=${rb.link.discordChannelId} FOR UPDATE`;
+      if (!row || this.running.get(rb.id)!==rb || rb.stopped) throw new Error('Bridge worker is no longer current');
+      const result=await work(tx);await assertLockedLease(tx,rb.lease);return result;
+    }) as Promise<T>;
+  }
+
   private async alertMissingWebhookPermission(rb: Running): Promise<void> { return this.alertDiscordPermission(rb,'Manage Webhooks'); }
 
   private async alertDiscordPermission(rb: Running, permission: 'Manage Webhooks' | 'Manage Messages' | 'View Channel'): Promise<void> {
     const detail = `the bot needs ${permission} in the linked Discord channel`;
-    const [claimed] = await this.sql`
+    if (!rb.deliveryStore) throw new Error('Delivery session is not ready');
+    const [claimed] = await rb.deliveryStore.withDeliveryFence(async tx => tx`
       UPDATE bridges SET perm_alerted_at = now(), status_detail = ${detail}
-      WHERE bridge_id = ${rb.id} AND perm_alerted_at IS NULL
-      RETURNING bridge_id`;
+      WHERE bridge_id = ${rb.id} AND status = 'active' AND perm_alerted_at IS NULL
+        AND community_id = ${rb.link.communityId} AND concord_channel_id = ${rb.link.concordChannelIdHex}
+        AND discord_guild_id = ${rb.link.discordGuildId} AND discord_channel_id = ${rb.link.discordChannelId}
+      RETURNING bridge_id`);
     if (!claimed) return;
     console.warn(`bridge ${rb.id}: ${detail}`);
+    await rb.assertMayForward();
     await rb.client
       .sendChat(rb.channel, {
         content:
@@ -1145,11 +1186,15 @@ export class BridgeManager {
    * which is the better failure than greeting the channel on every deploy.
    */
   private async announceBridge(rb: Running): Promise<void> {
-    const [claimed] = await this.sql`
+    if (!rb.deliveryStore) throw new Error('Delivery session is not ready');
+    const [claimed] = await rb.deliveryStore.withDeliveryFence(async tx => tx`
       UPDATE bridges SET announced_at = now()
-      WHERE bridge_id = ${rb.id} AND announced_at IS NULL
-      RETURNING bridge_id`;
+      WHERE bridge_id = ${rb.id} AND status = 'active' AND announced_at IS NULL
+        AND community_id = ${rb.link.communityId} AND concord_channel_id = ${rb.link.concordChannelIdHex}
+        AND discord_guild_id = ${rb.link.discordGuildId} AND discord_channel_id = ${rb.link.discordChannelId}
+      RETURNING bridge_id`);
     if (!claimed) return;
+    await rb.assertMayForward();
     await rb.client
       .sendChat(rb.channel, {
         content: "This channel is now mirrored with Discord.",
@@ -1303,7 +1348,7 @@ export class BridgeManager {
    * that throws leaves the row in its current status — still holding the
    * one-bridge-per-channel slot, so no duplicate can be minted mid-outage —
    * records when the failing streak began (in options, so it survives
-   * restarts), and retries with backoff. markSevered only fires once the
+   * restarts), and retries with backoff. Automatic severance only fires once the
    * streak outlives START_FAILURE_SEVER_AFTER_MS: a single relay window
    * where nobody answered used to sever permanently (see the Lynch Memorial
    * Park bridge, 2026-08-10), and severed rows are never retried.
@@ -1314,14 +1359,16 @@ export class BridgeManager {
     // backoff timer; start() also guards, but skip the work up front.
     if (this.running.has(row.bridge_id)) return;
     let observedEpoch: string | null | undefined;
+    let started: Running | undefined;
     try {
       if (row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
         const link:ChannelLink={communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
         observedEpoch=(await this.store.inspectDelivery(link))?.epoch ?? null;
       }
-      await this.start(row);
+      started = await this.start(row,observedEpoch,attempt);
     } catch (error) {
       if(this.shuttingDown)return;
+      if(error instanceof StartFailureRecordedError)return;
       if (error instanceof BridgeLeaseUnavailableError) {
         // Another owner (or a just-dead process's 90s lease) is not a bridge
         // failure. Do not overwrite its status detail or wait minutes to retry.
@@ -1329,13 +1376,7 @@ export class BridgeManager {
         return;
       }
       if (error instanceof PublicPolicyUnavailableError) {
-        try {
-          await this.sql`UPDATE bridges SET status_detail = ${error.message}, updated_at = now() WHERE bridge_id = ${row.bridge_id}`;
-        } catch (bookkeepingError) {
-          console.warn(`bridge ${row.bridge_id}: could not record deferred start`, bookkeepingError);
-        } finally {
-          this.scheduleStartRetry(row.bridge_id, attempt);
-        }
+        this.scheduleStartRetry(row.bridge_id, attempt);
         return;
       }
       if (error instanceof GatewayUnavailableError) {
@@ -1361,10 +1402,9 @@ export class BridgeManager {
       // unhandled rejection that killed the process — 2026-09-24, a postgres
       // CONNECT_TIMEOUT 70 minutes into a CPU-bound boot restarted the whole
       // thousand-bridge boot from zero.
-      await this.handleStartFailure(row, String(error), attempt, observedEpoch).catch((bookkeepingError) => {
-        console.error(`bridge ${row.bridge_id}: could not record start failure; retrying anyway:`, bookkeepingError);
-        this.scheduleStartRetry(row.bridge_id, attempt);
-      });
+      // The lease was released during failed startup; no worker proof remains
+      // with which to mutate a row that may already belong to a replacement.
+      this.scheduleStartRetry(row.bridge_id, attempt);
       return;
     }
     // Started and running: failing to clear the streak marker must not be
@@ -1372,35 +1412,42 @@ export class BridgeManager {
     // clears are gated on the bridge still being up: a severance that landed
     // between start() and here must keep its record, not have the reason
     // wiped by the very boot it cut off.
-    if (!this.running.has(row.bridge_id)) return;
-    await this.clearStartFailure(row).catch((error) =>
+    if (!started || this.running.get(row.bridge_id) !== started) return;
+    await this.clearStartFailure(row,started).catch((error) =>
       console.warn(`bridge ${row.bridge_id}: could not clear start-failure marker:`, error),
     );
-    await this.clearSeveredReason(row).catch((error) =>
+    await this.clearSeveredReason(row,started).catch((error) =>
       console.warn(`bridge ${row.bridge_id}: could not clear severed_reason:`, error),
     );
   }
 
-  private async handleStartFailure(row: BridgeRow, detail: string, attempt: number, observedEpoch?: string | null): Promise<void> {
+  private async handleStartFailure(row: BridgeRow, detail: string, attempt: number, observedEpoch: string | null, lease: BridgeLease): Promise<void> {
+    if (!row.community_id || !row.concord_channel_id || !row.discord_guild_id || !row.discord_channel_id) { this.scheduleStartRetry(row.bridge_id,attempt); return; }
+    const link:ChannelLink={communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
     const since = row.options?.startFailedAt;
-    const firstAt = typeof since === "string" ? Date.parse(since) : NaN;
-    if (Number.isFinite(firstAt) && Date.now() - firstAt >= START_FAILURE_SEVER_AFTER_MS) {
-      if (observedEpoch === undefined) { this.scheduleStartRetry(row.bridge_id,attempt); return; }
-      await this.markSevered(row.bridge_id, detail, row, observedEpoch);
-      return;
-    }
-    console.warn(`bridge ${row.bridge_id}: start failed (attempt ${attempt + 1}), will retry: ${detail}`);
-    if (Number.isFinite(firstAt)) {
-      await this.sql`
-        UPDATE bridges SET status_detail = ${detail}, updated_at = now()
-        WHERE bridge_id = ${row.bridge_id}`;
-    } else {
-      await this.sql`
-        UPDATE bridges SET options = options || ${this.sql.json({ startFailedAt: new Date().toISOString() })},
-          status_detail = ${detail}, updated_at = now()
-        WHERE bridge_id = ${row.bridge_id}`;
-    }
-    this.scheduleStartRetry(row.bridge_id, attempt);
+    const firstAt = typeof since === 'string' ? Date.parse(since) : NaN;
+    const expired = Number.isFinite(firstAt) && Date.now()-firstAt >= START_FAILURE_SEVER_AFTER_MS;
+    const changed=await this.sql.begin(async tx=>{
+      await tx`SET LOCAL statement_timeout = '15s'`;await tx`SET LOCAL lock_timeout = '5s'`;
+      const lifecycle=await lockDelivery(tx,'default',link);
+      await assertLockedLease(tx,lease);
+      if ((lifecycle?.epoch ?? null)!==observedEpoch || (lifecycle && lifecycle.owner_id!==row.bridge_id)) return false;
+      const [current]=await tx`SELECT * FROM bridges WHERE bridge_id=${row.bridge_id} AND status=${row.status}
+        AND community_id=${link.communityId} AND concord_channel_id=${link.concordChannelIdHex}
+        AND discord_guild_id=${link.discordGuildId} AND discord_channel_id=${link.discordChannelId} FOR UPDATE`;
+      if (!current || (current.options?.startFailedAt ?? null)!==(row.options?.startFailedAt ?? null)) return false;
+      if (expired) {
+        if (lifecycle?.active) await this.store.suspendDelivery(link,row.bridge_id,lifecycle.epoch,tx);
+        await tx`UPDATE bridges SET status='severed',status_detail=${detail},options=options-'startFailedAt',updated_at=now() WHERE bridge_id=${row.bridge_id}`;
+      } else if (Number.isFinite(firstAt)) {
+        await tx`UPDATE bridges SET status_detail=${detail},updated_at=now() WHERE bridge_id=${row.bridge_id}`;
+      } else {
+        await tx`UPDATE bridges SET options=options || ${tx.json({startFailedAt:new Date().toISOString()})},status_detail=${detail},updated_at=now() WHERE bridge_id=${row.bridge_id}`;
+      }
+      await assertLockedLease(tx,lease);return true;
+    });
+    if (!changed || !expired) this.scheduleStartRetry(row.bridge_id,attempt);
+    else this.cancelStartRetry(row.bridge_id);
   }
 
   private scheduleStartRetry(bridgeId: string, attempt: number, leaseContention = false): void {
@@ -1440,32 +1487,13 @@ export class BridgeManager {
     }
   }
 
-  private async clearStartFailure(row: BridgeRow): Promise<void> {
-    this.cancelStartRetry(row.bridge_id);
+  private async clearStartFailure(row: BridgeRow, rb: Running): Promise<void> {
     if (row.options?.startFailedAt === undefined) return;
-    console.log(`bridge ${row.bridge_id}: recovered from failing start`);
-    await this.sql`
+    await this.withWorkerFence(rb,async tx => { await tx`
       UPDATE bridges SET options = options - 'startFailedAt', status_detail = NULL, updated_at = now()
-      WHERE bridge_id = ${row.bridge_id}`;
-  }
-
-  private async markSevered(bridgeId: string, detail: string, expected: BridgeRow, expectedEpoch: string | null): Promise<void> {
-    const changed=await this.sql.begin(async tx=>{
-      await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
-      if(expected.community_id && expected.concord_channel_id && expected.discord_guild_id && expected.discord_channel_id) {
-        const link:ChannelLink={communityId:expected.community_id,concordChannelIdHex:expected.concord_channel_id,
-          discordGuildId:expected.discord_guild_id,discordChannelId:expected.discord_channel_id,enabled:true};
-        const state=await this.store.inspectDelivery(link,tx);
-        if((state?.epoch ?? null)!==expectedEpoch || (state && state.ownerId!==bridgeId))return false;
-        if(state?.active) await this.store.suspendDelivery(link,bridgeId,state.epoch,tx);
-      }
-      const rows=await tx`UPDATE bridges SET status='severed',status_detail=${detail},options=options-'startFailedAt',updated_at=now()
-        WHERE bridge_id=${bridgeId} AND status=${expected.status} AND community_id IS NOT DISTINCT FROM ${expected.community_id}
-          AND concord_channel_id IS NOT DISTINCT FROM ${expected.concord_channel_id} AND discord_guild_id IS NOT DISTINCT FROM ${expected.discord_guild_id}
-          AND discord_channel_id IS NOT DISTINCT FROM ${expected.discord_channel_id} RETURNING bridge_id`;
-      return rows.length>0;
-    });
-    if(changed) {this.cancelStartRetry(bridgeId);console.error(`bridge ${bridgeId}: severed: ${detail}`);}
+      WHERE bridge_id = ${row.bridge_id} AND status=${rb.status}
+        AND options->>'startFailedAt'=${String(row.options?.startFailedAt)}`; });
+    if (this.running.get(rb.id) === rb) this.cancelStartRetry(row.bridge_id);
   }
 
   /**
@@ -1473,7 +1501,7 @@ export class BridgeManager {
    * what the bridge does about it). Three things, the same three the operator
    * pause/unlink path does: stop forwarding (tear the running instance down
    * exactly as stop() does), surface it (bridges.status 'severed' +
-   * status_detail via markSevered — the dashboard's resume button already
+   * status_detail — the dashboard's resume button already
    * speaks 'severed'), and durably record WHY (schema.sql's
    * communities.severed_reason — the 'banned' | 'refounded' | 'dissolved'
    * column nothing wrote until now). A second verdict for an already-torn-down
@@ -1486,6 +1514,7 @@ export class BridgeManager {
     expected?: Running,
     expectedRow?: BridgeRow,
     expectedEpoch?: string | null,
+    expectedLease?: BridgeLease,
   ): Promise<void> {
     const rb=this.running.get(bridgeId);
     if(expected && rb!==expected)return;
@@ -1498,6 +1527,14 @@ export class BridgeManager {
         row.concord_channel_id!==expectedRow.concord_channel_id || row.discord_guild_id!==expectedRow.discord_guild_id ||
         row.discord_channel_id!==expectedRow.discord_channel_id)) return false;
       if(expected && (this.running.get(bridgeId)!==expected || row.status!==expected.status))return false;
+      if (expected?.status === 'active') {
+        if (!expected.deliveryStore) throw new Error('Delivery session is not ready');
+        await expected.deliveryStore.lockDeliveryFence(tx);
+      } else if (expected || expectedLease) {
+        const lease=expected?.lease ?? expectedLease!;
+        await tx`SELECT 1 FROM bridge_leases WHERE resource=${lease.resource} FOR UPDATE`;
+        await assertLockedLease(tx,lease);
+      }
       if(row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
         const link:ChannelLink={communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,
           discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
@@ -1514,7 +1551,16 @@ export class BridgeManager {
         AND community_id IS NOT DISTINCT FROM ${row.community_id} AND concord_channel_id IS NOT DISTINCT FROM ${row.concord_channel_id}
         AND discord_guild_id IS NOT DISTINCT FROM ${row.discord_guild_id} AND discord_channel_id IS NOT DISTINCT FROM ${row.discord_channel_id}
         RETURNING bridge_id`;
-      return updated.length>0;
+      if (!updated.length) return false;
+      await tx.savepoint(async sp => { await sp`INSERT INTO communities (tenant_id,community_id,relays,name,severed_reason)
+        VALUES ('default',${community.idHex},${community.relays ?? []},${community.name ?? null},${verdict.reason})
+        ON CONFLICT (tenant_id,community_id) DO UPDATE SET severed_reason=EXCLUDED.severed_reason`; }).catch(error =>
+        console.warn(`bridge ${bridgeId}: could not record severed_reason:`,error));
+      // The lease can expire while an earlier row or the community upsert waits.
+      // Recheck under the same lock so no stale severance can commit afterward.
+      if (expected?.status === 'active') await expected.deliveryStore!.assertDeliveryLease(tx);
+      else if (expected || expectedLease) await assertLockedLease(tx,expected?.lease ?? expectedLease!);
+      return true;
     });
     if(!changed)return;
     this.cancelStartRetry(bridgeId);
@@ -1522,10 +1568,6 @@ export class BridgeManager {
       await settleWithin(rb.lease.release().catch(error=>console.warn(`bridge ${bridgeId}: lease release failed`,error)));
       await this.closeRunning(rb);
     }
-    await this.sql`INSERT INTO communities (tenant_id,community_id,relays,name,severed_reason)
-      VALUES ('default',${community.idHex},${community.relays ?? []},${community.name ?? null},${verdict.reason})
-      ON CONFLICT (tenant_id,community_id) DO UPDATE SET severed_reason=EXCLUDED.severed_reason`.catch(error=>
-      console.warn(`bridge ${bridgeId}: could not record severed_reason:`,error));
   }
 
   /**
@@ -1544,6 +1586,7 @@ export class BridgeManager {
     folded: FoldedControl | undefined,
     primary: ReturnType<typeof localIdentity>,
     expectedEpoch: string | null,
+    lease: BridgeLease,
   ): Promise<void> {
     const wraps = await pool
       .query([
@@ -1561,7 +1604,7 @@ export class BridgeManager {
       joinedAtMs: row.created_at instanceof Date ? row.created_at.getTime() : Date.parse(String(row.created_at)),
     });
     if (!verdict) return;
-    await this.applySeverance(row.bridge_id, verdict, community, undefined, row, expectedEpoch);
+    await this.applySeverance(row.bridge_id, verdict, community, undefined, row, expectedEpoch, lease);
     throw new SeveredError(verdict);
   }
 
@@ -1571,12 +1614,11 @@ export class BridgeManager {
    * severance record — cleared only so a resumed bridge's row stops
    * advertising why it was severed the moment it is back.
    */
-  private async clearSeveredReason(row: BridgeRow): Promise<void> {
+  private async clearSeveredReason(row: BridgeRow, rb: Running): Promise<void> {
     if (!row.community_id) return;
-    await this.sql`
+    await this.withWorkerFence(rb,async tx => { await tx`
       UPDATE communities SET severed_reason = NULL
-      WHERE tenant_id = 'default' AND community_id = ${row.community_id}
-        AND severed_reason IS NOT NULL`;
+      WHERE tenant_id = 'default' AND community_id = ${row.community_id} AND severed_reason IS NOT NULL`; });
   }
 
   /** How many bridges are running in this process. */
