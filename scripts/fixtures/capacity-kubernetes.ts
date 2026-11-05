@@ -99,8 +99,8 @@ export function benchmarkPod(c: DestinationConfig, m: Resources, name: string) {
     hostNetwork: false, automountServiceAccountToken: false, restartPolicy: 'Always', terminationGracePeriodSeconds: 5, activeDeadlineSeconds: POD_LIFETIME_SECONDS,
     nodeSelector: { 'cloud.google.com/gke-provisioning': 'standard', 'kubernetes.io/arch': 'amd64' },
     // The claim is shared by every benchmark Pod. With the default policy each
-    // mount chowns it recursively, so Pod start (and cold/restart wall time)
-    // grew with everything earlier runs had written there.
+    // mount chowns it recursively, so Pod startup grows with earlier runs'
+    // data and can exceed the Running wait before a sample even starts.
     securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
     initContainers: [{ name: 'prepare-data', image: c.image, command: ['mkdir', '-p', '/storage/' + name],
       securityContext: { runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } },
