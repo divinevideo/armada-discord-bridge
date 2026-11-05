@@ -130,6 +130,10 @@ test('raw destination reports require a private output path outside the checkout
   expect(() => destinationOutputGuard('report', '/synthetic/checkout')).toThrow();
   expect(() => destinationOutputGuard('/synthetic/checkout/reports', '/synthetic/checkout')).toThrow();
   expect(() => destinationOutputGuard('/synthetic/private/reports', '/synthetic/checkout')).not.toThrow();
+  expect(() => destinationOutputGuard('/synthetic/checkout-reports', '/synthetic/checkout')).not.toThrow();
+  expect(() => destinationOutputGuard('/synthetic/checkout/..reports', '/synthetic/checkout')).toThrow('outside the checkout');
+  // Ancestors hold the checkout itself; the parent and '/' are refused alike.
+  for (const ancestor of ['/synthetic', '/', '/synthetic/checkout/..']) expect(() => destinationOutputGuard(ancestor, '/synthetic/checkout')).toThrow('ancestor');
 });
 
 test('destination preflight compares the selected relay, separate PVC and running CNPG primary', async () => {

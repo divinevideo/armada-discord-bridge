@@ -40,8 +40,12 @@ export function destinationConfig(value: unknown): DestinationConfig {
 }
 export function destinationOutputGuard(output: string | undefined, checkout: string) {
   need(output && isAbsolute(output), 'Private absolute destination output directory required');
-  const path = relative(resolve(checkout), resolve(output));
-  need(path.startsWith('..' + '/') || isAbsolute(path), 'Destination reports must stay outside the checkout');
+  // `to` lies outside `from`. A bare '..' prefix test would also match a child
+  // named '..reports', and testing only '../' once rejected the checkout's
+  // parent while accepting every higher ancestor, up to '/' itself.
+  const outside = (from: string, to: string) => { const path = relative(resolve(from), resolve(to)); return path === '..' || path.startsWith('..' + '/') || isAbsolute(path); };
+  need(outside(checkout, output), 'Destination reports must stay outside the checkout');
+  need(outside(output, checkout), 'Destination reports need a dedicated directory, not an ancestor of the checkout');
 }
 export function benchmarkURLGuard(c: Pick<DestinationConfig, 'databaseRole' | 'databaseName'>, value: string) {
   try {
