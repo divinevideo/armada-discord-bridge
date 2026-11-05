@@ -285,3 +285,22 @@ test('a destination case keeps harness-authored reasons and withholds everything
   expect(String(error)).toContain('diagnostics withheld');
   expect(String(error)).not.toContain('private-password');
 });
+
+import { rendezvous } from './strfry-capacity';
+test('concurrent samples finish preparation before any of them sends', async () => {
+  const order: string[] = [];
+  const gate = rendezvous(4);
+  await Promise.all([0, 40, 10, 25].map(async (delay, n) => {
+    await Bun.sleep(delay); order.push('prepared:' + n);
+    await gate.wait(); order.push('send:' + n);
+  }));
+  const lastPrepared = Math.max(...order.flatMap((entry, i) => entry.startsWith('prepared') ? [i] : []));
+  const firstSend = Math.min(...order.flatMap((entry, i) => entry.startsWith('send') ? [i] : []));
+  expect(lastPrepared).toBeLessThan(firstSend);
+});
+test('a sample whose preparation fails abandons the gate instead of stranding the others', async () => {
+  const gate = rendezvous(3);
+  const released = Promise.all([gate.wait(), gate.wait()]);
+  gate.abandon();
+  expect(await Promise.race([released.then(() => 'released'), Bun.sleep(500).then(() => 'stranded')])).toBe('released');
+});

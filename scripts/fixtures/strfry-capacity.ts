@@ -169,6 +169,21 @@ export async function refreshEntrypointObservation(capacity: { observeCurrent(or
   return true;
 }
 
+/**
+ * Releases every party together once all have arrived (or abandoned). The
+ * concurrency case must finish each sample's slow preparation (policy refresh,
+ * observation, two `kubectl logs` per sample on a destination) before any
+ * event is sent; otherwise the sends land hundreds of milliseconds apart, run
+ * mostly one after another, and are still reported as `inFlight: N`. A party
+ * whose preparation throws abandons the gate so the others are not stranded.
+ */
+export function rendezvous(parties: number) {
+  let arrived = 0, open!: () => void;
+  const opened = new Promise<void>((resolve) => { open = resolve; });
+  const arrive = () => { if (++arrived >= parties) open(); };
+  return { abandon: arrive, wait: () => { arrive(); return opened; } };
+}
+
 /** The reason recorded against a case whose measurement threw. */
 export function caseFailureReason(error: unknown, withheld: boolean): string {
   if (error instanceof SafeDiagnostic) return error.message;
@@ -303,15 +318,20 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     }
     let sequence = 0;
     async function effect(id: string) { return Number((await sql!`SELECT count(*) AS count FROM (SELECT event_id FROM moderation.carriers WHERE event_id=${id} UNION ALL SELECT event_id FROM moderation.accepted_control WHERE event_id=${id} UNION ALL SELECT event_id FROM moderation.rekey_events WHERE event_id=${id}) q`)[0].count) > 0; }
-    async function sample(instance: Awaited<ReturnType<typeof start>>, f: ReturnType<typeof capacityFixture>, id: CapacityCaseId, expectedAccept: boolean, event: NostrEvent, inFlight = 1): Promise<CapacitySample> {
-      await sql!`UPDATE moderation.community_policy SET payload=jsonb_set(payload,'{validUntil}',${sql!.json(Date.now()+120000)}) WHERE community_id=${f.policy.communityId}`;
-      const measuredPolicy = await store.getPolicy(f.policy.communityId);
-      const measuredRekeys = await sql!`SELECT event FROM moderation.rekey_events WHERE community_id=${f.policy.communityId}`;
-      const hasCapacity = await sql!`SELECT to_regclass('moderation.public_capacity_state') AS name`;
-      if (entrypointCapacity) await refreshEntrypointObservation(entrypointCapacity, measuredPolicy, "synthetic-capacity", f.policy.communityId);
-      else if (hasCapacity[0].name) await sql!`UPDATE moderation.public_capacity_state SET observed_at=clock_timestamp() WHERE org_id='synthetic-capacity' AND community_id=${f.policy.communityId}`;
-      const before = await effect(event.id), messagesFrom = instance.publisher.messages.length;
-      const logsBefore = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).length;
+    async function sample(instance: Awaited<ReturnType<typeof start>>, f: ReturnType<typeof capacityFixture>, id: CapacityCaseId, expectedAccept: boolean, event: NostrEvent, inFlight = 1, gate?: ReturnType<typeof rendezvous>): Promise<CapacitySample> {
+      const prepare = async () => {
+        await sql!`UPDATE moderation.community_policy SET payload=jsonb_set(payload,'{validUntil}',${sql!.json(Date.now()+120000)}) WHERE community_id=${f.policy.communityId}`;
+        const measuredPolicy = await store.getPolicy(f.policy.communityId);
+        const measuredRekeys = await sql!`SELECT event FROM moderation.rekey_events WHERE community_id=${f.policy.communityId}`;
+        const hasCapacity = await sql!`SELECT to_regclass('moderation.public_capacity_state') AS name`;
+        if (entrypointCapacity) await refreshEntrypointObservation(entrypointCapacity, measuredPolicy, "synthetic-capacity", f.policy.communityId);
+        else if (hasCapacity[0].name) await sql!`UPDATE moderation.public_capacity_state SET observed_at=clock_timestamp() WHERE org_id='synthetic-capacity' AND community_id=${f.policy.communityId}`;
+        const before = await effect(event.id), messagesFrom = instance.publisher.messages.length;
+        const logsBefore = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).length;
+        return { measuredPolicy, measuredRekeys, before, messagesFrom, logsBefore };
+      };
+      const { measuredPolicy, measuredRekeys, before, messagesFrom, logsBefore } = await prepare().catch((error) => { gate?.abandon(); throw error; });
+      await gate?.wait();
       const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
       let ok: any[] | undefined, error: string | undefined;
       try { ok = await until(() => instance.publisher.messages.slice(messagesFrom).find((m) => m[0] === "OK" && m[1] === event.id), matrix.observationTimeoutMs); } catch { error = "matching OK not observed within observer horizon"; }
@@ -367,7 +387,8 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
             }
             try {
               if (entry.id === "concurrency") {
-                entry.samples.push(...await Promise.all(Array.from({ length: matrix.concurrency }, () => sample(instance!, f, entry.id, expected, f.message(sequence++), matrix.concurrency))));
+                const gate = rendezvous(matrix.concurrency);
+                entry.samples.push(...await Promise.all(Array.from({ length: matrix.concurrency }, () => sample(instance!, f, entry.id, expected, f.message(sequence++), matrix.concurrency, gate))));
               } else entry.samples.push(await sample(instance, f, entry.id, expected, event));
             } finally { await release; }
             const recent = entry.samples.at(-1)!;
