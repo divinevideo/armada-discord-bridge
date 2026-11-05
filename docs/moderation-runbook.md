@@ -556,7 +556,11 @@ The destination backend reuses the same fourteen scenarios and outcome/timing
 checks as the disposable Docker harness. It needs no reviewed contract for the
 first synthetic calibration phase. It does not change the deployed entrypoint,
 create a launch contract, or mark destination/controller provenance verified.
-Subprocess and SQL setup failures withhold diagnostics. Kubernetes relay log
+Subprocess, driver and parse failures withhold diagnostics; a case whose failure
+the harness itself worded (an invalid Pod name, a failed preflight guard, a relay
+that did not restart) keeps that reason in the report so a configuration error
+is distinguishable from a cluster fault. `kubectl`, `git` and `docker` children
+do not inherit the harness's `CAPACITY_*` settings. Kubernetes relay log
 artifacts contain only whitelisted structured admission-timing fields; raw error
 logs and connection strings are not captured. The separate
 `destination-observations.json` records actual target readbacks for
@@ -629,11 +633,15 @@ transports retain the same database, LOGIN/current-role and version checks. Sele
 Then run `scripts/test-strfry-capacity-kubernetes.sh`. This operation writes
 synthetic fixtures only into the dedicated database and creates isolated Pods;
 it is not a read-only preflight. Keep actual community listeners and the public
-tunnel held throughout measurement. The driver removes its Pods, but retains
+tunnel held throughout measurement. The driver removes its Pods, including each
+Pod's relay database, on normal exit and on SIGINT/SIGTERM; every Pod also
+carries a six-hour `activeDeadlineSeconds` as the backstop for a `kill -9` or
+crash that no handler can intercept. It retains
 the benchmark database and reports for reviewed cleanup; it never drops a
 cluster/database or removes the credential/namespace/PVC. Each new benchmark Pod
 uses a unique subdirectory on the benchmark claim; container restart retains
-that directory while cold replacement starts fresh. Include disk behavior and
+that directory while cold replacement starts fresh. The emptied per-Pod
+directory remains after removal because the container mounting it cannot delete it. Include disk behavior and
 shared-node contention in the review rather than treating matching PVC specs as
 proof of identical performance.
 
