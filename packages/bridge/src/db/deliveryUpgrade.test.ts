@@ -9,9 +9,9 @@ const admin=postgres(url??'postgres://unused:unused@127.0.0.1:1/unused',{max:2,c
 const reachable=url?await admin`SELECT 1`.then(()=>true,error=>{if(['ECONNREFUSED','ETIMEDOUT','CONNECT_TIMEOUT','ENOTFOUND'].includes(error.code))return false;throw error;}):false;
 afterAll(()=>admin.end());
 test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligibility once and runtime DML grants cover every new table',async()=>{
- const suffix=crypto.randomUUID().replaceAll('-',''), schema=`delivery_upgrade_${suffix}`, role=`delivery_runtime_${suffix}`;
+ const suffix=crypto.randomUUID().replaceAll('-',''), schema=`delivery_upgrade_${suffix}`, role=`delivery_runtime_${suffix}`, password=crypto.randomUUID();
  await admin.unsafe(`CREATE SCHEMA ${schema}`);
- await admin.unsafe(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`);
+ await admin.unsafe(`CREATE ROLE ${role} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`);
  const db=postgres(url!,{max:2,connection:{search_path:schema},onnotice(){}});
  let runtime:postgres.Sql|undefined;
  const tenant='synthetic-upgrade';
@@ -39,7 +39,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    await admin.unsafe(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
    await admin.unsafe(`GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA ${schema} TO ${role}`);
    await admin.unsafe(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA ${schema} TO ${role}`);
-   const runtimeUrl=new URL(url!);runtimeUrl.username=role;
+   const runtimeUrl=new URL(url!);runtimeUrl.username=role;runtimeUrl.password=password;
    runtime=postgres(runtimeUrl.toString(),{max:2,connection:{search_path:schema},onnotice(){}});
    expect((await runtime`SELECT rolsuper FROM pg_roles WHERE rolname=current_user`)[0].rolsuper).toBe(false);
    const store=new PostgresMappingStore(runtime,tenant);

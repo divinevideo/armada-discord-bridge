@@ -33,7 +33,7 @@ import { isKlipyMediaHost, klipyItem } from "./klipy";
 import type { KlipyClient } from "./klipy";
 import { safeProbe } from "./net";
 
-import { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError, ActionableDeletionCapacityError, planDeletionIntake, observeDeletionDisposition, deletionRetryDelay, deletionKey } from "./deletionPolicy";
+import { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError, ActionableDeletionCapacityError, PromotionDeletionIntakeError, planDeletionIntake, observeDeletionDisposition, deletionRetryDelay, deletionKey } from "./deletionPolicy";
 import type { DeletionIntakeOutcome } from "./deletionPolicy";
 export { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError } from "./deletionPolicy";
 
@@ -910,18 +910,24 @@ export class BridgeRouter {
     let batch: PendingConcordDelete[];
     try { batch=await this.store.dueDeletes(link,target); }
     catch(error) { console.warn('bridge: durable deletion read deferred',error); return; }
+    let gap: ActionableDeletionCapacityError | PromotionDeletionIntakeError | undefined;
     for(const deletion of batch) {
       try { await this.applyDelete(deletion,link); }
       catch(error) {
-        if(error instanceof ActionableDeletionCapacityError) { this.deletionsDurable=false; throw error; }
-        console.warn(`bridge: deletion ${deletion.deleteRumorId} remains pending`,error);
-        try { this.options.onDeletionFailure?.(error); } catch(observationError) { console.warn('bridge: deletion observation failed',observationError); }
+        if(error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError) {
+          this.deletionsDurable=false;
+          if(!gap || error.repairFloor < gap.repairFloor) gap=error;
+        } else {
+          console.warn(`bridge: deletion ${deletion.deleteRumorId} remains pending`,error);
+          try { this.options.onDeletionFailure?.(error); } catch(observationError) { console.warn('bridge: deletion observation failed',observationError); }
+        }
       }
       // This is harmless after completion (the row is gone). Scheduling even
       // denied citations prevents a fixed denied prefix starving later work.
       try { await this.store.retryDelete(link,deletion); }
       catch(error) { console.warn('bridge: durable deletion retry scheduling deferred',error); }
     }
+    if(gap) throw gap;
   }
   private async deleteEvidence(deletion:PendingConcordDelete,link:ChannelLink) {
     const retired=await this.store.retiredReaction(link,deletion.targetRumorId);
@@ -944,7 +950,13 @@ export class BridgeRouter {
       }
       return;
     }
-    if(deletion.actionClass !== 'actionable') await this.store.promoteDelete(link,deletion);
+    if(deletion.actionClass !== 'actionable') {
+      try { await this.store.promoteDelete(link,deletion); }
+      catch(error) {
+        if(error instanceof ActionableDeletionCapacityError) { error.link={...link}; throw error; }
+        throw new PromotionDeletionIntakeError(deletion,link,error);
+      }
+    }
     const authorize = () => {
       if (!this.mayDelete(deletion, targetAuthor, link)) throw new Error("Concord deletion authority changed");
     };

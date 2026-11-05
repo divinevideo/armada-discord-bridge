@@ -10,6 +10,7 @@ import { ConcordClient } from './concord/client';
 import { localIdentity } from './concord/signer';
 import { PuppetCache } from './puppets';
 import { BridgeRouter, MemoryMappingStore } from './router';
+import { DeletionIntakeError } from './deletionPolicy';
 import type { ChannelLink, MappingStore, WebhookSender } from './router';
 
 export function deletionHarness(store: MappingStore = new MemoryMappingStore(), before: () => Promise<void> = async () => {}) {
@@ -298,4 +299,46 @@ it('reports original source as a replay gap on promotion overflow and accepts re
  await h.create().onConcordChat({...deletion,sourceWrapCreatedAt:source} as OpenedChat,h.link);
  expect(h.deleted).toEqual(['promoted-target']);
  expect(await h.store.pendingDeletes(h.link,fixture.expected.message.id)).toEqual([]);
+});
+
+it('drains accepted actions past more than one batch of blocked promotions', async () => {
+ let now=Date.now();
+ const store=new MemoryMappingStore(()=>now), h=deletionHarness(store);
+ const deletion=await opened(fixture.moderatorDeleteEvent,h.channel), citation=deletion.tags.find(tag=>tag[0]==='vac');
+ const source=Math.floor(now/1000)-1000;
+ await store.insert({discordMessageId:'queue-target',discordChannelId:h.link.discordChannelId,concordRumorId:fixture.expected.message.id,concordChannelId:h.channel.idHex,communityId:h.community.idHex,origin:'concord',authorRef:fixture.expected.member,partIndex:0});
+ const row=(id:string, actionClass:'unresolved'|'actionable', offset:number)=>({deleteRumorId:id,targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:now,sourceWrapCreatedAt:source+offset,actionClass,nextAttemptAtMs:actionClass==='unresolved'?now-1000:now});
+ await store.saveDeletes(h.link,Array.from({length:1024},(_,i)=>row(`accepted-${i}`,'actionable',0)));
+ await store.saveDeletes(h.link,Array.from({length:129},(_,i)=>row(`waiting-${i}`,'unresolved',129-i)));
+ let gap:any;
+ try {await h.router.retryPendingDeletes(h.link);} catch(error) {gap=error;}
+ expect(gap?.durable).toBe(false); expect(gap?.repairFloor).toBe(source+2); expect(gap?.link).toEqual(h.link);
+ try {await h.router.retryPendingDeletes(h.link);} catch {}
+ expect(h.deleted.length).toBeGreaterThan(0);
+ for(let i=0;i<20 && (await store.pendingDeletes(h.link)).length;i++) { now+=20_000; try {await h.router.retryPendingDeletes(h.link);} catch {} }
+ expect(await store.pendingDeletes(h.link)).toEqual([]);
+ expect(h.deleted).toHaveLength(1153);
+});
+
+it('reports a promotion storage outage across expiry and recovers via replay', async () => {
+ let now=Date.now();
+ const store=new MemoryMappingStore(()=>now), h=deletionHarness(store);
+ const deletion=await opened(fixture.moderatorDeleteEvent,h.channel), citation=deletion.tags.find(tag=>tag[0]==='vac');
+ const source=Math.floor(now/1000)-6*86400;
+ await store.saveDeletes(h.link,[{deleteRumorId:deletion.rumorId,targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:now,sourceWrapCreatedAt:source,nextAttemptAtMs:now-1000},
+  {deleteRumorId:'already-accepted',targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:now,sourceWrapCreatedAt:source,actionClass:'actionable'}]);
+ await store.insert({discordMessageId:'outage-target',discordChannelId:h.link.discordChannelId,concordRumorId:fixture.expected.message.id,concordChannelId:h.channel.idHex,communityId:h.community.idHex,origin:'concord',authorRef:fixture.expected.member,partIndex:0});
+ const promote=store.promoteDelete.bind(store);
+ store.promoteDelete=async()=>{throw new DeletionIntakeError('storage unavailable');};
+ let gap:any;
+ try {await h.router.retryPendingDeletes(h.link);} catch(error) {gap=error;}
+ expect(gap?.durable).toBe(false); expect(gap?.repairFloor).toBe(source); expect(gap?.link).toEqual(h.link);
+ expect(()=>h.router.assertDeletionDeliveryDurable()).toThrow();
+ expect((await store.pendingDeletes(h.link))[0].actionClass).toBe('unresolved');
+ expect(h.deleted).toEqual(['outage-target']);
+ now+=2*86400_000; store.promoteDelete=promote;
+ await h.router.retryPendingDeletes(h.link);
+ expect(await store.pendingDeletes(h.link)).toEqual([]); expect(h.deleted).toEqual(['outage-target']);
+ await h.create().onConcordChat({...deletion,sourceWrapCreatedAt:Math.floor(now/1000)} as OpenedChat,h.link);
+ expect(h.deleted).toEqual(['outage-target','outage-target']);
 });

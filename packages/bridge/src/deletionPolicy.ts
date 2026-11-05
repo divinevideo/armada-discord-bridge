@@ -17,6 +17,16 @@ export class ActionableDeletionCapacityError extends DeletionIntakeError {
     this.repairFloor = row.sourceWrapCreatedAt ?? Math.floor(row.createdAtMs / 1000);
   }
 }
+/** Promotion failed before the action entered durable actionable storage. */
+export class PromotionDeletionIntakeError extends DeletionIntakeError {
+  readonly repairFloor: number;
+  readonly link: ChannelLink;
+  constructor(row: PendingConcordDelete, link: ChannelLink, cause: unknown) {
+    super('Concord deletion promotion failed', { cause });
+    this.repairFloor = row.sourceWrapCreatedAt ?? Math.floor(row.createdAtMs / 1000);
+    this.link = { ...link };
+  }
+}
 export interface DeletionIntakeOutcome { stored: number; disposedExpired: number; disposedCapacity: number; disposedFuture?: number; }
 export const deletionPolicyCounters = { expired: 0, capacity: 0, future: 0 };
 export function observeDeletionDisposition(outcome: DeletionIntakeOutcome): void {
