@@ -165,6 +165,28 @@ export class PostgresMappingStore implements MappingStore {
     return row?.at == null ? undefined : Number(row.at);
   }
 
+  /** Full-link checkpoint: one bridge must never acknowledge another link's gap. */
+  async channelCursorStart(link: ChannelLink, streamPks: string[]): Promise<number> {
+    const legacy = streamPks.length ? await this.sql`SELECT min(last_seen_at)::bigint AS at FROM cursors
+      WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId}
+        AND stream_pk IN ${this.sql(streamPks)} AND relay_url = 'pool'` : [];
+    const floor = legacy[0]?.at == null ? Math.floor(Date.now() / 1000) : Number(legacy[0].at);
+    await this.sql`INSERT INTO channel_delivery_checkpoints
+      (tenant_id, community_id, concord_channel_id, discord_guild_id, discord_channel_id, last_seen_at)
+      VALUES (${this.tenantId}, ${link.communityId}, ${link.concordChannelIdHex}, ${link.discordGuildId}, ${link.discordChannelId}, ${floor})
+      ON CONFLICT DO NOTHING`;
+    const [row] = await this.sql`SELECT last_seen_at FROM channel_delivery_checkpoints
+      WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId} AND concord_channel_id = ${link.concordChannelIdHex}
+      AND discord_guild_id = ${link.discordGuildId} AND discord_channel_id = ${link.discordChannelId}`;
+    return Number(row.last_seen_at);
+  }
+  async channelCursorSet(link: ChannelLink, at: number): Promise<void> {
+    const rows = await this.sql`UPDATE channel_delivery_checkpoints SET last_seen_at = GREATEST(last_seen_at, ${at})
+      WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId} AND concord_channel_id = ${link.concordChannelIdHex}
+      AND discord_guild_id = ${link.discordGuildId} AND discord_channel_id = ${link.discordChannelId} RETURNING last_seen_at`;
+    if (!rows.length) throw new Error("Channel delivery checkpoint must be established before admission");
+  }
+
   /** Advance (never rewind) the high-water mark for one stream address. */
   async cursorSet(communityId: string, streamPk: string, lastSeenAt: number): Promise<void> {
     await this.sql`

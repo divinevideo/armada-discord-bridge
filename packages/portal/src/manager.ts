@@ -705,6 +705,9 @@ export class BridgeManager {
         unsubSeverance: () => {},
       };
 
+      // Persist the first replay floor before any live subscription can accept
+      // work, including a fresh link whose first durable delivery overflows.
+      if (rb.status === "active") await this.store.channelCursorStart(link, channel.streams.map(s => s.group.pk));
       cleanup.push(() => { if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer); rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance(); });
       rb.unsubChat = client.subscribeChannel(
         channel,
@@ -713,7 +716,8 @@ export class BridgeManager {
         (streamPk, wrapAt) => {
           if (!rb.concordCatchupReady || !rb.router) return;
           rb.router.assertDeletionDeliveryDurable();
-          return this.store.cursorSet(community.idHex, streamPk, wrapAt);
+          client.assertDeliveryHealthy();
+          return this.store.channelCursorSet(rb.link, wrapAt);
         },
       );
       // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
@@ -790,14 +794,13 @@ export class BridgeManager {
 
   /**
    * Bounded catch-up after downtime: replay wraps newer than the stored
-   * cursor through the router (the mapping table dedupes). A channel with no
-   * cursor has never been tailed; it starts live-only, deliberately, so a
-   * fresh bridge does not replay stored history into Discord.
+   * full-link checkpoint through the router (the mapping table dedupes).
+   * A first checkpoint starts at the live tail floor; it is persisted before
+   * admission so restart cannot mistake a first-delivery gap for a fresh link.
    */
   private async backfillMissed(rb: Running): Promise<void> {
     const streamPks = rb.channel.streams.map((s) => s.group.pk);
-    const cursor = await this.store.cursorGet(rb.link.communityId, streamPks);
-    if (cursor === undefined) { rb.concordCatchupReady = true; return; }
+    const cursor = await this.store.channelCursorStart(rb.link, streamPks);
     // Small overlap absorbs relay/pool clock skew; dedupe eats the rest.
     const { chats, newestWrapAt } = await rb.client.backfillChannel(rb.channel, cursor - 60);
     let mirrored = 0;
@@ -809,7 +812,8 @@ export class BridgeManager {
     if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
     rb.router.assertDeletionDeliveryDurable();
     if (newestWrapAt !== undefined) {
-      for (const pk of streamPks) await this.store.cursorSet(rb.link.communityId, pk, newestWrapAt);
+      rb.client.assertDeliveryHealthy();
+      await this.store.channelCursorSet(rb.link, newestWrapAt);
     }
     rb.concordCatchupReady = true;
     if (mirrored > 0) console.log(`bridge ${rb.id}: backfilled ${mirrored} missed messages`);
@@ -904,7 +908,8 @@ export class BridgeManager {
       (streamPk, wrapAt) => {
         if (!rb.concordCatchupReady || !rb.router) return;
         rb.router.assertDeletionDeliveryDurable();
-        return this.store.cursorSet(rb.link.communityId, streamPk, wrapAt);
+        rb.client.assertDeliveryHealthy();
+        return this.store.channelCursorSet(rb.link, wrapAt);
       },
     );
     console.log(`bridge ${rb.id}: stream keys rotated; chat subscription refreshed`);
@@ -924,6 +929,7 @@ export class BridgeManager {
       const [row] = await this.sql<BridgeRow[]>`
         UPDATE bridges SET status = 'active', status_detail = NULL, updated_at = now()
         WHERE bridge_id = ${rb.id} RETURNING *`;
+      await this.store.channelCursorStart(rb.link, rb.channel.streams.map(s => s.group.pk));
       rb.status = "active";
       try {
         this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);

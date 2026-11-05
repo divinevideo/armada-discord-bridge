@@ -21,10 +21,11 @@ const pending = (id: string, author = 'actor'): PendingConcordDelete => ({ delet
 beforeAll(() => migrate(url));
 afterAll(async () => {
   await sql`DELETE FROM pending_concord_deletes WHERE tenant_id LIKE ${tenant + '%'}`;
+  await sql`DELETE FROM channel_delivery_checkpoints WHERE tenant_id LIKE ${tenant + '%'}`;
   await sql`DELETE FROM retired_concord_reactions WHERE tenant_id LIKE ${tenant + '%'}`;
   await sql`DELETE FROM reaction_mappings WHERE tenant_id LIKE ${tenant + '%'}`;
   await sql`DELETE FROM messages WHERE tenant_id LIKE ${tenant + '%'}`;
-  await sql`DELETE FROM cursors WHERE tenant_id = ${tenant}`;
+  await sql`DELETE FROM cursors WHERE tenant_id LIKE ${tenant + '%'}`;
   await sql.end();
 });
 
@@ -105,6 +106,45 @@ describe('durable pending Concord deletions', () => {
     expect(await store.reactionByDiscord('reaction-parent', f.member.pk, '👍')).toMatchObject({ rumorId: readded.rumorId });
     await router.onConcordChat(reaction, scope); // retired rumor replay cannot resurrect it
     expect(reacted).toBe(2);
+    await connection.end();
+  });
+
+  it('persists full-link replay floors across restart and rekey without inheriting another link progress', async () => {
+    const testTenant = tenant + '-checkpoint';
+    let connection = postgres(url, { max: 1 });
+    let store = new PostgresMappingStore(connection, testTenant);
+    await store.cursorSet(link.communityId, 'legacy-old', 100);
+    await store.cursorSet(link.communityId, 'legacy-new', 220);
+    // Inherit the low watermark, never the fastest legacy stream.
+    expect(await store.channelCursorStart(link, ['legacy-old', 'legacy-new'])).toBe(100);
+    const other = { ...link, discordChannelId: 'another-link' };
+    await store.channelCursorStart(other, []);
+    await store.channelCursorSet(other, Math.floor(Date.now() / 1000) + 120);
+    await connection.end();
+    connection = postgres(url, { max: 1 }); store = new PostgresMappingStore(connection, testTenant);
+    expect(await store.channelCursorStart(link, ['rotated-stream'])).toBe(100);
+    const { community, folded } = bootstrapFixture(fixture);
+    const channel = channelsView(community, folded)[0];
+    const client = new ConcordClient(community, { query: async () => [fixture.moderatorDeleteEvent], publish: async () => {}, subscribe: () => () => {}, close: async () => {} }, localIdentity(generateSecretKey()));
+    client.folded = folded;
+    const deleted: string[] = [];
+    const router = new BridgeRouter(client, new PuppetCache('ab'.repeat(32)), store, {
+      send: async () => 'checkpoint-target', delete: async (_link, id, check) => { check?.(); deleted.push(id); },
+      edit: async () => {}, react: async () => {}, unreact: async () => {}, sendTyping: async () => {},
+    }, { resolve: async name => ({ name }) }, { applicationId: 'synthetic', webhookIds: new Set() }, { beforeSideEffect: async () => {} });
+    await store.insert({ discordMessageId: 'checkpoint-target', discordChannelId: link.discordChannelId, concordRumorId: fixture.expected.message.id, concordChannelId: channel.idHex, communityId: community.idHex, origin: 'concord', authorRef: fixture.expected.member, partIndex: 0 });
+    const replay = await client.backfillChannel(channel, await store.channelCursorStart(link, ['rotated-stream']) - 60);
+    for (const chat of replay.chats) await router.onConcordChat(chat, link);
+    expect(deleted).toEqual(['checkpoint-target']);
+
+    await store.channelCursorSet(link, 160);
+    expect(await store.channelCursorStart(link, ['rotated-stream'])).toBe(160);
+    const fresh = { ...link, discordGuildId: 'fresh-guild' };
+    const floor = await store.channelCursorStart(fresh, []);
+    expect(floor).toBeGreaterThanOrEqual(Math.floor(Date.now() / 1000) - 1);
+    await connection.end();
+    connection = postgres(url, { max: 1 }); store = new PostgresMappingStore(connection, testTenant);
+    expect(await store.channelCursorStart(fresh, ['new-epoch'])).toBe(floor);
     await connection.end();
   });
 

@@ -380,17 +380,20 @@ describe('durable delivery cursor', () => {
     const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
     const author = localIdentity(generateSecretKey());
     const wraps: NostrEvent[] = [];
-    for (let i = 0; i < 206; i++) wraps.push((await client.sendChat(channel, { content: `burst ${i}`, author })).wrap);
+    for (let i = 0; i < 206; i++) wraps.push((await client.sendChat(channel, { content: `burst ${i}`, author, ...(i === 200 ? { kind: 5, tags: [['e', 'ab'.repeat(32)]] } : {}) })).wrap);
     let enter!: () => void, release!: () => void, drain!: () => void;
     const started = new Promise<void>(resolve => { enter = resolve; });
     const blocked = new Promise<void>(resolve => { release = resolve; });
     const drained = new Promise<void>(resolve => { drain = resolve; });
     const contents: string[] = []; const errors: unknown[] = []; const cursors: number[] = [];
-    client.subscribeChannel(channel, async chat => {
+    const handler = async (chat: { content: string }) => {
       contents.push(chat.content);
       if (contents.length === 1) { enter(); await blocked; }
       if (contents.length === 200) drain();
-    }, (_url, error) => errors.push(error), (_pk, at) => cursors.push(at));
+    };
+    const onError = (_url: string, error: unknown) => { errors.push(error); };
+    const onCursor = (_pk: string, at: number) => { cursors.push(at); };
+    const unsubscribe = client.subscribeChannel(channel, handler, onError, onCursor);
     pool.emit(wraps[0]); await started;
     for (const wrap of wraps.slice(1, 205)) pool.emit(wrap);
     expect(contents).toHaveLength(1);
@@ -406,6 +409,24 @@ describe('durable delivery cursor', () => {
     expect(contents.at(-1)).toBe('burst 205');
     expect(contents).not.toContain('burst 200');
     expect(cursors).toEqual([]);
+    unsubscribe();
+    const realNow = Date.now;
+    try {
+      Date.now = () => realNow() + 120_000;
+      client.subscribeChannel(channel, handler, onError, onCursor);
+      pool.emit((await client.sendChat(channel, { content: 'after resubscription', author })).wrap);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(contents.at(-1)).toBe('after resubscription');
+      expect(cursors).toEqual([]);
+    } finally { Date.now = realNow; }
+  });
+
+  it('refuses to certify a saturated catch-up page as a complete replay', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const scratch = new FakePool(); const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+    const { wrap } = await writer.sendChat(channel, { content: 'signed page', author: localIdentity(generateSecretKey()) });
+    const client = new ConcordClient(community, new FakePool([wrap, wrap]), localIdentity(generateSecretKey()));
+    await expect(client.backfillChannel(channel, 0, 2)).rejects.toThrow('catch-up limit');
   });
 
   it('pins the cursor after a storage failure rather than advancing on a later success', async () => {

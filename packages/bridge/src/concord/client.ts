@@ -163,6 +163,12 @@ export interface SendChatOptions {
 
 export class ConcordClient {
   folded?: FoldedControl;
+  // A fresh REQ is only a live tail, not proof that an earlier delivery gap
+  // was replayed. Only a new client after durable catch-up may clear this.
+  private deliveryHealthy = true;
+  assertDeliveryHealthy(): void {
+    if (!this.deliveryHealthy) throw new Error("Concord delivery gap requires restart and durable catch-up");
+  }
 
   /** The bridge's own posting identity; the router skips its messages. */
   get primaryPk(): string {
@@ -343,7 +349,7 @@ export class ConcordClient {
     const seenRumors = new Set<string>();
     let deliveries: Promise<void> = Promise.resolve();
     let queuedDeliveries = 0;
-    let cursorHealthy = true;
+
     // Live tail only: without a floor, relays replay stored history into the
     // router on every (re)subscribe. Catch-up after downtime is cursor work,
     // not replay-everything. Small overlap absorbs clock skew.
@@ -365,8 +371,8 @@ export class ConcordClient {
           // Overflow may contain a deletion, so never acknowledge later wraps
           // past this gap; restart/catch-up must replay the relay copy.
           if (queuedDeliveries >= 200) {
-            cursorHealthy = false;
-            onError?.("dispatch", new Error("Concord delivery queue full; cursor remains pinned until resubscription"));
+            this.deliveryHealthy = false;
+            onError?.("dispatch", new Error("Concord delivery queue full; cursor remains pinned until restart and catch-up"));
             return;
           }
           queuedDeliveries++;
@@ -378,13 +384,13 @@ export class ConcordClient {
               if (seenRumors.size >= 65_536) seenRumors.clear();
               seenRumors.add(chat.rumorId);
             }
-            if (cursorHealthy && opened.length > 0 && wrap.kind === KIND_WRAP) {
+            if (this.deliveryHealthy && opened.length > 0 && wrap.kind === KIND_WRAP) {
               await onCursor?.(wrap.pubkey, wrap.created_at);
             }
           }).catch(error => {
             // A later success must not move the cursor past an action that
             // failed before durable storage. A fresh catch-up can retry it.
-            cursorHealthy = false;
+            this.deliveryHealthy = false;
             onError?.("dispatch", error);
           }).finally(() => { queuedDeliveries--; });
         },
@@ -416,6 +422,9 @@ export class ConcordClient {
       ],
       opts,
     );
+    // A saturated page cannot prove the replay gap is covered. Do not return
+    // a newer checkpoint that could silently skip the omitted durable wraps.
+    if (wraps.length >= limit) throw new Error("Concord catch-up limit reached; checkpoint remains pinned");
     const chats = await openChatBatch(wraps, channel);
     chats.sort((a, b) => a.ms - b.ms);
     const newestWrapAt = wraps.reduce<number | undefined>(

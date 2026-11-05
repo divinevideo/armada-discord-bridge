@@ -234,26 +234,26 @@ const onSubError = (relayUrl: string, error: unknown): void =>
   console.error(`bridge: chat subscription ${relayUrl}:`, error);
 const onCursor = (streamPk: string, wrapAt: number) => {
   router.assertDeletionDeliveryDurable();
-  return store.cursorSet(community.idHex, streamPk, wrapAt);
+  client.assertDeliveryHealthy();
+  return store.channelCursorSet(link, wrapAt);
 };
 let currentChannel = channel;
 
-// Bounded catch-up for messages missed while down (no cursor = fresh link,
-// live-only on purpose). The mapping table dedupes anything already mirrored.
+// Persist a channel-stable replay floor before the live tail can admit work.
+// The mapping table dedupes anything already mirrored.
 {
   const streamPks = channel.streams.map((s) => s.group.pk);
-  const cursor = await store.cursorGet(community.idHex, streamPks);
-  if (cursor !== undefined) {
-    const { chats, newestWrapAt } = await client.backfillChannel(channel, cursor - 60);
-    for (const chat of chats) {
-      await router.onConcordChat(chat, link);
-    }
-    if (newestWrapAt !== undefined) {
-      router.assertDeletionDeliveryDurable();
-      for (const pk of streamPks) await store.cursorSet(community.idHex, pk, newestWrapAt);
-    }
-    if (chats.length > 0) console.log(`bridge: backfilled ${chats.length} wraps missed while down`);
+  const cursor = await store.channelCursorStart(link, streamPks);
+  const { chats, newestWrapAt } = await client.backfillChannel(channel, cursor - 60);
+  for (const chat of chats) {
+    await router.onConcordChat(chat, link);
   }
+  if (newestWrapAt !== undefined) {
+    router.assertDeletionDeliveryDurable();
+    client.assertDeliveryHealthy();
+    await store.channelCursorSet(link, newestWrapAt);
+  }
+  if (chats.length > 0) console.log(`bridge: backfilled ${chats.length} wraps missed while down`);
 }
 
 let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);

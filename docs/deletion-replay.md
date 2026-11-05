@@ -26,7 +26,15 @@ batch so a denied prefix cannot starve a later satisfied citation. Both dispatch
 entry points await durable handling before acknowledging stream cursors. Live
 subscriptions admit at most 200 wraps, including the in-flight delivery, before
 constructing their promise chain. Overflow is refused synchronously and pins
-that subscription’s cursor so later successes cannot hide the replay gap.
+the client’s cursor acknowledgements across all later subscriptions so a fresh
+live-tail REQ cannot hide the replay gap. Only restart followed by successful
+catch-up can restore acknowledgement. Migration `021_channel_delivery_checkpoints.sql`
+stores progress for the full tenant/community/Concord-channel/Discord-guild/
+Discord-channel link, independent of changing stream keys. Workers persist its
+initial floor before admitting routed live work; legacy per-stream progress is
+inherited at the lowest existing watermark. Fresh links start at the current
+live-tail floor. A saturated catch-up query refuses to advance or certify
+completion; resolve the backlog before considering that worker caught up.
 
 Lease/visibility checks and the synchronous current-fold check run again at the
 Discord adapter's final dispatch boundary. Reactions retain their active mapping until
