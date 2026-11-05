@@ -62,3 +62,12 @@ test("only the fixed capacity refusal crosses the boundary; every other reason s
   await runPlugin(input([JSON.stringify({ type: "new", event: { id } }) + "\n"]), (line) => { output.push(line); }, async () => ({ id, action: "accept", msg: CAPACITY_REFUSAL }));
   expect(JSON.parse(output[0])).toEqual({ id, action: "accept" });
 });
+
+import { admissionTimingLine } from './strfryPlugin';
+test('timing logger keeps full correlation and excludes payload, source and credential fields', () => {
+  const sample = { eventId: id, innerAdmissionMs: 2, action: 'accept' as const, content: 'synthetic private content', sourceInfo: 'synthetic source', database: 'postgres://synthetic:private-password@db.example/benchmark', token: 'private-token' };
+  expect(JSON.parse(admissionTimingLine(sample)!)).toEqual({ type: 'moderation_admission_timing', eventId: id, innerAdmissionMs: 2, action: 'accept' });
+  expect(admissionTimingLine(sample)).not.toContain('private-');
+  expect(admissionTimingLine({ ...sample, eventId: 'short' })).not.toContain('short');
+  expect(admissionTimingLine({ ...sample, innerAdmissionMs: NaN })).toBeUndefined();
+});

@@ -643,3 +643,18 @@ synthetic seed operations remain calibration-only. It preserves normal admission
 and deadline checks. Final destination/controller review and a measured contract remain
 separate release work. A successful unit test or simulated Kubernetes lifecycle
 is not evidence that the destination benchmark has run.
+
+Native concurrency measurement requires a relay image with the verified carrier
+ID timing emitter. The production timing sink remains opt-in and writes only
+full validated event IDs, settled inner time and action; it does not write event
+content, source metadata, credentials or unknown caller fields. Correlation
+verification work is included in measured inner time. Invalid frames retain only
+aggregate timing, and a telemetry failure cannot reverse a settled admission.
+
+Previously published images that emit aggregate timing without event IDs cannot
+establish per-event concurrent timings. Their single-flight samples remain
+usable, but concurrent ambiguity is reported unsupported; do not invent an ID or
+assign a guessed timing to each request. Build, review and publish the runtime
+source containing the correlation emitter before actual native concurrency
+measurement, then bind the contract and measurement to that exact source/image.
+Unit and mock results do not prove that such an image is deployed or measured.

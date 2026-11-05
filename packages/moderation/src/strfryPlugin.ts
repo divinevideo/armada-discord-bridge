@@ -2,7 +2,7 @@ import postgres from "postgres";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { AdmissionResult } from "./contracts";
 import { CAPACITY_REFUSAL, loadPublicCapacity } from "./publicCapacity";
-import { PolicyStore } from "./policyStore";
+import { PolicyStore, type AdmissionTimingSample } from "./policyStore";
 import { HEX_ID, MAX_EVENT_BYTES } from "./relayPolicy";
 
 /** Bounded input; process/SQL deadlines complement strfry's hard plugin timeout. */
@@ -69,11 +69,17 @@ export async function runPlugin(
   if (buffer.length || discarding) await output(JSON.stringify(reject()) + "\n");
 }
 
+/** Timing stderr is a fixed schema, never the event or the caller's extra fields. */
+export function admissionTimingLine(sample: AdmissionTimingSample): string | undefined {
+  if (!Number.isFinite(sample.innerAdmissionMs) || sample.innerAdmissionMs < 0 || !["accept", "reject"].includes(sample.action)) return;
+  return JSON.stringify({ type: "moderation_admission_timing", innerAdmissionMs: sample.innerAdmissionMs, action: sample.action, ...(typeof sample.eventId === "string" && HEX_ID.test(sample.eventId) ? { eventId: sample.eventId } : {}) }) + "\n";
+}
+
 if (import.meta.main) {
   const url = process.env.MODERATION_DATABASE_URL;
   if (!url) { process.stderr.write("Moderation database is not configured\n"); process.exit(1); }
   const sql = postgres(url, { max: 1, connect_timeout: 1, idle_timeout: 10, onnotice: () => {} });
-  const store = new PolicyStore(sql, { capacity: loadPublicCapacity(), ...(process.env.MODERATION_CAPACITY_TIMING === "1" ? { onAdmissionTiming: (sample: { innerAdmissionMs: number; action: "accept" | "reject" }) => { process.stderr.write(JSON.stringify({ type: "moderation_admission_timing", ...sample }) + "\n"); } } : {}) });
+  const store = new PolicyStore(sql, { capacity: loadPublicCapacity(), ...(process.env.MODERATION_CAPACITY_TIMING === "1" ? { onAdmissionTiming: (sample: AdmissionTimingSample) => { const line = admissionTimingLine(sample); if (line) process.stderr.write(line); } } : {}) });
   try {
     await runPlugin(process.stdin, (line) => new Promise<void>((resolve, reject) => {
       process.stdout.write(line, (error) => error ? reject(error) : resolve());
