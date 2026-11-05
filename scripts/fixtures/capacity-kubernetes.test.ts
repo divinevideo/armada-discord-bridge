@@ -365,3 +365,32 @@ test('the loopback Docker script cannot be redirected to a live cluster by lefto
     for (const name of ['CAPACITY_KUBERNETES_CONFIG', 'CAPACITY_EXECUTE_DESTINATION', 'CAPACITY_DATABASE_URL']) expect(seen).not.toContain(name + '=');
   } finally { await rm(bin, { recursive: true, force: true }); }
 });
+
+import { forward } from './capacity-kubernetes';
+test('a long-lived port-forward is drained so chatty kubectl output cannot stall it, and its exit is observable', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'capacity-forward-test-'));
+  try {
+    const marker = join(dir, 'finished'), script = join(dir, 'kubectl');
+    // After the ready line, write far more than any pipe buffer to both streams.
+    await writeFile(script, `#!/bin/sh\necho "Forwarding from 127.0.0.1:41234 -> 7777"\ni=0\nwhile [ $i -lt 300 ]; do head -c 10000 /dev/zero | tr '\\0' x >&2; head -c 10000 /dev/zero | tr '\\0' y; echo; i=$((i+1)); done\necho done > ${marker}\nexec sleep 30\n`);
+    await chmod(script, 0o755);
+    const f = await forward([script, 'pod/synthetic']);
+    expect(f.url).toBe('ws://127.0.0.1:41234');
+    for (let n = 0; n < 100 && !await Bun.file(marker).exists(); n++) await Bun.sleep(50);
+    expect(await Bun.file(marker).exists()).toBe(true);
+    expect(f.alive!()).toBe(true);
+    f.stop();
+    for (let n = 0; n < 100 && f.alive!(); n++) await Bun.sleep(20);
+    expect(f.alive!()).toBe(false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a dead forward is reported with a readable reason before any sample runs', async () => {
+  const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, async () => '');
+  expect(() => backend.assertTransportAlive()).not.toThrow();
+  (backend as any).databaseForward = { url: 'ws://127.0.0.1:1', stop() {}, alive: () => false };
+  expect(() => backend.assertTransportAlive()).toThrow('database transport exited');
+  (backend as any).databaseForward = { url: 'ws://127.0.0.1:1', stop() {}, alive: () => true };
+  (backend as any).pods.set('capacity-synthetic-1', { uid: 'u', forward: { url: 'ws://127.0.0.1:2', stop() {}, alive: () => false } });
+  expect(() => backend.assertTransportAlive()).toThrow('relay transport exited');
+});

@@ -144,10 +144,23 @@ export async function capacityCommand(args: string[], input?: string): Promise<s
   } catch { throw new SafeDiagnostic('Capacity Kubernetes command failed (diagnostics withheld)'); }
 }
 
-interface Forward { url: string; stop(): void }
-async function forward(args: string[], remotePort = 7777): Promise<Forward> {
+export interface Forward {
+  url: string; stop(): void;
+  /** False once the kubectl process has exited. Optional so test doubles need not model it. */
+  alive?(): boolean;
+}
+async function discard(reader: ReadableStreamDefaultReader<Uint8Array>) {
+  try { while (!(await reader.read()).done); } catch { /* the process is gone */ }
+}
+export async function forward(args: string[], remotePort = 7777): Promise<Forward> {
   const child = Bun.spawn([...args.slice(0, -1).map(arg => arg.startsWith('--request-timeout=') ? '--request-timeout=0' : arg), 'port-forward', args.at(-1)!, '--address=127.0.0.1', `:${remotePort}`], { stdout: 'pipe', stderr: 'pipe' });
-  const reader = child.stdout.getReader(); let text = '';
+  let exited = false; void child.exited.then(() => { exited = true; });
+  // kubectl writes "Handling connection for N" to stdout and connection errors
+  // to stderr for as long as the forward lives. Nothing read either pipe after
+  // the ready line, so a small pipe buffer (about 16 KB on macOS) eventually
+  // blocked kubectl and silently stalled the forward.
+  void discard(child.stderr.getReader());
+  const reader = child.stdout.getReader(); let text = '', ready = false;
   try {
     const started = Date.now();
     while (Date.now() - started < 30000) {
@@ -155,11 +168,11 @@ async function forward(args: string[], remotePort = 7777): Promise<Forward> {
       if (result.done) break;
       text += new TextDecoder().decode(result.value);
       const port = text.match(new RegExp(`Forwarding from 127\\.0\\.0\\.1:(\\d+) -> ${remotePort}`));
-      if (port) return { url: `ws://127.0.0.1:${port[1]}`, stop: () => child.kill() };
+      if (port) { ready = true; void discard(reader); return { url: `ws://127.0.0.1:${port[1]}`, stop: () => child.kill(), alive: () => !exited }; }
     }
     throw new Error('Private benchmark port-forward did not become ready');
   } catch (e) { child.kill(); throw e; }
-  finally { reader.releaseLock(); }
+  finally { if (!ready) reader.releaseLock(); }
 }
 
 export class KubernetesCapacity {
@@ -169,7 +182,7 @@ export class KubernetesCapacity {
   private databaseForward?: Forward;
   private closed = false;
   private pods = new Map<string, { uid: string; config: string; directory: string; forward?: Forward }>();
-  constructor(c: unknown, private matrix: CapacityMatrix, private execute: Run = capacityCommand, private portForward = forward) { this.config = destinationConfig(c); }
+  constructor(c: unknown, private matrix: CapacityMatrix, private execute: Run = capacityCommand, private portForward: (args: string[], remotePort?: number) => Promise<Forward> = forward) { this.config = destinationConfig(c); }
   private args() { return ['kubectl', `--context=${this.config.context}`, '--request-timeout=30s', '-n', this.config.namespace]; }
   private async json(args: string[]) { return JSON.parse(await this.execute([...this.args(), ...args, '-o', 'json'])); }
   async prepare() {
@@ -225,6 +238,16 @@ export class KubernetesCapacity {
       this.evidence.controllerTransport = { context: this.config.context, namespace: this.config.databaseCluster.namespace, pod: anchor.name, uid: anchor.uid, address: anchor.address, localHost: '127.0.0.1', remotePort: 5432 };
       return url.toString();
     } catch (error) { f.stop(); throw error; }
+  }
+  /**
+   * Fail fast, with a readable reason, when a long-lived forward has died. The
+   * single database forward lives for the whole run (hours) and nothing else
+   * supervised it, so a dropped connection surfaced as an opaque, withheld SQL
+   * error on every later sample.
+   */
+  assertTransportAlive() {
+    need(this.databaseForward?.alive?.() !== false, 'Private benchmark database transport exited');
+    for (const record of this.pods.values()) need(record.forward?.alive?.() !== false, 'Private benchmark relay transport exited');
   }
   assertControllerAddress(address: unknown) {
     need(this.databaseForward && this.databasePrimary, 'Controller connection has no owned primary transport');

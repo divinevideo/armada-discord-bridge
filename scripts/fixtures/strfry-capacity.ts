@@ -317,7 +317,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     const store = new PolicyStore(sql!);
     const entrypointCapacity = entrypointContract ? new PublicCapacityStore(sql!, entrypointContract) : undefined;
     async function ready(port: string | undefined) {
-      for (let attempt = 0; ; attempt++) { try { await fetch(`http://127.0.0.1:${port}`); return; } catch { if (attempt > 200) throw new SafeDiagnostic("Capacity relay unavailable"); await Bun.sleep(50); } }
+      for (let attempt = 0; ; attempt++) { try { await fetch(`http://127.0.0.1:${port}`, { signal: AbortSignal.timeout(2000) }); return; } catch { if (attempt > 200) throw new SafeDiagnostic("Capacity relay unavailable"); await Bun.sleep(50); } }
     }
     let relaySequence = 0;
     async function start(mode: string) {
@@ -352,6 +352,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     async function effect(id: string) { return Number((await sql!`SELECT count(*) AS count FROM (SELECT event_id FROM moderation.carriers WHERE event_id=${id} UNION ALL SELECT event_id FROM moderation.accepted_control WHERE event_id=${id} UNION ALL SELECT event_id FROM moderation.rekey_events WHERE event_id=${id}) q`)[0].count) > 0; }
     async function sample(instance: Awaited<ReturnType<typeof start>>, f: ReturnType<typeof capacityFixture>, id: CapacityCaseId, expectedAccept: boolean, event: NostrEvent, inFlight = 1, gate?: ReturnType<typeof rendezvous>): Promise<CapacitySample> {
       const prepare = async () => {
+        kube?.assertTransportAlive();
         await sql!`UPDATE moderation.community_policy SET payload=jsonb_set(payload,'{validUntil}',${sql!.json(Date.now()+120000)}) WHERE community_id=${f.policy.communityId}`;
         const measuredPolicy = await store.getPolicy(f.policy.communityId);
         const measuredRekeys = await sql!`SELECT event FROM moderation.rekey_events WHERE community_id=${f.policy.communityId}`;
