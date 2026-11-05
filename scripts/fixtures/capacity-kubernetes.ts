@@ -82,8 +82,11 @@ export function destinationTimingLog(text: string): string {
   return text.split('\n').flatMap(line => {
     try {
       const value = JSON.parse(line.slice(line.indexOf('{')));
-      if (value.type !== 'moderation_admission_timing' || !/^[0-9a-f]{64}$/.test(value.eventId) || !Number.isFinite(value.innerAdmissionMs)) return [];
-      return [JSON.stringify({ type: value.type, eventId: value.eventId, innerAdmissionMs: value.innerAdmissionMs })];
+      if (value.type !== 'moderation_admission_timing' || !Number.isFinite(value.innerAdmissionMs)) return [];
+      if ('eventId' in value && (typeof value.eventId !== 'string' || !/^[0-9a-f]{64}$/.test(value.eventId))) return [];
+      // The deployed emitter is aggregate-only; calibration can add correlation.
+      // Retaining an absent ID lets the sampler use only its single-flight fallback.
+      return [JSON.stringify({ type: value.type, ...('eventId' in value ? { eventId: value.eventId } : {}), innerAdmissionMs: value.innerAdmissionMs })];
     } catch { return []; }
   }).join('\n');
 }

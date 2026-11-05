@@ -180,3 +180,15 @@ test('entrypoint replay binds the reviewed contract to the exact image and prese
   expect(() => capacityContractForEntrypoint({ imageId: 'sha256:' + 'c'.repeat(64) }, identity)).toThrow('image identity');
   expect(() => capacityContractForEntrypoint({ imageId: identity.imageId, version: 1 }, identity)).toThrow('Invalid capacity contract');
 });
+
+test('retains the production emitter timing shape without inventing event correlation or exposing extra fields', () => {
+  // strfryPlugin emits aggregate timing; only the calibration launcher adds eventId.
+  const emitted = { type: 'moderation_admission_timing', innerAdmissionMs: 3, action: 'accept' };
+  const filtered = destinationTimingLog(JSON.stringify({ ...emitted, database: 'postgres://synthetic:private-password@db.example/benchmark', token: 'private-token' }));
+  expect(JSON.parse(filtered)).toEqual({ type: emitted.type, innerAdmissionMs: emitted.innerAdmissionMs });
+  expect(JSON.parse(filtered).eventId).toBeUndefined();
+  expect(filtered).not.toContain('private-');
+  const repeated = destinationTimingLog(JSON.stringify(emitted) + '\n' + JSON.stringify({ ...emitted, innerAdmissionMs: 5 }));
+  expect(repeated.split('\n')).toHaveLength(2);
+  expect(repeated).not.toContain('eventId');
+});
