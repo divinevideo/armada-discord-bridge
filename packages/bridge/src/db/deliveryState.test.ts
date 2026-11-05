@@ -294,9 +294,9 @@ test.skipIf(!reachable)('an uncertain replacement recovers zero after a gap writ
  } finally {unlock();await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
 });
 
-test.skipIf(!reachable)('replacement replays an old expired deletion with no pending row after an intake outage', async()=>{
+for (const legacy of [false,true]) test.skipIf(!reachable)(`replacement recovers an old duplicate after intake outage (${legacy ? 'legacy unknown' : 'current lifecycle'})`, async()=>{
  const {community,folded}=bootstrapFixture(interopFixture), channel=channelsView(community,folded)[0];
- const scope:ChannelLink={communityId:community.idHex,concordChannelIdHex:channel.idHex,discordGuildId:tenant,discordChannelId:`${tenant}-old-deletion`,enabled:true};
+ const scope:ChannelLink={communityId:community.idHex,concordChannelIdHex:channel.idHex,discordGuildId:tenant,discordChannelId:`${tenant}-old-deletion-${legacy}`,enabled:true};
  const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
  const source=80, event=finalizeEvent({...interopFixture.moderatorDeleteEvent,created_at:source},channel.current.group.sk);
  const pool={replayRelays:['synthetic-relay'],query:async()=>[],publish:async()=>{},subscribe:()=>()=>{},close:async()=>{},
@@ -305,8 +305,10 @@ test.skipIf(!reachable)('replacement replays an old expired deletion with no pen
  const client=new ConcordClient(community,pool,localIdentity(generateSecretKey()));client.folded=folded;
  const deleted:string[]=[];
  try {
-  await store.activateDelivery(scope,'old-duplicate',[],1000);
-  const first=await store.openDelivery(scope,'old-duplicate',lease,[],1000,crypto.randomUUID(),pool.replayRelays);
+  if (legacy) await sql`INSERT INTO channel_delivery_upgrade_eligibility(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id)
+    VALUES (${tenant},${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId},'old-duplicate')`;
+  await store.activateDelivery(scope,'old-duplicate',[],legacy ? 1000 : 50);
+  const first=await store.openDelivery(scope,'old-duplicate',lease,[],legacy ? 1000 : 50,crypto.randomUUID(),pool.replayRelays);
   const chat=(await openChatBatch([event],channel))[0];
   const unavailable=new Proxy(first.store,{get(target,key){if(key==='saveDeletes')return async()=>{throw new Error('synthetic intake outage');};const value=Reflect.get(target,key,target);return typeof value==='function'?value.bind(target):value;}});
   const webhooks={send:async()=> 'discord-message',edit:async()=>{},react:async()=>{},unreact:async()=>{},sendTyping:async()=>{},delete:async(_link:ChannelLink,id:string,authorize?:()=>void)=>{authorize?.();deleted.push(id);}};
@@ -317,9 +319,41 @@ test.skipIf(!reachable)('replacement replays an old expired deletion with no pen
   expect(await first.store.certifyDelivery(first.snapshot.version,1200,{},true)).toBe(true);
   const replacement=await store.openDelivery(scope,'old-duplicate',lease,[],2000,crypto.randomUUID(),pool.replayRelays);
   expect(replacement.snapshot.repairFloor).toBe(0);
-  await replacement.store.insert({discordMessageId:'discord-message',discordChannelId:scope.discordChannelId,concordRumorId:interopFixture.expected.message.id,concordChannelId:scope.concordChannelIdHex,communityId:scope.communityId,origin:'concord',authorRef:interopFixture.expected.member,partIndex:0});
+  await replacement.store.insert({discordMessageId:`discord-message-${legacy}`,discordChannelId:scope.discordChannelId,concordRumorId:interopFixture.expected.message.id,concordChannelId:scope.concordChannelIdHex,communityId:scope.communityId,origin:'concord',authorRef:interopFixture.expected.member,partIndex:0});
   const router=make(replacement.store), lane=new LinkDelivery({onError:()=>{},onGap:floor=>replacement.store.markDeliveryGap(floor)});
   await lane.repair({store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:(item)=>router.onConcordChat(item,scope)});
-  expect(deleted).toEqual(['discord-message']);
+  expect(deleted).toEqual([`discord-message-${legacy}`]);
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
+});
+
+test.skipIf(!reachable)('unlink does not revive old signed deletions after a new owner restarts',async()=>{
+ const {community,folded}=bootstrapFixture(interopFixture),channel=channelsView(community,folded)[0];
+ const scope:ChannelLink={communityId:community.idHex,concordChannelIdHex:channel.idHex,discordGuildId:tenant,discordChannelId:`${tenant}-relink`,enabled:true};
+ const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ const old=finalizeEvent({...interopFixture.moderatorDeleteEvent,created_at:80},channel.current.group.sk);
+ const current=finalizeEvent({...interopFixture.moderatorDeleteEvent,created_at:2100},channel.current.group.sk);
+ let events=[old];const relays=['synthetic-relay'];
+ const pool={replayRelays:relays,query:async()=>[],publish:async()=>{},subscribe:()=>()=>{},close:async()=>{},
+  enumerateRelay:async(_u:string,f:{since?:number;until?:number})=>events.filter(e=>e.created_at>=f.since!&&e.created_at<=f.until!).map(e=>e.id),
+  fetchRelay:async(_u:string,ids:string[])=>events.filter(e=>ids.includes(e.id))};
+ const client=new ConcordClient(community,pool,localIdentity(generateSecretKey()));client.folded=folded;const deleted:string[]=[];
+ try {
+  const first=await store.activateDelivery(scope,'old-owner',[],50);const oldView=(await store.openDelivery(scope,'old-owner',lease,[],50,crypto.randomUUID(),relays)).store;
+  const chat=(await openChatBatch([old],channel))[0];
+  await oldView.insert({discordMessageId:'old-copy',discordChannelId:scope.discordChannelId,concordRumorId:interopFixture.expected.message.id,concordChannelId:scope.concordChannelIdHex,communityId:scope.communityId,origin:'concord',authorRef:interopFixture.expected.member,partIndex:0});
+  await oldView.saveDeletes(scope,[{deleteRumorId:chat.rumorId,targetRumorId:interopFixture.expected.message.id,author:chat.author,createdAtMs:Date.now(),sourceWrapCreatedAt:80,actionClass:'actionable'}]);
+  await store.terminateDelivery(scope,'old-owner',first.epoch);expect(await store.pendingDeletes(scope)).toHaveLength(0);
+  const next=await store.activateDelivery(scope,'new-owner',[],2000);expect(next.deletionFloor).toBe(2000);
+  const firstNew=await store.openDelivery(scope,'new-owner',lease,[],2000,crypto.randomUUID(),relays);
+  const webhooks={send:async()=> 'message',edit:async()=>{},react:async()=>{},unreact:async()=>{},sendTyping:async()=>{},delete:async(_l:ChannelLink,id:string,authorize?:()=>void)=>{authorize?.();deleted.push(id);}};
+  const firstRouter=new BridgeRouter(client,new PuppetCache('ab'.repeat(32)),firstNew.store,webhooks,{resolve:async pk=>({name:pk})},{applicationId:'synthetic',webhookIds:new Set()},{beforeSideEffect:()=>firstNew.store.assertDeliveryCurrent()});
+  const firstLane=new LinkDelivery({onError:()=>{},deletionFloor:firstNew.snapshot.deletionFloor,onGap:floor=>firstNew.store.markDeliveryGap(floor)});
+  await firstLane.repair({store:firstNew.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:item=>firstRouter.onConcordChat(item,scope)});expect(deleted).toEqual([]);
+  const replacement=await store.openDelivery(scope,'new-owner',lease,[],3000,crypto.randomUUID(),relays);expect(replacement.snapshot.repairFloor).toBe(0);
+  const router=new BridgeRouter(client,new PuppetCache('ab'.repeat(32)),replacement.store,webhooks,{resolve:async pk=>({name:pk})},{applicationId:'synthetic',webhookIds:new Set()},{beforeSideEffect:()=>replacement.store.assertDeliveryCurrent()});
+  const lane=new LinkDelivery({onError:()=>{},deletionFloor:replacement.snapshot.deletionFloor,onGap:floor=>replacement.store.markDeliveryGap(floor)});
+  const repair=()=>lane.repair({store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:item=>router.onConcordChat(item,scope)});
+  await repair();expect(deleted).toEqual([]);
+  events=[current];await replacement.store.markDeliveryGap(0);await repair();expect(deleted).toEqual(['old-copy']);
  } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
 });

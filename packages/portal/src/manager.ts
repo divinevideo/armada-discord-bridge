@@ -38,7 +38,7 @@ import { identityRelayPool } from "@armada-bridge/bridge/src/concord/identityPoo
 import { intakeDirectInviteKeys } from "@armada-bridge/bridge/src/concord/keyIntake";
 import { RelayPool } from "@armada-bridge/bridge/src/concord/pool";
 import { localIdentity } from "@armada-bridge/bridge/src/concord/signer";
-import { PostgresMappingStore } from "@armada-bridge/bridge/src/db/store";
+import { PostgresMappingStore, StaleDeliveryFenceError } from "@armada-bridge/bridge/src/db/store";
 import { assertLockedLease, lockDelivery } from "@armada-bridge/bridge/src/db/deliveryState";
 import { DiscordAdapter, isMissingPermissions, parseBotCommand } from "@armada-bridge/bridge/src/discord/adapter";
 import { Kind0ProfileResolver } from "@armada-bridge/bridge/src/profiles";
@@ -53,7 +53,7 @@ import type postgres from "postgres";
 import { replayDiscordSince } from "./catchup";
 import { botChannelMessagesAfter, restToInbound } from "./discordRest";
 import type { PortalEnv } from "./env";
-import { filterPublicRelays } from "./relayGuard";
+import { deliveryRelays, filterPublicRelays } from "./relayGuard";
 import { seal, unseal } from "./seal";
 import { detectSeverance, severanceDetail, type SeveranceVerdict } from "./severance";
 
@@ -690,7 +690,7 @@ export class BridgeManager {
       // deliveries on relay.ditto.pub or relay.dreamith.to — every private
       // channel an import admitted it to failed "concord channel not found" on
       // every start (2026-09-24). The npub is public already (kind 0, guestbook).
-      const pool = identityRelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), primarySk);
+      const pool = identityRelayPool(await deliveryRelays(community.relays, STOCK_RELAYS), primarySk);
 
       this.startingPools.add(pool);
       cleanup.push(() => { this.startingPools.delete(pool); return pool.close(); });
@@ -1012,10 +1012,15 @@ export class BridgeManager {
     const shared = !pending && rb.delivery
       ? {lane:rb.delivery,currentChannel:()=>rb.channel} : undefined;
     return rb.client.subscribeChannel(rb.channel,
-      chat => this.onConcordChat(rb,chat,confirmCode).catch(error => {
-        if (pending) { console.warn(`bridge ${rb.id}: confirmation attempt failed`,error); return; }
-        throw error;
-      }),
+      chat => {
+        // A pending feeder is control-only for its entire lifetime. Work
+        // already queued before unsubscribe must never enter active routing.
+        if (pending && rb.status !== 'pending_confirm') return;
+        return this.onConcordChat(rb,chat,confirmCode).catch(error => {
+          if (pending) { console.warn(`bridge ${rb.id}: confirmation attempt failed`,error); return; }
+          throw error;
+        });
+      },
       (relayUrl,error) => { rb.delivery?.subscriptionError(relayUrl); console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`,error); },
       undefined,shared);
   }
@@ -1044,12 +1049,18 @@ export class BridgeManager {
       if (rb.stopped || this.running.get(rb.id) !== rb) return;
       await rb.assertMayForward();
       const row = await this.sql.begin(async tx => {
+        await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
+        await tx`SELECT 1 FROM bridge_leases WHERE resource=${rb.lease.resource} FOR UPDATE`;
+        await assertLockedLease(tx,rb.lease);
+        if (rb.stopped || rb.status !== 'pending_confirm' || this.running.get(rb.id) !== rb) throw new Error('Confirmation worker is no longer current');
         await this.store.activateDelivery(rb.link,rb.id,rb.channel.streams.map(s=>s.group.pk),Math.floor(Date.now()/1000),tx);
         const [updated] = await tx<BridgeRow[]>`UPDATE bridges SET status='active',status_detail=NULL,updated_at=now()
           WHERE bridge_id=${rb.id} AND status='pending_confirm' AND community_id=${rb.link.communityId}
             AND concord_channel_id=${rb.link.concordChannelIdHex} AND discord_guild_id=${rb.link.discordGuildId}
             AND discord_channel_id=${rb.link.discordChannelId} RETURNING *`;
         if (!updated) throw new Error('Confirmation no longer owns this link');
+        if (rb.stopped || rb.status !== 'pending_confirm' || this.running.get(rb.id) !== rb) throw new Error('Confirmation worker is no longer current');
+        await assertLockedLease(tx,rb.lease);
         return updated;
       });
       rb.status = 'active';
@@ -1219,6 +1230,7 @@ export class BridgeManager {
     rb.deliveryEpoch = opened.snapshot.epoch;
     rb.deliveryRecoveryFloor = opened.snapshot.recoveryFloor;
     rb.delivery = new LinkDelivery({
+      deletionFloor: opened.snapshot.deletionFloor,
       onError: error => console.warn(`bridge ${rb.id}: delivery operation failed`,error),
       onGap: floor => opened.store.markDeliveryGap(floor),
     });
@@ -1519,7 +1531,8 @@ export class BridgeManager {
     const rb=this.running.get(bridgeId);
     if(expected && rb!==expected)return;
     if(expected) { expected.stopped=true; expected.delivery?.stop(); try {expected.unsubChat();}catch{} expected.unsubChat=()=>{}; }
-    const changed=await this.sql.begin(async tx=>{
+    let changed: boolean;
+    try { changed=await this.sql.begin(async tx=>{
       await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
       const [row]=await tx<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id=${bridgeId}`;
       if(!row)return false;
@@ -1561,8 +1574,24 @@ export class BridgeManager {
       if (expected?.status === 'active') await expected.deliveryStore!.assertDeliveryLease(tx);
       else if (expected || expectedLease) await assertLockedLease(tx,expected?.lease ?? expectedLease!);
       return true;
-    });
-    if(!changed)return;
+    }); } catch (error) {
+      if (expected && this.running.get(bridgeId) === expected) {
+        // A stale session is already fenced; its lease may also be used by a
+        // replacement session and must not be released on the old proof.
+        if (!(error instanceof StaleDeliveryFenceError)) await settleWithin(expected.lease.release());
+        await this.closeRunning(expected);
+        if (!this.running.has(bridgeId)) this.scheduleStartRetry(bridgeId,0,true);
+      }
+      throw error;
+    }
+    if (!changed) {
+      if (expected && this.running.get(bridgeId) === expected) {
+        await settleWithin(expected.lease.release());
+        await this.closeRunning(expected);
+        if (!this.running.has(bridgeId)) this.scheduleStartRetry(bridgeId,0,true);
+      }
+      return;
+    }
     this.cancelStartRetry(bridgeId);
     if(rb && (!expected || rb===expected)) {
       await settleWithin(rb.lease.release().catch(error=>console.warn(`bridge ${bridgeId}: lease release failed`,error)));

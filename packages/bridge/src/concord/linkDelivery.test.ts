@@ -338,3 +338,14 @@ it('rechecks the stream inventory after an awaited checkpoint', async () => {
   await started;channel={streams:[{group:{pk:'first'}},{group:{pk:'second'}}]} as unknown as ChannelV2;release();
   await expect(repair).rejects.toThrow('stream');await lane.flushGaps();expect(floors).toEqual([80]);
 });
+
+it('replays zero inventory but only applies deletions from the current lifecycle', async () => {
+  const snapshot={ownerId:'new',epoch:'new',active:true,suspended:false,workerUncertain:true,sessionGeneration:2,version:1,activationFloor:2000,recoveryFloor:2000,deletionFloor:2000,repairFloor:0,coverage:{},ordinaryCoverage:{},legacyBoundaries:{}};
+  const channel={streams:[{epoch:0n,group:{pk:'stream'}}]} as unknown as ChannelV2;
+  const seen:string[]=[];let from=-1;
+  const lane=new LinkDelivery({onError:()=>{},deletionFloor:2000} as any);
+  await lane.repair({store:{deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>true},channel:()=>channel,deliver:async chat=>{seen.push(chat.rumorId);},replay:async(_c,since,opts)=>{
+    from=since;await opts.onBatch!({chats:[{rumorId:'old',kind:5,streamPk:'stream',sourceWrapCreatedAt:80,createdAt:80,epoch:0n},{rumorId:'current',kind:5,streamPk:'stream',sourceWrapCreatedAt:2000,createdAt:80,epoch:0n}] as DeliveredChat[]},{signal:opts.signal!});
+  }});
+  expect(from).toBe(0);expect(seen).toEqual(['current']);
+});

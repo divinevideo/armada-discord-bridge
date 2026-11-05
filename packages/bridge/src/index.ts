@@ -205,6 +205,7 @@ const puppets = new PuppetCache(config.masterSecretHex);
 const profiles = new Kind0ProfileResolver(pool);
 
 const lane = new LinkDelivery({
+  deletionFloor: openedDelivery.snapshot.deletionFloor,
   onError: error => console.warn("bridge: delivery operation failed", error),
   onGap: floor => deliveryStore!.markDeliveryGap(floor),
 });

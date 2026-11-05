@@ -32,7 +32,10 @@ export class LinkDelivery {
   private generation = 0;
   private readonly seen = new Set<string>();
   gapFloor?: number;
-  constructor(private readonly options: { onError: (error: unknown) => void; onGap?: (floor: number) => Promise<unknown>; capacity?: number }) {}
+  constructor(private readonly options: { onError: (error: unknown) => void; onGap?: (floor: number) => Promise<unknown>; capacity?: number; deletionFloor?: number }) {}
+  applies(chat: Pick<DeliveredChat, 'kind' | 'sourceWrapCreatedAt'>): boolean {
+    return chat.kind !== KIND_DELETE || chat.sourceWrapCreatedAt >= (this.options.deletionFloor ?? 0);
+  }
   hasSeen(id: string): boolean { return this.seen.has(id); }
   remember(id: string): void {
     if (this.seen.size >= 65_536) this.seen.clear();
@@ -160,6 +163,7 @@ export class LinkDelivery {
             signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
             if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
             if (!filterEpochCutoff([chat], options.channel()).length) continue;
+            if (chat.kind === KIND_DELETE && chat.sourceWrapCreatedAt < (snapshot.deletionFloor ?? 0)) continue;
             const known = [snapshot.legacyBoundaries[chat.streamPk], snapshot.ordinaryCoverage[chat.streamPk], snapshot.coverage[chat.streamPk]].filter((at): at is number => at !== undefined);
             const boundary = known.length ? Math.max(...known) : undefined;
             // A legacy cursor completed its boundary second. A recovery floor

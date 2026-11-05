@@ -371,6 +371,7 @@ export class ConcordClient {
               const opened = await openChatBatch([wrap], channel);
               signal.throwIfAborted();
               for (const chat of filterEpochCutoff(opened, currentChannel())) {
+                if (!lane.applies({kind: chat.kind, sourceWrapCreatedAt: wrap.created_at})) continue;
                 if (lane.hasSeen(chat.rumorId)) continue;
                 signal.throwIfAborted();
                 await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });

@@ -641,3 +641,15 @@ it('does not acknowledge a live wrap as certified replay coverage', async () => 
   await done; await new Promise(resolve => setTimeout(resolve, 0));
   expect(acknowledgements).toEqual([]);
 });
+
+it('applies the lifecycle deletion boundary to verified live carriers',async()=>{
+ const {community}=makeCommunity(),channel=makeChannel(community),pool=new FakePool();
+ const client=new ConcordClient(community,pool,localIdentity(generateSecretKey())),author=localIdentity(generateSecretKey());
+ const seen:number[]=[];
+ const wrap=(await client.sendChat(channel,{content:'',kind:5,tags:[['e','ab'.repeat(32)]],author})).wrap;
+ const now=wrap.created_at,lane=new LinkDelivery({onError:()=>{},deletionFloor:now});
+ client.subscribeChannel(channel,chat=>{seen.push(chat.sourceWrapCreatedAt);},undefined,undefined,{lane,currentChannel:()=>channel});
+ const older=finalizeEvent({...wrap,created_at:now-1},channel.current.group.sk);
+ pool.emit(older);pool.emit(wrap);await lane.run(async()=>{});
+ expect(seen).toEqual([now]);
+});
