@@ -28,9 +28,9 @@ function pool(events: Record<string, NostrEvent[]>, caps: Record<string, number>
 }
 
 test('empty windows certify the frozen run-start endpoint, without inventing a newest event', async () => {
-  const start = Math.floor(Date.now() / 1000), p = pool({ a: [] }), windows: number[] = [];
-  const result = await replayChannel(p, channel, start - 600, 500, { onWindowComplete: async w => { windows.push(w.until); } });
-  expect(windows).toEqual([start - 301, start - 1, start]);
+  const start = Math.floor(Date.now() / 1000), p = pool({ a: [] }), windows: Array<[number, number]> = [];
+  const result = await replayChannel(p, channel, start - 600, 500, { onWindowComplete: async w => { windows.push([w.until, w.runUntil]); } });
+  expect(windows).toEqual([[start - 301, start], [start - 1, start], [start, start]]);
   expect(result.certifiedUntil).toBe(start); expect(result.newestWrapAt).toBeUndefined();
 });
 test('different relay subsets and caps each have their outstanding IDs fetched before coverage', async () => {
@@ -59,10 +59,10 @@ test('a purged carrier is reconciled once and new inventory IDs are fetched befo
   expect(fetched).toBe(replacement.id); expect(result.certifiedUntil).toBe(at);
 });
 test('inventory resource limits split oldest first and pin an oversized second', async () => {
-  const at = Math.floor(Date.now() / 1000), p = pool({ a: [] }), windows: Array<[number, number]> = [];
+  const at = Math.floor(Date.now() / 1000), p = pool({ a: [] }), windows: Array<[number, number, number]> = [];
   p.enumerateRelay = async (_url, filter) => { if (filter.since! < filter.until!) throw new ReplayWindowLimitError('sync limit'); return []; };
-  await replayChannel(p, channel, at - 2, 500, { onWindowComplete: async w => { windows.push([w.since, w.until]); } });
-  expect(windows).toEqual([[at - 2, at - 2], [at - 1, at - 1], [at, at]]);
+  await replayChannel(p, channel, at - 2, 500, { onWindowComplete: async w => { windows.push([w.since, w.until, w.runUntil]); } });
+  expect(windows).toEqual([[at - 2, at - 2, at], [at - 1, at - 1, at], [at, at, at]]);
   p.enumerateRelay = async () => { throw new ReplayWindowLimitError('sync limit'); };
   await expect(replayChannel(p, channel, at)).rejects.toThrow('second exceeds');
 });

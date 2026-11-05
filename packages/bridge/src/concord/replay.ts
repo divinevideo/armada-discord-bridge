@@ -6,7 +6,7 @@ import { REPLAY_MAX_IDS, ReplayWindowLimitError } from './reconciliation';
 
 export type DeliveredChat = OpenedChat & { sourceWrapCreatedAt: number };
 export interface ReplayBatch { chats: DeliveredChat[]; newestWrapAt?: number }
-export interface ReplayWindow { since: number; until: number }
+export interface ReplayWindow { since: number; until: number; runUntil: number }
 /** Cancellation bounds the replay wait, not the external operation. Callers
  * must retain in-flight callbacks in the same serial delivery lane until they
  * settle, and fence every later effect/checkpoint with current authority and
@@ -139,7 +139,7 @@ export async function replayChannel(pool: RelayLike, channel: ChannelV2, sinceSe
       }
     }
     signal.throwIfAborted();
-    if (opts?.onWindowComplete) await awaitReplayCallback(opts.onWindowComplete, { since, until }, signal);
+    if (opts?.onWindowComplete) await awaitReplayCallback(opts.onWindowComplete, { since, until, runUntil: upper }, signal);
     signal.throwIfAborted();
     certifiedUntil = until;
     if (batch.newestWrapAt !== undefined) newestWrapAt = Math.max(newestWrapAt ?? batch.newestWrapAt, batch.newestWrapAt);

@@ -1,4 +1,6 @@
 import { expect, it } from 'bun:test';
+import type { DeliveredChat, ReplayOptions } from './replay';
+import type { ChannelV2 } from '@armada-bridge/concord-core';
 import { LinkDelivery } from './linkDelivery';
 
 it('keeps the same effect lane while a subscription is replaced', async () => {
@@ -108,4 +110,96 @@ it('coalesces overflow persistence while its database write is blocked', async (
   release();
   await delivery.flushGaps();
   expect(floors).toEqual([2000, 1000]);
+});
+
+it('commits completed replay windows and clears only the frozen final window', async () => {
+  const calls: Array<[number, boolean]> = [];
+  let version = 0, repairFloor: number | undefined = 100;
+  const state = () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version, activationFloor: 100, repairFloor, coverage: {}, legacyBoundaries: {} });
+  const store = {
+    deliverySnapshot: async () => state(),
+    certifyDelivery: async (expected: number, until: number, _coverage: Record<string, number>, complete: boolean) => {
+      if (expected !== version) return false;
+      calls.push([until, complete]); version++; repairFloor = complete ? undefined : until + 1; return true;
+    },
+  };
+  const channel = { streams: [{ group: { pk: 'stream' } }] } as unknown as ChannelV2;
+  const delivery = new LinkDelivery({ onError: () => {} });
+  await delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, _since, opts) => {
+    await opts.onWindowComplete!({ since: 40, until: 299, runUntil: 500 }, { signal: new AbortController().signal });
+    await opts.onWindowComplete!({ since: 300, until: 500, runUntil: 500 }, { signal: new AbortController().signal });
+  } });
+  expect(calls).toEqual([[299, false], [500, true]]);
+  expect(repairFloor).toBeUndefined();
+});
+
+it('resumes a certified prefix after an interrupted replay', async () => {
+  let version = 0, repairFloor: number | undefined = 100, coverage: Record<string, number> = {};
+  const store = {
+    deliverySnapshot: async () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version, activationFloor: 100, repairFloor, coverage, legacyBoundaries: {} }),
+    certifyDelivery: async (expected: number, until: number, next: Record<string, number>, complete: boolean) => {
+      if (expected !== version) return false;
+      version++; coverage = next; repairFloor = complete ? undefined : until + 1; return true;
+    },
+  };
+  const channel = { streams: [{ group: { pk: 'stream' } }] } as unknown as ChannelV2;
+  const delivery = new LinkDelivery({ onError: () => {}, onGap: async floor => { version++; repairFloor = Math.min(repairFloor ?? floor, floor); } });
+  delivery.markGap(100);
+  await delivery.flushGaps();
+  const floors: number[] = [];
+  const options = { store, channel: () => channel, deliver: async () => {}, replay: async (_channel: ChannelV2, since: number, opts: ReplayOptions) => {
+    floors.push(since);
+    if (floors.length === 1) {
+      await opts.onWindowComplete!({ since, until: 339, runUntil: 800 }, { signal: new AbortController().signal });
+      throw new Error('attempt deadline');
+    }
+    await opts.onWindowComplete!({ since, until: 800, runUntil: 800 }, { signal: new AbortController().signal });
+  } };
+  await expect(delivery.repair(options)).rejects.toThrow('attempt deadline');
+  await delivery.repair(options);
+  expect(floors).toEqual([40, 280]);
+  expect(repairFloor).toBeUndefined();
+});
+
+it('replays only deletions below each legacy carrier boundary', async () => {
+  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version: 0, activationFloor: 100, repairFloor: 40, coverage: {}, legacyBoundaries: { first: 100, second: 50 } };
+  const store = { deliverySnapshot: async () => snapshot, certifyDelivery: async () => true };
+  const channel = { streams: [{ epoch: 0n, group: { pk: 'first' } }, { epoch: 1n, group: { pk: 'second' } }] } as unknown as ChannelV2;
+  const delivered: string[] = [];
+  const chats = [
+    { rumorId: 'old message', kind: 9, streamPk: 'first', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 0n },
+    { rumorId: 'old deletion', kind: 5, streamPk: 'first', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 0n },
+    { rumorId: 'second message', kind: 9, streamPk: 'second', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 1n },
+  ] as DeliveredChat[];
+  const delivery = new LinkDelivery({ onError: () => {} });
+  await delivery.repair({ store, channel: () => channel, deliver: async chat => { delivered.push(chat.rumorId); }, replay: async (_channel, _since, opts) => {
+    await opts.onBatch!({ chats }, { signal: new AbortController().signal });
+  } });
+  expect(delivered).toEqual(['old deletion', 'second message']);
+});
+
+it('keeps a newer persisted gap when the final replay checkpoint is blocked', async () => {
+  let version = 0, repairFloor: number | undefined = 100, release!: () => void, entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const snapshot = () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version, activationFloor: 100, repairFloor, coverage: {}, legacyBoundaries: {} });
+  const store = {
+    deliverySnapshot: async () => snapshot(),
+    certifyDelivery: async (expected: number, _until: number, _coverage: Record<string, number>, complete: boolean) => {
+      entered(); await blocked;
+      if (expected !== version) return false;
+      version++; if (complete) repairFloor = undefined; return true;
+    },
+  };
+  const delivery = new LinkDelivery({ onError: () => {}, onGap: async floor => { version++; repairFloor = Math.min(repairFloor ?? floor, floor); } });
+  const channel = { streams: [{ group: { pk: 'stream' } }] } as unknown as ChannelV2;
+  const running = delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since, opts) => {
+    await opts.onWindowComplete!({ since, until: 500, runUntil: 500 }, { signal: opts.signal! });
+  } });
+  await started;
+  delivery.markGap(80);
+  await delivery.flushGaps();
+  release();
+  await expect(running).rejects.toThrow();
+  expect(repairFloor).toBe(80);
 });
