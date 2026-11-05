@@ -11,7 +11,7 @@ export interface DestinationConfig {
 }
 export interface DatabaseObservation {
   database: string; role: string; login: string; loginCanLogin: boolean; serverVersion: string; superuser: boolean; createDatabase: boolean;
-  createRole: boolean; ownsDatabase: boolean; populatedTables: number; schemaPresent: boolean; roleMemberships: number; serverAddress?: string;
+  createRole: boolean; replication: boolean; bypassRls: boolean; ownsDatabase: boolean; populatedTables: number; schemaPresent: boolean; roleMemberships: number; serverAddress?: string;
 }
 type Json = Record<string, any>;
 type Resources = Pick<CapacityMatrix, 'cpu' | 'memoryBytes' | 'databaseCpu' | 'databaseMemoryBytes'>;
@@ -49,10 +49,10 @@ export function benchmarkURLGuard(c: Pick<DestinationConfig, 'databaseRole' | 'd
     if (!['postgres:', 'postgresql:'].includes(url.protocol) || decodeURIComponent(url.username) !== c.databaseRole || decodeURIComponent(url.pathname.slice(1)) !== c.databaseName || [...url.searchParams.keys()].some(key => key !== 'sslmode')) throw new Error();
   } catch { throw new Error('Dedicated benchmark URL identity or startup parameters are invalid (diagnostics withheld)'); }
 }
-export const BENCHMARK_IDENTITY_SQL = `SELECT pg_catalog.current_database() AS database,current_user AS role,session_user AS login,pg_catalog.host(pg_catalog.inet_server_addr()) AS "serverAddress",pg_catalog.split_part(pg_catalog.current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",r.rolcanlogin AS "loginCanLogin",pg_catalog.pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_catalog.pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database() WHERE r.rolname=session_user`;
-export function benchmarkLoginGuard(c: DestinationConfig, o: Pick<DatabaseObservation, 'role' | 'login' | 'loginCanLogin' | 'superuser' | 'createDatabase' | 'createRole' | 'roleMemberships'>) {
+export const BENCHMARK_IDENTITY_SQL = `SELECT pg_catalog.current_database() AS database,current_user AS role,session_user AS login,pg_catalog.host(pg_catalog.inet_server_addr()) AS "serverAddress",pg_catalog.split_part(pg_catalog.current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",r.rolcanlogin AS "loginCanLogin",r.rolreplication AS replication,r.rolbypassrls AS "bypassRls",pg_catalog.pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_catalog.pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database() WHERE r.rolname=session_user`;
+export function benchmarkLoginGuard(c: Pick<DestinationConfig, 'databaseRole'>, o: Pick<DatabaseObservation, 'role' | 'login' | 'loginCanLogin' | 'superuser' | 'createDatabase' | 'createRole' | 'replication' | 'bypassRls' | 'roleMemberships'>) {
   need(o.role === c.databaseRole && o.login === c.databaseRole, 'Both session login and current role must be the dedicated benchmark role');
-  need(o.loginCanLogin === true && o.superuser === false && o.createDatabase === false && o.createRole === false && o.roleMemberships === 0, 'Benchmark login must be unprivileged and have no memberships');
+  need(o.loginCanLogin === true && o.superuser === false && o.createDatabase === false && o.createRole === false && o.replication === false && o.bypassRls === false && o.roleMemberships === 0, 'Benchmark login must be unprivileged and have no memberships');
 }
 export function benchmarkDatabaseGuard(c: DestinationConfig, o: DatabaseObservation) {
   benchmarkLoginGuard(c, o);

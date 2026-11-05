@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from 'bun:test';
 import postgres from 'postgres';
-import { BENCHMARK_IDENTITY_SQL } from './capacity-kubernetes';
+import { BENCHMARK_IDENTITY_SQL, benchmarkLoginGuard } from './capacity-kubernetes';
 
 const sql = postgres(process.env.DATABASE_URL!, { max: 1, onnotice() {} });
 afterAll(() => sql.end());
@@ -58,3 +58,26 @@ test('SQL shutdown failure cannot strand remaining cleanup or its idle connectio
     expect(await backendGone(session.pid)).toBe(true);
   } finally { await client.end(); }
 });
+
+for (const privilege of ['REPLICATION', 'BYPASSRLS'] as const) {
+  test(`actual PostgreSQL ${privilege} LOGIN is rejected by the benchmark guard`, async () => {
+    const role = `concord_capacity_${privilege.toLowerCase()}_${process.pid}`;
+    const url = new URL(process.env.DATABASE_URL!); url.username = role;
+    let client: ReturnType<typeof postgres> | undefined;
+    try {
+      await sql.unsafe(`CREATE ROLE "${role}" LOGIN ${privilege}`);
+      client = postgres(url.toString(), { max: 1, onnotice() {} });
+      const [identity] = await client.unsafe<Parameters<typeof benchmarkLoginGuard>[1][]>(BENCHMARK_IDENTITY_SQL);
+      expect(identity.login).toBe(role);
+      expect(() => benchmarkLoginGuard({ databaseRole: role }, identity)).toThrow('unprivileged');
+      expect(identity.replication).toBe(privilege === 'REPLICATION');
+      expect(identity.bypassRls).toBe(privilege === 'BYPASSRLS');
+      await sql.unsafe(`ALTER ROLE "${role}" NOREPLICATION NOBYPASSRLS`);
+      const [ordinary] = await client.unsafe<Parameters<typeof benchmarkLoginGuard>[1][]>(BENCHMARK_IDENTITY_SQL);
+      expect(() => benchmarkLoginGuard({ databaseRole: role }, ordinary)).not.toThrow();
+    } finally {
+      await client?.end();
+      await sql.unsafe(`DROP ROLE IF EXISTS "${role}"`);
+    }
+  });
+}

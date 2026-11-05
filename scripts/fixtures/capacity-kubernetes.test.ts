@@ -5,7 +5,7 @@ const image = 'registry.example/relay@sha256:' + 'a'.repeat(64);
 const sha = 'b'.repeat(40);
 const config = { context: 'explicit-production', namespace: 'concord-capacity-synthetic', image, sourceSha: sha, databaseCluster: { namespace: 'postgres-clusters', name: 'postgres' }, relayDeployment: { namespace: 'armada-chat', name: 'concord-relay', container: 'relay' }, relayRequests: { cpu: 0.25, memoryBytes: 268435456 }, relayStorage: { claimName: 'capacity-data', productionClaimName: 'concord-relay' }, databaseSecret: 'benchmark-database', databaseSecretKey: 'DATABASE_URL', databaseName: 'concord_capacity_synthetic', databaseRole: 'concord_capacity_synthetic', postgresVersion: '18.1', platform: 'linux/amd64' };
 const matrix = { cpu: 2, memoryBytes: 1073741824, databaseCpu: 2, databaseMemoryBytes: 8589934592 };
-const db = { database: config.databaseName, role: config.databaseRole, login: config.databaseRole, loginCanLogin: true, serverVersion: '18.1', superuser: false, createDatabase: false, createRole: false, ownsDatabase: true, populatedTables: 0, schemaPresent: true, roleMemberships: 0 };
+const db = { database: config.databaseName, role: config.databaseRole, login: config.databaseRole, loginCanLogin: true, serverVersion: '18.1', superuser: false, createDatabase: false, createRole: false, replication: false, bypassRls: false, ownsDatabase: true, populatedTables: 0, schemaPresent: true, roleMemberships: 0 };
 
 describe('isolated destination measurement', () => {
   test('requires an immutable image, explicit context and isolated namespace/database', () => {
@@ -16,8 +16,8 @@ describe('isolated destination measurement', () => {
   });
   test('refuses populated, privileged, mismatched or wrong-version databases', () => {
     expect(() => benchmarkDatabaseGuard(config, db)).not.toThrow();
-    for (const change of [{ loginCanLogin: false }, { database: 'bridge' }, { role: 'postgres' }, { serverVersion: '16.4' }, { populatedTables: 1 }, { schemaPresent: false }, { roleMemberships: 1 }, { superuser: true }, { createDatabase: true }, { createRole: true }, { ownsDatabase: false }]) {
-      expect(() => benchmarkDatabaseGuard(config, { ...db, ...change })).toThrow();
+    for (const change of [{ loginCanLogin: false }, { database: 'bridge' }, { role: 'postgres' }, { serverVersion: '16.4' }, { populatedTables: 1 }, { schemaPresent: false }, { roleMemberships: 1 }, { superuser: true }, { createDatabase: true }, { createRole: true }, { replication: true }, { bypassRls: true }, { replication: undefined }, { bypassRls: undefined }, { ownsDatabase: false }]) {
+      expect(() => benchmarkDatabaseGuard(config, JSON.parse(JSON.stringify({ ...db, ...change })))).toThrow();
     }
   });
   test('requires dedicated labeled namespace and deny-ingress policy before creating Pods', () => {
