@@ -62,12 +62,19 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
       await observeWorkerCapacity(sql, capacity, community.idHex);
       const { folded } = controlState(policy);
       registerStreamKeys(channelsView(community, folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
-      health.checkedAt = Date.now();
       // Capacity observation awaits SQL after the policy refresh. A disconnect
-      // during that await must not let this old policy restore a green gauge.
-      if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt, folded);
-      health.ready = !policy.rekeyPending;
-      health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
+      // or subscription error during either await has already marked the
+      // worker unready and invalidated the stored policy. Publishing this old
+      // policy would turn /readyz green over an empty store and restore a green
+      // gauge, so a stale refresh publishes nothing; the next refresh reports.
+      // That cannot strand the worker unready: refreshes run one at a time, and
+      // every generation bump during one already set ready = false.
+      if (generation === authorityGeneration) {
+        health.checkedAt = Date.now();
+        health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt, folded);
+        health.ready = !policy.rekeyPending;
+        health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
+      }
       return policy;
     } catch (error) { clearAuthority(); throw error; }
   };
