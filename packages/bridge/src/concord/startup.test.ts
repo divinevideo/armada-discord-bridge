@@ -54,6 +54,8 @@ describe('standalone catch-up handoff', () => {
     const originalNow = Date.now; const initialTime = Math.floor(originalNow() / 1000);
     let clock = initialTime - 100, sends = 0, floorPersisted = false, controlInstalled = false, catchupReady = false;
     let deletionAt = 0, unsubscribe = () => {};
+    let finishCatchup!: () => void;
+    const caughtUp = new Promise<void>(resolve => { finishCatchup = resolve; });
     try {
       Date.now = () => clock * 1000;
       const target = await publishMemberChat('backlog target');
@@ -89,9 +91,10 @@ describe('standalone catch-up handoff', () => {
             for (const chat of batch.chats) await deliver(chat);
             if (batch.newestWrapAt !== undefined) checkpoints.push(batch.newestWrapAt);
           } });
-          catchupReady = true;
+          catchupReady = true; finishCatchup();
         },
       });
+      await caughtUp;
       await publishMemberChat('newer live message');
       // Await the final live cursor, not a fixed delay; the deletion shares the serial router lane.
       for (let i = 0; i < 100 && !checkpoints.includes(initialTime + 120); i++) await new Promise(resolve => setTimeout(resolve, 1));
@@ -102,4 +105,22 @@ describe('standalone catch-up handoff', () => {
       expect(await store.pendingDeletes(link)).toEqual([]);
     } finally { unsubscribe(); Date.now = originalNow; }
   });
+});
+
+it('returns startup control while slow replay remains pending', async () => {
+  let release!: () => void, entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const order: string[] = [];
+  const result = startConcordDelivery({
+    establishFloor: async () => { order.push('floor'); },
+    installLive: () => { order.push('live'); },
+    installControl: () => { order.push('control'); },
+    catchUp: async () => { order.push('replay'); entered(); await blocked; },
+  });
+  await started;
+  const completed = await Promise.race([result.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 10))]);
+  release();
+  expect(completed).toBe(true);
+  expect(order).toEqual(['floor', 'live', 'control', 'replay']);
 });
