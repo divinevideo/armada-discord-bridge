@@ -240,3 +240,18 @@ it('bounds replay work without starving an authorized deletion behind denied act
   await h.router.retryPendingDeletes(h.link);
   expect(h.deleted).toEqual(['member-copy']);
 });
+
+// This is a deliberate policy limit, not a storage outage: retain evidence of
+// why silently evicting unknown targets would trade away future self-deletes.
+it('exposes the unknown-target quota limit using four legal signed member deletions', async () => {
+  const h = await signedReactionHarness();
+  for (let batch = 0; batch < 4; batch++) {
+    const tags = Array.from({ length: 256 }, (_, i) => ['e', (batch * 256 + i + 100_000).toString(16).padStart(64, '0')]);
+    await h.router.onConcordChat(await h.event(h.f.member, 5, tags), h.link);
+  }
+  await h.router.retryPendingDeletes(h.link);
+  expect(await h.store.pendingDeletes(h.link)).toHaveLength(1024);
+  const selfDelete = await h.event(h.f.member, 5, [['e', h.f.allowedRumorId]]);
+  await expect(h.router.onConcordChat(selfDelete, h.link)).rejects.toThrow('capacity');
+  expect(() => h.router.assertDeletionDeliveryDurable()).toThrow();
+});

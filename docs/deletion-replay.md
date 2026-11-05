@@ -64,3 +64,16 @@ the bot endpoint must also resolve the fallback.
 Ship all three additive migrations with the worker source through the existing release
 process. Local synthetic tests and an isolated database prove source behavior,
 not live Discord delivery or production admission readiness.
+
+A known quota tradeoff remains: four legal signed member deletions with 256
+unknown target identifiers each fill that actor’s 1,024 pending slots. Retry
+cannot prove those targets will never arrive, so a later deletion is refused
+and pins acknowledgement. The signed regression
+`exposes the unknown-target quota limit using four legal signed member deletions`
+records this behavior, including refusal of a subsequent mapped self-delete.
+There is no TTL, eviction, or operator repair API in this change. Dropping excess
+work, aging out unknown targets, or reserving capacity for known targets each
+changes the current delivery contract and needs an explicit admission/retention
+policy. Do not silently delete queue rows or advance the checkpoint as recovery.
+Retired target evidence likewise currently follows message-mapping retention;
+a retention window is a separate policy decision.
