@@ -153,6 +153,18 @@ export function capacityContractForEntrypoint(value: unknown, identity: { imageI
   return validateCapacityContract(value, identity);
 }
 
+export async function finalizeCapacityMeasurement(writeArtifacts: () => Promise<void>, cleanup: readonly (() => void | Promise<void>)[]): Promise<void> {
+  const closeFrom = async (index: number): Promise<void> => {
+    if (index === cleanup.length) return;
+    try { await cleanup[index](); }
+    finally { await closeFrom(index + 1); }
+  };
+  // Artifact I/O and any one shutdown can fail independently. Each remaining
+  // resource must still close, especially the API-owned database forward.
+  try { await writeArtifacts(); }
+  finally { await closeFrom(0); }
+}
+
 export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityMeasurementReport> {
   validateMatrix(matrix);
   const destination = process.env.CAPACITY_KUBERNETES_CONFIG ? destinationConfig(JSON.parse(await readFile(process.env.CAPACITY_KUBERNETES_CONFIG, "utf8"))) : undefined;
@@ -354,22 +366,29 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       await writeFile(join(output, "partial-report.json"), JSON.stringify(report, null, 2) + "\n");
     }
   } finally {
-    report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
-    const artifact = serializeCapacityReport(report);
-    await writeFile(join(output, "measurement-report.json"), artifact.json);
-    await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
-    await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
-    await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
-    for (const ws of sockets) ws.close(); await sql?.end({ timeout: 2 }); await locker?.end({ timeout: 2 });
-    if (kube) {
-      await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
-      await kube.finish();
-    } else {
-      for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
-      await docker("network", "rm", label).catch(() => {});
-    }
-    if (!output.startsWith(directory + "/")) await rm(directory, { recursive: true, force: true });
+    await finalizeCapacityMeasurement(async () => {
+      report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
+      const artifact = serializeCapacityReport(report);
+      await writeFile(join(output, "measurement-report.json"), artifact.json);
+      await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
+      await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
+      await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
+      if (kube) await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
+    }, [
+      ...sockets.map(ws => () => ws.close()),
+      () => sql?.end({ timeout: 2 }),
+      () => locker?.end({ timeout: 2 }),
+      async () => {
+        if (kube) await kube.finish();
+        else {
+          for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
+          await docker("network", "rm", label).catch(() => {});
+        }
+      },
+      async () => { if (!output.startsWith(directory + "/")) await rm(directory, { recursive: true, force: true }); },
+    ]);
   }
+
   console.log(`Capacity raw report: ${output}; certified=false`);
   return report;
 }
