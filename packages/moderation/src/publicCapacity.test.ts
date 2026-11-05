@@ -181,3 +181,18 @@ test("producer refuses stale policy even when capacity observation remains fresh
  await expect(store.pause({ orgId: org, communityId: f.community.idHex, reasonCode: "stale_policy_pause" })).resolves.toMatchObject({ state: "paused" });
  expect((await sql`SELECT state FROM moderation.public_capacity_state WHERE org_id = ${org} AND community_id = ${f.community.idHex}`)[0].state).toBe("paused");
 });
+
+test('concurrent timing samples correlate verified carriers and omit a forged claimed ID', async () => {
+ const a = await moderationFixture(), b = await moderationFixture();
+ const samples: import('./policyStore').AdmissionTimingSample[] = [];
+ const store = new PolicyStore(sql, { onAdmissionTiming: value => { samples.push(value); } });
+ try {
+   for (const g of [a, b]) await store.install(g.policy, [g.chatStream, g.controlStream, g.guestbookStream], 0);
+   expect((await Promise.all([store.admit(a.allowed), store.admit(b.allowed)])).map(x => x.action)).toEqual(['accept', 'accept']);
+   expect(new Set(samples.map(x => x.eventId))).toEqual(new Set([a.allowed.id, b.allowed.id]));
+   expect(samples.every(x => Number.isFinite(x.innerAdmissionMs))).toBe(true);
+   const forged = { ...a.allowed, id: 'ef'.repeat(32) };
+   expect((await store.admit(forged)).action).toBe('reject');
+   expect(samples.at(-1)?.eventId).toBeUndefined();
+ } finally { for (const g of [a, b]) await sql`DELETE FROM moderation.community_policy WHERE community_id = ${g.community.idHex}`; }
+});

@@ -549,3 +549,137 @@ CLI is supported from a checkout of the reviewed release with Bun 1.3.10 and
 `bun --env-file "$RECOVERY_ENV_FILE" packages/moderation/src/publicationOperator.ts status "$COMMUNITY_ID"`.
 The image/network commands above are maintenance instructions; this release
 work does not execute them against a deployed service.
+
+## Isolated Kubernetes destination measurement
+
+The destination backend reuses the same fourteen scenarios and outcome/timing
+checks as the disposable Docker harness. It needs no reviewed contract for the
+first synthetic calibration phase. It does not change the deployed entrypoint,
+create a launch contract, or mark destination/controller provenance verified.
+Subprocess, driver and parse failures withhold diagnostics; a case whose failure
+the harness itself worded (an invalid Pod name, a failed preflight guard, a relay
+that did not restart) keeps that reason in the report so a configuration error
+is distinguishable from a cluster fault. `kubectl`, `git` and `docker` children
+do not inherit the harness's `CAPACITY_*` settings. Kubernetes relay log
+artifacts contain only whitelisted structured admission-timing fields; raw error
+logs and connection strings are not captured. The separate
+`destination-observations.json` records actual target readbacks for
+review while the measurement report keeps `certified: false`,
+`destinationMatched: false` and `controllerModelVerified: false`.
+
+Before running it, an authorized Platform operator must provision a fresh
+`concord-capacity-*` namespace labeled `divine.video/capacity-benchmark=true`, a
+default-deny ingress NetworkPolicy, approved egress to the selected database, and
+one dedicated credential Secret and a separately bound benchmark PVC labeled
+`divine.video/capacity-benchmark=true`. Its StorageClass, access/volume mode and
+requested size must match the selected production relay claim while its PV must
+be different. The driver captures both claim specifications; it never mounts
+the production claim. It must contain no other Pods, Services,
+Ingresses or HTTPRoutes. The driver creates only owned benchmark Pods, never a
+Service or public listener route; transport is an authenticated Kubernetes
+port-forward bound to `127.0.0.1`. Deletion is restricted to the UID returned by
+creation. A changed UID is an error, not permission to delete its replacement.
+
+Provision a fresh `concord_capacity_*` database and role on the selected CNPG
+PostgreSQL 18.1 cluster. The role must own this database and its local tables,
+have no superuser/create-role/create-database authority or role memberships, and
+have no privileges on the chat database. The dedicated Secret and controller credentials must name this same database
+and role. Mounted credentials connect directly to the verified CNPG primary Pod
+address. The controller instead uses a driver-owned, API-authenticated database
+port-forward to that primary Pod, with its UID/IP checked before and after the
+forward is established. Both `session_user` and `current_user` must identify this dedicated LOGIN role;
+its actual login attributes are checked through qualified system catalogs. URL
+startup overrides and alternate usernames are refused for both the controller
+and mounted credential, and inherited startup options are cleared. Never reuse
+the production operator, migrator or validator credential.
+
+Apply the exact candidate moderation migrations through the approved operator
+provisioning workflow **before** measurement, then grant/transfer only the
+isolated database's local object ownership to the benchmark role. Do not grant
+production role memberships. The shared-cluster backend deliberately does not
+run `migrateModeration`: those migrations contain cluster-global role and
+membership management, which is not benchmark authority. The Docker backend
+continues to migrate its disposable cluster. The destination guard checks that
+required moderation tables exist, all user tables are owned locally and empty,
+and database identity/version/role privilege checks pass before any fixture
+writes. These checks do not prove complete schema equality: review the exact
+migration execution/source record alongside the captured table inventory.
+
+Copy `scripts/fixtures/capacity-destination.example.json` to a private file and
+replace its synthetic metadata with the reviewed explicit context, namespace,
+pinned image/source identity, selected relay Deployment/container, resource
+requests, CNPG cluster and dedicated Secret references. The driver compares the
+benchmark limits to `scripts/fixtures/capacity-matrix-destination.json`, the
+selected Deployment's image/requests/limits, the actual running benchmark Pod's
+image/native platform/source and standard-node placement, and the CNPG primary
+Pod's image/resources/address. It refuses mismatches rather than assuming that a
+namespace or image name proves the destination. No source identity override is
+injected into the relay image. The current destination matrix describes 2 CPU /
+1 GiB relay limits and 2 CPU / 8 GiB database limits; update it only with actual
+reviewed deployment readbacks.
+
+Supply `CAPACITY_DATABASE_URL` using approved private credential tooling, without
+printing it or storing it in the metadata JSON. Only its credentials, database
+and permitted TLS setting are used: its hostname and port are replaced with the
+owned loopback database forward, with no fallback to the supplied endpoint.
+PostgreSQL may see loopback on this transport rather than the Pod IP; that is
+accepted only while the owned forward is bound to the verified primary Pod/UID.
+SQL identity uses `host(inet_server_addr())` to remove inet display masks. The
+mounted credential still requires an exact bare primary Pod address. Both
+transports retain the same database, LOGIN/current-role and version checks. Select a private absolute
+`CAPACITY_OUTPUT_DIR` outside version control. Set
+`CAPACITY_KUBERNETES_CONFIG` to the private metadata file and
+`CAPACITY_EXECUTE_DESTINATION=1` only after the benchmark operation is authorized.
+Then run `scripts/test-strfry-capacity-kubernetes.sh`. This operation writes
+synthetic fixtures only into the dedicated database and creates isolated Pods;
+it is not a read-only preflight. Keep actual community listeners and the public
+tunnel held throughout measurement. The driver deletes only its UID-bound Pods on normal exit and on SIGINT/SIGTERM,
+waiting for in-flight resource acquisition before cleanup resolves. It retains
+each Pod's relay database and configuration on the benchmark PVC for reviewed
+cleanup; name-targeted exec cannot safely reclaim files if a Pod is replaced. Every Pod also
+carries a six-hour `activeDeadlineSeconds` as the backstop for a `kill -9` or
+crash that no handler can intercept, and for a Ctrl-C that kills `kubectl create`
+after the API server accepted the request (the Pod's UID is then never learned,
+so it cannot be tracked or removed by the driver). The deadline stops the compute but leaves a
+Failed Pod object, and the namespace guard refuses any existing Pod, so delete
+such leftovers by hand before the next run. It retains
+the benchmark database and reports for reviewed cleanup; it never drops a
+cluster/database or removes the credential/namespace/PVC. Each new benchmark Pod
+uses a unique subdirectory on the benchmark claim; container restart retains
+that directory while cold replacement starts fresh. Per-Pod directories and
+files remain after Pod removal; review and reclaim them separately before disk
+pressure affects subsequent measurements. Include disk behavior and
+shared-node contention in the review rather than treating matching PVC specs as
+proof of identical performance.
+
+Review all raw cases, unsupported outcomes, latency and late-work observations,
+resource contention, schema/source evidence and the separate controller model
+before deriving candidate bounds. Target checks do not establish the production
+controller/intervention assumptions or certify the envelope. Do not edit false
+provenance bits or convert synthetic calibration into public admission evidence.
+With an independently reviewed candidate contract, repeat on a **new empty,
+migrated benchmark database** using `CAPACITY_MODE=entrypoint` and
+`CAPACITY_CONTRACT_FILE`. That phase invokes the unchanged image's real policy
+launcher with its contract path. Before fixture admission it validates the full
+candidate contract against the exact image, source and platform, then uses the
+normal operator capacity observation against installed policy and real counts.
+It never seeds normal capacity rows or clears a pause in entrypoint mode; those
+synthetic seed operations remain calibration-only. It preserves normal admission
+and deadline checks. Final destination/controller review and a measured contract remain
+separate release work. A successful unit test or simulated Kubernetes lifecycle
+is not evidence that the destination benchmark has run.
+
+Native concurrency measurement requires a relay image with the verified carrier
+ID timing emitter. The production timing sink remains opt-in and writes only
+full validated event IDs, settled inner time and action; it does not write event
+content, source metadata, credentials or unknown caller fields. Correlation
+verification work is included in measured inner time. Invalid frames retain only
+aggregate timing, and a telemetry failure cannot reverse a settled admission.
+
+Previously published images that emit aggregate timing without event IDs cannot
+establish per-event concurrent timings. Their single-flight samples remain
+usable, but concurrent ambiguity is reported unsupported; do not invent an ID or
+assign a guessed timing to each request. Build, review and publish the runtime
+source containing the correlation emitter before actual native concurrency
+measurement, then bind the contract and measurement to that exact source/image.
+Unit and mock results do not prove that such an image is deployed or measured.
