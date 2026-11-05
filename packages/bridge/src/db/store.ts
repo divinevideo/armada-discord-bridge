@@ -457,3 +457,30 @@ export async function ensureLink(
     ON CONFLICT (tenant_id, discord_channel_id, concord_channel_id)
     DO UPDATE SET enabled = EXCLUDED.enabled`;
 }
+
+/** The environment is an explicit first provision, but an existing row is
+ * attach-only: a restart cannot revive a stopped lifecycle or disabled link. */
+export async function provisionStandalone(sql: postgres.Sql, link: ChannelLink,
+  community: { idHex: string; relays: string[]; name?: string }, streams: string[], at: number, tenant = 'default'): Promise<boolean> {
+  const store = new PostgresMappingStore(sql, tenant);
+  return sql.begin(async tx => {
+    await tx`INSERT INTO communities (tenant_id,community_id,relays,name)
+      VALUES (${tenant},${community.idHex},${community.relays},${community.name ?? null})
+      ON CONFLICT (tenant_id,community_id) DO UPDATE SET relays=EXCLUDED.relays,name=EXCLUDED.name`;
+    const inserted = await tx`INSERT INTO channel_links
+      (tenant_id,discord_guild_id,discord_channel_id,community_id,concord_channel_id,enabled)
+      VALUES (${tenant},${link.discordGuildId},${link.discordChannelId},${link.communityId},${link.concordChannelIdHex},true)
+      ON CONFLICT (tenant_id,discord_channel_id,concord_channel_id) DO NOTHING RETURNING 1`;
+    if (inserted.length) {
+      // Lock before checking: a concurrent control transition must not be
+      // replaced by an activation based on a stale empty observation.
+      if (await lockDelivery(tx, tenant, link)) throw new Error('Standalone lifecycle already exists');
+      await store.activateDelivery(link, standaloneDeliveryOwner(link), streams, at, tx);
+      return true;
+    }
+    const [existing] = await tx`SELECT enabled FROM channel_links WHERE ${deliveryScope(tx,tenant,link)} FOR SHARE`;
+    if (!existing) throw new Error('Standalone link scope changed');
+    if (!existing.enabled) throw new Error('Standalone link is disabled');
+    return false;
+  }) as Promise<boolean>;
+}
