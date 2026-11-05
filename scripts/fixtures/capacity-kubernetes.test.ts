@@ -148,13 +148,14 @@ test('destination preflight compares the selected relay, separate PVC and runnin
     return JSON.stringify({ items: [] });
   };
   let databaseForwardStopped = false;
-  const backend = new KubernetesCapacity(config, m, execute, async (args, port) => {
+  const makeBackend = () => new KubernetesCapacity(config, m, execute, async (args, port) => {
     expect(port).toBe(5432);
     expect(args).toContain('postgres-clusters');
     expect(args.at(-1)).toBe('pod/synthetic-postgres-primary');
     if (replacePrimaryDuringForward) primaryUID = 'replacement-primary-uid';
     return { url: 'ws://127.0.0.1:15432', stop: () => { databaseForwardStopped = true; } };
   });
+  const backend = makeBackend();
   expect(await backend.prepare()).toContain('image=registry.example/postgresql:18.1-test');
   const credentialURL = `postgres://${config.databaseRole}:synthetic-password@unrelated.example/${config.databaseName}`;
   const bound = new URL(await backend.controllerDatabaseURL(credentialURL));
@@ -169,7 +170,10 @@ test('destination preflight compares the selected relay, separate PVC and runnin
   expect(() => backend.assertControllerAddress('127.0.0.1')).toThrow();
   databaseForwardStopped = false;
   replacePrimaryDuringForward = true;
-  await expect(backend.controllerDatabaseURL(credentialURL)).rejects.toThrow('primary changed');
+  await expect(backend.controllerDatabaseURL(credentialURL)).rejects.toThrow('already finished');
+  const replacementCheck = makeBackend();
+  await replacementCheck.prepare();
+  await expect(replacementCheck.controllerDatabaseURL(credentialURL)).rejects.toThrow('primary changed');
   expect(databaseForwardStopped).toBe(true);
   expect(backend.evidence.databaseServerAddress).toBe('10.0.0.2');
   expect(backend.evidence.destinationMatched).toBe(false);
@@ -314,7 +318,7 @@ test('benchmark Pods are bounded in lifetime so a skipped cleanup cannot strand 
   expect(POD_LIFETIME_SECONDS).toBeLessThanOrEqual(24 * 3600);
 });
 
-test('removal reclaims the relay database only for an owned Pod and refuses new Pods once finished', async () => {
+test('removal retains PVC files and deletes only the owned UID even if a name is reused', async () => {
   const calls: string[][] = [];
   let uid = 'owned-uid';
   const execute = async (args: string[]) => {
@@ -329,9 +333,8 @@ test('removal reclaims the relay database only for an owned Pod and refuses new 
   expect(calls.some(c => c.includes('rm'))).toBe(false);
   uid = 'owned-uid';
   await backend.remove('capacity-synthetic-1');
-  const reclaim = calls.findIndex(c => c.includes('rm') && c.includes('/data/db') && c.includes('/data/strfry.conf'));
-  const removal = calls.findIndex(c => c.includes('delete'));
-  expect(reclaim).toBeGreaterThan(-1); expect(removal).toBeGreaterThan(reclaim);
+  expect(calls.some(c => c.includes('exec'))).toBe(false);
+  expect(calls.some(c => c.includes('delete'))).toBe(true);
   // An interrupt may finish the backend while a creation is still in flight.
   await backend.finish();
   await expect(backend.start('capacity-synthetic-2', '/missing', '/missing')).rejects.toThrow('already finished');
@@ -615,3 +618,30 @@ test('a relay that never restarts and a forward that never becomes ready are rep
     expect(caseFailureReason(forwardError, true)).toBe('Private benchmark port-forward did not become ready');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+for (const acquisition of ['database', 'relay'] as const) {
+  test(`finish waits for an in-flight ${acquisition} forward and stops it before resolving`, async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    let opening = false, stopped = false, finished = false;
+    const pod = { metadata: { uid: 'u' }, status: { podIP: '10.0.0.7', containerStatuses: [{ restartCount: 1, state: { running: {} } }] } };
+    let reads = 0;
+    const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any,
+      async args => { if (!args.includes('get')) return ''; pod.status.containerStatuses[0].restartCount = reads++ === 0 ? 0 : 1; return JSON.stringify(pod); },
+      async () => { opening = true; await pending; return { url: 'ws://127.0.0.1:43210', stop: () => { stopped = true; } }; });
+    (backend as any).databasePrimary = { name: 'primary', uid: 'u', address: '10.0.0.7' };
+    (backend as any).pods.set('capacity-synthetic-1', { uid: 'u' });
+    const acquiring = (acquisition === 'database'
+      ? backend.controllerDatabaseURL(`postgres://${config.databaseRole}:synthetic@ignored/${config.databaseName}`)
+      : backend.restart('capacity-synthetic-1', 1, 1)).catch((error: unknown) => error);
+    while (!opening) await Bun.sleep(1);
+    const finishing = backend.finish().then(() => { finished = true; });
+    await Bun.sleep(10);
+    expect(finished).toBe(false);
+    release();
+    expect(String(await acquiring)).toContain('already finished');
+    await finishing;
+    expect(stopped).toBe(true);
+    expect(finished).toBe(true);
+  });
+}

@@ -633,8 +633,10 @@ transports retain the same database, LOGIN/current-role and version checks. Sele
 Then run `scripts/test-strfry-capacity-kubernetes.sh`. This operation writes
 synthetic fixtures only into the dedicated database and creates isolated Pods;
 it is not a read-only preflight. Keep actual community listeners and the public
-tunnel held throughout measurement. The driver removes its Pods, including each
-Pod's relay database, on normal exit and on SIGINT/SIGTERM; every Pod also
+tunnel held throughout measurement. The driver deletes only its UID-bound Pods on normal exit and on SIGINT/SIGTERM,
+waiting for in-flight resource acquisition before cleanup resolves. It retains
+each Pod's relay database and configuration on the benchmark PVC for reviewed
+cleanup; name-targeted exec cannot safely reclaim files if a Pod is replaced. Every Pod also
 carries a six-hour `activeDeadlineSeconds` as the backstop for a `kill -9` or
 crash that no handler can intercept, and for a Ctrl-C that kills `kubectl create`
 after the API server accepted the request (the Pod's UID is then never learned,
@@ -644,8 +646,9 @@ such leftovers by hand before the next run. It retains
 the benchmark database and reports for reviewed cleanup; it never drops a
 cluster/database or removes the credential/namespace/PVC. Each new benchmark Pod
 uses a unique subdirectory on the benchmark claim; container restart retains
-that directory while cold replacement starts fresh. The emptied per-Pod
-directory remains after removal because the container mounting it cannot delete it. Include disk behavior and
+that directory while cold replacement starts fresh. Per-Pod directories and
+files remain after Pod removal; review and reclaim them separately before disk
+pressure affects subsequent measurements. Include disk behavior and
 shared-node contention in the review rather than treating matching PVC specs as
 proof of identical performance.
 

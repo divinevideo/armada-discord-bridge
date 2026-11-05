@@ -256,7 +256,10 @@ export class KubernetesCapacity {
     this.evidence.context = c.context; this.evidence.namespace = c.namespace; this.evidence.databaseCluster = { ...c.databaseCluster, image: cluster.spec.imageName, resources: cluster.spec.resources };
     return `cnpg=${c.databaseCluster.namespace}/${c.databaseCluster.name};image=${cluster.spec.imageName};cpus=${this.matrix.databaseCpu};memoryBytes=${this.matrix.databaseMemoryBytes}`;
   }
-  async controllerDatabaseURL(credentials: string): Promise<string> {
+  controllerDatabaseURL(credentials: string): Promise<string> {
+    return this.acquire(() => this.openControllerDatabaseURL(credentials));
+  }
+  private async openControllerDatabaseURL(credentials: string): Promise<string> {
     benchmarkURLGuard(this.config, credentials);
     need(this.databasePrimary && !this.databaseForward, 'Verified CNPG primary transport required');
     const anchor = this.databasePrimary;
@@ -296,19 +299,34 @@ export class KubernetesCapacity {
     // loopback rather than PodIP. The owned forward, not this address, binds it.
     need(address === '127.0.0.1' || address === '::1' || address === this.databasePrimary.address, 'Controller server address is inconsistent with its owned primary transport');
   }
-  async finish() {
-    // An interrupt can run this while the measurement is still awaiting a Pod
-    // creation. Refuse new Pods afterwards so one cannot appear after the sweep.
+  private acquisitions = new Set<Promise<unknown>>();
+  private finishing?: Promise<void>;
+  private acquire<T>(run: () => Promise<T>): Promise<T> {
+    if (this.closed) return Promise.reject(new SafeDiagnostic('Capacity backend already finished'));
+    const pending = Promise.resolve().then(() => {
+      need(!this.closed, 'Capacity backend already finished');
+      return run();
+    }).then(value => {
+      need(!this.closed, 'Capacity backend already finished');
+      return value;
+    });
+    this.acquisitions.add(pending);
+    void pending.then(() => this.acquisitions.delete(pending), () => this.acquisitions.delete(pending));
+    return pending;
+  }
+  finish(): Promise<void> {
+    if (this.finishing) return this.finishing;
     this.closed = true;
-    // The interrupt handler exits the process the moment this resolves, so a
-    // creation still in flight must finish (and remove its own Pod, see
-    // createPod) before then; a process that has exited cannot clean up after
-    // a `kubectl create` the API server went on to complete. Not instant: the
-    // wait covers create (30 s timeout) plus that Pod's own removal chain, up to
-    // about three minutes in the worst case. Every step has its own timeout, so
-    // it cannot hang, and a second signal still takes the default action.
-    await Promise.allSettled([...this.creations]);
-    try { await this.close(); } finally { this.databaseForward?.stop(); this.databaseForward = undefined; }
+    // A late create/forward still owns resources. Wait for every acquisition
+    // before sweeping: compensation after finish resolves is too late for the
+    // interrupt handler, which exits the process as soon as finish settles.
+    // Not instant: acquisition and removal each include API requests and waits
+    // with their own timeouts. A second signal still takes the default action.
+    return this.finishing = (async () => {
+      await Promise.allSettled([...this.acquisitions]);
+      await Promise.allSettled([...this.creations]);
+      try { await this.close(); } finally { this.databaseForward?.stop(); this.databaseForward = undefined; }
+    })();
   }
   private async owned(name: string) {
     const record = this.pods.get(name); need(record, 'Pod was not created by this measurement');
@@ -339,12 +357,18 @@ export class KubernetesCapacity {
     const created = JSON.parse(await this.execute([...this.args(), 'create', '-f', '-', '-o', 'json'], JSON.stringify(manifest)));
     need(created.metadata?.uid, 'Created benchmark Pod has no UID');
     this.pods.set(name, { uid: created.metadata.uid });
+    // Compensate a creation that completed after shutdown began, without
+    // proceeding to fixture upload or opening a relay. finish() awaits this
+    // acquisition and retries the UID-conditioned sweep if compensation fails.
     if (this.closed) {
       try { await this.remove(name); } catch { throw new SafeDiagnostic('A Pod created during shutdown could not be removed; inspect the dedicated namespace'); }
       throw new SafeDiagnostic('Capacity backend already finished');
     }
   }
-  async start(name: string, config: string, directory: string, contract?: string, communities: [string, string][] = []) {
+  start(name: string, config: string, directory: string, contract?: string, communities: [string, string][] = []) {
+    return this.acquire(() => this.startOnce(name, config, directory, contract, communities));
+  }
+  private async startOnce(name: string, config: string, directory: string, contract?: string, communities: [string, string][] = []) {
     need(!this.closed, 'Capacity backend already finished');
     const manifest = benchmarkPod(this.config, this.matrix, name);
     if (contract) (manifest.spec.containers[0].env as Json[]).push({ name: 'MODERATION_COMMUNITY_ORGS', value: JSON.stringify(Object.fromEntries(communities)) });
@@ -375,7 +399,10 @@ export class KubernetesCapacity {
     return f.url;
   }
   async logs(name: string) { await this.owned(name); return destinationTimingLog(await this.execute([...this.args(), 'logs', name, '-c', 'relay'])); }
-  async restart(name: string, attempts = 180, intervalMs = 1000) {
+  restart(name: string, attempts = 180, intervalMs = 1000) {
+    return this.acquire(() => this.restartOnce(name, attempts, intervalMs));
+  }
+  private async restartOnce(name: string, attempts: number, intervalMs: number) {
     this.pods.get(name)?.forward?.stop();
     const before = await this.owned(name), count = before.status?.containerStatuses?.[0]?.restartCount ?? 0;
     await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'sh', '-c', 'kill -TERM 1']).catch(() => {});
@@ -396,15 +423,9 @@ export class KubernetesCapacity {
   }
   private async removeOnce(name: string) {
     const pod = await this.owned(name); const record = this.pods.get(name)!; record.forward?.stop();
-    // The Pod's data lives in a subPath of the shared benchmark volume, which
-    // outlives it. Reclaim the relay database and the config upload() wrote into
-    // the same subPath now: each Pod otherwise leaves
-    // its LMDB behind, entrypoint mode creates one Pod per history point, and
-    // the growing tree is re-walked by fsGroup ownership handling on every
-    // later Pod start. Best effort: a Pod past its deadline cannot be exec'd
-    // into. Only the empty per-Pod directory remains, which a container
-    // mounting that subPath cannot remove.
-    await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'rm', '-rf', '/data/db', '/data/strfry.conf', '/data/strfry.conf.new']).catch(() => {});
+    // Retain PVC files for reviewed cleanup. kubectl exec targets a name,
+    // not a UID: even after owned() a replacement could receive a destructive
+    // command before the UID-conditioned API delete rejects that replacement.
     // UID precondition prevents a replacement resource from being removed by cleanup.
     await this.execute([...this.args(), 'delete', '--raw', `/api/v1/namespaces/${this.config.namespace}/pods/${name}`, '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: pod.metadata.uid } }));
     await this.execute([...this.args(), 'wait', '--for=delete', `pod/${name}`, '--timeout=90s']);
