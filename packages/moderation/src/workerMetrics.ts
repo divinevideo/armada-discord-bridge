@@ -5,12 +5,15 @@ import { controlState } from "./relayPolicy";
 
 export interface WorkerAuthorityObservation { available: boolean; validUntil: number }
 /** Aggregate capability observation, never an authorization input. Target rank,
- * channel scope and publication fences remain enforced by ConcordActions. */
-export function observeWorkerAuthority(community: CommunityV2, worker: string, policy: CommunityPolicy, now = Date.now()): WorkerAuthorityObservation {
+ * channel scope and publication fences remain enforced by ConcordActions.
+ * `folded` must be `controlState(policy).folded`. The refresh already folds the
+ * full control history for stream keys, and folding it again here would double
+ * the cost of every refresh, including those on the action path. */
+export function observeWorkerAuthority(community: CommunityV2, worker: string, policy: CommunityPolicy, now = Date.now(), folded?: ReturnType<typeof controlState>["folded"]): WorkerAuthorityObservation {
   const unavailable = { available: false, validUntil: now };
   try {
     if (policy.communityId !== community.idHex || policy.owner !== community.owner || worker === community.owner || !policy.complete || policy.rekeyPending || !Number.isFinite(policy.validUntil) || policy.validUntil <= now) return unavailable;
-    const { folded } = controlState(policy);
+    folded ??= controlState(policy).folded;
     if (folded.incomplete.length || policy.banned.includes(worker) || folded.banned.has(worker)) return unavailable;
     if (!isAuthorized(folded.roster, worker, community.owner, Permissions.BAN) || !isAuthorized(folded.roster, worker, community.owner, Permissions.MANAGE_MESSAGES)) return unavailable;
     const entityId = grantLocator(community.id, hex32(worker)), grant = folded.heads.get(bytesToHex(entityId));

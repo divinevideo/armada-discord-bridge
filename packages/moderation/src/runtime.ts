@@ -60,11 +60,12 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
     try {
       const policy = await watcher!.refresh();
       await observeWorkerCapacity(sql, capacity, community.idHex);
-      registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
+      const { folded } = controlState(policy);
+      registerStreamKeys(channelsView(community, folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
       health.checkedAt = Date.now();
       // Capacity observation awaits SQL after the policy refresh. A disconnect
       // during that await must not let this old policy restore a green gauge.
-      if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt);
+      if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt, folded);
       health.ready = !policy.rekeyPending;
       health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
       return policy;

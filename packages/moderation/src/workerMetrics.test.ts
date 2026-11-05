@@ -31,6 +31,16 @@ test("revoked or missing grants and banned workers cannot report authority", asy
   expect(observeWorkerAuthority(f.community, f.moderator.pk, { ...f.policy, banned: [f.moderator.pk] }).available).toBe(false);
 });
 
+test("a caller's fold of the policy is used instead of folding the control history again", async () => {
+  const f = await moderationFixture();
+  const grant = controlState(f.policy).folded.heads.get(bytesToHex(grantLocator(f.community.id, hex32(f.moderator.pk))))!;
+  const revoked = await sealEdition(buildGrantEdition(f.community.id, { member: f.moderator.pk, roleIds: [] }, { actorPubkey: f.owner.pk, version: 2n, prevHash: grant.hash }), currentControlWriteGroup(f.community), f.owner.signer);
+  // Deliberately mismatched: only the passed fold carries the revocation.
+  const { folded } = controlState({ ...f.policy, controlEvents: [...f.policy.controlEvents, revoked] });
+  expect(observeWorkerAuthority(f.community, f.moderator.pk, f.policy).available).toBe(true);
+  expect(observeWorkerAuthority(f.community, f.moderator.pk, f.policy, Date.now(), folded).available).toBe(false);
+});
+
 test("missing write key, stale, incomplete, rekey and unverified policy never report authority", async () => {
   const f = await moderationFixture();
   expect(observeWorkerAuthority({ ...f.community, controlRoot: undefined }, f.moderator.pk, f.policy).available).toBe(false);
