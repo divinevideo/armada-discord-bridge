@@ -441,3 +441,42 @@ test('the output guard sees where mkdir would really write, through symlinks and
     expect(await realpathOfFuture(dir)).toBe(real);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+import { quantity } from './capacity-kubernetes';
+test('Kubernetes quantities compare by value, not by spelling', async () => {
+  expect(quantity('1Gi')).toBe(1073741824);
+  expect(quantity('1024Mi')).toBe(1073741824);
+  expect(quantity('1073741824')).toBe(1073741824);
+  expect(quantity(1073741824)).toBe(1073741824);
+  expect(quantity('0.5Gi')).toBe(536870912);
+  expect(quantity('1G')).toBe(1e9);
+  expect(quantity('1024M')).toBe(1.024e9);
+  expect(quantity('1Ti')).toBe(2 ** 40);
+  expect(quantity('129e6')).toBe(129e6);
+  expect(quantity('1E3')).toBe(1000);
+  expect(quantity('2')).toBe(quantity('2000m'));
+  expect(quantity('250m')).toBe(0.25);
+  expect(quantity('100m')).toBe(0.1);
+  expect(quantity(0.25)).toBe(quantity('250m'));
+  expect(quantity(undefined)).toBeNaN();
+  for (const bad of ['', 'abc', '1 Gi', '-1', '1Gb', '1gi', 'Gi']) expect(() => quantity(bad)).toThrow('Unsupported Kubernetes quantity');
+});
+
+test('preflight accepts the same storage size spelled differently and still refuses a different one', async () => {
+  const m = { ...fullMatrix, ...matrix } as any;
+  const relay = benchmarkPod(config, m, 'capacity-synthetic-1').spec.containers[0];
+  // The deployment states its limits in other spellings of the same values.
+  relay.resources = { requests: { cpu: '250m', memory: '256Mi' }, limits: { cpu: '2000m', memory: '1024Mi' } };
+  const claim = (size: string, volumeName: string) => ({ metadata: { labels: { 'divine.video/capacity-benchmark': 'true' } }, status: { phase: 'Bound' }, spec: { volumeName, storageClassName: 'synthetic-rwo', volumeMode: 'Filesystem', accessModes: ['ReadWriteOnce'], resources: { requests: { storage: size } } } });
+  const run = (benchmark: string, destination: string) => new KubernetesCapacity(config, m, async (args: string[]) => {
+    if (args.includes('deployment')) return JSON.stringify({ spec: { template: { spec: { containers: [relay] } } } });
+    if (args.includes('pvc')) return JSON.stringify(args.includes('capacity-data') ? claim(benchmark, 'benchmark-pv') : claim(destination, 'production-pv'));
+    if (args.includes('namespace')) return JSON.stringify({ metadata: { name: config.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } } });
+    if (args.includes('networkpolicies')) return JSON.stringify({ items: [{ spec: { podSelector: {}, policyTypes: ['Ingress'], ingress: [] } }] });
+    if (args.includes('cluster')) return JSON.stringify({ spec: { imageName: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2', memory: '8192Mi' } } }, status: { currentPrimary: 'synthetic-postgres-primary' } });
+    if (args.includes('pod')) return JSON.stringify({ metadata: { uid: 'u' }, spec: { containers: [{ name: 'postgres', image: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2000m', memory: '8Gi' } } }] }, status: { podIP: '10.0.0.2' } });
+    return JSON.stringify({ items: [] });
+  }).prepare();
+  await expect(run('20Gi', '20480Mi')).resolves.toContain('cnpg=');
+  await expect(run('20Gi', '21Gi')).rejects.toThrow('storage size');
+});

@@ -104,8 +104,27 @@ export function benchmarkPod(c: DestinationConfig, m: Resources, name: string) {
     }], volumes: [{ name: 'data', persistentVolumeClaim: { claimName: c.relayStorage.claimName } }, { name: 'fixtures', emptyDir: {} }, { name: 'tmp', emptyDir: { sizeLimit: '128Mi' } }],
   } };
 }
-function cpu(value: string | number): number { return typeof value === 'string' && value.endsWith('m') ? Number(value.slice(0, -1)) / 1000 : Number(value); }
-function memory(value: string | number): number { const match = String(value).match(/^(\d+)(Ki|Mi|Gi)?$/); need(match, 'Unsupported memory quantity'); return Number(match[1]) * ({ Ki: 1024, Mi: 1048576, Gi: 1073741824 }[match[2] ?? ''] ?? 1); }
+const BINARY_SUFFIX: Record<string, number> = { Ki: 2 ** 10, Mi: 2 ** 20, Gi: 2 ** 30, Ti: 2 ** 40, Pi: 2 ** 50, Ei: 2 ** 60 };
+const DECIMAL_SUFFIX: Record<string, number> = { '': 1, k: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15, E: 1e18 };
+const FRACTION_DIVISOR: Record<string, number> = { n: 1e9, u: 1e6, m: 1e3 };
+/**
+ * A Kubernetes resource quantity as a number. Preflight compares what the
+ * cluster reports against what the matrix declares, and the API server
+ * canonicalizes nothing for the caller: the same 1 GiB may read `1Gi`,
+ * `1024Mi`, `1073741824` or `1.073741824G`, and the same CPU `2` or `2000m`.
+ * Comparing strings, or parsing only Ki/Mi/Gi, refused equivalent and
+ * legitimate destinations with a message that named the wrong thing.
+ * An absent quantity is NaN so a comparison fails cleanly with its own message.
+ */
+export function quantity(value: string | number | undefined | null): number {
+  if (value === undefined || value === null) return NaN;
+  const match = String(value).match(/^([0-9]+(?:\.[0-9]*)?|\.[0-9]+)(Ki|Mi|Gi|Ti|Pi|Ei|n|u|m|k|M|G|T|P|E|[eE][+-]?[0-9]+)?$/);
+  need(match, 'Unsupported Kubernetes quantity');
+  const amount = Number(match[1]), suffix = match[2] ?? '';
+  if (suffix in FRACTION_DIVISOR) return amount / FRACTION_DIVISOR[suffix];
+  return amount * (BINARY_SUFFIX[suffix] ?? DECIMAL_SUFFIX[suffix] ?? 10 ** Number(suffix.slice(1)));
+}
+const cpu = quantity, memory = quantity;
 export function verifyRelayReadback(c: DestinationConfig, m: Resources, pod: Json, identity: Json, node: Json) {
   const container = pod.spec?.containers?.find((x: Json) => x.name === 'relay');
   const status = pod.status?.containerStatuses?.find((x: Json) => x.name === 'relay');
@@ -209,7 +228,7 @@ export class KubernetesCapacity {
     const sourceStorage = JSON.parse(await this.execute(['kubectl', `--context=${c.context}`, '--request-timeout=30s', '-n', c.relayDeployment.namespace, 'get', 'pvc', c.relayStorage.productionClaimName, '-o', 'json']));
     need(storage.metadata?.labels?.['divine.video/capacity-benchmark'] === 'true' && storage.status?.phase === 'Bound' && sourceStorage.status?.phase === 'Bound' && storage.spec?.volumeName && storage.spec.volumeName !== sourceStorage.spec?.volumeName, 'Separate bound benchmark storage required');
     for (const field of ['storageClassName', 'volumeMode', 'accessModes']) need(JSON.stringify(storage.spec[field]) === JSON.stringify(sourceStorage.spec[field]), 'Benchmark storage class/mode differs from destination');
-    need(storage.spec.resources?.requests?.storage === sourceStorage.spec?.resources?.requests?.storage, 'Benchmark storage size differs from destination');
+    need(quantity(storage.spec.resources?.requests?.storage) === quantity(sourceStorage.spec?.resources?.requests?.storage), 'Benchmark storage size differs from destination');
     this.evidence.relayStorage = { benchmark: { name: c.relayStorage.claimName, spec: storage.spec }, destination: { name: c.relayStorage.productionClaimName, spec: sourceStorage.spec } };
     const namespace = await this.json(['get', 'namespace', c.namespace]);
     const policies = await this.json(['get', 'networkpolicies']);
