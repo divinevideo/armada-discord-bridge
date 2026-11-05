@@ -1,12 +1,17 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import postgres from 'postgres';
+import { buildChannelEdition, bytesToHex, currentControlWriteGroup, mintCommunity, sealEdition } from '@armada-bridge/concord-core';
 import type { ChannelV2 } from '@armada-bridge/concord-core';
+import { generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { ConcordClient } from '../packages/bridge/src/concord/client';
+import { localIdentity } from '../packages/bridge/src/concord/signer';
+import type { RelayLike } from '../packages/bridge/src/concord/pool';
 import type { DeliveredChat, ReplayOptions } from '../packages/bridge/src/concord/replay';
 import type { DeliverySnapshot } from '../packages/bridge/src/db/deliveryState';
 import type { ChannelLink } from '../packages/bridge/src/router';
 import { PostgresMappingStore } from '../packages/bridge/src/db/store';
 import { migrate } from '../packages/bridge/src/db/migrate';
-import { probeFloor, readProbeState, scanCandidates, secondsIso } from './probe-backlog';
+import { inspectProbeCandidates, probeFloor, readProbeState, scanCandidates, secondsIso } from './probe-backlog';
 
 const channel = { streams: [{ group: { pk: 'a'.repeat(64) } }] } as ChannelV2;
 const context = { signal: new AbortController().signal };
@@ -87,6 +92,63 @@ test('deadline aborts replay and rejects late callback observations', async () =
   await expect(captured!.onBatch!({ chats: chats(9) }, context)).rejects.toThrow();
   await expect(captured!.onWindowComplete!({ since: 0, until: 100, runUntil: 100 }, context)).rejects.toThrow();
   expect(result.decodedCandidates).toBe(0); expect(result.observedCertifiedUntil).toBeUndefined();
+});
+
+test('a source failing control discovery cannot be hidden by its later successful replay', async () => {
+  const owner = localIdentity(generateSecretKey());
+  const { community } = mintCommunity('Synthetic discovery', owner.pk, ['wss://a.example', 'wss://b.example']);
+  const id = new Uint8Array(32).fill(17);
+  community.privateChannels.push({ id, key: generateSecretKey(), epoch: 1n, name: 'Synthetic held channel' });
+  const edition = await sealEdition(buildChannelEdition(id, { name: 'Synthetic public channel', private: false },
+    { actorPubkey: owner.pk, version: 1n }), currentControlWriteGroup(community), owner.signer);
+  let controlFails = true, replaySources: string[] = [], bestEffortQueries = 0;
+  const sourceControl = async (url: string) => {
+    if (url === community.relays[1] && controlFails) throw new Error('synthetic source unavailable');
+    return url === community.relays[1] ? [edition] : [];
+  };
+  const pool: RelayLike = {
+    replayRelays: community.relays,
+    query: async () => { bestEffortQueries++; return (await Promise.allSettled(community.relays.map(sourceControl)))
+      .flatMap(result => result.status === 'fulfilled' ? result.value : []); },
+    queryStrict: async () => (await Promise.all(community.relays.map(sourceControl))).flat(),
+    // The source recovers for data replay even while its control query fails.
+    enumerateRelay: async url => { replaySources.push(url); return []; }, fetchRelay: async () => [],
+    publish: async () => { throw new Error('probe published'); }, subscribe: () => { throw new Error('probe subscribed'); }, close: async () => {},
+  };
+  const legacy = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  await legacy.syncControl();
+  const incompleteChannel = legacy.channel(bytesToHex(id))!;
+  expect(incompleteChannel.streams).toHaveLength(1); // Only the held private key; root history is omitted.
+  expect((await scanCandidates(incompleteChannel, 0, legacy.backfillChannel.bind(legacy))).scanComplete).toBe(true);
+  expect(replaySources).toEqual(community.relays);
+  replaySources = [];
+  await expect(inspectProbeCandidates(community, pool, snapshot, bytesToHex(id))).rejects.toThrow('synthetic source unavailable');
+  expect(replaySources).toEqual([]); expect(bestEffortQueries).toBe(1);
+  controlFails = false;
+  const recovered = await inspectProbeCandidates(community, pool, snapshot, bytesToHex(id));
+  expect(replaySources).toEqual(community.relays);
+  expect(recovered.discoveredStreamCount).toBe(2);
+  expect(recovered.discoveredStreamsScanComplete).toBe(true);
+  expect(recovered.scanComplete).toBe(false);
+  expect(recovered.streamInventory).toBe('uncertified_control_req');
+  expect(recovered.incompleteReason).toBe('stream_inventory_uncertified');
+});
+
+test('successful capped control REQ remains ambiguous rather than complete stream inventory', async () => {
+  const sk = generateSecretKey();
+  const { community } = mintCommunity('Synthetic capped discovery', getPublicKey(sk), ['wss://a.example']);
+  const id = new Uint8Array(32).fill(18);
+  community.privateChannels.push({ id, key: generateSecretKey(), epoch: 1n, name: 'Synthetic held channel' });
+  const pool: RelayLike = { replayRelays: community.relays,
+    query: async () => { throw new Error('best effort discovery'); },
+    queryStrict: async () => [], // EOSE can hide capped/omitted control editions.
+    enumerateRelay: async () => [], fetchRelay: async () => [], publish: async () => {}, subscribe: () => () => {}, close: async () => {} };
+  const result = await inspectProbeCandidates(community, pool, snapshot, bytesToHex(id));
+  expect(result.discoveredStreamCount).toBe(1);
+  expect(result.discoveredStreamsScanComplete).toBe(true); expect(result.scanComplete).toBe(false);
+  expect(result.incompleteReason).toBe('stream_inventory_uncertified');
+  delete pool.queryStrict;
+  await expect(inspectProbeCandidates(community, pool, snapshot, bytesToHex(id))).rejects.toThrow('Strict control discovery unavailable');
 });
 
 const url = process.env.DATABASE_URL;

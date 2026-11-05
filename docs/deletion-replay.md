@@ -156,6 +156,15 @@ reported as unknown history requiring upgrade/activation, not as live-only or
 complete. A persisted uncertainty marker selects zero for the replacement scan
 without changing the lifecycle's deletion applicability floor.
 
+Probe control discovery requires successful REQ responses from every configured
+source before payload replay; a failed source is not hidden by later successful
+history enumeration. These control REQs may still be capped: their EOSE does
+not certify that all control editions or held stream keys were discovered.
+The report therefore always exposes `streamInventory: uncertified_control_req`
+and `scanComplete: false`. `discoveredStreamsScanComplete` describes only the
+payload inventory for the discovered stream set; it cannot certify the stream
+set itself. An otherwise completed scan reports `stream_inventory_uncertified`.
+
 The probe streams decoded candidate counts by kind (message, deletion, reaction,
 typing and other). It does not apply lifecycle/ordinary boundaries, current
 router authorization, mapping dedupe or no-op handling to predict Discord posts.
@@ -163,8 +172,9 @@ It processes at most 65,536 decoded candidates, 4096 completed windows and a
 60-second scan deadline per link, using the same bounded replay implementation.
 A stopped/failed scan reports incomplete status and only its observed completed
 prefix separately from the persisted checkpoint. Partial-window candidate counts
-may exceed that prefix. Even a complete scan describes only the retained
-inventory through its frozen upper bound, not end-to-end delivery readiness.
+may exceed that prefix. Even a completed scan of discovered streams describes only their retained
+inventory through its frozen upper bound, not a complete stream inventory or
+end-to-end delivery readiness.
 Errors use fixed reason codes without arbitrary source text; timestamps are
 seconds converted to milliseconds for display. Imports do not execute the CLI.
 

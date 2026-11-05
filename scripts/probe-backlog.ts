@@ -6,9 +6,10 @@
 import postgres from 'postgres';
 import { generateSecretKey } from 'nostr-tools/pure';
 import { KIND_DELETE, KIND_REACTION, KIND_TYPING, STOCK_RELAYS, parseInviteLink } from '@armada-bridge/concord-core';
-import type { ChannelV2 } from '@armada-bridge/concord-core';
+import type { ChannelV2, CommunityV2 } from '@armada-bridge/concord-core';
 import { ConcordClient, resolveInvite } from '../packages/bridge/src/concord/client';
 import { RelayPool } from '../packages/bridge/src/concord/pool';
+import type { RelayLike } from '../packages/bridge/src/concord/pool';
 import { localIdentity } from '../packages/bridge/src/concord/signer';
 import type { ReplayOptions, ReplayResult } from '../packages/bridge/src/concord/replay';
 import type { ChannelLink } from '../packages/bridge/src/router';
@@ -110,6 +111,27 @@ export async function scanCandidates(channel: ChannelV2, floor: number, replay: 
   return result;
 }
 
+/** Every configured source must answer discovery before we inspect payloads.
+ * Strict REQ detects source failures but cannot prove absence of capped control
+ * editions, so even a completed payload scan is conditional on discovered keys. */
+export async function inspectProbeCandidates(community: CommunityV2, pool: RelayLike, snapshot: DeliverySnapshot, channelId: string) {
+  if (!pool.queryStrict) throw new Error('Strict control discovery unavailable');
+  const strictPool: RelayLike = {
+    query: pool.queryStrict.bind(pool),
+    replayRelays: pool.replayRelays,
+    enumerateRelay: pool.enumerateRelay?.bind(pool), fetchRelay: pool.fetchRelay?.bind(pool),
+    publish: pool.publish.bind(pool), subscribe: pool.subscribe.bind(pool), close: pool.close.bind(pool),
+  };
+  const client = new ConcordClient(community, strictPool, localIdentity(generateSecretKey()));
+  await client.syncControl({ signal: AbortSignal.timeout(PROBE_LIMITS.durationMs) });
+  const channel = client.channel(channelId);
+  if (!channel) throw new Error('Probe channel unavailable');
+  const scan = await scanCandidates(channel, probeFloor(snapshot, channel.streams.map(stream => stream.group.pk)), client.backfillChannel.bind(client));
+  return { ...scan, discoveredStreamCount: channel.streams.length, discoveredStreamsScanComplete: scan.scanComplete,
+    scanComplete: false, streamInventory: 'uncertified_control_req' as const,
+    incompleteReason: scan.incompleteReason ?? 'stream_inventory_uncertified' as const };
+}
+
 type ProbeRow = Pick<BridgeRow, 'bridge_id' | 'status' | 'invite_url_sealed' | 'community_id' | 'concord_channel_id' | 'discord_guild_id' | 'discord_channel_id'> & { tenant_id: string };
 
 export async function runProbeCli(ids = process.argv.slice(2)): Promise<void> {
@@ -157,11 +179,7 @@ export async function runProbeCli(ids = process.argv.slice(2)): Promise<void> {
         const relays = await deliveryRelays(community.relays, STOCK_RELAYS);
         pool = new RelayPool(relays);
         stage = 'control_unavailable';
-        const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
-        await client.syncControl({ signal: AbortSignal.timeout(PROBE_LIMITS.durationMs) });
-        const channel = client.channel(link.concordChannelIdHex);
-        if (!channel) { stage = 'channel_unavailable'; throw new Error(); }
-        const scan = await scanCandidates(channel, probeFloor(s, channel.streams.map(stream => stream.group.pk)), client.backfillChannel.bind(client));
+        const scan = await inspectProbeCandidates(community, pool, s, link.concordChannelIdHex);
         console.log(JSON.stringify({ ...metadata, state: s.suspended ? 'suspended' : 'active', configuredRelayCount: relays.length,
           ...scan, scanFloorIso: secondsIso(scan.scanFloor), observedCertifiedUntilIso: secondsIso(scan.observedCertifiedUntil),
           interpretation: 'decoded_candidates_only_not_discord_post_predictions' }));
