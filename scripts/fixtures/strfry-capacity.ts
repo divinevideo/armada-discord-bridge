@@ -327,7 +327,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       const url = await kube.controllerDatabaseURL(credentials);
       await destinationDatabaseSetup(async () => {
         benchmarkURLGuard(destination, url);
-        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {}, connection: { options: '' } }); locker = postgres(url, { max: 1, onnotice: () => {}, connection: { options: '' } });
+        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {}, connection: { options: '' } }); locker = postgres(url, { max: 1, max_lifetime: null, onnotice: () => {}, connection: { options: '' } });
         const [identity] = await sql.unsafe<Omit<DatabaseObservation, "populatedTables" | "schemaPresent">[]>(BENCHMARK_IDENTITY_SQL);
         const tables = await sql`SELECT n.nspname AS schema,c.relname AS name,pg_catalog.pg_get_userbyid(c.relowner)=current_user AS owned FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','m','f') ORDER BY n.nspname,c.relname`;
         let populatedTables = 0;
@@ -357,7 +357,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       catch { if (attempt > 200) throw new SafeDiagnostic("Capacity PostgreSQL unavailable"); await Bun.sleep(100); }
     }
     const pgPort = (await docker("port", dbName, "5432/tcp")).split(":").at(-1), url = `postgres://bridge@127.0.0.1:${pgPort}/bridge`;
-    sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, onnotice: () => {} });
+    sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, max_lifetime: null, onnotice: () => {} });
     }
     if (!sql || !locker) throw new SafeDiagnostic("Capacity database connection was not initialized");
     // Shared-cluster role creation/membership is not benchmark authority. The
@@ -423,7 +423,14 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       let release: Promise<unknown> | undefined;
       if (holdLockMs) {
         await locker!`SELECT pg_advisory_lock(hashtextextended(${f.policy.communityId},483210))`;
-        release = Bun.sleep(holdLockMs).then(() => locker!`SELECT pg_advisory_unlock(hashtextextended(${f.policy.communityId},483210))`);
+        // The locker must keep one session for the whole hold. postgres.js retires
+        // a pooled connection after 30-60 minutes by default and closes it when
+        // idle, which drops a session lock without any error. If that happens
+        // mid-hold, a fault sample measures nothing, so a lost lock must fail it.
+        release = Bun.sleep(holdLockMs).then(async () => {
+          const [held] = await locker!`SELECT pg_advisory_unlock(hashtextextended(${f.policy.communityId},483210)) AS released`;
+          if (!held.released) throw new SafeDiagnostic("Fault-injection lock was lost before release");
+        });
       }
       try {
         const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
