@@ -431,6 +431,11 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           const [held] = await locker!`SELECT pg_advisory_unlock(hashtextextended(${f.policy.communityId},483210)) AS released`;
           if (!held.released) throw new SafeDiagnostic("Fault-injection lock was lost before release");
         });
+        // The hold ends while the sample is still in its post-ack observation
+        // horizon, seconds before the finally awaits it. Mark the rejection as
+        // observed now so Bun does not report it as unhandled; the finally's
+        // await still rethrows it into the case reason.
+        release.catch(() => {});
       }
       try {
         const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
