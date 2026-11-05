@@ -136,7 +136,7 @@ test('destination preflight compares the selected relay, separate PVC and runnin
   const m = { ...fullMatrix, ...matrix } as any;
   const relay = benchmarkPod(config, m, 'capacity-synthetic-1').spec.containers[0];
   const storage = { metadata: { labels: { 'divine.video/capacity-benchmark': 'true' } }, status: { phase: 'Bound' }, spec: { volumeName: 'synthetic-benchmark-pv', storageClassName: 'synthetic-rwo', volumeMode: 'Filesystem', accessModes: ['ReadWriteOnce'], resources: { requests: { storage: '20Gi' } } } };
-  let failStorage = false;
+  let failStorage = false, primaryUID = 'synthetic-primary-uid', replacePrimaryDuringForward = false;
   const execute = async (args: string[]) => {
     expect(args).not.toContain('create'); expect(args).not.toContain('delete');
     if (args.includes('deployment')) return JSON.stringify({ spec: { template: { spec: { containers: [relay] } } } });
@@ -144,11 +144,33 @@ test('destination preflight compares the selected relay, separate PVC and runnin
     if (args.includes('namespace')) return JSON.stringify({ metadata: { name: config.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } } });
     if (args.includes('networkpolicies')) return JSON.stringify({ items: [{ spec: { podSelector: {}, policyTypes: ['Ingress'], ingress: [] } }] });
     if (args.includes('cluster')) return JSON.stringify({ spec: { imageName: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2', memory: '8Gi' } } }, status: { currentPrimary: 'synthetic-postgres-primary' } });
-    if (args.includes('pod')) return JSON.stringify({ spec: { containers: [{ name: 'postgres', image: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2', memory: '8Gi' } } }] }, status: { podIP: '10.0.0.2' } });
+    if (args.includes('pod')) return JSON.stringify({ metadata: { uid: primaryUID }, spec: { containers: [{ name: 'postgres', image: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2', memory: '8Gi' } } }] }, status: { podIP: '10.0.0.2' } });
     return JSON.stringify({ items: [] });
   };
-  const backend = new KubernetesCapacity(config, m, execute);
+  let databaseForwardStopped = false;
+  const backend = new KubernetesCapacity(config, m, execute, async (args, port) => {
+    expect(port).toBe(5432);
+    expect(args).toContain('postgres-clusters');
+    expect(args.at(-1)).toBe('pod/synthetic-postgres-primary');
+    if (replacePrimaryDuringForward) primaryUID = 'replacement-primary-uid';
+    return { url: 'ws://127.0.0.1:15432', stop: () => { databaseForwardStopped = true; } };
+  });
   expect(await backend.prepare()).toContain('image=registry.example/postgresql:18.1-test');
+  const credentialURL = `postgres://${config.databaseRole}:synthetic-password@unrelated.example/${config.databaseName}`;
+  const bound = new URL(await backend.controllerDatabaseURL(credentialURL));
+  expect(bound.hostname).toBe('127.0.0.1');
+  expect(bound.port).toBe('15432');
+  expect(bound.username).toBe(config.databaseRole);
+  expect(() => backend.assertControllerAddress('127.0.0.1')).not.toThrow();
+  expect(() => backend.assertControllerAddress('::1')).not.toThrow();
+  expect(() => backend.assertControllerAddress('10.0.0.99')).toThrow();
+  await backend.finish();
+  expect(databaseForwardStopped).toBe(true);
+  expect(() => backend.assertControllerAddress('127.0.0.1')).toThrow();
+  databaseForwardStopped = false;
+  replacePrimaryDuringForward = true;
+  await expect(backend.controllerDatabaseURL(credentialURL)).rejects.toThrow('primary changed');
+  expect(databaseForwardStopped).toBe(true);
   expect(backend.evidence.databaseServerAddress).toBe('10.0.0.2');
   expect(backend.evidence.destinationMatched).toBe(false);
   failStorage = true;

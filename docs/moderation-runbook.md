@@ -579,8 +579,11 @@ creation. A changed UID is an error, not permission to delete its replacement.
 Provision a fresh `concord_capacity_*` database and role on the selected CNPG
 PostgreSQL 18.1 cluster. The role must own this database and its local tables,
 have no superuser/create-role/create-database authority or role memberships, and
-have no privileges on the chat database. The dedicated Secret and private local
-connection must name this same database/role and observed CNPG primary. Both `session_user` and `current_user` must identify this dedicated LOGIN role;
+have no privileges on the chat database. The dedicated Secret and controller credentials must name this same database
+and role. Mounted credentials connect directly to the verified CNPG primary Pod
+address. The controller instead uses a driver-owned, API-authenticated database
+port-forward to that primary Pod, with its UID/IP checked before and after the
+forward is established. Both `session_user` and `current_user` must identify this dedicated LOGIN role;
 its actual login attributes are checked through qualified system catalogs. URL
 startup overrides and alternate usernames are refused for both the controller
 and mounted credential, and inherited startup options are cleared. Never reuse
@@ -612,7 +615,14 @@ injected into the relay image. The current destination matrix describes 2 CPU /
 reviewed deployment readbacks.
 
 Supply `CAPACITY_DATABASE_URL` using approved private credential tooling, without
-printing it or storing it in the metadata JSON. Select a private absolute
+printing it or storing it in the metadata JSON. Only its credentials, database
+and permitted TLS setting are used: its hostname and port are replaced with the
+owned loopback database forward, with no fallback to the supplied endpoint.
+PostgreSQL may see loopback on this transport rather than the Pod IP; that is
+accepted only while the owned forward is bound to the verified primary Pod/UID.
+SQL identity uses `host(inet_server_addr())` to remove inet display masks. The
+mounted credential still requires an exact bare primary Pod address. Both
+transports retain the same database, LOGIN/current-role and version checks. Select a private absolute
 `CAPACITY_OUTPUT_DIR` outside version control. Set
 `CAPACITY_KUBERNETES_CONFIG` to the private metadata file and
 `CAPACITY_EXECUTE_DESTINATION=1` only after the benchmark operation is authorized.

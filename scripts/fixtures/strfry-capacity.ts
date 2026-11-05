@@ -191,8 +191,9 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   try {
     if (kube && destination) {
       report.resourceEnvelope.database = await kube.prepare();
-      const url = process.env.CAPACITY_DATABASE_URL;
-      if (!url) throw new Error("Dedicated private CAPACITY_DATABASE_URL required");
+      const credentials = process.env.CAPACITY_DATABASE_URL;
+      if (!credentials) throw new Error("Dedicated private CAPACITY_DATABASE_URL required");
+      const url = await kube.controllerDatabaseURL(credentials);
       await destinationDatabaseSetup(async () => {
         benchmarkURLGuard(destination, url);
         sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {}, connection: { options: '' } }); locker = postgres(url, { max: 1, onnotice: () => {}, connection: { options: '' } });
@@ -206,7 +207,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
         const schemaPresent = ['community_policy','streams','public_capacity_state','publication_recoveries'].every(name => tables.some(table => table.schema === 'moderation' && table.name === name));
         const observation = { ...identity, populatedTables, schemaPresent } as DatabaseObservation;
         benchmarkDatabaseGuard(destination, observation);
-        if (observation.serverAddress !== kube.evidence.databaseServerAddress) throw new Error("Database is not the observed CNPG primary");
+        kube.assertControllerAddress(observation.serverAddress);
         kube.evidence.schemaTables = tables.map(table => ({ schema: table.schema, name: table.name }));
         kube.evidence.databaseObservation = observation;
       });
@@ -362,7 +363,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     for (const ws of sockets) ws.close(); await sql?.end({ timeout: 2 }); await locker?.end({ timeout: 2 });
     if (kube) {
       await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
-      await kube.close();
+      await kube.finish();
     } else {
       for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
       await docker("network", "rm", label).catch(() => {});

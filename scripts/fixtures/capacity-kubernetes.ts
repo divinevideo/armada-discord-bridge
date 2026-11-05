@@ -39,7 +39,7 @@ export function benchmarkURLGuard(c: Pick<DestinationConfig, 'databaseRole' | 'd
     if (!['postgres:', 'postgresql:'].includes(url.protocol) || decodeURIComponent(url.username) !== c.databaseRole || decodeURIComponent(url.pathname.slice(1)) !== c.databaseName || [...url.searchParams.keys()].some(key => key !== 'sslmode')) throw new Error();
   } catch { throw new Error('Dedicated benchmark URL identity or startup parameters are invalid (diagnostics withheld)'); }
 }
-export const BENCHMARK_IDENTITY_SQL = `SELECT pg_catalog.current_database() AS database,current_user AS role,session_user AS login,pg_catalog.inet_server_addr()::text AS "serverAddress",pg_catalog.split_part(pg_catalog.current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",r.rolcanlogin AS "loginCanLogin",pg_catalog.pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_catalog.pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database() WHERE r.rolname=session_user`;
+export const BENCHMARK_IDENTITY_SQL = `SELECT pg_catalog.current_database() AS database,current_user AS role,session_user AS login,pg_catalog.host(pg_catalog.inet_server_addr()) AS "serverAddress",pg_catalog.split_part(pg_catalog.current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",r.rolcanlogin AS "loginCanLogin",pg_catalog.pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_catalog.pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database() WHERE r.rolname=session_user`;
 export function benchmarkLoginGuard(c: DestinationConfig, o: Pick<DatabaseObservation, 'role' | 'login' | 'loginCanLogin' | 'superuser' | 'createDatabase' | 'createRole' | 'roleMemberships'>) {
   need(o.role === c.databaseRole && o.login === c.databaseRole, 'Both session login and current role must be the dedicated benchmark role');
   need(o.loginCanLogin === true && o.superuser === false && o.createDatabase === false && o.createRole === false && o.roleMemberships === 0, 'Benchmark login must be unprivileged and have no memberships');
@@ -112,8 +112,8 @@ export async function capacityCommand(args: string[], input?: string): Promise<s
 }
 
 interface Forward { url: string; stop(): void }
-async function forward(args: string[]): Promise<Forward> {
-  const child = Bun.spawn([...args.slice(0, -1).map(arg => arg.startsWith('--request-timeout=') ? '--request-timeout=0' : arg), 'port-forward', args.at(-1)!, '--address=127.0.0.1', ':7777'], { stdout: 'pipe', stderr: 'pipe' });
+async function forward(args: string[], remotePort = 7777): Promise<Forward> {
+  const child = Bun.spawn([...args.slice(0, -1).map(arg => arg.startsWith('--request-timeout=') ? '--request-timeout=0' : arg), 'port-forward', args.at(-1)!, '--address=127.0.0.1', `:${remotePort}`], { stdout: 'pipe', stderr: 'pipe' });
   const reader = child.stdout.getReader(); let text = '';
   try {
     const started = Date.now();
@@ -121,7 +121,7 @@ async function forward(args: string[]): Promise<Forward> {
       const result = await Promise.race([reader.read(), Bun.sleep(30000).then(() => ({ done: true, value: undefined }))]);
       if (result.done) break;
       text += new TextDecoder().decode(result.value);
-      const port = text.match(/Forwarding from 127\.0\.0\.1:(\d+) -> 7777/);
+      const port = text.match(new RegExp(`Forwarding from 127\\.0\\.0\\.1:(\\d+) -> ${remotePort}`));
       if (port) return { url: `ws://127.0.0.1:${port[1]}`, stop: () => child.kill() };
     }
     throw new Error('Private benchmark port-forward did not become ready');
@@ -132,6 +132,8 @@ async function forward(args: string[]): Promise<Forward> {
 export class KubernetesCapacity {
   readonly config: DestinationConfig;
   readonly evidence: Json = { version: 1, certified: false, controllerModelVerified: false, destinationMatched: false, relayObservations: [] };
+  private databasePrimary?: { name: string; uid: string; address: string };
+  private databaseForward?: Forward;
   private pods = new Map<string, { uid: string; config: string; directory: string; forward?: Forward }>();
   constructor(c: unknown, private matrix: CapacityMatrix, private execute: Run = capacityCommand, private portForward = forward) { this.config = destinationConfig(c); }
   private args() { return ['kubectl', `--context=${this.config.context}`, '--request-timeout=30s', '-n', this.config.namespace]; }
@@ -159,10 +161,45 @@ export class KubernetesCapacity {
     const primary = JSON.parse(await this.execute(['kubectl', `--context=${c.context}`, '--request-timeout=30s', '-n', c.databaseCluster.namespace, 'get', 'pod', cluster.status.currentPrimary, '-o', 'json']));
     const database = primary.spec?.containers?.find((x: Json) => x.name === 'postgres');
     need(primary.status?.podIP && database?.image === cluster.spec.imageName && cpu(database.resources?.limits?.cpu) === this.matrix.databaseCpu && memory(database.resources?.limits?.memory) === this.matrix.databaseMemoryBytes, 'Running CNPG primary does not match expected destination envelope');
+    need(typeof primary.metadata?.uid === 'string', 'CNPG primary UID unavailable');
+    this.databasePrimary = { name: cluster.status.currentPrimary, uid: primary.metadata.uid, address: primary.status.podIP };
     this.evidence.databaseServerAddress = primary.status.podIP;
     this.evidence.databasePrimaryImageID = primary.status?.containerStatuses?.find((x: Json) => x.name === 'postgres')?.imageID;
     this.evidence.context = c.context; this.evidence.namespace = c.namespace; this.evidence.databaseCluster = { ...c.databaseCluster, image: cluster.spec.imageName, resources: cluster.spec.resources };
     return `cnpg=${c.databaseCluster.namespace}/${c.databaseCluster.name};image=${cluster.spec.imageName};cpus=${this.matrix.databaseCpu};memoryBytes=${this.matrix.databaseMemoryBytes}`;
+  }
+  async controllerDatabaseURL(credentials: string): Promise<string> {
+    benchmarkURLGuard(this.config, credentials);
+    need(this.databasePrimary && !this.databaseForward, 'Verified CNPG primary transport required');
+    const anchor = this.databasePrimary;
+    const args = ['kubectl', `--context=${this.config.context}`, '--request-timeout=30s', '-n', this.config.databaseCluster.namespace];
+    const check = async () => {
+      const pod = JSON.parse(await this.execute([...args, 'get', 'pod', anchor.name, '-o', 'json']));
+      need(pod.metadata?.uid === anchor.uid && pod.status?.podIP === anchor.address, 'CNPG primary changed during transport binding');
+    };
+    await check();
+    const f = await this.portForward([...args, 'pod/' + anchor.name], 5432);
+    try {
+      await check();
+      const endpoint = new URL(f.url);
+      need(endpoint.hostname === '127.0.0.1' && /^\d+$/.test(endpoint.port), 'Database forward is not a private loopback endpoint');
+      const url = new URL(credentials);
+      // A caller supplies credentials, never the destination. Only the owned
+      // API-authenticated forward to the verified Pod/UID becomes a SQL endpoint.
+      url.hostname = '127.0.0.1'; url.port = endpoint.port;
+      this.databaseForward = f;
+      this.evidence.controllerTransport = { context: this.config.context, namespace: this.config.databaseCluster.namespace, pod: anchor.name, uid: anchor.uid, address: anchor.address, localHost: '127.0.0.1', remotePort: 5432 };
+      return url.toString();
+    } catch (error) { f.stop(); throw error; }
+  }
+  assertControllerAddress(address: unknown) {
+    need(this.databaseForward && this.databasePrimary, 'Controller connection has no owned primary transport');
+    // Port-forward dials inside the Pod network namespace; PostgreSQL may see
+    // loopback rather than PodIP. The owned forward, not this address, binds it.
+    need(address === '127.0.0.1' || address === '::1' || address === this.databasePrimary.address, 'Controller server address is inconsistent with its owned primary transport');
+  }
+  async finish() {
+    try { await this.close(); } finally { this.databaseForward?.stop(); this.databaseForward = undefined; }
   }
   private async owned(name: string) {
     const record = this.pods.get(name); need(record, 'Pod was not created by this measurement');
