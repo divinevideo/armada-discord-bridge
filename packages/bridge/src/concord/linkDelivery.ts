@@ -7,10 +7,12 @@ import type { DeliveredChat, ReplayOptions } from './replay';
 type RepairStore = {
   deliverySnapshot(): Promise<DeliverySnapshot>;
   certifyDelivery(version: number, until: number, coverage: Record<string, number>, complete: boolean): Promise<boolean>;
+  setDeliveryRelays?(relays: string[]): Promise<DeliverySnapshot>;
 };
 type RepairOptions = {
   store: RepairStore;
   channel: () => ChannelV2;
+  relays?: () => readonly string[];
   replay: (channel: ChannelV2, since: number, options: ReplayOptions) => Promise<unknown>;
   deliver: (chat: DeliveredChat, signal: AbortSignal) => Promise<unknown>;
 };
@@ -115,9 +117,21 @@ export class LinkDelivery {
     await this.flushGaps();
     this.controller.signal.throwIfAborted();
     const generation = this.generation;
+    const capturedRelays = options.relays ? [...new Set(options.relays())].sort() : undefined;
+    if (capturedRelays) {
+      if (!options.store.setDeliveryRelays) throw new Error('Delivery store cannot fence relay context');
+      await options.store.setDeliveryRelays(capturedRelays);
+    }
     let snapshot = await options.store.deliverySnapshot();
     this.controller.signal.throwIfAborted();
     if (generation !== this.generation) throw new Error('Delivery gap changed during replay startup');
+    const assertRelays = () => {
+      if (capturedRelays && JSON.stringify([...new Set(options.relays!())].sort()) !== JSON.stringify(capturedRelays)) {
+        this.markGap(0);
+        throw new Error('Configured relay set changed during replay');
+      }
+    };
+    assertRelays();
     const channel = options.channel();
     const streams = channel.streams.map(stream => stream.group.pk);
     const missing = streams.filter(pk => snapshot.coverage[pk] === undefined);
@@ -134,7 +148,7 @@ export class LinkDelivery {
         signal,
         onBatch: async ({ chats }, context) => this.run(async () => {
           for (const chat of chats) {
-            signal.throwIfAborted(); context.signal.throwIfAborted();
+            signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
             if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
             if (!filterEpochCutoff([chat], options.channel()).length) continue;
             const known = [snapshot.legacyBoundaries[chat.streamPk], snapshot.ordinaryCoverage[chat.streamPk], snapshot.coverage[chat.streamPk]].filter((at): at is number => at !== undefined);
@@ -152,23 +166,24 @@ export class LinkDelivery {
           }
         }),
         onWindowComplete: async (window, context) => this.run(async () => {
-          signal.throwIfAborted(); context.signal.throwIfAborted();
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
           if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
           if (snapshot.repairFloor !== undefined && snapshot.repairFloor > window.until) return;
           const coverage = { ...snapshot.coverage };
           for (const pk of streams) coverage[pk] = Math.max(coverage[pk] ?? 0, window.until);
           const committed = await this.certify(async () => {
-            signal.throwIfAborted(); context.signal.throwIfAborted();
+            signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
             return options.store.certifyDelivery(snapshot.version, window.until, coverage, window.until === window.runUntil);
           }, window.until === window.runUntil);
-          signal.throwIfAborted(); context.signal.throwIfAborted();
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
           if (!committed || generation !== this.generation) throw new Error('Delivery checkpoint lost its fence');
           if (this.gapFloor !== undefined) this.gapFloor = window.until === window.runUntil ? undefined : window.until + 1;
           snapshot = await options.store.deliverySnapshot();
-          signal.throwIfAborted(); context.signal.throwIfAborted();
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertRelays();
           if (generation !== this.generation) throw new Error('Delivery gap changed after checkpoint');
         }),
       });
+      signal.throwIfAborted(); assertRelays();
     } finally {
       if (this.attempt === attempt) this.attempt = undefined;
     }

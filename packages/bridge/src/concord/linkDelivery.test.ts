@@ -296,3 +296,31 @@ it('advances a dense one-second historical prefix across repeated short attempts
   for(let i=0;i<3;i++) await expect(delivery.repair(options)).rejects.toThrow('budget');
   expect(floors).toEqual([100,101,102]);
 });
+
+it('invalidates a replay whose configured relay set changes during the run', async () => {
+  let relays=['wss://a.example'],writes=0; const floors:number[]=[];
+  const snapshot={ownerId:'owner',epoch:'epoch',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version:0,activationFloor:100,recoveryFloor:100,repairFloor:100,coverage:{},ordinaryCoverage:{},legacyBoundaries:{},relays:['wss://a.example']};
+  const store={deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{writes++;return true;},setDeliveryRelays:async()=>snapshot};
+  const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2;
+  const lane=new LinkDelivery({onError:()=>{},onGap:async floor=>{floors.push(floor);}});
+  await expect(lane.repair({store,channel:()=>channel,relays:()=>relays,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+    relays=['wss://a.example','wss://b.example'];
+    await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
+  }})).rejects.toThrow('relay');
+  await lane.flushGaps();
+  expect(writes).toBe(0); expect(floors).toEqual([0]);
+});
+
+it('rechecks the relay set after an awaited checkpoint', async () => {
+  let relays=['wss://a.example'],entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(resolve=>{entered=resolve;}), blocked=new Promise<void>(resolve=>{release=resolve;});
+  const snapshot={ownerId:'owner',epoch:'epoch',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version:0,activationFloor:100,recoveryFloor:100,repairFloor:100,coverage:{},ordinaryCoverage:{},legacyBoundaries:{},relays:['wss://a.example']};
+  const store={deliverySnapshot:async()=>snapshot,setDeliveryRelays:async()=>snapshot,certifyDelivery:async()=>{entered();await blocked;return true;}};
+  const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2, floors:number[]=[];
+  const lane=new LinkDelivery({onError:()=>{},onGap:async floor=>{floors.push(floor);}});
+  const repair=lane.repair({store,channel:()=>channel,relays:()=>relays,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+    await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
+  }});
+  await started;relays=['wss://b.example'];release();
+  await expect(repair).rejects.toThrow('relay');await lane.flushGaps();expect(floors).toEqual([0]);
+});
