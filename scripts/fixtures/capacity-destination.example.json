@@ -1,0 +1,29 @@
+{
+  "context": "explicit-production-context",
+  "namespace": "concord-capacity-synthetic",
+  "image": "registry.example/relay@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "sourceSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "platform": "linux/amd64",
+  "relayDeployment": {
+    "namespace": "chat-example",
+    "name": "concord-relay",
+    "container": "relay"
+  },
+  "relayRequests": {
+    "cpu": 0.25,
+    "memoryBytes": 268435456
+  },
+  "databaseCluster": {
+    "namespace": "postgres-example",
+    "name": "postgres"
+  },
+  "databaseSecret": "capacity-database",
+  "databaseSecretKey": "DATABASE_URL",
+  "databaseName": "concord_capacity_synthetic",
+  "databaseRole": "concord_capacity_synthetic",
+  "postgresVersion": "18.1",
+  "relayStorage": {
+    "claimName": "capacity-data",
+    "productionClaimName": "concord-relay"
+  }
+}

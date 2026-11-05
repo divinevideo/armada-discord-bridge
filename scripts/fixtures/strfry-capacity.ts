@@ -1,9 +1,10 @@
 /** Disposable, synthetic-only external-hook measurements. Importing never starts Docker. */
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, writeFile, rm, chmod } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import postgres from "postgres";
+import { KubernetesCapacity, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup } from "./capacity-kubernetes";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { encrypt } from "nostr-tools/nip44";
 import { getEventHash, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -14,6 +15,7 @@ import type { CommunityPolicy, StreamDescriptor } from "../../packages/moderatio
 import { controlState } from "../../packages/moderation/src/relayPolicy";
 import { PolicyStore, migrateModeration } from "../../packages/moderation/src/policyStore";
 import { REQUIRED_CAPACITY_CASES, capacityReportHash } from "../../packages/moderation/src/capacityContract";
+import type { DatabaseObservation } from "./capacity-kubernetes";
 import type { CapacityCaseId, CapacityMeasurementReport, CapacitySample } from "../../packages/moderation/src/capacityContract";
 
 const hash = (data: string) => createHash("sha256").update(data).digest("hex");
@@ -147,17 +149,23 @@ export function summarizeCapacity(report: CapacityMeasurementReport, urgentReser
 
 export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityMeasurementReport> {
   validateMatrix(matrix);
-  const image = process.env.STRFRY_TEST_IMAGE;
+  const destination = process.env.CAPACITY_KUBERNETES_CONFIG ? destinationConfig(JSON.parse(await readFile(process.env.CAPACITY_KUBERNETES_CONFIG, "utf8"))) : undefined;
+  if (destination && process.env.CAPACITY_EXECUTE_DESTINATION !== "1") throw new Error("Destination execution requires explicit CAPACITY_EXECUTE_DESTINATION=1");
+  if (destination) destinationOutputGuard(process.env.CAPACITY_OUTPUT_DIR, await command(["git", "rev-parse", "--show-toplevel"]));
+  const kube = destination ? new KubernetesCapacity(destination, matrix) : undefined;
+  const image = destination?.image ?? process.env.STRFRY_TEST_IMAGE;
   if (!image) throw new Error("STRFRY_TEST_IMAGE must name a locally built exact candidate");
-  const imageInfo = JSON.parse(await command(["docker", "image", "inspect", image]))[0];
+  const imageInfo = destination ? { Id: destination.image.split("@")[1], Os: "linux", Architecture: "amd64", Config: { Labels: { "org.opencontainers.image.revision": destination.sourceSha } } } : JSON.parse(await command(["docker", "image", "inspect", image]))[0];
   const sourceSha = imageInfo.Config.Labels?.["org.opencontainers.image.revision"], harnessSha = await command(["git", "rev-parse", "HEAD"]);
   if (!/^[0-9a-f]{40}$/.test(sourceSha ?? "") || !/^[0-9a-f]{40}$/.test(harnessSha) || !/^sha256:[0-9a-f]{64}$/.test(imageInfo.Id)) throw new Error("Immutable image/source/harness identity required");
   if (await command(["git", "status", "--porcelain", "--untracked-files=no"])) throw new Error("Commit the capacity harness before measuring");
-  const label = `capacity-${process.pid}-${crypto.randomUUID()}`, directory = await mkdtemp(join(tmpdir(), label));
+  const label = kube ? `capacity-${hash(crypto.randomUUID()).slice(0, 20)}` : `capacity-${process.pid}-${crypto.randomUUID()}`;
+  const directory = await mkdtemp(join(tmpdir(), label));
   await chmod(directory, 0o755);
   const output = resolve(process.env.CAPACITY_OUTPUT_DIR ?? join(directory, "report"));
   await mkdir(output, { recursive: true });
-  const platform = `${imageInfo.Os}/${imageInfo.Architecture}`, host = await command(["docker", "info", "--format", "{{.Architecture}}"]);
+  if (destination) destinationOutputGuard(await realpath(output), await realpath(await command(["git", "rev-parse", "--show-toplevel"])));
+  const platform = `${imageInfo.Os}/${imageInfo.Architecture}`, host = destination ? "amd64" : await command(["docker", "info", "--format", "{{.Architecture}}"]);
   const native = ({ x86_64: "amd64", aarch64: "arm64" } as Record<string, string>)[host] ?? host;
   const pgImage = "postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6";
   const report: CapacityMeasurementReport = { version: 1, sourceSha, harnessSha, imageId: imageInfo.Id, platform, resourceEnvelope: { cpus: matrix.cpu, memoryBytes: matrix.memoryBytes, database: `${pgImage};cpus=${matrix.databaseCpu};memoryBytes=${matrix.databaseMemoryBytes}` }, fixtureHash: hash("synthetic-capacity-v1"), matrixHash: hash(JSON.stringify(matrix)), startedAt: Date.now(), finishedAt: 0, emulated: native !== imageInfo.Architecture, certified: false, provenance: { destinationMatched: false, controllerModelVerified: false }, cases: REQUIRED_CAPACITY_CASES.map((id) => ({ id, status: "unsupported", reason: "not run", samples: [] })) };
@@ -165,12 +173,36 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   let sql: postgres.Sql | undefined, locker: postgres.Sql | undefined;
   const communities: [string, string][] = [];
   const calibration = process.env.CAPACITY_MODE !== "entrypoint";
+  if (!calibration && !process.env.CAPACITY_CONTRACT_FILE) throw new Error("Entrypoint replay requires a reviewed measured candidate contract");
   const synthetic = { version: 1, sourceSha, harnessSha, imageId: imageInfo.Id, platform, reportHash: "0".repeat(64), resourceEnvelope: report.resourceEnvelope, maxima: { historyCount: 4096, historyBytes: Number.MAX_SAFE_INTEGER, rekeyCount: 4096, streamCount: 1024, inFlight: matrix.concurrency, innerAdmissionMs: 1499 }, thresholds: { warningHistoryCount: 4095, pauseHistoryCount: 4096, urgentReserve: 0 }, deadlines: { sqlMs: 1500, pluginMs: 2000, externalMs: 3000, observedMaxMs: 2999 }, maxSampleAgeMs: 120000, measuredAt: Date.now() };
   const launcher = capacityCalibrationLauncher();
   const docker = (...args: string[]) => command(["docker", ...args]);
+  const relayLogs = (name: string) => kube ? kube.logs(name) : docker("logs", name);
+  const removeRelay = (name: string) => kube ? kube.remove(name) : docker("rm", "-f", name);
   await writeFile(join(directory, "launcher.ts"), launcher);
   await writeFile(join(directory, "plugin.sh"), "#!/bin/sh\nexec bun /capacity/launcher.ts\n", { mode: 0o755 });
   try {
+    if (kube && destination) {
+      report.resourceEnvelope.database = await kube.prepare();
+      const url = process.env.CAPACITY_DATABASE_URL;
+      if (!url) throw new Error("Dedicated private CAPACITY_DATABASE_URL required");
+      await destinationDatabaseSetup(async () => {
+        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, onnotice: () => {} });
+        const [identity] = await sql`SELECT current_database() AS database,current_user AS role,inet_server_addr()::text AS "serverAddress",split_part(current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_roles r JOIN pg_database d ON d.datname=current_database() WHERE r.rolname=current_user`;
+        const tables = await sql`SELECT n.nspname AS schema,c.relname AS name,pg_get_userbyid(c.relowner)=current_user AS owned FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','m','f') ORDER BY n.nspname,c.relname`;
+        let populatedTables = 0;
+        for (const table of tables) {
+          if (!table.owned || !['public', 'moderation'].includes(table.schema)) throw new Error("Unexpected benchmark table ownership/schema");
+          if ((await sql`SELECT EXISTS(SELECT 1 FROM ${sql(table.schema + '.' + table.name)} LIMIT 1) AS present`)[0].present) populatedTables++;
+        }
+        const schemaPresent = ['community_policy','streams','public_capacity_state','publication_recoveries'].every(name => tables.some(table => table.schema === 'moderation' && table.name === name));
+        const observation = { ...identity, populatedTables, schemaPresent } as DatabaseObservation;
+        benchmarkDatabaseGuard(destination, observation);
+        if (observation.serverAddress !== kube.evidence.databaseServerAddress) throw new Error("Database is not the observed CNPG primary");
+        kube.evidence.schemaTables = tables.map(table => ({ schema: table.schema, name: table.name }));
+        kube.evidence.databaseObservation = observation;
+      });
+    } else {
     await docker("network", "create", label);
     const dbName = label + "-pg";
     containers.push(dbName);
@@ -186,17 +218,26 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     }
     const pgPort = (await docker("port", dbName, "5432/tcp")).split(":").at(-1), url = `postgres://bridge@127.0.0.1:${pgPort}/bridge`;
     sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, onnotice: () => {} });
-    await migrateModeration(sql);
-    const store = new PolicyStore(sql);
+    }
+    if (!sql || !locker) throw new Error("Capacity database connection was not initialized");
+    // Shared-cluster role creation/membership is not benchmark authority. The
+    // isolated destination DB must be pre-migrated by the approved operator.
+    if (!kube) await migrateModeration(sql!);
+    const store = new PolicyStore(sql!);
     async function ready(port: string | undefined) {
       for (let attempt = 0; ; attempt++) { try { await fetch(`http://127.0.0.1:${port}`); return; } catch { if (attempt > 200) throw new Error("Capacity relay unavailable"); await Bun.sleep(50); } }
     }
+    let relaySequence = 0;
     async function start(mode: string) {
-      const name = `${label}-${mode}-${containers.length}`;
+      const name = `${label}-${mode}-${relaySequence++}`;
       const plugin = mode === "plugin_failure" || mode === "external_timeout" ? `/capacity/${mode}.sh` : calibration ? "/capacity/plugin.sh" : "/usr/local/bin/relay-policy";
       if (mode === "plugin_failure" || mode === "external_timeout") await writeFile(join(directory, mode + ".sh"), "#!/bin/sh\n" + (mode === "plugin_failure" ? "exit 1\n" : "sleep 10\n"), { mode: 0o755 });
       const config = join(directory, name + ".conf");
       await writeFile(config, `db = "/data/db/"\nrelay { nofiles = 0 bind = "0.0.0.0" port = 7777 writePolicy { plugin = "${plugin}" timeoutSeconds = 3 } logging { dumpInAll = false dumpInEvents = false dumpInReqs = false invalidEvents = false } }\n`);
+      let relayUrl: string;
+      if (kube) {
+        relayUrl = await kube.start(name, config, directory, calibration ? undefined : process.env.CAPACITY_CONTRACT_FILE, communities);
+      } else {
       const args = ["run", "-d", "--name", name, "--network", label, "--cpus", String(matrix.cpu), "--memory", String(matrix.memoryBytes), "--ulimit", "nofile=65536:65536", "-p", "127.0.0.1::7777", "-v", `${config}:/data/strfry.conf:ro`, "-v", `${directory}:/capacity:ro`, "-e", "MODERATION_DATABASE_URL=postgres://bridge@pg/bridge", "-e", "MODERATION_CAPACITY_TIMING=1", "-e", `MODERATION_SOURCE_SHA=${sourceSha}`, "-e", `MODERATION_CAPACITY_PLATFORM=${platform}`, "-e", `MODERATION_COMMUNITY_ORGS=${JSON.stringify(Object.fromEntries(communities))}`];
       if (!calibration) {
         if (!process.env.CAPACITY_CONTRACT_FILE) throw new Error("Entrypoint measurement requires an explicitly reviewed external contract");
@@ -205,7 +246,10 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       args.push(imageInfo.Id); containers.push(name); await docker(...args);
       const limits = JSON.parse(await docker("inspect", name, "--format", "{{json .HostConfig}}"));
       if (limits.Memory !== matrix.memoryBytes || limits.NanoCpus !== matrix.cpu * 1e9) throw new Error("Relay resource limits differ from matrix");
-      const port = (await docker("port", name, "7777/tcp")).split(":").at(-1), relayUrl = `ws://127.0.0.1:${port}`;
+      const port = (await docker("port", name, "7777/tcp")).split(":").at(-1);
+      relayUrl = `ws://127.0.0.1:${port}`;
+      }
+      const port = new URL(relayUrl).port;
       await ready(port);
       const publisher = await socket(relayUrl), subscriber = await socket(relayUrl); sockets.push(publisher.ws, subscriber.ws);
       const subscription = crypto.randomUUID(); subscriber.ws.send(JSON.stringify(["REQ", subscription, { kinds: [1059] }]));
@@ -221,7 +265,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       const hasCapacity = await sql!`SELECT to_regclass('moderation.public_capacity_state') AS name`;
       if (hasCapacity[0].name) await sql!`UPDATE moderation.public_capacity_state SET observed_at=clock_timestamp() WHERE org_id='synthetic-capacity' AND community_id=${f.policy.communityId}`;
       const before = await effect(event.id), messagesFrom = instance.publisher.messages.length;
-      const logsBefore = (await docker("logs", instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).length;
+      const logsBefore = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).length;
       const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
       let ok: any[] | undefined, error: string | undefined;
       try { ok = await until(() => instance.publisher.messages.slice(messagesFrom).find((m) => m[0] === "OK" && m[1] === event.id), matrix.observationTimeoutMs); } catch { error = "matching OK not observed within observer horizon"; }
@@ -232,7 +276,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       await Bun.sleep(matrix.lateObservationMs);
       fanout = instance.subscriber.messages.some((m) => m[0] === "EVENT" && m[2]?.id === event.id);
       const dbAfter = await effect(event.id), persistedAfter = await instance.publisher.query(event.id);
-      const timings = (await docker("logs", instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).slice(logsBefore).flatMap((line) => { try { return [JSON.parse(line.slice(line.indexOf("{")))]; } catch { return []; } });
+      const timings = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).slice(logsBefore).flatMap((line) => { try { return [JSON.parse(line.slice(line.indexOf("{")))]; } catch { return []; } });
       const correlated = timings.filter((timing) => timing.eventId === event.id);
       const timing = correlated.length === 1 ? correlated[0].innerAdmissionMs : inFlight === 1 && timings.length === 1 ? timings[0].innerAdmissionMs : null;
       return { caseId: id, historyCount: measuredPolicy!.controlEvents.length + measuredRekeys.length, historyBytes: Buffer.byteLength(JSON.stringify(measuredPolicy!.controlEvents)) + Buffer.byteLength(JSON.stringify(measuredRekeys.map(row => row.event))), rekeyCount: measuredRekeys.length, streamCount: f.streams.length, inFlight, wallMs, innerAdmissionMs: Number.isFinite(timing) ? timing : null, expectedAccept, accepted, okReceived: !!ok, persisted, fanout, lateDatabaseWrite: !before && !dbAtAck && dbAfter, unsafeEffect: (!accepted && (dbAfter || persistedAfter || fanout)) || (accepted && (!dbAfter || !persistedAfter)), ...(["plugin_failure", "external_timeout"].includes(id) ? { innerNotStarted: true } : {}), ...(error ? { error } : {}) };
@@ -249,6 +293,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           const f = capacityFixture(count, { label: `${entry.id}:${count}`, roots: entry.id === "held_roots" || entry.id === "rekey" ? matrix.heldRoots : 1, channels: entry.id === "stream_growth" ? matrix.channels : 1, large: entry.id === "cache_bytes" });
           fixtureHashes.push(f.fixtureHash); communities.push([f.policy.communityId, "synthetic-capacity"]);
           await writeFile(join(directory, "calibration.json"), JSON.stringify({ contract: synthetic, communities }));
+          if (kube) await kube.updateFixtures(directory);
           await store.install(f.policy, f.streams, 0);
           if (calibration) {
             // Only the disposable operator seeds its own fixture latch; the deployed entrypoint has no bypass.
@@ -256,14 +301,14 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
             if (table[0].name) await sql`INSERT INTO moderation.public_capacity_state(org_id,community_id,state,contract_hash,reason_code,history_count,history_bytes,rekey_count,stream_count,in_flight,observed_at) VALUES('synthetic-capacity',${f.policy.communityId},'normal',${hash(canonical(synthetic))},'synthetic_calibration',${count},${f.historyBytes},0,${f.streams.length},0,clock_timestamp()) ON CONFLICT DO NOTHING`;
           }
           if (!instance || entry.id === "cold" || entry.id === "restart" || !calibration) {
-            if (instance) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await docker("rm", "-f", instance.name); }
+            if (instance) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await removeRelay(instance.name); }
             instance = await start(entry.id);
           }
           let beforeRestart: NostrEvent | undefined;
           if (entry.id === "warm" || entry.id === "restart") { beforeRestart = f.message(sequence++); const warm = await sample(instance, f, entry.id, count > 0, beforeRestart); entry.samples.push(warm); }
-          if (entry.id === "restart") { instance.publisher.ws.close(); instance.subscriber.ws.close(); await docker("restart", instance.name); const port = (await docker("port", instance.name, "7777/tcp")).split(":").at(-1); await ready(port); const publisher = await socket(`ws://127.0.0.1:${port}`), subscriber = await socket(`ws://127.0.0.1:${port}`); sockets.push(publisher.ws, subscriber.ws); subscriber.ws.send(JSON.stringify(["REQ", "after-restart", { kinds: [1059] }])); await until(() => subscriber.messages.some((m) => m[0] === "EOSE") ? true : undefined, 5000); instance = { name: instance.name, publisher, subscriber }; if (count > 0 && beforeRestart && !await publisher.query(beforeRestart.id)) throw new Error("Accepted carrier lost across actual relay restart"); }
+          if (entry.id === "restart") { instance.publisher.ws.close(); instance.subscriber.ws.close(); const restartedUrl = kube ? await kube.restart(instance.name) : (await docker("restart", instance.name), `ws://127.0.0.1:${(await docker("port", instance.name, "7777/tcp")).split(":").at(-1)}`); const port = new URL(restartedUrl).port; await ready(port); const publisher = await socket(`ws://127.0.0.1:${port}`), subscriber = await socket(`ws://127.0.0.1:${port}`); sockets.push(publisher.ws, subscriber.ws); subscriber.ws.send(JSON.stringify(["REQ", "after-restart", { kinds: [1059] }])); await until(() => subscriber.messages.some((m) => m[0] === "EOSE") ? true : undefined, 5000); instance = { name: instance.name, publisher, subscriber }; if (count > 0 && beforeRestart && !await publisher.query(beforeRestart.id)) throw new Error("Accepted carrier lost across actual relay restart"); }
           for (let rep = 0; rep < matrix.repetitions; rep++) {
-            if (entry.id === "cold" && rep > 0) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await docker("rm", "-f", instance.name); instance = await start(entry.id); }
+            if (entry.id === "cold" && rep > 0) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await removeRelay(instance.name); instance = await start(entry.id); }
             const event = entry.id === "append" ? f.append() : entry.id === "rekey" ? f.rekey(sequence++) : f.message(sequence++);
             const expected = expectedCapacityAcceptance(entry.id, count);
             let release: Promise<unknown> | undefined;
@@ -289,8 +334,9 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
         const generatedCount = [...pressure.values()].reduce((n, point) => n + point.count, 0), generatedBytes = [...pressure.values()].reduce((n, point) => n + point.bytes, 0);
         const limits = entry.id === "cache_entries" && generatedCount <= matrix.cacheEntryWorkingSet ? "cache entry pressure not reached" : entry.id === "cache_bytes" && generatedBytes <= matrix.cacheByteWorkingSet ? "cache byte pressure not reached" : entry.samples.some((s) => s.innerAdmissionMs === null && !s.innerNotStarted) ? "inner timing unavailable or concurrent attribution ambiguous" : undefined;
         entry.status = limits ? "unsupported" : "measured"; entry.reason = limits;
-        if (instance) { await writeFile(join(output, entry.id + "-relay.log"), await docker("logs", instance.name)); }
-      } catch (error) { entry.status = "unsupported"; entry.reason = error instanceof Error ? error.message : "measurement failed"; }
+        if (instance) { await writeFile(join(output, entry.id + "-relay.log"), await relayLogs(instance.name)); }
+      } catch (error) { entry.status = "unsupported"; entry.reason = kube ? "Destination sample failed (diagnostics withheld)" : error instanceof Error ? error.message : "measurement failed"; }
+      if (kube) await kube.close();
       await writeFile(join(output, "partial-report.json"), JSON.stringify(report, null, 2) + "\n");
     }
   } finally {
@@ -301,8 +347,13 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
     await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
     for (const ws of sockets) ws.close(); await sql?.end({ timeout: 2 }); await locker?.end({ timeout: 2 });
-    for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
-    await docker("network", "rm", label).catch(() => {});
+    if (kube) {
+      await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
+      await kube.close();
+    } else {
+      for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
+      await docker("network", "rm", label).catch(() => {});
+    }
     if (!output.startsWith(directory + "/")) await rm(directory, { recursive: true, force: true });
   }
   console.log(`Capacity raw report: ${output}; certified=false`);
