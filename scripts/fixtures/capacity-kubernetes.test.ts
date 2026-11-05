@@ -43,6 +43,7 @@ describe('isolated destination measurement', () => {
     expect(c.volumeMounts[0]).toEqual({ name: 'data', mountPath: '/data', subPath: 'capacity-synthetic-1' });
     expect(c.resources.limits).toEqual({ cpu: '2', memory: '1073741824' });
     expect(c.securityContext.runAsNonRoot).toBe(true);
+    expect(pod.spec.securityContext.fsGroupChangePolicy).toBe('OnRootMismatch');
     expect(c.env.find((e: any) => e.name === 'MODERATION_DATABASE_URL')).toEqual({ name: 'MODERATION_DATABASE_URL', valueFrom: { secretKeyRef: { name: 'benchmark-database', key: 'DATABASE_URL' } } });
     expect(JSON.stringify(pod)).not.toContain('postgres://');
     expect(JSON.stringify(pod)).not.toContain('LoadBalancer');
