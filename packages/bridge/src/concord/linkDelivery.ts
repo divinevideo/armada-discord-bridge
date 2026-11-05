@@ -103,7 +103,7 @@ export class LinkDelivery {
     const streams = channel.streams.map(stream => stream.group.pk);
     const missing = streams.some(pk => snapshot.coverage[pk] === undefined);
     const floor = Math.max(0, Math.min(snapshot.repairFloor ?? snapshot.certifiedUntil ?? snapshot.activationFloor,
-      ...(missing ? [snapshot.activationFloor] : [])) - 60);
+      ...(missing ? [snapshot.recoveryFloor] : [])) - 60);
     const attempt = new AbortController();
     this.attempt = attempt;
     const signal = AbortSignal.any([this.controller.signal, attempt.signal]);

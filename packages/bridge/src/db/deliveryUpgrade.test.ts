@@ -16,17 +16,23 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
  let runtime:postgres.Sql|undefined;
  const tenant='synthetic-upgrade';
  const link:ChannelLink={communityId:'a'.repeat(64),concordChannelIdHex:'b'.repeat(64),discordGuildId:'synthetic-guild',discordChannelId:'synthetic-channel',enabled:true};
- const owner=crypto.randomUUID(),old=Date.now()-8*86400_000;
+ const owner=crypto.randomUUID(), checkpointOwner=crypto.randomUUID(), old=Date.now()-8*86400_000;
  try {
    const directory=new URL('./',import.meta.url);
    await db.unsafe(await readFile(new URL('schema.sql',directory),'utf8'));
    for(const file of (await readdir(new URL('migrations/',directory))).filter(file=>file.endsWith('.sql') && file<'022').sort()) await db.unsafe(await readFile(new URL('migrations/'+file,directory),'utf8'));
    await db`INSERT INTO bridges(tenant_id,bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
      VALUES (${tenant},${owner},'synthetic-owner','paused',${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId})`;
+   await db`INSERT INTO bridges(tenant_id,bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+     VALUES (${tenant},${checkpointOwner},'synthetic-owner','paused',${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'checkpoint-only')`;
+   await db`INSERT INTO channel_delivery_checkpoints(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,last_seen_at)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'checkpoint-only',70)`;
    await db`INSERT INTO communities(tenant_id,community_id,relays) VALUES (${tenant},${link.communityId},ARRAY[]::text[])`;
    await db`INSERT INTO channel_links(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,enabled)
      VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'standalone-channel',true)`;
    await db`INSERT INTO cursors(tenant_id,community_id,stream_pk,relay_url,last_seen_at) VALUES (${tenant},${link.communityId},'old','pool',100),(${tenant},${link.communityId},'new','pool',200)`;
+   await db`INSERT INTO channel_delivery_checkpoints(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,last_seen_at)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},80)`;
    await db`INSERT INTO messages(tenant_id,community_id,concord_channel_id,discord_channel_id,discord_message_id,concord_rumor_id,origin,author_ref)
      VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordChannelId},'synthetic-message',${'c'.repeat(64)},'concord',${'d'.repeat(64)})`;
    for(const target of ['c'.repeat(64),'e'.repeat(64)]) await db`INSERT INTO pending_concord_deletes
@@ -34,6 +40,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
      VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${'f'.repeat(64)},${target},${'1'.repeat(64)},${old})`;
    await db.unsafe(await readFile(new URL('migrations/022_delivery_lifecycle.sql',directory),'utf8'));
    await db.unsafe(await readFile(new URL('migrations/023_delivery_pause.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/024_delivery_recovery_floor.sql',directory),'utf8'));
    // Match the deployment migration hook: explicit DML grants after migrations,
    // not superuser tests or a dependency on unspecified default privileges.
    await admin.unsafe(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
@@ -46,7 +53,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    const lease=(await new BridgeLeases(runtime).acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
    try {
      const snapshot=await store.activateDelivery(link,owner,['old','new'],1000);
-     expect(snapshot.repairFloor).toBe(100);expect(snapshot.legacyBoundaries).toEqual({old:100,new:200});
+     expect(snapshot.repairFloor).toBe(80);expect(snapshot.activationFloor).toBe(1000);expect(snapshot.recoveryFloor).toBe(80);expect(snapshot.legacyBoundaries).toEqual({old:100,new:200});
      const view=store.forDelivery(link,{ownerId:owner,epoch:snapshot.epoch,lease});
      const held=await view.pendingDeletes(link);
      expect(held.find(row=>row.targetRumorId==='c'.repeat(64))?.actionClass).toBe('actionable');
@@ -59,11 +66,22 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
      await view.completeDelete(link,'f'.repeat(64),'c'.repeat(64));
      // Restart and later cursors never replace the frozen legacy boundaries.
      await store.cursorSet(link.communityId,'old',900);
-     expect((await store.activateDelivery(link,owner,['old','new'],2000)).legacyBoundaries).toEqual({old:100,new:200});
+     const resumed = await store.activateDelivery(link,owner,['old','new'],2000);
+     expect(resumed.legacyBoundaries).toEqual({old:100,new:200}); expect(resumed.activationFloor).toBe(1000);expect(resumed.recoveryFloor).toBe(80);
      await store.terminateDelivery(link,owner,snapshot.epoch);
      const relink=await store.activateDelivery(link,owner,['old','new'],3000);
-     expect(relink.repairFloor).toBe(3000);expect(relink.legacyBoundaries).toEqual({});
+     expect(relink.repairFloor).toBe(3000);expect(relink.recoveryFloor).toBe(3000);expect(relink.legacyBoundaries).toEqual({});
    } finally {await lease.release();}
+   const checkpointOnly={...link,discordChannelId:'checkpoint-only'};
+   const checkpointLease=(await new BridgeLeases(runtime).acquire(bridgeResource(checkpointOnly.discordGuildId,checkpointOnly.discordChannelId)))!;
+   try {
+     const oldCheckpoint=await store.activateDelivery(checkpointOnly,checkpointOwner,[],1000);
+     expect(oldCheckpoint.legacyBoundaries).toEqual({}); expect(oldCheckpoint.recoveryFloor).toBe(70);
+     const view=store.forDelivery(checkpointOnly,{ownerId:checkpointOwner,epoch:oldCheckpoint.epoch,lease:checkpointLease});
+     expect(await view.certifyDelivery(oldCheckpoint.version,1200,{},true)).toBe(true);
+     const healed=await view.deliverySnapshot();
+     expect(healed.repairFloor).toBeUndefined(); expect(healed.recoveryFloor).toBe(70);
+   } finally { await checkpointLease.release(); }
    const standalone={...link,discordChannelId:'standalone-channel'};
    expect((await store.activateDelivery(standalone,standaloneDeliveryOwner(standalone),['old','new'],1000)).repairFloor).toBe(100);
    const fresh={...link,discordChannelId:'new-after-migration'};

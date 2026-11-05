@@ -6,7 +6,7 @@ import type { BridgeLease } from './leases';
 export type DeliveryLeaseProof = Pick<BridgeLease,'resource'|'holder'|'token'>;
 export interface DeliveryFence { ownerId: string; epoch: string; lease: DeliveryLeaseProof; }
 export interface DeliverySnapshot {
- ownerId: string; epoch: string; active: boolean; suspended: boolean; version: number; activationFloor: number;
+ ownerId: string; epoch: string; active: boolean; suspended: boolean; version: number; activationFloor: number; recoveryFloor: number;
  certifiedUntil?: number; repairFloor?: number; coverage: Record<string,number>; legacyBoundaries: Record<string,number>;
 }
 export class StaleDeliveryFenceError extends Error {}
@@ -16,7 +16,7 @@ export function deliveryScope(sql: postgres.Sql | postgres.TransactionSql, tenan
  AND discord_guild_id=${link.discordGuildId} AND discord_channel_id=${link.discordChannelId}`;
 }
 export function deliverySnapshot(row: Record<string,any>): DeliverySnapshot {
- return { ownerId:row.owner_id, epoch:row.epoch, active:row.active,suspended:row.suspended,version:Number(row.version),activationFloor:Number(row.activation_floor),
+ return { ownerId:row.owner_id, epoch:row.epoch, active:row.active,suspended:row.suspended,version:Number(row.version),activationFloor:Number(row.activation_floor),recoveryFloor:Number(row.recovery_floor),
  ...(row.certified_until == null ? {} : {certifiedUntil:Number(row.certified_until)}),
  ...(row.repair_floor == null ? {} : {repairFloor:Number(row.repair_floor)}),coverage:row.coverage,legacyBoundaries:row.legacy_boundaries };
 }

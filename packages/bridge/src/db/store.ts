@@ -315,6 +315,8 @@ export class PostgresMappingStore implements MappingStore {
       }
       const unsafe=(!old && eligible.length)?await tx`SELECT last_seen_at FROM channel_delivery_checkpoints WHERE ${deliveryScope(tx,this.tenantId,link)}`:[];
       const floors=[at,...Object.values(legacy),...unsafe.map(row=>Number(row.last_seen_at))];
+      // Keep the upgrade floor for future stream discovery after repair clears.
+      // A fresh lifecycle has no legacy values, so its floor remains at.
       const floor=Math.min(...floors);
       await tx`UPDATE channel_delivery_upgrade_eligibility SET consumed=true WHERE ${deliveryScope(tx,this.tenantId,link)}`;
       if(old) {
@@ -323,10 +325,10 @@ export class PostgresMappingStore implements MappingStore {
         await tx`DELETE FROM channel_delivery_checkpoints WHERE ${deliveryScope(tx,this.tenantId,link)}`;
       }
       const [row]=await tx`INSERT INTO channel_delivery_lifecycles
-        (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,repair_floor,legacy_boundaries)
-        VALUES (${this.tenantId},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${ownerId},${at},${floor},${tx.json(legacy)})
+        (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,recovery_floor,repair_floor,legacy_boundaries)
+        VALUES (${this.tenantId},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${ownerId},${at},${floor},${floor},${tx.json(legacy)})
         ON CONFLICT (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id) DO UPDATE SET
-        owner_id=EXCLUDED.owner_id,epoch=gen_random_uuid(),active=true,suspended=false,activation_floor=EXCLUDED.activation_floor,
+        owner_id=EXCLUDED.owner_id,epoch=gen_random_uuid(),active=true,suspended=false,activation_floor=EXCLUDED.activation_floor,recovery_floor=EXCLUDED.recovery_floor,
         version=0,certified_until=NULL,repair_floor=EXCLUDED.repair_floor,coverage='{}',legacy_boundaries=EXCLUDED.legacy_boundaries RETURNING *`;
       return deliverySnapshot(row);
     };
