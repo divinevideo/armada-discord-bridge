@@ -31,6 +31,11 @@ const startWorker = (f: Fixture, sql: postgres.Sql, health: WorkerHealth, signal
   const communities = new Map([[f.community.idHex, "synthetic"]]);
   return runModerationWorker({ sql, community: f.community, identity: f.moderator, communities, capacity: { communities, contract: undefined }, health, signal, relayUrl: "ws://127.0.0.1:1", bridgeTenantId: "synthetic", puppetMaster: "ab".repeat(32), discordToken: "synthetic", publicChannels: { guildId: "12345678901234567", channelIds: ["12345678901234568"], excludedCategoryIds: [] }, publicAuthors: [], decisions: { expire: async () => {} } as unknown as Decisions, lifecycle: { expireEvidence: async () => {}, expireAudit: async () => {} } });
 };
+// These spies replace prototypes shared by every test file in the bun process.
+// Restore them even when the worker rejects: an `await running` that throws
+// would otherwise skip the restore and leak mocked RelayPool, PolicyWatcher and
+// ModerationWorker methods into later files, which then pass or fail on mocks.
+const restore = (mocks: { mockRestore(): void }[]) => { for (const mock of mocks) mock.mockRestore(); };
 
 for (const callback of ["disconnect", "subscription error"] as const) {
   test(`worker authority stays cleared when ${callback} races the capacity await`, async () => {
@@ -64,8 +69,7 @@ for (const callback of ["disconnect", "subscription error"] as const) {
       expect(retainedDuringRefresh).toBe(true);
     } finally {
       releaseCapacity.resolve(); stop.abort();
-      await running;
-      for (const mock of mocks) mock.mockRestore();
+      try { await running; } finally { restore(mocks); }
     }
     expect(health.authority).toBeUndefined();
   });
@@ -104,7 +108,6 @@ test("a failed action-path refresh clears worker authority although the tick swa
     expect(code).toBe("ready");
   } finally {
     stop.abort();
-    await running;
-    for (const mock of mocks) mock.mockRestore();
+    try { await running; } finally { restore(mocks); }
   }
 });
