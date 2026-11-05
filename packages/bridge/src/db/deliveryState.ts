@@ -4,9 +4,9 @@ import { deletionLinkKey } from '../router';
 import { bridgeResource } from './leases';
 import type { BridgeLease } from './leases';
 export type DeliveryLeaseProof = Pick<BridgeLease,'resource'|'holder'|'token'>;
-export interface DeliveryFence { ownerId: string; epoch: string; lease: DeliveryLeaseProof; }
+export interface DeliveryFence { ownerId: string; epoch: string; sessionId: string; sessionGeneration: number; lease: DeliveryLeaseProof; }
 export interface DeliverySnapshot {
- ownerId: string; epoch: string; active: boolean; suspended: boolean; version: number; activationFloor: number; recoveryFloor: number;
+ ownerId: string; epoch: string; active: boolean; suspended: boolean; version: number; activationFloor: number; recoveryFloor: number; workerUncertain: boolean; sessionGeneration: number; sessionId?: string;
  certifiedUntil?: number; repairFloor?: number; coverage: Record<string,number>; legacyBoundaries: Record<string,number>;
 }
 export class StaleDeliveryFenceError extends Error {}
@@ -16,7 +16,7 @@ export function deliveryScope(sql: postgres.Sql | postgres.TransactionSql, tenan
  AND discord_guild_id=${link.discordGuildId} AND discord_channel_id=${link.discordChannelId}`;
 }
 export function deliverySnapshot(row: Record<string,any>): DeliverySnapshot {
- return { ownerId:row.owner_id, epoch:row.epoch, active:row.active,suspended:row.suspended,version:Number(row.version),activationFloor:Number(row.activation_floor),recoveryFloor:Number(row.recovery_floor),
+ return { ownerId:row.owner_id, epoch:row.epoch, active:row.active,suspended:row.suspended,version:Number(row.version),activationFloor:Number(row.activation_floor),recoveryFloor:Number(row.recovery_floor),workerUncertain:row.worker_uncertain,sessionGeneration:Number(row.worker_generation),...(row.worker_session ? {sessionId:row.worker_session}:{}),
  ...(row.certified_until == null ? {} : {certifiedUntil:Number(row.certified_until)}),
  ...(row.repair_floor == null ? {} : {repairFloor:Number(row.repair_floor)}),coverage:row.coverage,legacyBoundaries:row.legacy_boundaries };
 }
@@ -32,6 +32,7 @@ export async function lockDelivery(tx: postgres.TransactionSql, tenant: string, 
  await tx`SELECT pg_advisory_xact_lock(hashtextextended(${tenant + deletionLinkKey(link)},19306))`;
  const [row]=await tx`SELECT * FROM channel_delivery_lifecycles WHERE ${deliveryScope(tx,tenant,link)} FOR UPDATE`;
  if(fence && (!row?.active || row.suspended || row.owner_id !== fence.ownerId || row.epoch !== fence.epoch)) throw new StaleDeliveryFenceError('Delivery lifecycle is no longer current');
+ if(fence && (!fence.sessionId || row.worker_session !== fence.sessionId || Number(row.worker_generation) !== fence.sessionGeneration)) throw new StaleDeliveryFenceError('Delivery worker session is no longer current');
  return row;
 }
 

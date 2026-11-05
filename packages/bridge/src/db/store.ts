@@ -4,6 +4,7 @@
  */
 
 import type postgres from "postgres";
+import { randomUUID } from "node:crypto";
 
 import { deletionLinkKey } from "../router";
 import type { PendingConcordDelete, ChannelLink, MappingStore, MessageMappingRow, ReactionMappingRow } from "../router";
@@ -273,7 +274,7 @@ export class PostgresMappingStore implements MappingStore {
   /** Attach under a live lease, never reactivate from a stale control-plane row.
    * Only the migration's unconsumed eligibility may initialize missing state;
    * current persisted status and full scope must still authorize that upgrade. */
-  async openDelivery(link:ChannelLink,ownerId:string,lease:DeliveryLeaseProof,streamPks:string[]=[],at=Math.floor(Date.now()/1000)):
+  async openDelivery(link:ChannelLink,ownerId:string,lease:DeliveryLeaseProof,streamPks:string[]=[],at=Math.floor(Date.now()/1000),sessionId=randomUUID()):
     Promise<{store:PostgresMappingStore;snapshot:DeliverySnapshot}> {
     const snapshot=await this.sql.begin(async tx=>{
       const row=await lockDelivery(tx,this.tenantId,link);
@@ -281,7 +282,12 @@ export class PostgresMappingStore implements MappingStore {
       await assertLockedLease(tx,lease);
       if(row) {
         if(!row.active || row.suspended || row.owner_id!==ownerId) throw new StaleDeliveryFenceError('Delivery lifecycle is no longer current');
-        return deliverySnapshot(row);
+        if(row.worker_session===sessionId && row.worker_lease_holder===lease.holder && BigInt(row.worker_lease_token ?? -1)===lease.token) { await assertLockedLease(tx,lease); return deliverySnapshot(row); }
+        const [armed]=await tx`UPDATE channel_delivery_lifecycles SET worker_session=${sessionId},worker_lease_holder=${lease.holder},worker_lease_token=${lease.token.toString()},worker_uncertain=true,worker_generation=worker_generation+1,
+          repair_floor=CASE WHEN worker_uncertain THEN 0 ELSE repair_floor END,version=version+1
+          WHERE ${deliveryScope(tx,this.tenantId,link)} RETURNING *`;
+        await assertLockedLease(tx,lease);
+        return deliverySnapshot(armed);
       }
       const eligible=await tx`SELECT 1 FROM channel_delivery_upgrade_eligibility
         WHERE ${deliveryScope(tx,this.tenantId,link)} AND owner_id=${ownerId} AND NOT consumed`;
@@ -289,11 +295,14 @@ export class PostgresMappingStore implements MappingStore {
         ? await tx`SELECT 1 FROM channel_links WHERE ${deliveryScope(tx,this.tenantId,link)} AND enabled FOR SHARE`
         : await tx`SELECT 1 FROM bridges WHERE ${deliveryScope(tx,this.tenantId,link)} AND bridge_id::text=${ownerId} AND status='active' FOR SHARE`;
       if(!eligible.length || !status.length) throw new StaleDeliveryFenceError('Delivery lifecycle requires explicit activation');
-      const initialized=await this.activateDelivery(link,ownerId,streamPks,at,tx);
+      await this.activateDelivery(link,ownerId,streamPks,at,tx);
+      // An upgraded owner has no proof that its prior worker stopped cleanly.
+      const [armed]=await tx`UPDATE channel_delivery_lifecycles SET worker_session=${sessionId},worker_lease_holder=${lease.holder},worker_lease_token=${lease.token.toString()},worker_uncertain=true,worker_generation=worker_generation+1,
+        repair_floor=0,version=version+1 WHERE ${deliveryScope(tx,this.tenantId,link)} RETURNING *`;
       await assertLockedLease(tx,lease);
-      return initialized;
+      return deliverySnapshot(armed);
     });
-    return {snapshot,store:this.forDelivery(link,{ownerId,epoch:snapshot.epoch,lease})};
+    return {snapshot,store:this.forDelivery(link,{ownerId,epoch:snapshot.epoch,sessionId,sessionGeneration:snapshot.sessionGeneration,lease})};
   }
 
   /** Authorized control-plane transition; pass tx to commit status and lifecycle together.
@@ -303,7 +312,7 @@ export class PostgresMappingStore implements MappingStore {
       const old=await lockDelivery(tx,this.tenantId,link);
       if(old?.active && old.owner_id===ownerId) {
         if(!old.suspended) return deliverySnapshot(old);
-        const [resumed]=await tx`UPDATE channel_delivery_lifecycles SET suspended=false,version=version+1
+        const [resumed]=await tx`UPDATE channel_delivery_lifecycles SET suspended=false,worker_session=NULL,worker_lease_holder=NULL,worker_lease_token=NULL,version=version+1
           WHERE ${deliveryScope(tx,this.tenantId,link)} RETURNING *`;
         return deliverySnapshot(resumed);
       }
@@ -325,11 +334,11 @@ export class PostgresMappingStore implements MappingStore {
         await tx`DELETE FROM channel_delivery_checkpoints WHERE ${deliveryScope(tx,this.tenantId,link)}`;
       }
       const [row]=await tx`INSERT INTO channel_delivery_lifecycles
-        (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,recovery_floor,repair_floor,legacy_boundaries)
-        VALUES (${this.tenantId},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${ownerId},${at},${floor},${floor},${tx.json(legacy)})
+        (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,recovery_floor,repair_floor,legacy_boundaries,worker_uncertain)
+        VALUES (${this.tenantId},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${ownerId},${at},${floor},${floor},${tx.json(legacy)},${eligible.length>0})
         ON CONFLICT (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id) DO UPDATE SET
         owner_id=EXCLUDED.owner_id,epoch=gen_random_uuid(),active=true,suspended=false,activation_floor=EXCLUDED.activation_floor,recovery_floor=EXCLUDED.recovery_floor,
-        version=0,certified_until=NULL,repair_floor=EXCLUDED.repair_floor,coverage='{}',legacy_boundaries=EXCLUDED.legacy_boundaries RETURNING *`;
+        version=0,certified_until=NULL,repair_floor=EXCLUDED.repair_floor,coverage='{}',legacy_boundaries=EXCLUDED.legacy_boundaries,worker_uncertain=EXCLUDED.worker_uncertain,worker_session=NULL,worker_lease_holder=NULL,worker_lease_token=NULL,worker_generation=channel_delivery_lifecycles.worker_generation+1 RETURNING *`;
       return deliverySnapshot(row);
     };
     return transaction?run(transaction):this.sql.begin(run) as Promise<DeliverySnapshot>;
@@ -362,7 +371,7 @@ export class PostgresMappingStore implements MappingStore {
       if(!old || old.owner_id!==ownerId) return false;
       if(old.epoch!==epoch) throw new StaleDeliveryFenceError('Control transition lifecycle epoch changed');
       if(!old.active) return false;
-      await tx`UPDATE channel_delivery_lifecycles SET suspended=true,version=version+1
+      await tx`UPDATE channel_delivery_lifecycles SET suspended=true,worker_session=NULL,worker_lease_holder=NULL,worker_lease_token=NULL,worker_generation=worker_generation+1,version=version+1
         WHERE ${deliveryScope(tx,this.tenantId,link)}`;
       return true;
     };

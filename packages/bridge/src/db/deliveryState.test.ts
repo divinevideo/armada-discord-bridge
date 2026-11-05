@@ -21,7 +21,7 @@ describe.skipIf(!reachable)('atomic delivery lifecycle fencing',()=>{
      await store.cursorSet(link.communityId,'legacy',10);
      const snapshot=await store.activateDelivery(link,'synthetic-owner',['legacy'],1000);
      expect(snapshot.activationFloor).toBe(1000); expect(snapshot.repairFloor).toBe(1000);
-     const view=store.forDelivery(link,{ownerId:'synthetic-owner',epoch:snapshot.epoch,lease});
+     const view=(await store.openDelivery(link,'synthetic-owner',lease)).store;
      await view.saveDeletes(link,[input]);
      expect((await store.activateDelivery(link,'synthetic-owner',['legacy'],2000)).epoch).toBe(snapshot.epoch);
      const gap=await view.markDeliveryGap(900);
@@ -33,12 +33,12 @@ describe.skipIf(!reachable)('atomic delivery lifecycle fencing',()=>{
  test('replaced lease rejects every old mutation and old paused unlink cannot touch new owner',async()=>{
    const first=(await leases.acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
    const before=await store.activateDelivery(link,'synthetic-owner',[],1000);
-   const stale=store.forDelivery(link,{ownerId:'synthetic-owner',epoch:before.epoch,lease:first});
+   const stale=(await store.openDelivery(link,'synthetic-owner',first)).store;
    await first.release();
    const second=(await leases.acquire(first.resource))!;
    try {
      const next=await store.activateDelivery(link,'synthetic-new-owner',[],3000);
-     const current=store.forDelivery(link,{ownerId:'synthetic-new-owner',epoch:next.epoch,lease:second});
+     const current=(await store.openDelivery(link,'synthetic-new-owner',second)).store;
      await current.saveDeletes(link,[input]);
      await expect(stale.saveDeletes(link,[input])).rejects.toThrow();
      await expect(stale.completeDelete(link,input.deleteRumorId,input.targetRumorId)).rejects.toThrow();
@@ -66,7 +66,7 @@ test.skipIf(!reachable)('real concurrent lease takeover serializes before a queu
   const snap=await store.activateDelivery(link,'race-owner',[],Math.floor(Date.now()/1000));
   const application=`delivery-race-${crypto.randomUUID()}`;
   const worker=postgres(url!,{max:1,connection:{application_name:application}});
-  const view=new PostgresMappingStore(worker,tenant).forDelivery(link,{ownerId:'race-owner',epoch:snap.epoch,lease});
+  const view=(await new PostgresMappingStore(worker,tenant).openDelivery(link,'race-owner',lease)).store;
   let pending:Promise<unknown>|undefined, replacement:Awaited<ReturnType<BridgeLeases['acquire']>>;
   try {
     await sql.begin(async tx=>{
@@ -86,7 +86,7 @@ test.skipIf(!reachable)('control revocation atomically fences queued callbacks e
  const snap=await store.activateDelivery(link,'termination-race',[],1000);
  const application=`delivery-revoke-${crypto.randomUUID()}`;
  const worker=postgres(url!,{max:1,connection:{application_name:application}});
- const view=new PostgresMappingStore(worker,tenant).forDelivery(link,{ownerId:'termination-race',epoch:snap.epoch,lease});
+ const view=(await new PostgresMappingStore(worker,tenant).openDelivery(link,'termination-race',lease)).store;
  let pending:Promise<unknown>|undefined;
  try {
    await sql.begin(async tx=>{
@@ -103,8 +103,8 @@ test.skipIf(!reachable)('partial certification resumes after restart and a concu
  const lease=(await leases.acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
  try {
    const snap=await store.activateDelivery(link,'partial-repair',[],1000);
-   const view=store.forDelivery(link,{ownerId:'partial-repair',epoch:snap.epoch,lease});
-   expect(await view.certifyDelivery(snap.version,1299,{stream:1299})).toBe(true);
+   const opened=await store.openDelivery(link,'partial-repair',lease); const view=opened.store;
+   expect(await view.certifyDelivery(opened.snapshot.version,1299,{stream:1299})).toBe(true);
    const restart=await store.activateDelivery(link,'partial-repair',[],5000);
    expect(restart.repairFloor).toBe(1300); expect(restart.certifiedUntil).toBe(1299);
    const gap=await view.markDeliveryGap(1100);
@@ -117,7 +117,7 @@ test.skipIf(!reachable)('partial certification resumes after restart and a concu
 test.skipIf(!reachable)('a lease expiring during a blocked write rolls the mutation back',async()=>{
  const lease=(await leases.acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
  const snap=await store.activateDelivery(link,'expiry-during-write',[],1000);
- const view=store.forDelivery(link,{ownerId:'expiry-during-write',epoch:snap.epoch,lease});
+ const view=(await store.openDelivery(link,'expiry-during-write',lease)).store;
  try {
    await sql`UPDATE bridge_leases SET expires_at=clock_timestamp()+interval '100 milliseconds' WHERE resource=${lease.resource}`;
    await expect((view as any).write(async(tx:postgres.TransactionSql)=>{
@@ -141,15 +141,17 @@ test.skipIf(!reachable)('pause fences a different worker while preserving epoch 
  const lease=(await leases.acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
  try {
   const snap=await store.activateDelivery(link,'pause-owner',[],1000);
-  const view=store.forDelivery(link,{ownerId:'pause-owner',epoch:snap.epoch,lease});
+  const view=(await store.openDelivery(link,'pause-owner',lease)).store;
   await view.saveDeletes(link,[input]);
   await store.suspendDelivery(link,'pause-owner',snap.epoch);
   await expect(view.assertDeliveryCurrent()).rejects.toThrow('lifecycle');
   await expect(view.completeDelete(link,input.deleteRumorId,input.targetRumorId)).rejects.toThrow('lifecycle');
   expect(await store.pendingDeletes(link)).toHaveLength(1);
   expect((await store.activateDelivery(link,'pause-owner',[],2000)).epoch).toBe(snap.epoch);
-  await view.assertDeliveryCurrent();
-  expect(await view.pendingDeletes(link)).toHaveLength(1);
+  await expect(view.assertDeliveryCurrent()).rejects.toThrow('session');
+  const resumed=(await store.openDelivery(link,'pause-owner',lease)).store;
+  await resumed.assertDeliveryCurrent();
+  expect(await resumed.pendingDeletes(link)).toHaveLength(1);
  } finally {await lease.release();}
 });
 test.skipIf(!reachable)('same-owner stale control callbacks cannot terminate a relink or commit its status update',async()=>{
@@ -171,4 +173,56 @@ test.skipIf(!reachable)('due link selection filters eligible owners before its l
  await store.saveDeletes(link,[{...input,nextAttemptAtMs:1}]);
  expect((await store.dueDeletionLinks(1,['eligible-owner'])).map(value=>value.ownerId)).toEqual(['eligible-owner']);
  expect(await store.dueDeletionLinks(1,[])).toEqual([]);
+});
+
+test.skipIf(!reachable)('worker attachment arms a durable uncertainty marker and fences earlier sessions', async()=>{
+ const scope={...link,discordChannelId:`${tenant}-session`};
+ const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ const owner='session-owner', firstSession=crypto.randomUUID(), secondSession=crypto.randomUUID();
+ try {
+  await store.activateDelivery(scope,owner,[],1000);
+  const first=await store.openDelivery(scope,owner,lease,[],1000,firstSession);
+  expect(first.snapshot.repairFloor).toBe(1000);
+  expect(first.snapshot.workerUncertain).toBe(true);
+  expect(first.snapshot.sessionId).toBe(firstSession);
+  expect(await first.store.certifyDelivery(first.snapshot.version,1200,{},true)).toBe(true);
+  const same=await store.openDelivery(scope,owner,lease,[],1000,firstSession);
+  expect(same.snapshot.repairFloor).toBeUndefined();
+  const second=await store.openDelivery(scope,owner,lease,[],1000,secondSession);
+  expect(second.snapshot.repairFloor).toBe(0);
+  await expect(first.store.assertDeliveryCurrent()).rejects.toThrow('session');
+  await second.store.assertDeliveryCurrent();
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
+});
+
+test.skipIf(!reachable)('resuming with the same session id never revives a stale pre-pause view', async()=>{
+ const scope={...link,discordChannelId:`${tenant}-reuse-session`};
+ const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ const owner='resume-session', sessionId=crypto.randomUUID();
+ try {
+  const state=await store.activateDelivery(scope,owner,[],1000);
+  const old=await store.openDelivery(scope,owner,lease,[],1000,sessionId);
+  await store.suspendDelivery(scope,owner,state.epoch);
+  await store.activateDelivery(scope,owner,[],2000);
+  const fresh=await store.openDelivery(scope,owner,lease,[],2000,sessionId);
+  await fresh.store.assertDeliveryCurrent();
+  await expect(old.store.assertDeliveryCurrent()).rejects.toThrow('session');
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
+});
+
+test.skipIf(!reachable)('same session id with a successor lease still starts conservative recovery', async()=>{
+ const scope={...link,discordChannelId:`${tenant}-successor-session`};
+ const owner='lease-session', sessionId=crypto.randomUUID();
+ const first=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ let second:Awaited<ReturnType<BridgeLeases['acquire']>>;
+ try {
+  await store.activateDelivery(scope,owner,[],1000);
+  const old=await store.openDelivery(scope,owner,first,[],1000,sessionId);
+  expect(await old.store.certifyDelivery(old.snapshot.version,1200,{},true)).toBe(true);
+  await first.release();
+  second=(await leases.acquire(first.resource))!;
+  const fresh=await store.openDelivery(scope,owner,second,[],2000,sessionId);
+  expect(fresh.snapshot.repairFloor).toBe(0);
+  await expect(old.store.assertDeliveryCurrent()).rejects.toThrow();
+ } finally {await first.release();await second?.release();await sql`DELETE FROM bridge_leases WHERE resource=${first.resource}`;}
 });

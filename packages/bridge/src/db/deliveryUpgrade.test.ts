@@ -44,6 +44,9 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    await db`INSERT INTO channel_delivery_lifecycles(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,recovery_floor,legacy_boundaries)
      VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'intermediate', 'intermediate',1000,1000,${db.json({future:1600,old:100})})`;
    await db.unsafe(await readFile(new URL('migrations/025_delivery_legacy_boundaries.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/026_delivery_worker_session.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/027_delivery_worker_generation.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/028_delivery_session_lease.sql',directory),'utf8'));
    expect((await db`SELECT legacy_boundaries FROM channel_delivery_lifecycles WHERE discord_channel_id='intermediate'`)[0].legacy_boundaries).toEqual({future:999,old:100});
    // Match the deployment migration hook: explicit DML grants after migrations,
    // not superuser tests or a dependency on unspecified default privileges.
@@ -58,7 +61,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    try {
      const snapshot=await store.activateDelivery(link,owner,['old','new'],1000);
      expect(snapshot.repairFloor).toBe(80);expect(snapshot.activationFloor).toBe(1000);expect(snapshot.recoveryFloor).toBe(80);expect(snapshot.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999});
-     const view=store.forDelivery(link,{ownerId:owner,epoch:snapshot.epoch,lease});
+     const view=(await store.openDelivery(link,owner,lease)).store;
      const held=await view.pendingDeletes(link);
      expect(held.find(row=>row.targetRumorId==='c'.repeat(64))?.actionClass).toBe('actionable');
      expect(held.find(row=>row.targetRumorId==='e'.repeat(64))?.actionClass).toBe('unresolved');
@@ -81,8 +84,8 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    try {
      const oldCheckpoint=await store.activateDelivery(checkpointOnly,checkpointOwner,[],1000);
      expect(oldCheckpoint.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999}); expect(oldCheckpoint.recoveryFloor).toBe(70);
-     const view=store.forDelivery(checkpointOnly,{ownerId:checkpointOwner,epoch:oldCheckpoint.epoch,lease:checkpointLease});
-     expect(await view.certifyDelivery(oldCheckpoint.version,1200,{},true)).toBe(true);
+     const opened=await store.openDelivery(checkpointOnly,checkpointOwner,checkpointLease); const view=opened.store;
+     expect(await view.certifyDelivery(opened.snapshot.version,1200,{},true)).toBe(true);
      const healed=await view.deliverySnapshot();
      expect(healed.repairFloor).toBeUndefined(); expect(healed.recoveryFloor).toBe(70);
    } finally { await checkpointLease.release(); }
