@@ -19,6 +19,7 @@ import { PublicCapacityStore, loadPublicCapacity } from "./publicCapacity";
 import { PolicyWatcher } from "./policyWatcher";
 import { RelayPurger } from "./relayPurge";
 import { controlState } from "./relayPolicy";
+import { observeWorkerAuthority, type WorkerAuthorityObservation } from "./workerMetrics";
 import { ModerationWorker } from "./worker";
 export function validateWorkerCommunity(community: CommunityV2, moderatorPk: string, communities: ReadonlyMap<string, string>): void {
   if (!communities.has(community.idHex) || communities.size !== 1 || community.owner === moderatorPk || community.privateChannels.length) throw new Error("Worker requires one approved public community and a non-owner member identity");
@@ -35,7 +36,7 @@ export async function observeWorkerCapacity(sql: postgres.Sql, capacity: ReturnT
   if (!orgId) throw new Error("Capacity community scope unavailable");
   await new PublicCapacityStore(sql, capacity.contract).observeCurrent(orgId, communityId);
 }
-export interface WorkerHealth { ready: boolean; code: "starting" | "ready" | "policy_unavailable" | "rekey_recovery_required" | "delivery_unavailable" | "stopped"; checkedAt: number }
+export interface WorkerHealth { ready: boolean; code: "starting" | "ready" | "policy_unavailable" | "rekey_recovery_required" | "delivery_unavailable" | "stopped"; checkedAt: number; authority?: WorkerAuthorityObservation }
 export async function runModerationWorker(options: { capacity?: ReturnType<typeof loadPublicCapacity>; sql: postgres.Sql; decisions: Decisions; lifecycle: Pick<Lifecycle, "expireEvidence" | "expireAudit">; community: CommunityV2; identity: LocalIdentity; communities: ReadonlyMap<string, string>; relayUrl: string; bridgeTenantId: string; puppetMaster: string; discordToken: string; publicChannels: PublicChannelRules; publicAuthors: string[]; signal: AbortSignal; health: WorkerHealth }): Promise<void> {
   validateWorkerCommunity(options.community, options.identity.pk, options.communities);
   const { sql, community, identity, health } = options;
@@ -44,16 +45,31 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
   const store = new PolicyStore(sql), driver = new LocalRelayDriver(options.relayUrl);
   const purger = new RelayPurger(new CarrierIndex(sql), driver);
   let watcher: PolicyWatcher | undefined;
-  const pool = new RelayPool([options.relayUrl], { onDisconnect: () => { health.ready = false; health.code = "policy_unavailable"; void watcher?.disconnected(); } });
+  let authorityGeneration = 0;
+  const clearAuthority = () => { authorityGeneration++; health.authority = undefined; };
+  const pool = new RelayPool([options.relayUrl], { onDisconnect: () => { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; void watcher?.disconnected(); } });
   watcher = new PolicyWatcher(community, store, pool, [...options.publicAuthors, identity.pk], identity);
   const refresh = async () => {
-    const policy = await watcher!.refresh();
-    await observeWorkerCapacity(sql, capacity, community.idHex);
-    registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
-    health.checkedAt = Date.now();
-    health.ready = !policy.rekeyPending;
-    health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
-    return policy;
+    // Capture the generation; do not clear on entry. The last observation
+    // stays bounded by its own validUntil, and every action authorization
+    // refreshes too, so clearing here would read as lost authority for the
+    // length of each routine refresh. Disconnects and subscription errors
+    // still bump the generation; a failed refresh clears before rethrowing,
+    // because worker.tick swallows the failures of action-path refreshes.
+    const generation = authorityGeneration;
+    try {
+      const policy = await watcher!.refresh();
+      await observeWorkerCapacity(sql, capacity, community.idHex);
+      const { folded } = controlState(policy);
+      registerStreamKeys(channelsView(community, folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
+      health.checkedAt = Date.now();
+      // Capacity observation awaits SQL after the policy refresh. A disconnect
+      // during that await must not let this old policy restore a green gauge.
+      if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt, folded);
+      health.ready = !policy.rekeyPending;
+      health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
+      return policy;
+    } catch (error) { clearAuthority(); throw error; }
   };
   registerStreamKeys([...controlGroups(community), ...guestbookGroups(community), ...community.heldRoots.map((root) => baseRekeyGroupKey(root.key, community.id, root.epoch + 1n))], pool.urls);
   const actions = new ConcordActions(community, identity, refresh);
@@ -76,7 +92,7 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
       let controlChanged = true, nextRefresh = 0;
       unsubscribe = pool.subscribe([{ kinds: [1059], authors: controlGroups(community).map((group) => group.pk) }], {
         onEvent: () => { controlChanged = true; },
-        onError: () => { health.ready = false; health.code = "policy_unavailable"; void watcher!.disconnected(); },
+        onError: () => { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; void watcher!.disconnected(); },
       });
       while (!options.signal.aborted) {
         await assertLeadership();
@@ -93,12 +109,12 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
           await worker.tick();
           await restrictions.tick();
           await expireModerationRecords(options.decisions, options.lifecycle);
-        } catch { health.ready = false; health.code = "policy_unavailable"; await watcher!.disconnected(); }
+        } catch { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; await watcher!.disconnected(); }
         await delay(1000, undefined, { signal: options.signal }).catch(() => {});
       }
     });
   } finally {
-    health.ready = false; health.code = "stopped";
+    clearAuthority(); health.ready = false; health.code = "stopped";
     unsubscribe();
     await watcher.disconnected();
     await pool.close();
