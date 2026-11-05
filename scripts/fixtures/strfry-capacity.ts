@@ -465,8 +465,8 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           if (kube) await kube.updateFixtures(directory);
           await store.install(f.policy, f.streams, 0);
           // A reviewed entrypoint replay uses normal operator observations,
-          // never the calibration seed or an implicit durable-pause reset.
-          if (entrypointCapacity) await entrypointCapacity.observeCurrent("synthetic-capacity", f.policy.communityId);
+          // taken by sample() before each send, never the calibration seed or
+          // an implicit durable-pause reset.
           if (calibration) {
             // Only the disposable operator seeds its own fixture latch; the deployed entrypoint has no bypass.
             const table = await sql`SELECT to_regclass('moderation.public_capacity_state') AS name`;
