@@ -11,6 +11,7 @@ export async function portalMetricsResponse(sql: postgres.Sql, discordConnected:
       count(*) FILTER (WHERE status = 'severed') AS severed FROM bridges`;
     const paused = Number(row.paused), severed = Number(row.severed);
     if (![paused, severed, relaySocketsDown].every(value => Number.isSafeInteger(value) && value >= 0)) throw new Error("Invalid aggregate");
-    return new Response(`armada_discord_connected ${Number(discordConnected)}\narmada_relay_sockets_down ${relaySocketsDown}\narmada_bridges_paused ${paused}\narmada_bridges_severed ${severed}\n`, { headers: { "content-type": "text/plain; version=0.0.4", "cache-control": "no-store" } });
+    const series = { armada_discord_connected: Number(discordConnected), armada_relay_sockets_down: relaySocketsDown, armada_bridges_paused: paused, armada_bridges_severed: severed };
+    return new Response(Object.entries(series).map(([name, value]) => `# TYPE ${name} gauge\n${name} ${value}\n`).join(""), { headers: { "content-type": "text/plain; version=0.0.4", "cache-control": "no-store" } });
   } catch { return new Response("unavailable", { status: 503 }); }
 }

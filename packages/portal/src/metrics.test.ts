@@ -9,13 +9,13 @@ test.skipIf(!dbUp)("portal metrics count only persisted paused and severed statu
   await sql.begin(async tx => {
     await tx`CREATE TEMP TABLE bridges (status text) ON COMMIT DROP`;
     const empty = await portalMetricsResponse(tx as unknown as postgres.Sql, true, 0);
-    expect(await empty.text()).toContain("armada_bridges_paused 0\narmada_bridges_severed 0\n");
+    expect(await empty.text()).toContain("# TYPE armada_bridges_paused gauge\narmada_bridges_paused 0\n# TYPE armada_bridges_severed gauge\narmada_bridges_severed 0\n");
     for (const status of ["draft", "pending_confirm", "active", "paused", "paused", "severed", "unlinked"]) await tx`INSERT INTO bridges VALUES (${status})`;
     const response = await portalMetricsResponse(tx as unknown as postgres.Sql, false, 2);
     expect(response.status).toBe(200);
-    expect(await response.text()).toBe("armada_discord_connected 0\narmada_relay_sockets_down 2\narmada_bridges_paused 2\narmada_bridges_severed 1\n");
+    expect(await response.text()).toBe("# TYPE armada_discord_connected gauge\narmada_discord_connected 0\n# TYPE armada_relay_sockets_down gauge\narmada_relay_sockets_down 2\n# TYPE armada_bridges_paused gauge\narmada_bridges_paused 2\n# TYPE armada_bridges_severed gauge\narmada_bridges_severed 1\n");
     await tx`UPDATE bridges SET status = 'active' WHERE status IN ('paused', 'severed')`;
-    expect(await (await portalMetricsResponse(tx as unknown as postgres.Sql, true, 0)).text()).toContain("armada_bridges_paused 0\narmada_bridges_severed 0\n");
+    expect(await (await portalMetricsResponse(tx as unknown as postgres.Sql, true, 0)).text()).toContain("# TYPE armada_bridges_paused gauge\narmada_bridges_paused 0\n# TYPE armada_bridges_severed gauge\narmada_bridges_severed 0\n");
   });
 });
 test("portal SQL failure fails the entire scrape without leaking database details", async () => {
