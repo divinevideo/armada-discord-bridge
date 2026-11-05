@@ -604,7 +604,6 @@ export class BridgeRouter {
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (this.queued >= MAX_QUEUED_CHATS) {
       if (chat.kind === KIND_DELETE) {
-        this.deletionsDurable = false;
         throw new Error("Concord deletion queue full; delivery cursor must remain pinned");
       }
       // Shedding load beats unbounded growth: past this the sender is flooding
@@ -892,15 +891,10 @@ export class BridgeRouter {
         rows.push(row);
       }
       await this.store.saveDeletes(link,rows);
-    } catch(error) { this.deletionsDurable=false; throw error instanceof DeletionIntakeError ? error : new DeletionIntakeError('Concord deletion intake failed: '+String(error),{cause:error}); }
+    } catch(error) { throw error instanceof DeletionIntakeError ? error : new DeletionIntakeError('Concord deletion intake failed: '+String(error),{cause:error}); }
     // Once durable, a transient read or effect failure belongs to the retry
     // queue. It must not masquerade as missing relay intake.
     for (const target of targets) await this.applyPendingDeletes(link,target);
-  }
-
-  private deletionsDurable = true;
-  assertDeletionDeliveryDurable(): void {
-    if (!this.deletionsDurable) throw new Error("Concord deletion storage failed; cursor remains pinned until restart");
   }
 
   private deletionRetry?: Promise<void>;
@@ -924,7 +918,6 @@ export class BridgeRouter {
       try { await this.applyDelete(deletion,link); }
       catch(error) {
         if(error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError) {
-          this.deletionsDurable=false;
           if(!gap || error.repairFloor < gap.repairFloor) gap=error;
         } else {
           console.warn(`bridge: deletion ${deletion.deleteRumorId} remains pending`,error);

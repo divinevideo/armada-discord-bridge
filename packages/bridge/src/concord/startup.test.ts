@@ -50,9 +50,9 @@ describe('standalone catch-up handoff', () => {
       await pool.publish(wrap); return { rumor, wrap };
     };
     const link = { communityId: f.community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true };
-    const store = new MemoryMappingStore(); const deleted: string[] = [], checkpoints: number[] = [];
+    const store = new MemoryMappingStore(); const deleted: string[] = [];
     const originalNow = Date.now; const initialTime = Math.floor(originalNow() / 1000);
-    let clock = initialTime - 100, sends = 0, floorPersisted = false, controlInstalled = false, catchupReady = false;
+    let clock = initialTime - 100, sends = 0, floorPersisted = false, controlInstalled = false;
     let deletionAt = 0, unsubscribe = () => {};
     let finishCatchup!: () => void;
     const caughtUp = new Promise<void>(resolve => { finishCatchup = resolve; });
@@ -80,27 +80,23 @@ describe('standalone catch-up handoff', () => {
         establishFloor: async () => { floorPersisted = true; },
         installLive: () => {
           expect(floorPersisted).toBe(true);
-          unsubscribe = client.subscribeChannel(channel, deliver, undefined, (_pk, at) => {
-            if (!catchupReady) return;
-            router.assertDeletionDeliveryDurable(); client.assertDeliveryHealthy(); checkpoints.push(at);
-          });
+          unsubscribe = client.subscribeChannel(channel, deliver);
         },
         installControl: () => { controlInstalled = true; },
         catchUp: async () => {
           await client.backfillChannel(channel, target.wrap.created_at - 60, 500, { onBatch: async batch => {
             for (const chat of batch.chats) await deliver(chat);
-            if (batch.newestWrapAt !== undefined) checkpoints.push(batch.newestWrapAt);
           } });
-          catchupReady = true; finishCatchup();
+          finishCatchup();
         },
       });
       await caughtUp;
       await publishMemberChat('newer live message');
-      // Await the final live cursor, not a fixed delay; the deletion shares the serial router lane.
-      for (let i = 0; i < 100 && !checkpoints.includes(initialTime + 120); i++) await new Promise(resolve => setTimeout(resolve, 1));
+      // The deletion shares the serial router lane with subsequent traffic.
+      for (let i = 0; i < 100 && sends < 2; i++) await new Promise(resolve => setTimeout(resolve, 1));
       expect(controlInstalled).toBe(true);
       expect(deletionAt).toBe(initialTime + 1);
-      expect(checkpoints).toContain(initialTime + 120);
+      expect(sends).toBe(2);
       expect(deleted).toEqual(['discord-1']);
       expect(await store.pendingDeletes(link)).toEqual([]);
     } finally { unsubscribe(); Date.now = originalNow; }

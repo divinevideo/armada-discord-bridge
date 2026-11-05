@@ -61,14 +61,15 @@ it('handles real SIGTERM during a blocked synthetic catch-up', async () => {
     const shutdown=new Shutdown(500), lane=new LinkDelivery({onError:()=>{}});
     shutdown.signal.addEventListener('abort',()=>lane.stop(),{once:true});
     let release; const blocked=new Promise(r=>release=r); let effects=0, checkpoints=0;
-    shutdown.register(()=>process.stdout.write('released\\n'));
+    const keepAlive=setInterval(()=>{},1000);
+    let released=false; shutdown.register(()=>{clearInterval(keepAlive);released=true;});
     const snapshot={ownerId:'o',epoch:'e',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version:0,activationFloor:100,recoveryFloor:100,repairFloor:100,coverage:{},ordinaryCoverage:{},legacyBoundaries:{}};
     const channel={streams:[{epoch:0n,group:{pk:'s'}}]};
     const run=lane.repair({store:{deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{checkpoints++;return true;}},channel:()=>channel,
       deliver:async(_chat,signal)=>{process.stdout.write('ready\\n');await blocked;signal.throwIfAborted();effects++;},
       replay:async(_c,_s,opts)=>{const pending=opts.onBatch({chats:[{rumorId:'r',streamPk:'s',sourceWrapCreatedAt:100,createdAt:100,epoch:0n,kind:5}]},{signal:opts.signal});void pending.catch(()=>{});await Promise.race([pending,new Promise((_r,reject)=>opts.signal.addEventListener('abort',()=>reject(opts.signal.reason),{once:true}))]);}});
     void run.catch(()=>{});
-    process.on('SIGTERM',()=>{shutdown.finishStartup();void shutdown.begin().then(async()=>{release();await Promise.allSettled([run]);await Bun.sleep(0);process.stdout.write('effects='+effects+' checkpoints='+checkpoints+'\\n');process.exit(0);});});
+    process.on('SIGTERM',()=>{shutdown.finishStartup();void shutdown.begin().then(async()=>{release();await Promise.allSettled([run]);await Bun.sleep(0);process.stdout.write((released?'released\\n':'')+'effects='+effects+' checkpoints='+checkpoints+'\\n',()=>process.exit(0));});});
   `;
   const child=Bun.spawn([process.execPath,'-e',script],{cwd:process.cwd(),env:{PATH:process.env.PATH!,HOME:process.env.HOME!,TMPDIR:process.env.TMPDIR ?? '/tmp'},stdout:'pipe',stderr:'pipe'});
   const reader=child.stdout.getReader(), decoder=new TextDecoder(); let output='';

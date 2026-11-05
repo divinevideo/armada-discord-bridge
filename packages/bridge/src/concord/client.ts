@@ -45,7 +45,7 @@ import {
   wrapSeal,
 } from "@armada-bridge/concord-core";
 import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from "../deletionPolicy";
-import type { LinkDelivery } from "./linkDelivery";
+import { LinkDelivery } from "./linkDelivery";
 import type {
   ChannelV2,
   CommunityListEntry,
@@ -169,12 +169,6 @@ export interface SendChatOptions {
 
 export class ConcordClient {
   folded?: FoldedControl;
-  // A fresh REQ is only a live tail, not proof that an earlier delivery gap
-  // was replayed. Only a new client after durable catch-up may clear this.
-  private deliveryHealthy = true;
-  assertDeliveryHealthy(): void {
-    if (!this.deliveryHealthy) throw new Error("Concord delivery gap requires restart and durable catch-up");
-  }
 
   /** The bridge's own posting identity; the router skips its messages. */
   get primaryPk(): string {
@@ -349,13 +343,12 @@ export class ConcordClient {
     channel: ChannelV2,
     onChat: (chat: DeliveredChat) => unknown,
     onError?: (relayUrl: string, error: unknown) => void,
-    /** Called per durable wrap that opened; feeds the catch-up cursor. */
-    onCursor?: (streamPk: string, wrapCreatedAt: number) => unknown,
+    /** Retained for source compatibility; live payloads never certify coverage. */
+    _onCursor?: (streamPk: string, wrapCreatedAt: number) => unknown,
     shared?: { lane: LinkDelivery; currentChannel: () => ChannelV2 },
   ): () => void {
-    const seenRumors = new Set<string>();
-    let deliveries: Promise<void> = Promise.resolve();
-    let queuedDeliveries = 0;
+    const lane = shared?.lane ?? new LinkDelivery({ onError: () => {} });
+    const currentChannel = shared?.currentChannel ?? (() => channel);
 
     // Live tail only: without a floor, relays replay stored history into the
     // router on every (re)subscribe. Catch-up after downtime is cursor work,
@@ -373,57 +366,27 @@ export class ConcordClient {
       {
         onError,
         onEvent: (wrap) => {
-          if (shared) {
-            const work = async (signal: AbortSignal) => {
-              try {
-                const opened = await openChatBatch([wrap], channel);
+          const work = async (signal: AbortSignal) => {
+            try {
+              const opened = await openChatBatch([wrap], channel);
+              signal.throwIfAborted();
+              for (const chat of filterEpochCutoff(opened, currentChannel())) {
+                if (lane.hasSeen(chat.rumorId)) continue;
                 signal.throwIfAborted();
-                for (const chat of filterEpochCutoff(opened, shared.currentChannel())) {
-                  if (shared.lane.hasSeen(chat.rumorId)) continue;
-                  signal.throwIfAborted();
-                  await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });
-                  signal.throwIfAborted();
-                  shared.lane.remember(chat.rumorId);
-                }
-              } catch (error) {
-                if (wrap.kind === KIND_WRAP && !signal.aborted) shared.lane.markGap(
-                  error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError ? Math.min(wrap.created_at, error.repairFloor) : wrap.created_at,
-                );
-                onError?.("dispatch", error);
-                throw error;
+                await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });
+                signal.throwIfAborted();
+                lane.remember(chat.rumorId);
               }
+            } catch (error) {
+              if (wrap.kind === KIND_WRAP && !signal.aborted) lane.markGap(
+                error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError ? Math.min(wrap.created_at, error.repairFloor) : wrap.created_at,
+              );
+              onError?.("dispatch", error);
+              throw error;
+            }
             };
-            if (wrap.kind === KIND_WRAP_EPHEMERAL) shared.lane.typing(work);
-            else void shared.lane.admit(wrap.created_at, work)?.catch(() => {});
-            return;
-          }
-          // Bound admission before the promise chain: a blocked Discord send
-          // otherwise hides arbitrarily many wraps from the router's own cap.
-          // Overflow may contain a deletion, so never acknowledge later wraps
-          // past this gap; restart/catch-up must replay the relay copy.
-          if (queuedDeliveries >= 200) {
-            this.deliveryHealthy = false;
-            onError?.("dispatch", new Error("Concord delivery queue full; cursor remains pinned until restart and catch-up"));
-            return;
-          }
-          queuedDeliveries++;
-          deliveries = deliveries.then(async () => {
-            const opened = await openChatBatch([wrap], channel);
-            for (const chat of opened) {
-              if (seenRumors.has(chat.rumorId)) continue;
-              await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });
-              if (seenRumors.size >= 65_536) seenRumors.clear();
-              seenRumors.add(chat.rumorId);
-            }
-            if (this.deliveryHealthy && opened.length > 0 && wrap.kind === KIND_WRAP) {
-              await onCursor?.(wrap.pubkey, wrap.created_at);
-            }
-          }).catch(error => {
-            // A later success must not move the cursor past an action that
-            // failed before durable storage. A fresh catch-up can retry it.
-            this.deliveryHealthy = false;
-            onError?.("dispatch", error);
-          }).finally(() => { queuedDeliveries--; });
+          if (wrap.kind === KIND_WRAP_EPHEMERAL) lane.typing(work);
+          else void lane.admit(wrap.created_at, work)?.catch(() => {});
         },
       },
     );

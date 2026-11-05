@@ -41,13 +41,11 @@ describe('Concord deletion authority at the Discord boundary', () => {
     const message = await opened(fixture.chatEvent, h.channel);
     expect(await deliverConcordChat(h.router, message, h.link, error => errors.push(error))).toEqual([]);
     expect(errors).toHaveLength(1);
-    expect(() => h.router.assertDeletionDeliveryDurable()).not.toThrow();
     h.webhooks.send = send;
     expect(await deliverConcordChat(h.router, message, h.link, error => errors.push(error))).toHaveLength(1);
     h.store.saveDeletes = async () => { throw new Error('storage unavailable'); };
     await expect(deliverConcordChat(h.router, await opened(fixture.moderatorDeleteEvent, h.channel), h.link, error => errors.push(error))).rejects.toThrow('storage unavailable');
     expect(errors).toHaveLength(1);
-    expect(() => h.router.assertDeletionDeliveryDurable()).toThrow();
   });
 
   for (const [name, message, deletion] of [
@@ -194,13 +192,12 @@ describe('signed reaction deletion', () => {
   });
 });
 
-it('refuses cursor advancement after pending deletion storage fails', async () => {
+it('propagates pending deletion storage failures', async () => {
   class UnavailableStore extends MemoryMappingStore {
     override async saveDeletes(): Promise<never> { throw new Error('storage unavailable'); }
   }
   const h = deletionHarness(new UnavailableStore());
   await expect(h.router.onConcordChat(await opened(fixture.moderatorDeleteEvent, h.channel), h.link)).rejects.toThrow('storage unavailable');
-  expect(() => h.router.assertDeletionDeliveryDurable()).toThrow('cursor remains pinned');
   expect(h.deleted).toEqual([]);
 });
 
@@ -254,7 +251,6 @@ it('keeps actionable self-deletes independent of a full unknown-target allocatio
   expect(await h.store.pendingDeletes(h.link)).toHaveLength(1024);
   const selfDelete = await h.event(h.f.member, 5, [['e', h.f.allowedRumorId]]);
   await expect(h.router.onConcordChat(selfDelete, h.link)).resolves.toEqual([]);
-  expect(() => h.router.assertDeletionDeliveryDurable()).not.toThrow();
 });
 
 it('contains a read failure after durable intake without rejecting deletion delivery', async () => {
@@ -333,7 +329,6 @@ it('reports a promotion storage outage across expiry and recovers via replay', a
  let gap:any;
  try {await h.router.retryPendingDeletes(h.link);} catch(error) {gap=error;}
  expect(gap?.durable).toBe(false); expect(gap?.repairFloor).toBe(source); expect(gap?.link).toEqual(h.link);
- expect(()=>h.router.assertDeletionDeliveryDurable()).toThrow();
  expect((await store.pendingDeletes(h.link))[0].actionClass).toBe('unresolved');
  expect(h.deleted).toEqual(['outage-target']);
  now+=2*86400_000; store.promoteDelete=promote;

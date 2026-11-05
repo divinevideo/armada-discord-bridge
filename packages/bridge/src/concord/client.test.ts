@@ -288,7 +288,7 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     expect(opened.tags).toContainEqual(["channel", channel.idHex]);
   });
 
-  it("subscribeChannel delivers ephemeral typing wraps and durable chat, cursors durable only", async () => {
+  it("subscribeChannel delivers ephemeral typing wraps and durable chat", async () => {
     const { community } = makeCommunity();
     const channel = makeChannel(community);
     const pool = new FakePool();
@@ -296,24 +296,18 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     const author = localIdentity(generateSecretKey());
 
     const kinds: number[] = [];
-    const cursors: Array<{ pk: string; at: number }> = [];
     client.subscribeChannel(
       channel,
       (chat) => kinds.push(chat.kind),
-      undefined,
-      (pk, at) => cursors.push({ pk, at }),
     );
 
     await client.sendTyping(channel, author);
-    const { wrap } = await client.sendChat(channel, { content: "hi", author });
+    await client.sendChat(channel, { content: "hi", author });
     for (const event of pool.published) pool.emit(event);
     await new Promise((r) => setTimeout(r, 20));
 
     expect(kinds.sort()).toEqual([KIND_MESSAGE, KIND_TYPING].sort());
-    // Only the durable chat wrap advances the cursor.
-    expect(cursors).toHaveLength(1);
-    expect(cursors[0].pk).toBe(channel.current.group.pk);
-    expect(cursors[0].at).toBe(wrap.created_at);
+
   });
 
   it("publishManifest publishes a valid kind 10304 command manifest", async () => {
@@ -373,66 +367,23 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
 });
 
 describe('durable delivery cursor', () => {
-  it('does not advance past an opened wrap while its handler is still persisting it', async () => {
-    const { community } = makeCommunity(); const channel = makeChannel(community);
-    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
-    let entered!: () => void, release!: () => void, advanced!: () => void;
-    const started = new Promise<void>(resolve => { entered = resolve; });
-    const pending = new Promise<void>(resolve => { release = resolve; });
-    const done = new Promise<void>(resolve => { advanced = resolve; });
-    const cursors: number[] = [];
-    client.subscribeChannel(channel, async () => { entered(); await pending; }, undefined, (_pk, at) => { cursors.push(at); advanced(); });
-    const { wrap } = await client.sendChat(channel, { content: 'persist me', author: localIdentity(generateSecretKey()) });
-    pool.emit(wrap); await started;
-    expect(cursors).toEqual([]);
-    release(); await done;
-    expect(cursors).toEqual([wrap.created_at]);
-  });
-
-  it('bounds signed burst admission while a handler is blocked and pins overflow cursors', async () => {
+  it('bounds signed burst admission and persists overflow while accepting later work', async () => {
     const { community } = makeCommunity(); const channel = makeChannel(community);
     const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
     const author = localIdentity(generateSecretKey());
     const wraps: NostrEvent[] = [];
-    for (let i = 0; i < 206; i++) wraps.push((await client.sendChat(channel, { content: `burst ${i}`, author, ...(i === 200 ? { kind: 5, tags: [['e', 'ab'.repeat(32)]] } : {}) })).wrap);
-    let enter!: () => void, release!: () => void, drain!: () => void;
+    for (let i = 0; i < 4; i++) wraps.push((await client.sendChat(channel, { content: `burst ${i}`, author })).wrap);
+    let enter!: () => void, release!: () => void;
     const started = new Promise<void>(resolve => { enter = resolve; });
     const blocked = new Promise<void>(resolve => { release = resolve; });
-    const drained = new Promise<void>(resolve => { drain = resolve; });
-    const contents: string[] = []; const errors: unknown[] = []; const cursors: number[] = [];
-    const handler = async (chat: { content: string }) => {
-      contents.push(chat.content);
-      if (contents.length === 1) { enter(); await blocked; }
-      if (contents.length === 200) drain();
-    };
-    const onError = (_url: string, error: unknown) => { errors.push(error); };
-    const onCursor = (_pk: string, at: number) => { cursors.push(at); };
-    const unsubscribe = client.subscribeChannel(channel, handler, onError, onCursor);
-    pool.emit(wraps[0]); await started;
-    for (const wrap of wraps.slice(1, 205)) pool.emit(wrap);
-    expect(contents).toHaveLength(1);
-    expect(errors).toHaveLength(5);
-    expect(cursors).toEqual([]);
-    release(); await drained;
-    // Once the admitted batch drains, new work is accepted without forgetting
-    // that five durable wraps still require catch-up after this subscription.
-    await new Promise(resolve => setTimeout(resolve, 0));
-    pool.emit(wraps[205]);
-    await new Promise(resolve => setTimeout(resolve, 20));
-    expect(contents).toHaveLength(201);
-    expect(contents.at(-1)).toBe('burst 205');
-    expect(contents).not.toContain('burst 200');
-    expect(cursors).toEqual([]);
-    unsubscribe();
-    const realNow = Date.now;
-    try {
-      Date.now = () => realNow() + 120_000;
-      client.subscribeChannel(channel, handler, onError, onCursor);
-      pool.emit((await client.sendChat(channel, { content: 'after resubscription', author })).wrap);
-      await new Promise(resolve => setTimeout(resolve, 20));
-      expect(contents.at(-1)).toBe('after resubscription');
-      expect(cursors).toEqual([]);
-    } finally { Date.now = realNow; }
+    const contents: string[] = [], floors: number[] = [];
+    const lane = new LinkDelivery({ capacity: 1, onError: () => {}, onGap: async floor => { floors.push(floor); } });
+    client.subscribeChannel(channel, async chat => { contents.push(chat.content); if (contents.length === 1) { enter(); await blocked; } }, undefined, undefined, { lane, currentChannel: () => channel });
+    pool.emit(wraps[0]); await started; pool.emit(wraps[1]);
+    await lane.flushGaps(); expect(floors).toEqual([wraps[1].created_at]);
+    release(); await lane.run(async () => {});
+    pool.emit(wraps[2]); await lane.run(async () => {});
+    expect(contents).toEqual(['burst 0', 'burst 2']);
   });
 
   it('recovers more than 500 signed wraps in bounded oldest-first batches', async () => {
@@ -489,37 +440,29 @@ describe('durable delivery cursor', () => {
     expect(batches).toBe(0);
   });
 
-  it('keeps live cursor acknowledgement healthy after an ordinary mirror error', async () => {
+  it('continues delivery after an ordinary mirror error', async () => {
     const { community } = makeCommunity(); const channel = makeChannel(community);
     const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
     const author = localIdentity(generateSecretKey()); let calls = 0, finish!: () => void;
-    const done = new Promise<void>(resolve => { finish = resolve; }); const cursors: number[] = []; const errors: unknown[] = [];
-    const router = { onConcordChat: async () => { if (++calls === 1) throw new Error('Discord 503'); return []; } };
+    const done = new Promise<void>(resolve => { finish = resolve; }); const errors: unknown[] = [];
+    const router = { onConcordChat: async () => { if (++calls === 1) throw new Error('Discord 503'); finish(); return []; } };
     const link = { communityId: community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true };
-    client.subscribeChannel(channel, chat => deliverConcordChat(router, chat, link, error => errors.push(error)), undefined, (_pk, at) => {
-      cursors.push(at); if (cursors.length === 2) finish();
-    });
+    client.subscribeChannel(channel, chat => deliverConcordChat(router, chat, link, error => errors.push(error)));
     pool.emit((await client.sendChat(channel, { content: 'temporary failure', author })).wrap);
     pool.emit((await client.sendChat(channel, { content: 'later success', author })).wrap);
-    await done;
-    expect(errors).toHaveLength(1);
-    expect(cursors).toHaveLength(2);
-    expect(() => client.assertDeliveryHealthy()).not.toThrow();
+    await done; expect(errors).toHaveLength(1); expect(calls).toBe(2);
   });
 
-  it('pins the cursor after a storage failure rather than advancing on a later success', async () => {
+  it('persists a storage gap and continues accepting subsequent work', async () => {
     const { community } = makeCommunity(); const channel = makeChannel(community);
     const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
-    let calls = 0, finish!: () => void;
-    const handled = new Promise<void>(resolve => { finish = resolve; });
-    const cursors: number[] = []; const errors: unknown[] = [];
-    client.subscribeChannel(channel, async () => { if (++calls === 1) throw new Error('storage unavailable'); finish(); }, (_url, error) => errors.push(error), (_pk, at) => cursors.push(at));
+    let calls = 0, finish!: () => void; const handled = new Promise<void>(resolve => { finish = resolve; });
+    const floors: number[] = []; const lane = new LinkDelivery({ onError: () => {}, onGap: async floor => { floors.push(floor); } });
+    client.subscribeChannel(channel, async () => { if (++calls === 1) throw new Error('storage unavailable'); finish(); }, undefined, undefined, { lane, currentChannel: () => channel });
     const author = localIdentity(generateSecretKey());
-    pool.emit((await client.sendChat(channel, { content: 'fails', author })).wrap);
-    pool.emit((await client.sendChat(channel, { content: 'later', author })).wrap);
-    await handled;
-    expect(errors).toHaveLength(1);
-    expect(cursors).toEqual([]);
+    const failed = (await client.sendChat(channel, { content: 'fails', author })).wrap;
+    pool.emit(failed); pool.emit((await client.sendChat(channel, { content: 'later', author })).wrap);
+    await handled; await lane.flushGaps(); expect(floors).toContain(failed.created_at); expect(calls).toBe(2);
   });
 });
 
@@ -686,4 +629,15 @@ it('repairs from a promoted deletion’s original source floor', async () => {
   client.subscribeChannel(channel, async () => { throw error; }, () => failed(), undefined, { lane, currentChannel: () => channel });
   pool.emit(wrap); await done; await lane.flushGaps();
   expect(floors).toEqual([original]);
+});
+
+it('does not acknowledge a live wrap as certified replay coverage', async () => {
+  const { community } = makeCommunity(); const channel = makeChannel(community);
+  const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  let handled!: () => void; const done = new Promise<void>(resolve => { handled = resolve; });
+  const acknowledgements: number[] = [];
+  client.subscribeChannel(channel, () => handled(), undefined, (_pk, at) => acknowledgements.push(at));
+  pool.emit((await client.sendChat(channel, { content: 'live', author: localIdentity(generateSecretKey()) })).wrap);
+  await done; await new Promise(resolve => setTimeout(resolve, 0));
+  expect(acknowledgements).toEqual([]);
 });
