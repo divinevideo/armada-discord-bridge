@@ -78,10 +78,15 @@ export function capacityRelayName(label: string, mode: string, sequence: number)
  * Upper bound on a benchmark Pod's life. Pods are bare (restartPolicy Always,
  * 2 CPU / 1 GiB limits) and every cleanup path is a `finally` or a signal
  * handler, so a kill -9, crash or laptop sleep would otherwise leave them
- * running in the shared cluster indefinitely, and the next run's namespace
- * guard ("no existing workloads") would then refuse until someone cleaned up
- * by hand. A single case can hold one Pod across every history point and
- * repetition, so this is generous rather than tight.
+ * consuming that compute in the shared cluster indefinitely.
+ *
+ * This bounds the cost, not the chore: a Pod past its deadline is stopped and
+ * becomes a Failed Pod object that stays until someone deletes it, and
+ * benchmarkNamespaceGuard lists pods without a phase filter, so the next run
+ * still refuses ("no existing workloads") until that object is deleted by hand.
+ *
+ * A single case can hold one Pod across every history point and repetition,
+ * so this is generous rather than tight.
  */
 export const POD_LIFETIME_SECONDS = 6 * 60 * 60;
 export function benchmarkPod(c: DestinationConfig, m: Resources, name: string) {
