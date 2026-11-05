@@ -1347,7 +1347,7 @@ export class MemoryMappingStore implements MappingStore {
     if (current) { current.nextAttemptAtMs = this.now() + deletionRetryDelay(current.attempts ?? 0); current.attempts = (current.attempts ?? 0) + 1; }
   }
   async wakeDeletes(link: ChannelLink): Promise<void> {
-    for (const value of this.deletions.values()) if (value.scope === deletionLinkKey(link)) value.row.nextAttemptAtMs = this.now();
+    for (const value of this.deletions.values()) if (value.scope === deletionLinkKey(link)) value.row.nextAttemptAtMs = value.row.actionClass === 'actionable' ? 0 : 1;
   }
   async completeDelete(link: ChannelLink, deletion: string, target: string): Promise<void> {
     this.deletions.delete(`${deletionLinkKey(link)}:${deletion}:${target}`);

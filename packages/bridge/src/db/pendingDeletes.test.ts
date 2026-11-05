@@ -194,6 +194,13 @@ it('disposes expired/carrier replay and unresolved overflow without consuming ac
  await store.wakeDeletes(link);
  expect((await store.pendingDeletes(link,'durable-action'))[0].attempts).toBe(1);
 });
+it('fold wake prioritizes accepted work over older unresolved rows',async()=>{
+ const store=new PostgresMappingStore(sql,tenant+'-wake-order'), now=Date.now();
+ await store.saveDeletes(link,[{...pending('waiting'),actionClass:'unresolved',createdAtMs:now-1000}]);
+ await store.saveDeletes(link,[{...pending('accepted'),createdAtMs:now}]);
+ await store.wakeDeletes(link);
+ expect((await store.dueDeletes(link)).map(row=>row.actionClass)).toEqual(['actionable','unresolved']);
+});
 
 it('retains a saved action when its subsequent Postgres read fails', async () => {
   const { community, folded } = bootstrapFixture(fixture);

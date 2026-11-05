@@ -342,3 +342,18 @@ it('reports a promotion storage outage across expiry and recovers via replay', a
  await h.create().onConcordChat({...deletion,sourceWrapCreatedAt:Math.floor(now/1000)} as OpenedChat,h.link);
  expect(h.deleted).toEqual(['outage-target','outage-target']);
 });
+
+it('drains accepted actions despite repeated fold wakeups of blocked promotions', async () => {
+ const now=Date.now(), store=new MemoryMappingStore(()=>now), h=deletionHarness(store);
+ const deletion=await opened(fixture.moderatorDeleteEvent,h.channel), citation=deletion.tags.find(tag=>tag[0]==='vac');
+ const source=Math.floor(now/1000)-1000;
+ await store.insert({discordMessageId:'wake-target',discordChannelId:h.link.discordChannelId,concordRumorId:fixture.expected.message.id,concordChannelId:h.channel.idHex,communityId:h.community.idHex,origin:'concord',authorRef:fixture.expected.member,partIndex:0});
+ const row=(id:string, actionClass:'unresolved'|'actionable')=>({deleteRumorId:id,targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:now,sourceWrapCreatedAt:source,actionClass,nextAttemptAtMs:actionClass==='unresolved'?now-1000:now});
+ await store.saveDeletes(h.link,Array.from({length:129},(_,i)=>row(`wake-waiting-${i}`,'unresolved')));
+ await store.saveDeletes(h.link,Array.from({length:1024},(_,i)=>row(`wake-accepted-${i}`,'actionable')));
+ for(let i=0;i<3;i++) { try {await h.router.retryPendingDeletes(h.link,true);} catch {} }
+ expect(h.deleted.length).toBeGreaterThan(0);
+ for(let i=0;i<15 && (await store.pendingDeletes(h.link)).length;i++) { try {await h.router.retryPendingDeletes(h.link,true);} catch {} }
+ expect(await store.pendingDeletes(h.link)).toEqual([]);
+ expect(h.deleted).toHaveLength(1153);
+});

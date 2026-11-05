@@ -100,7 +100,9 @@ export class PostgresMappingStore implements MappingStore {
       WHERE ${this.scope(tx,link)} AND delete_rumor_id=${row.deleteRumorId} AND target_rumor_id=${row.targetRumorId}`;},link);
   }
   async wakeDeletes(link:ChannelLink):Promise<void> {
-    await this.write(async tx=>{await tx`UPDATE pending_concord_deletes SET next_attempt_at_ms=0 WHERE ${this.scope(tx,link)}`;},link);
+    // A fold may wake repeatedly: accepted work must be able to free capacity
+    // even when more than one batch of older promotions is blocked.
+    await this.write(async tx=>{await tx`UPDATE pending_concord_deletes SET next_attempt_at_ms=CASE WHEN action_class='actionable' THEN 0 ELSE 1 END WHERE ${this.scope(tx,link)}`;},link);
   }
   async completeDelete(link: ChannelLink, deletion: string, target: string): Promise<void> {
     await this.write(async tx=>{await tx`DELETE FROM pending_concord_deletes WHERE ${this.scope(tx,link)}
