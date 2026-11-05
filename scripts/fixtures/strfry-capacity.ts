@@ -113,9 +113,20 @@ async function socket(url: string) {
   } };
 }
 
-/** Mounted only into disposable fixtures; never a production config path. */
+/**
+ * Mounted only into disposable fixtures; never a production config path.
+ *
+ * The launcher runs inside the image under test, which may predate this
+ * harness: it imports only symbols every supported image exports (runPlugin,
+ * PolicyStore) and formats its own timing line. Importing a newer export such
+ * as admissionTimingLine makes the module fail at load on an older image, so
+ * every admission then behaves like plugin_failure. The `eventId` stamp is the
+ * same compatibility shim: an older PolicyStore cannot report a verified ID,
+ * and this harness only ever sends valid, signed events, so the claimed ID is
+ * the real one. A newer PolicyStore's own `timing.eventId` wins via the spread.
+ */
 export function capacityCalibrationLauncher(configPath = "/capacity/calibration.json"): string {
-  return `import { readFileSync } from 'node:fs';\nimport postgres from '/opt/divine/node_modules/postgres/src/index.js';\nimport { runPlugin, admissionTimingLine } from '/opt/divine/packages/moderation/src/strfryPlugin.ts';\nimport { PolicyStore } from '/opt/divine/packages/moderation/src/policyStore.ts';\nconst sql=postgres(process.env.MODERATION_DATABASE_URL,{max:1,onnotice:()=>{}});\nconsole.error(JSON.stringify({type:'capacity_calibration_launcher',pid:process.pid,synthetic:true}));\ntry{await runPlugin(process.stdin,line=>new Promise((resolve,reject)=>process.stdout.write(line,e=>e?reject(e):resolve())),(event,signal)=>{const data=JSON.parse(readFileSync(${JSON.stringify(configPath)},'utf8'));const store=new PolicyStore(sql,{capacity:{communities:new Map(data.communities),contract:data.contract},onAdmissionTiming:timing=>{const line=admissionTimingLine(timing);if(line)process.stderr.write(line);}});return store.admit(event,signal);});}finally{await sql.end({timeout:1});}\n`;
+  return `import { readFileSync } from 'node:fs';\nimport postgres from '/opt/divine/node_modules/postgres/src/index.js';\nimport { runPlugin } from '/opt/divine/packages/moderation/src/strfryPlugin.ts';\nimport { PolicyStore } from '/opt/divine/packages/moderation/src/policyStore.ts';\nconst sql=postgres(process.env.MODERATION_DATABASE_URL,{max:1,onnotice:()=>{}});\nconsole.error(JSON.stringify({type:'capacity_calibration_launcher',pid:process.pid,synthetic:true}));\ntry{await runPlugin(process.stdin,line=>new Promise((resolve,reject)=>process.stdout.write(line,e=>e?reject(e):resolve())),(event,signal)=>{const data=JSON.parse(readFileSync(${JSON.stringify(configPath)},'utf8'));const store=new PolicyStore(sql,{capacity:{communities:new Map(data.communities),contract:data.contract},onAdmissionTiming:timing=>console.error(JSON.stringify({type:'moderation_admission_timing',eventId:event.id,...timing}))});return store.admit(event,signal);});}finally{await sql.end({timeout:1});}\n`;
 }
 
 export function expectedCapacityAcceptance(id: CapacityCaseId, historyCount: number): boolean {
