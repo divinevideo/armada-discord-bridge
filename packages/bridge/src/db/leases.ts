@@ -4,6 +4,8 @@ import type postgres from "postgres";
 export class BridgeLeaseUnavailableError extends Error {}
 
 export interface BridgeLease {
+  readonly resource: string;
+  readonly holder: string;
   readonly token: bigint;
   assertCurrent(): Promise<void>;
   renew(): Promise<void>;
@@ -53,7 +55,7 @@ export class BridgeLeases {
     const timer = setInterval(() => { void renew().catch(() => {}); }, 30_000);
     timer.unref();
     return {
-      token,
+      resource, holder, token,
       renew,
       assertCurrent: async () => {
         check();

@@ -117,7 +117,7 @@ test("terminal startup failure still schedules retry when status bookkeeping fai
 
 test("stop closes subscriptions and sockets and writes pause despite release failure", async () => {
   const f = fixture();
-  f.register({ token: 1n, assertCurrent: async () => {}, renew: async () => {}, release: async () => { throw new Error("release failed"); } });
+  f.register({ resource: "synthetic-resource", holder: "00000000-0000-4000-8000-000000000000", token: 1n, assertCurrent: async () => {}, renew: async () => {}, release: async () => { throw new Error("release failed"); } });
   await f.manager.stop(f.row.bridge_id, "paused");
   expect(f.closed()).toEqual([1, 1, 1]);
   expect(f.manager.isLive(f.row.bridge_id)).toBe(false);

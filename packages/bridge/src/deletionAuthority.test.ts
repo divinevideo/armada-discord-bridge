@@ -118,7 +118,7 @@ describe('Concord deletion authority at the Discord boundary', () => {
     await create().onConcordChat(deletion, link);
     expect(deleted).toEqual([]);
     client.folded = foldControlState([...initial, future], f.community.id, f.owner.pk);
-    await create().retryPendingDeletes(link);
+    await create().retryPendingDeletes(link,true);
     expect(deleted).toEqual(['message']);
   });
 });
@@ -177,7 +177,7 @@ describe('signed reaction deletion', () => {
     expect(await h.store.reactionByRumorId(reaction.rumorId)).toBeDefined();
     expect(await h.store.pendingDeletes(h.link)).toHaveLength(1);
     h.fail(false);
-    await h.router.retryPendingDeletes(h.link);
+    await h.router.retryPendingDeletes(h.link,true);
     expect(h.removed).toEqual(['message']);
     expect(await h.store.reactionByRumorId(reaction.rumorId)).toBeUndefined();
     expect(await h.store.pendingDeletes(h.link)).toEqual([]);
@@ -195,7 +195,7 @@ describe('signed reaction deletion', () => {
 
 it('refuses cursor advancement after pending deletion storage fails', async () => {
   class UnavailableStore extends MemoryMappingStore {
-    override async saveDeletes(): Promise<void> { throw new Error('storage unavailable'); }
+    override async saveDeletes(): Promise<never> { throw new Error('storage unavailable'); }
   }
   const h = deletionHarness(new UnavailableStore());
   await expect(h.router.onConcordChat(await opened(fixture.moderatorDeleteEvent, h.channel), h.link)).rejects.toThrow('storage unavailable');
@@ -211,7 +211,7 @@ it('waits for its own mapped copy without deleting another link copy', async () 
   expect(h.deleted).toEqual([]);
   expect(await h.store.pendingDeletes(h.link)).toHaveLength(1);
   await h.store.insert({ ...row, discordMessageId: 'own-copy', discordChannelId: h.link.discordChannelId });
-  await h.router.retryPendingDeletes(h.link);
+  await h.router.retryPendingDeletes(h.link,true);
   expect(h.deleted).toEqual(['own-copy']);
   expect(await h.store.pendingDeletes(h.link)).toEqual([]);
 });
@@ -232,9 +232,9 @@ it('bounds replay work without starving an authorized deletion behind denied act
   await h.store.insert({ discordMessageId: 'member-copy', discordChannelId: h.link.discordChannelId, concordRumorId: fixture.expected.message.id, concordChannelId: h.channel.idHex, communityId: h.community.idHex, origin: 'concord', authorRef: fixture.expected.member, partIndex: 0 });
   const denied = await opened(fixture.moderatorDeletesOwnerEvent, h.channel);
   const citation = denied.tags.find(tag => tag[0] === 'vac')!;
-  await h.store.saveDeletes(h.link, Array.from({ length: 128 }, (_, i) => ({ deleteRumorId: `held-${i}`, targetRumorId: fixture.expected.ownerMessageId, author: denied.author, citation, createdAtMs: i })));
+  await h.store.saveDeletes(h.link, Array.from({ length: 128 }, (_, i) => ({ deleteRumorId: `held-${i}`, targetRumorId: fixture.expected.ownerMessageId, author: denied.author, citation, createdAtMs: Date.now() - 1000 + i })));
   const allowed = await opened(fixture.moderatorDeleteEvent, h.channel);
-  await h.store.saveDeletes(h.link, [{ deleteRumorId: allowed.rumorId, targetRumorId: fixture.expected.message.id, author: allowed.author, citation: allowed.tags.find(tag => tag[0] === 'vac'), createdAtMs: 129 }]);
+  await h.store.saveDeletes(h.link, [{ deleteRumorId: allowed.rumorId, targetRumorId: fixture.expected.message.id, author: allowed.author, citation: allowed.tags.find(tag => tag[0] === 'vac'), createdAtMs: Date.now() - 871 }]);
   await h.router.retryPendingDeletes(h.link);
   expect(h.deleted).toEqual([]);
   await h.router.retryPendingDeletes(h.link);
@@ -243,7 +243,7 @@ it('bounds replay work without starving an authorized deletion behind denied act
 
 // This is a deliberate policy limit, not a storage outage: retain evidence of
 // why silently evicting unknown targets would trade away future self-deletes.
-it('exposes the unknown-target quota limit using four legal signed member deletions', async () => {
+it('keeps actionable self-deletes independent of a full unknown-target allocation', async () => {
   const h = await signedReactionHarness();
   for (let batch = 0; batch < 4; batch++) {
     const tags = Array.from({ length: 256 }, (_, i) => ['e', (batch * 256 + i + 100_000).toString(16).padStart(64, '0')]);
@@ -252,6 +252,50 @@ it('exposes the unknown-target quota limit using four legal signed member deleti
   await h.router.retryPendingDeletes(h.link);
   expect(await h.store.pendingDeletes(h.link)).toHaveLength(1024);
   const selfDelete = await h.event(h.f.member, 5, [['e', h.f.allowedRumorId]]);
-  await expect(h.router.onConcordChat(selfDelete, h.link)).rejects.toThrow('capacity');
-  expect(() => h.router.assertDeletionDeliveryDurable()).toThrow();
+  await expect(h.router.onConcordChat(selfDelete, h.link)).resolves.toEqual([]);
+  expect(() => h.router.assertDeletionDeliveryDurable()).not.toThrow();
+});
+
+it('contains a read failure after durable intake without rejecting deletion delivery', async () => {
+  const h = deletionHarness();
+  const inventory=h.store.pendingDeletes.bind(h.store);
+  h.store.pendingDeletes = h.store.dueDeletes = async () => { throw new Error('read unavailable after save'); };
+  await expect(h.router.onConcordChat(await opened(fixture.moderatorDeleteEvent,h.channel),h.link)).resolves.toEqual([]);
+  expect(await inventory(h.link)).toHaveLength(1);
+});
+it('retains actionable effects through long outages and authority loss, then rechecks current authority',async()=>{
+  let now=Date.now();
+  const store=new MemoryMappingStore(()=>now), h=deletionHarness(store);
+  await h.router.onConcordChat(await opened(fixture.chatEvent,h.channel),h.link);
+  h.webhooks.delete=async()=>{throw Object.assign(new Error('missing Manage Messages'),{code:50013});};
+  await h.router.onConcordChat(await opened(fixture.moderatorDeleteEvent,h.channel),h.link);
+  expect((await store.pendingDeletes(h.link))[0].actionClass).toBe('actionable');
+  const folded=h.client.folded!;
+  h.client.folded={...folded,banned:new Set([fixture.expected.moderator])};
+  now+=8*86400_000;
+  await h.router.retryPendingDeletes(h.link);
+  expect((await store.pendingDeletes(h.link))[0].actionClass).toBe('actionable');
+  h.webhooks.delete=async(_link,id,authorize)=>{authorize?.();h.deleted.push(id);};
+  h.client.folded=folded;
+  await h.router.retryPendingDeletes(h.link,true);
+  expect(h.deleted).toHaveLength(1);
+  expect(await store.pendingDeletes(h.link)).toEqual([]);
+});
+it('reports original source as a replay gap on promotion overflow and accepts replay after capacity is freed',async()=>{
+ const h=deletionHarness();
+ const deletion=await opened(fixture.moderatorDeleteEvent,h.channel);
+ const citation=deletion.tags.find(tag=>tag[0]==='vac');
+ const source=Math.floor(Date.now()/1000)-100;
+ for(let i=0;i<1024;i++) await h.store.saveDeletes(h.link,[{deleteRumorId:`capacity-${i}`,targetRumorId:`missing-${i}`,author:deletion.author,createdAtMs:Date.now(),sourceWrapCreatedAt:source,actionClass:'actionable',nextAttemptAtMs:Date.now()+3600_000}]);
+ await h.store.saveDeletes(h.link,[{deleteRumorId:deletion.rumorId,targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:Date.now(),sourceWrapCreatedAt:source}]);
+ await h.store.insert({discordMessageId:'promoted-target',discordChannelId:h.link.discordChannelId,concordRumorId:fixture.expected.message.id,concordChannelId:h.channel.idHex,communityId:h.community.idHex,origin:'concord',authorRef:fixture.expected.member,partIndex:0});
+ // Target wake goes straight to the newly resolvable action despite retry timers.
+ let gap: any;
+ try {await h.router.retryPendingDeletes(h.link);} catch(error){gap=error;}
+ expect(gap?.durable).toBe(false);expect(gap?.repairFloor).toBe(source);expect(gap?.link).toEqual(h.link);
+ expect((await h.store.pendingDeletes(h.link,fixture.expected.message.id))[0].actionClass).toBe('unresolved');
+ await h.store.completeDelete(h.link,'capacity-0','missing-0');
+ await h.create().onConcordChat({...deletion,sourceWrapCreatedAt:source} as OpenedChat,h.link);
+ expect(h.deleted).toEqual(['promoted-target']);
+ expect(await h.store.pendingDeletes(h.link,fixture.expected.message.id)).toEqual([]);
 });

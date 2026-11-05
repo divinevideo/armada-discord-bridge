@@ -223,3 +223,21 @@ it('retains the originating worker fence after shared adapter lookup', async () 
   expect(deleted).toBe(0);
   await adapter.stop();
 });
+
+it('permission observations distinguish bot deletion permission and access loss without making them terminal', async () => {
+  const { discordPermissionObservation } = await import('./adapter');
+  expect(discordPermissionObservation({code:50013},'delete')).toEqual({permission:'Manage Messages',operation:'delete'});
+  expect(discordPermissionObservation({code:50001},'delete')).toEqual({permission:'View Channel',operation:'delete'});
+  expect(discordPermissionObservation({code:50013},'send')).toEqual({permission:'Manage Webhooks',operation:'send'});
+  expect(discordPermissionObservation({code:50013},'unreact')).toBeUndefined();
+  expect(discordPermissionObservation({code:10003},'delete')).toBeUndefined();
+});
+it('keeps unknown channel, missing access, and missing message permissions retryable',async()=>{
+ for(const code of [10003,50001,50013]) {
+  const adapter=new DiscordAdapter('synthetic',{onMessage:async()=>{}},async()=>{});
+  (adapter as any).webhookFor=async()=>({deleteMessage:async()=>{throw {code:10008};}});
+  (adapter as any).textChannel=async()=>({messages:{delete:async()=>{throw {code};}}});
+  await expect(adapter.delete({discordChannelId:'100000000000000002'} as never,'100000000000000003')).rejects.toMatchObject({code});
+  await adapter.stop();
+ }
+});

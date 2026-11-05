@@ -477,3 +477,13 @@ function isUsernameRejection(error: unknown): boolean {
 export function isMissingPermissions(error: unknown): boolean {
   return (error as { code?: number })?.code === 50013;
 }
+
+/** Observation only: permission/access refusal remains retryable. Dispatch
+ * context matters because bot deletion and webhook mirroring use different grants. */
+export function discordPermissionObservation(error: unknown, operation: 'send' | 'delete' | 'unreact'):
+  { permission: 'Manage Webhooks' | 'Manage Messages' | 'View Channel'; operation: typeof operation } | undefined {
+  const code=(error as {code?:number})?.code;
+  if(code===50001) return {permission:'View Channel',operation};
+  if(code===50013 && operation !== 'unreact') return {permission:operation==='delete'?'Manage Messages':'Manage Webhooks',operation};
+  return undefined;
+}

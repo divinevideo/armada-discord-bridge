@@ -33,6 +33,10 @@ import { isKlipyMediaHost, klipyItem } from "./klipy";
 import type { KlipyClient } from "./klipy";
 import { safeProbe } from "./net";
 
+import { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError, ActionableDeletionCapacityError, planDeletionIntake, observeDeletionDisposition, deletionRetryDelay, deletionKey } from "./deletionPolicy";
+import type { DeletionIntakeOutcome } from "./deletionPolicy";
+export { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError } from "./deletionPolicy";
+
 type LocalIdentitySigner = LocalIdentity["signer"];
 import type { PuppetCache } from "./puppets";
 import { DISCORD_MAX_CHARS, concordToDiscord, discordToConcord, splitForDiscord, substitutedEmbedMedia } from "./transform";
@@ -107,18 +111,25 @@ export interface PendingConcordDelete {
   author: string;
   citation?: string[];
   createdAtMs: number;
+  /** Verified outer carrier time (seconds), never the inner rumor timestamp. */
+  sourceWrapCreatedAt?: number;
+  firstObservedAtMs?: number;
+  actionClass?: "unresolved" | "actionable";
+  expiresAtMs?: number;
+  nextAttemptAtMs?: number;
+  attempts?: number;
 }
-export const MAX_PENDING_DELETES_PER_LINK = 4096;
-export const MAX_PENDING_DELETES_PER_ACTOR = 1024;
-export const DELETION_RETRY_MS = 10_000;
-export const MAX_PENDING_DELETE_REPLAY_BATCH = 128;
 export const deletionLinkKey = (link: ChannelLink): string => JSON.stringify([
   link.communityId, link.concordChannelIdHex, link.discordGuildId, link.discordChannelId,
 ]);
 
 export interface MappingStore {
   /** Atomic, deduplicated and bounded: capacity refusal must not acknowledge a cursor. */
-  saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<void>;
+  saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<DeletionIntakeOutcome>;
+  dueDeletes(link: ChannelLink, targetRumorId?: string): Promise<PendingConcordDelete[]>;
+  promoteDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void>;
+  retryDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void>;
+  wakeDeletes(link: ChannelLink): Promise<void>;
   pendingDeletes(link: ChannelLink, targetRumorId?: string): Promise<PendingConcordDelete[]>;
   completeDelete(link: ChannelLink, deleteRumorId: string, targetRumorId: string): Promise<void>;
   insert(row: MessageMappingRow): Promise<void>;
@@ -170,6 +181,8 @@ export interface BlobPort {
 }
 
 export interface RouterOptions {
+  /** Observe retryable deletion failures through the existing operational alert path. */
+  onDeletionFailure?: (error: unknown) => void;
   /** Required at runtime: current worker ownership and deployment-specific channel permissions. */
   beforeSideEffect?: () => Promise<void>;
   /** Kind 3302 is not frozen in the CORDs yet; off by default. */
@@ -859,11 +872,21 @@ export class BridgeRouter {
     if (chat.channelIdHex !== link.concordChannelIdHex || this.client.community.idHex !== link.communityId) return;
     const citation = citationFromTags(chat.tags);
     const targets = [...new Set(chat.tags.filter(t => t[0] === "e" && t[1]).map(t => t[1]))];
-    try { await this.store.saveDeletes(link, targets.map(targetRumorId => ({
-      deleteRumorId: chat.rumorId, targetRumorId, author: chat.author,
-      ...(citation ? { citation: citationToTag(citation) } : {}), createdAtMs: Date.now(),
-    }))); } catch (error) { this.deletionsDurable = false; throw error; }
-    for (const target of targets) await this.applyPendingDeletes(link, target);
+    const rows: PendingConcordDelete[] = [];
+    try {
+      for (const targetRumorId of targets) {
+        const row: PendingConcordDelete = { deleteRumorId:chat.rumorId,targetRumorId,author:chat.author,
+          ...(citation ? {citation:citationToTag(citation)} : {}),createdAtMs:Date.now(),
+          sourceWrapCreatedAt:(chat as OpenedChat & {sourceWrapCreatedAt?:number}).sourceWrapCreatedAt };
+        const evidence=await this.deleteEvidence(row,link);
+        if(evidence.scoped.length && this.mayDelete(row,evidence.targetAuthor,link)) row.actionClass='actionable';
+        rows.push(row);
+      }
+      await this.store.saveDeletes(link,rows);
+    } catch(error) { this.deletionsDurable=false; throw error instanceof DeletionIntakeError ? error : new DeletionIntakeError('Concord deletion intake failed: '+String(error),{cause:error}); }
+    // Once durable, a transient read or effect failure belongs to the retry
+    // queue. It must not masquerade as missing relay intake.
+    for (const target of targets) await this.applyPendingDeletes(link,target);
   }
 
   private deletionsDurable = true;
@@ -873,52 +896,55 @@ export class BridgeRouter {
 
   private deletionRetry?: Promise<void>;
   /** Coalesce fold/timer notifications into the channel's existing serial effect lane. */
-  retryPendingDeletes(link: ChannelLink): Promise<void> {
+  retryPendingDeletes(link: ChannelLink, wake = false): Promise<void> {
     if (this.deletionRetry) return this.deletionRetry;
-    const run = this.chatQueue.then(() => this.applyPendingDeletes(link));
+    const run = this.chatQueue.then(async () => { if(wake) await this.store.wakeDeletes(link); await this.applyPendingDeletes(link); });
     this.chatQueue = run.catch(() => {});
     const pending = run.finally(() => { if (this.deletionRetry === pending) this.deletionRetry = undefined; });
     this.deletionRetry = pending;
     return pending;
   }
 
-  private pendingDeleteOffset = 0;
   private async applyPendingDeletes(link: ChannelLink, target?: string): Promise<void> {
     if (!link.enabled) return;
-    const held = await this.store.pendingDeletes(link, target);
-    // Bound retry work as well as stored work. Rotate over blocked actions so
-    // a permanently denied prefix cannot starve a newly satisfied citation.
-    const start = target || !held.length ? 0 : this.pendingDeleteOffset % held.length;
-    const batch = [...held.slice(start), ...held.slice(0, start)].slice(0, MAX_PENDING_DELETE_REPLAY_BATCH);
-    if (!target && held.length) this.pendingDeleteOffset = (start + batch.length) % held.length;
-    for (const deletion of batch) {
-      try { await this.applyDelete(deletion, link); }
-      catch (error) {
-        // Keep both the action and reaction mapping until the external effect
-        // is acknowledged. A process restart must retry rather than forget it.
-        console.warn(`bridge: deletion ${deletion.deleteRumorId} remains pending`, error);
+    let batch: PendingConcordDelete[];
+    try { batch=await this.store.dueDeletes(link,target); }
+    catch(error) { console.warn('bridge: durable deletion read deferred',error); return; }
+    for(const deletion of batch) {
+      try { await this.applyDelete(deletion,link); }
+      catch(error) {
+        if(error instanceof ActionableDeletionCapacityError) { this.deletionsDurable=false; throw error; }
+        console.warn(`bridge: deletion ${deletion.deleteRumorId} remains pending`,error);
+        try { this.options.onDeletionFailure?.(error); } catch(observationError) { console.warn('bridge: deletion observation failed',observationError); }
       }
+      // This is harmless after completion (the row is gone). Scheduling even
+      // denied citations prevents a fixed denied prefix starving later work.
+      try { await this.store.retryDelete(link,deletion); }
+      catch(error) { console.warn('bridge: durable deletion retry scheduling deferred',error); }
     }
+  }
+  private async deleteEvidence(deletion:PendingConcordDelete,link:ChannelLink) {
+    const retired=await this.store.retiredReaction(link,deletion.targetRumorId);
+    const reaction=retired ?? await this.store.reactionByRumorId(deletion.targetRumorId);
+    const rows=reaction ? await this.store.byDiscordId(reaction.discordMessageId) : await this.store.byRumorId(deletion.targetRumorId);
+    const scoped=rows.filter(row=>this.inLink(row,link));
+    return { retired,reaction,scoped,targetAuthor:scoped.length ? this.targetAuthor(reaction ?? scoped[0]) : '' };
   }
 
   private async applyDelete(deletion: PendingConcordDelete, link: ChannelLink): Promise<void> {
     const target = deletion.targetRumorId;
-    const retired = await this.store.retiredReaction(link, target);
-    const reaction = retired ?? await this.store.reactionByRumorId(target);
-    const rows = reaction ? await this.store.byDiscordId(reaction.discordMessageId) : await this.store.byRumorId(target);
-    const scoped = rows.filter(row => this.inLink(row, link));
-    // Another link may have mirrored this rumor before our own mapping arrives.
-    // Its rows prove no authority here, but must not erase our deferred action.
-    if (!scoped.length) return;
-    const targetAuthor = this.targetAuthor(reaction ?? scoped[0]);
+    const {retired,reaction,scoped,targetAuthor}=await this.deleteEvidence(deletion,link);
+    // A mapping from another link proves no target scope here.
+    if(!scoped.length) return;
     if (!this.mayDelete(deletion, targetAuthor, link)) {
       // A missing non-owner citation cannot ever become a resolved citation.
       // Cited actions remain: later grants, ranks or an unban can change the fold.
-      if (!deletion.citation && deletion.author !== this.client.community.owner && deletion.author !== targetAuthor) {
+      if (deletion.actionClass !== "actionable" && !deletion.citation && deletion.author !== this.client.community.owner && deletion.author !== targetAuthor) {
         await this.store.completeDelete(link, deletion.deleteRumorId, target);
       }
       return;
     }
+    if(deletion.actionClass !== 'actionable') await this.store.promoteDelete(link,deletion);
     const authorize = () => {
       if (!this.mayDelete(deletion, targetAuthor, link)) throw new Error("Concord deletion authority changed");
     };
@@ -1276,19 +1302,40 @@ function stripAttachedUrls(content: string, urls: string[] | undefined): string 
 export class MemoryMappingStore implements MappingStore {
   rows: MessageMappingRow[] = [];
   private deletions = new Map<string, { scope: string; row: PendingConcordDelete }>();
-  async saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<void> {
-    const scope = deletionLinkKey(link);
-    const incoming = new Map(rows.map(row => [`${scope}:${row.deleteRumorId}:${row.targetRumorId}`, row]));
-    const fresh = [...incoming].filter(([key]) => !this.deletions.has(key));
-    const held = [...this.deletions.values()].filter(value => value.scope === scope);
-    if (held.length + fresh.length > MAX_PENDING_DELETES_PER_LINK || fresh.some(([, row]) =>
-      held.filter(value => value.row.author === row.author).length + fresh.filter(([, other]) => other.author === row.author).length > MAX_PENDING_DELETES_PER_ACTOR)) {
-      throw new Error("Pending Concord deletion capacity exceeded");
+  constructor(private readonly now: () => number = Date.now) {}
+  private expire(link: ChannelLink): void {
+    for (const [key, value] of this.deletions) if (value.scope === deletionLinkKey(link) && value.row.actionClass === 'unresolved' && value.row.expiresAtMs! <= this.now()) {
+      this.deletions.delete(key); observeDeletionDisposition({ stored: 0, disposedExpired: 1, disposedCapacity: 0 });
     }
-    for (const [key, row] of fresh) this.deletions.set(key, { scope, row });
+  }
+  async saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<DeletionIntakeOutcome> {
+    this.expire(link);
+    const scope = deletionLinkKey(link);
+    const held = [...this.deletions.values()].filter(value => value.scope === scope).map(value => value.row);
+    let plan: ReturnType<typeof planDeletionIntake>;
+    try { plan=planDeletionIntake(held, rows, this.now()); }
+    catch(error) { if(error instanceof ActionableDeletionCapacityError) error.link={...link}; throw error; }
+    const { writes, outcome } = plan;
+    for (const row of writes) this.deletions.set(`${scope}:${deletionKey(row)}`, { scope, row });
+    observeDeletionDisposition(outcome); return outcome;
   }
   async pendingDeletes(link: ChannelLink, target?: string): Promise<PendingConcordDelete[]> {
-    return [...this.deletions.values()].filter(value => value.scope === deletionLinkKey(link) && (!target || value.row.targetRumorId === target)).map(value => value.row);
+    return [...this.deletions.values()].filter(value => value.scope === deletionLinkKey(link) && (!target || value.row.targetRumorId === target)).map(value => ({ ...value.row }));
+  }
+  async dueDeletes(link: ChannelLink, target?: string): Promise<PendingConcordDelete[]> {
+    this.expire(link);
+    return (await this.pendingDeletes(link,target)).filter(row => target || row.nextAttemptAtMs! <= this.now())
+      .sort((a,b) => a.nextAttemptAtMs! - b.nextAttemptAtMs!).slice(0,MAX_PENDING_DELETE_REPLAY_BATCH);
+  }
+  async promoteDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void> {
+    await this.saveDeletes(link,[{ ...row, actionClass: 'actionable' }]);
+  }
+  async retryDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void> {
+    const current = this.deletions.get(`${deletionLinkKey(link)}:${deletionKey(row)}`)?.row;
+    if (current) { current.nextAttemptAtMs = this.now() + deletionRetryDelay(current.attempts ?? 0); current.attempts = (current.attempts ?? 0) + 1; }
+  }
+  async wakeDeletes(link: ChannelLink): Promise<void> {
+    for (const value of this.deletions.values()) if (value.scope === deletionLinkKey(link)) value.row.nextAttemptAtMs = this.now();
   }
   async completeDelete(link: ChannelLink, deletion: string, target: string): Promise<void> {
     this.deletions.delete(`${deletionLinkKey(link)}:${deletion}:${target}`);

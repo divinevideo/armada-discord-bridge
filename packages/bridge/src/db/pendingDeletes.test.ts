@@ -17,7 +17,7 @@ const url = process.env.DATABASE_URL!;
 const sql = postgres(url, { max: 4, onnotice: () => {} });
 const tenant = `pending-delete-${crypto.randomUUID()}`;
 const link: ChannelLink = { communityId: fixture.expected.communityId, concordChannelIdHex: fixture.expected.message.channelId, discordChannelId: 'synthetic-channel', discordGuildId: 'synthetic-guild', enabled: true };
-const pending = (id: string, author = 'actor'): PendingConcordDelete => ({ deleteRumorId: id, targetRumorId: id, author, createdAtMs: Date.now() });
+const pending = (id: string, author = 'actor'): PendingConcordDelete => ({ deleteRumorId: id, targetRumorId: id, author, createdAtMs: Date.now(), actionClass: 'actionable' });
 beforeAll(() => migrate(url));
 afterAll(async () => {
   await sql`DELETE FROM pending_concord_deletes WHERE tenant_id LIKE ${tenant + '%'}`;
@@ -53,7 +53,7 @@ describe('durable pending Concord deletions', () => {
     connection = postgres(url, { max: 1 });
     store = new PostgresMappingStore(connection, tenant);
     client.folded = folded;
-    await create().retryPendingDeletes(link);
+    await create().retryPendingDeletes(link,true);
     expect(deleted).toEqual(['synthetic-message']);
     expect(await store.pendingDeletes(link)).toEqual([]);
     await connection.end();
@@ -93,12 +93,12 @@ describe('durable pending Concord deletions', () => {
     expect(await store.retiredReaction({ ...scope, discordGuildId: 'another-guild' }, reaction.rumorId)).toBeUndefined();
     await connection.end();
     connection = postgres(url, { max: 1 }); store = new PostgresMappingStore(connection, testTenant); router = create();
-    await router.retryPendingDeletes(scope);
+    await router.retryPendingDeletes(scope,true);
     expect(await store.pendingDeletes(scope)).toEqual([]);
     const readded = await event(7, f.allowedRumorId);
     await router.onConcordChat(readded, scope);
     await router.onConcordChat(await event(5, reaction.rumorId), scope);
-    await router.retryPendingDeletes(scope);
+    await router.retryPendingDeletes(scope,true);
     expect(await store.pendingDeletes(scope)).toEqual([]);
     expect(unreacted).toBe(1); // Old-target duplicate must not remove the new reaction.
     expect(reacted).toBe(2);
@@ -175,4 +175,45 @@ describe('durable pending Concord deletions', () => {
     expect(await store.pendingDeletes(link)).toHaveLength(MAX_PENDING_DELETES_PER_LINK);
     expect(await store.pendingDeletes(link, 'overflow')).toEqual([]);
   });
+});
+it('disposes expired/carrier replay and unresolved overflow without consuming actionable capacity',async()=>{
+ const store=new PostgresMappingStore(sql,tenant+'-classes');
+ const author='a'.repeat(64), source=Math.floor(Date.now()/1000);
+ const unresolved=(id:string)=>({...pending(id,author),actionClass:'unresolved' as const,sourceWrapCreatedAt:source});
+ const expired={...unresolved('expired'),sourceWrapCreatedAt:source-8*86400};
+ expect((await store.saveDeletes(link,[expired])).disposedExpired).toBe(1);
+ expect((await store.saveDeletes(link,[{...expired,createdAtMs:Date.now()+100}])).disposedExpired).toBe(1);
+ const intake=await store.saveDeletes(link,Array.from({length:1025},(_,i)=>unresolved(`quarantine-${i}`)));
+ expect(intake.stored).toBe(1024);expect(intake.disposedCapacity).toBe(1);
+ const action={...expired,deleteRumorId:'durable-action',targetRumorId:'durable-action',actionClass:'actionable' as const};
+ await store.saveDeletes(link,[action]);
+ expect((await store.pendingDeletes(link,'durable-action'))[0].expiresAtMs).toBeUndefined();
+ expect((await store.dueDeletes(link))).toHaveLength(128);
+ await store.retryDelete(link,action);
+ expect(await store.dueDeletes(link,'durable-action')).toHaveLength(1);
+ await store.wakeDeletes(link);
+ expect((await store.pendingDeletes(link,'durable-action'))[0].attempts).toBe(1);
+});
+
+it('retains a saved action when its subsequent Postgres read fails', async () => {
+  const { community, folded } = bootstrapFixture(fixture);
+  const channel = channelsView(community, folded)[0];
+  const client = new ConcordClient(community, { query: async () => [], publish: async () => {}, subscribe: () => () => {}, close: async () => {} }, localIdentity(generateSecretKey()));
+  client.folded = folded;
+  const store = new PostgresMappingStore(sql, tenant + '-read-failure');
+  await store.insert({ discordMessageId: 'read-failure-target', discordChannelId: link.discordChannelId, concordRumorId: fixture.expected.message.id, concordChannelId: channel.idHex, communityId: community.idHex, origin: 'concord', authorRef: fixture.expected.member, partIndex: 0 });
+  const due = store.dueDeletes.bind(store);
+  store.dueDeletes = async () => { await sql`SELECT 1 / 0`; return []; };
+  const deleted: string[] = [];
+  const router = new BridgeRouter(client, new PuppetCache('ab'.repeat(32)), store, {
+    send: async () => 'unused', delete: async (_link, id, check) => { check?.(); deleted.push(id); },
+    edit: async () => {}, react: async () => {}, unreact: async () => {}, sendTyping: async () => {},
+  }, { resolve: async name => ({ name }) }, { applicationId: 'synthetic', webhookIds: new Set() }, { beforeSideEffect: async () => {} });
+  const deletion = (await openChatBatch([fixture.moderatorDeleteEvent], channel))[0];
+  await expect(router.onConcordChat(deletion, link)).resolves.toEqual([]);
+  expect((await store.pendingDeletes(link))[0].actionClass).toBe('actionable');
+  store.dueDeletes = due;
+  await router.retryPendingDeletes(link, true);
+  expect(deleted).toEqual(['read-failure-target']);
+  expect(await store.pendingDeletes(link)).toEqual([]);
 });
