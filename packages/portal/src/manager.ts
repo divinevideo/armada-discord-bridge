@@ -18,6 +18,7 @@ import { BridgeLeases, BridgeLeaseUnavailableError, bridgeResource, type BridgeL
 import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
 import { PublicCapacityGuard } from "../../moderation/src/publicCapacity";
+import { deliverConcordChat } from "@armada-bridge/bridge/src/concord/delivery";
 import { randomBytes } from "node:crypto";
 import {
   KIND_WRAP,
@@ -806,7 +807,7 @@ export class BridgeManager {
     let mirrored = 0;
     for (const chat of chats) {
       if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
-      const ids = await rb.router.onConcordChat(chat, rb.link);
+      const ids = await this.deliverRoutedChat(rb, chat);
       mirrored += ids.length > 0 ? 1 : 0;
     }
     if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
@@ -949,12 +950,16 @@ export class BridgeManager {
       return;
     }
     if (!rb.router) throw new Error("Bridge routing is not ready");
-    try {
-      await rb.router.onConcordChat(chat, rb.link);
-    } catch (error) {
-      if (isMissingPermissions(error)) return void this.alertMissingWebhookPermission(rb);
-      throw error;
-    }
+    await this.deliverRoutedChat(rb, chat);
+  }
+
+  private async deliverRoutedChat(rb: Running, chat: OpenedChat): Promise<string[]> {
+    if (!rb.router) throw new Error("Bridge routing is not ready");
+    return deliverConcordChat(rb.router, chat, rb.link, error => {
+      if (isMissingPermissions(error)) void this.alertMissingWebhookPermission(rb).catch(alertError =>
+        console.warn(`bridge ${rb.id}: missing-permission alert failed`, alertError));
+      else console.warn(`bridge ${rb.id}: ordinary Concord mirror ${chat.rumorId} failed`, error);
+    });
   }
 
   /**

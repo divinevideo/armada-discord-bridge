@@ -5,6 +5,7 @@ import { generateSecretKey } from 'nostr-tools/pure';
 import { bootstrapFixture } from '../../../scripts/fixtures/community-bootstrap';
 import { moderationFixture } from '../../../scripts/fixtures/moderation-events';
 import fixture from '../../../test-fixtures/concord/community-interop.json';
+import { deliverConcordChat } from './concord/delivery';
 import { ConcordClient } from './concord/client';
 import { localIdentity } from './concord/signer';
 import { PuppetCache } from './puppets';
@@ -26,11 +27,28 @@ export function deletionHarness(store: MappingStore = new MemoryMappingStore(), 
     unreact: async (_link, id, _emoji, authorize) => { authorize?.(); unreacted.push(id); },
   };
   const create = () => new BridgeRouter(client, puppets, store, webhooks, { resolve: async pk => ({ name: pk }) }, { applicationId: 'synthetic-app', webhookIds: new Set() }, { beforeSideEffect: before });
-  return { community, client, channel, link, store, puppets, deleted, unreacted, create, router: create() };
+  return { community, client, channel, link, store, puppets, deleted, unreacted, webhooks, create, router: create() };
 }
 const opened = async (event: typeof fixture.chatEvent, channel: ChannelV2) => (await openChatBatch([event], channel))[0];
 
 describe('Concord deletion authority at the Discord boundary', () => {
+  it('contains ordinary mirror failures but still rejects nondurable signed deletions', async () => {
+    const h = deletionHarness();
+    const send = h.webhooks.send;
+    h.webhooks.send = async () => { throw new Error('Discord unavailable'); };
+    const errors: unknown[] = [];
+    const message = await opened(fixture.chatEvent, h.channel);
+    expect(await deliverConcordChat(h.router, message, h.link, error => errors.push(error))).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(() => h.router.assertDeletionDeliveryDurable()).not.toThrow();
+    h.webhooks.send = send;
+    expect(await deliverConcordChat(h.router, message, h.link, error => errors.push(error))).toHaveLength(1);
+    h.store.saveDeletes = async () => { throw new Error('storage unavailable'); };
+    await expect(deliverConcordChat(h.router, await opened(fixture.moderatorDeleteEvent, h.channel), h.link, error => errors.push(error))).rejects.toThrow('storage unavailable');
+    expect(errors).toHaveLength(1);
+    expect(() => h.router.assertDeletionDeliveryDurable()).toThrow();
+  });
+
   for (const [name, message, deletion] of [
     ['owner target', fixture.ownerChatEvent, fixture.moderatorDeletesOwnerEvent],
     ['admin target', fixture.adminChatEvent, fixture.moderatorDeletesAdminEvent],

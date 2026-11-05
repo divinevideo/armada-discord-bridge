@@ -27,6 +27,7 @@ import { BridgeLeases, bridgeResource } from "./db/leases";
 import { discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
 import { BlossomStore } from "./blossom";
 import { KlipyClient } from "./klipy";
+import { deliverConcordChat } from "./concord/delivery";
 import { ConcordClient, resolveInvite } from "./concord/client";
 import { intakeDirectInviteKeys } from "./concord/keyIntake";
 import { identityRelayPool } from "./concord/identityPool";
@@ -229,7 +230,8 @@ const retryDeletes = () => router.retryPendingDeletes(link).catch(error => conso
 await retryDeletes();
 const deletionRetryTimer = setInterval(() => void retryDeletes(), DELETION_RETRY_MS);
 cleanup.push(() => clearInterval(deletionRetryTimer));
-const onChat = (chat: OpenedChat) => router.onConcordChat(chat, link);
+const onChat = (chat: OpenedChat) => deliverConcordChat(router, chat, link, error =>
+  console.warn(`bridge: ordinary Concord mirror ${chat.rumorId} failed`, error));
 const onSubError = (relayUrl: string, error: unknown): void =>
   console.error(`bridge: chat subscription ${relayUrl}:`, error);
 const onCursor = (streamPk: string, wrapAt: number) => {
@@ -246,7 +248,7 @@ let currentChannel = channel;
   const cursor = await store.channelCursorStart(link, streamPks);
   const { chats, newestWrapAt } = await client.backfillChannel(channel, cursor - 60);
   for (const chat of chats) {
-    await router.onConcordChat(chat, link);
+    await onChat(chat);
   }
   if (newestWrapAt !== undefined) {
     router.assertDeletionDeliveryDurable();
