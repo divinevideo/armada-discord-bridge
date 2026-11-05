@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import type postgres from "postgres";
 import { RelayPool } from "../../bridge/src/concord/pool";
 import { moderationFixture } from "../../../scripts/fixtures/moderation-events";
@@ -31,11 +31,15 @@ const startWorker = (f: Fixture, sql: postgres.Sql, health: WorkerHealth, signal
   const communities = new Map([[f.community.idHex, "synthetic"]]);
   return runModerationWorker({ sql, community: f.community, identity: f.moderator, communities, capacity: { communities, contract: undefined }, health, signal, relayUrl: "ws://127.0.0.1:1", bridgeTenantId: "synthetic", puppetMaster: "ab".repeat(32), discordToken: "synthetic", publicChannels: { guildId: "12345678901234567", channelIds: ["12345678901234568"], excludedCategoryIds: [] }, publicAuthors: [], decisions: { expire: async () => {} } as unknown as Decisions, lifecycle: { expireEvidence: async () => {}, expireAudit: async () => {} } });
 };
-// These spies replace prototypes shared by every test file in the bun process.
-// Restore them even when the worker rejects: an `await running` that throws
-// would otherwise skip the restore and leak mocked RelayPool, PolicyWatcher and
-// ModerationWorker methods into later files, which then pass or fail on mocks.
-const restore = (mocks: { mockRestore(): void }[]) => { for (const mock of mocks) mock.mockRestore(); };
+// These spies replace prototypes shared by every test file in the bun process,
+// so cleanup lives in afterEach, not in the test's own finally. A worker that
+// rejects before the awaited hook fires, or never reaches it and times out,
+// makes bun abandon the test body with its finally unrun: the mocked RelayPool,
+// PolicyWatcher and ModerationWorker methods would leak into later files, which
+// then pass or fail on mocks, and the worker loop would keep running.
+const cleanups: (() => void)[] = [];
+afterEach(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
+const isolate = (stop: AbortController, mocks: { mockRestore(): void }[]) => { cleanups.push(() => { stop.abort(); for (const mock of mocks) mock.mockRestore(); }); };
 
 for (const callback of ["disconnect", "subscription error"] as const) {
   test(`worker authority stays cleared when ${callback} races the capacity await`, async () => {
@@ -56,6 +60,7 @@ for (const callback of ["disconnect", "subscription error"] as const) {
       spyOn(ModerationWorker.prototype, "tick").mockResolvedValue(false),
       spyOn(DiscordRestrictionObserver.prototype, "tick").mockResolvedValue(),
     ];
+    isolate(stop, mocks);
     const running = startWorker(f, sql, health, stop.signal);
     try {
       await capacityEntered.promise;
@@ -69,7 +74,7 @@ for (const callback of ["disconnect", "subscription error"] as const) {
       expect(retainedDuringRefresh).toBe(true);
     } finally {
       releaseCapacity.resolve(); stop.abort();
-      try { await running; } finally { restore(mocks); }
+      await running;
     }
     expect(health.authority).toBeUndefined();
   });
@@ -100,6 +105,7 @@ test("a failed action-path refresh clears worker authority although the tick swa
     }),
     spyOn(DiscordRestrictionObserver.prototype, "tick").mockResolvedValue(),
   ];
+  isolate(stop, mocks);
   const running = startWorker(f, sql, health, stop.signal);
   try {
     const { before, after, code } = await ticked.promise;
@@ -108,6 +114,6 @@ test("a failed action-path refresh clears worker authority although the tick swa
     expect(code).toBe("ready");
   } finally {
     stop.abort();
-    try { await running; } finally { restore(mocks); }
+    await running;
   }
 });
