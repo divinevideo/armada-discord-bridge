@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, realpath } from "node:f
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import postgres from "postgres";
-import { KubernetesCapacity, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
+import { KubernetesCapacity, capacityRelayName, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { encrypt } from "nostr-tools/nip44";
 import { getEventHash, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -251,7 +251,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     }
     let relaySequence = 0;
     async function start(mode: string) {
-      const name = `${label}-${mode}-${relaySequence++}`;
+      const name = capacityRelayName(label, mode, relaySequence++);
       const plugin = mode === "plugin_failure" || mode === "external_timeout" ? `/capacity/${mode}.sh` : calibration ? "/capacity/plugin.sh" : "/usr/local/bin/relay-policy";
       if (mode === "plugin_failure" || mode === "external_timeout") await writeFile(join(directory, mode + ".sh"), "#!/bin/sh\n" + (mode === "plugin_failure" ? "exit 1\n" : "sleep 10\n"), { mode: 0o755 });
       const config = join(directory, name + ".conf");

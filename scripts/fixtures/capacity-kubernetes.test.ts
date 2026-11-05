@@ -237,3 +237,17 @@ test('both benchmark connection paths refuse startup-role URL overrides and priv
   const embedded = new Function('return ' + benchmarkURLGuard.toString())();
   expect(() => embedded(config, valid + '?options=-c%20role%3Dsynthetic_role')).toThrow();
 });
+
+import { capacityRelayName } from './capacity-kubernetes';
+import { REQUIRED_CAPACITY_CASES } from '../../packages/moderation/src/capacityContract';
+test('every required case yields a valid owned Pod name, including cases whose ids contain underscores', () => {
+  // The harness label is `capacity-` plus 20 hex characters.
+  const label = 'capacity-' + 'a'.repeat(20);
+  expect(REQUIRED_CAPACITY_CASES.some(id => id.includes('_'))).toBe(true);
+  for (const id of REQUIRED_CAPACITY_CASES) {
+    const name = capacityRelayName(label, id, 123);
+    expect(() => benchmarkPod(config, { ...matrix }, name)).not.toThrow();
+    expect(name).not.toContain('_');
+  }
+  expect(capacityRelayName(label, 'cache_entries', 7)).toBe(label + '-cache-entries-7');
+});

@@ -55,6 +55,15 @@ export function benchmarkNamespaceGuard(c: DestinationConfig, namespace: Json, p
   need(!policies.some(p => p.spec?.ingress?.length > 0), 'Additional ingress allowances defeat benchmark isolation');
   need(policies.some(p => Object.keys(p.spec?.podSelector ?? { invalid: true }).length === 0 && p.spec?.policyTypes?.includes('Ingress') && Array.isArray(p.spec?.ingress) && p.spec.ingress.length === 0), 'Default deny ingress required for isolated benchmark');
 }
+/**
+ * Relay names double as Kubernetes Pod names, which are DNS labels: case ids
+ * such as `cache_entries` carry underscores that `benchmarkPod` (and the API
+ * server) reject. Without this, 8 of the 14 required cases could never start a
+ * Pod and every destination run reported them unsupported.
+ */
+export function capacityRelayName(label: string, mode: string, sequence: number): string {
+  return `${label}-${mode.replaceAll('_', '-')}-${sequence}`;
+}
 export function benchmarkPod(c: DestinationConfig, m: Resources, name: string) {
   need(name.length <= 63 && /^capacity-[a-z0-9-]+$/.test(name), 'Invalid owned benchmark Pod name');
   return { apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: c.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } }, spec: {
