@@ -373,3 +373,20 @@ it('rechecks the stored deletion epoch against a rotation before retrying', asyn
   await h.router.retryPendingDeletes(h.link, true);
   expect(h.deleted).toEqual([]);
 });
+
+it('rechecks a queued chat after adopting a retirement cutoff', async () => {
+  const h = deletionHarness();
+  let release!: () => void, entered!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  let sends = 0;
+  h.webhooks.send = async () => { sends++; if (sends === 1) { entered(); await blocked; } return `synthetic-${sends}`; };
+  const first = await opened(fixture.chatEvent, h.channel);
+  const queued = await opened(fixture.ownerChatEvent, h.channel);
+  const a = h.router.onConcordChat(first, h.link); await started;
+  const b = h.router.onConcordChat(queued, h.link);
+  h.client.channel = () => ({ ...h.channel, streams: h.channel.streams.map(s => ({ ...s, retiredAt: queued.createdAt - 1 })) });
+  release(); await a;
+  expect(await b).toEqual([]);
+  expect(sends).toBe(1);
+});

@@ -633,6 +633,12 @@ export class BridgeRouter {
 
   private async dispatchConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (!link.enabled) return [];
+    // The chat may have waited behind another effect while a rotation was
+    // adopted. Decode memo entries predate that rotation, so apply the core
+    // read-side cutoff again at the point this queue starts dispatching it.
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) throw new Error("Concord channel unavailable during dispatch");
+    if (!filterEpochCutoff([chat], channel).length) return [];
     // Layer 1 + 2: bridge-originated or already-bridged rumors never bounce.
     // The primary's own posts (confirm requests, announcements) stay
     // Armada-side; mirroring them trips Discord's webhook username filter
