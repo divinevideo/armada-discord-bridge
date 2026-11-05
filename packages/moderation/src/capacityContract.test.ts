@@ -127,7 +127,13 @@ it("exports a disposable library launcher without an entrypoint bypass", () => {
   expect(launcher).toContain('"/data/synthetic-test.json"');
   expect(launcher).toContain("new PolicyStore(sql,{capacity:");
   expect(launcher).toContain("runPlugin(process.stdin");
+  // The launcher runs in the image under test, which can predate this
+  // harness. It must import only symbols that image already exports, and carry
+  // its own correlation: a missing export fails the module load, and then
+  // every admission behaves like plugin_failure.
   expect(launcher).toContain("eventId:event.id");
+  const imports = [...launcher.matchAll(/import \{([^}]*)\} from '\/opt\/divine\/packages\/moderation\/src\/(\w+)\.ts'/g)].map(m => [m[2], m[1].split(",").map(x => x.trim())]);
+  expect(Object.fromEntries(imports)).toEqual({ strfryPlugin: ["runPlugin"], policyStore: ["PolicyStore"] });
   expect(launcher).not.toContain("process.env.MODERATION_CAPACITY_CONTRACT_FILE");
 });
 it("derives only a conservative review candidate with measured overshoot and explicit reserve", () => {

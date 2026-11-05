@@ -27,7 +27,8 @@ function streamOf(row: Record<string, any>): StreamDescriptor {
   return { communityId: row.community_id, channelId: row.channel_id ?? undefined, plane: row.plane, epoch: String(row.epoch), retiredAt: row.retired_at == null ? undefined : Number(row.retired_at), previousEpoch: row.previous_epoch == null ? undefined : String(row.previous_epoch), previousCommit: row.previous_commit ?? undefined, key: { pk: row.pubkey, convKey: new Uint8Array(row.read_key), restricted: row.restricted } };
 }
 
-export interface PolicyStoreOptions { capacity?: { communities: ReadonlyMap<string, string>; contract: PublicCapacityContract | undefined }; onAdmissionTiming?: (sample: { innerAdmissionMs: number; action: "accept" | "reject" }) => void }
+export interface AdmissionTimingSample { innerAdmissionMs: number; action: "accept" | "reject"; eventId?: string }
+export interface PolicyStoreOptions { capacity?: { communities: ReadonlyMap<string, string>; contract: PublicCapacityContract | undefined }; onAdmissionTiming?: (sample: AdmissionTimingSample) => void }
 export class PolicyStore {
   private readonly capacity: PublicCapacityStore | undefined;
   constructor(private readonly sql: postgres.Sql, private readonly options: PolicyStoreOptions = {}) { if (options.capacity) this.capacity = new PublicCapacityStore(sql, options.capacity.contract); }
@@ -111,8 +112,15 @@ export class PolicyStore {
 
   async admit(event: NostrEvent, signal?: AbortSignal): Promise<AdmissionResult> {
     const start = performance.now();
+    let eventId: string | undefined;
+    // Timing is opt-in. Verify correlation independently even when SQL rejects
+    // before policy inspection; never label an invalid frame with its claimed ID.
+    // Include this work in measured inner time rather than hiding its overhead.
+    // verifiedEvent only returns an event whose id matches its hash, and
+    // admitEvent echoes that same id, so a verified id needs no second check.
+    if (this.options.onAdmissionTiming) try { eventId = verifiedEvent(event).id; } catch { /* Invalid frames retain only aggregate timing. */ }
     const result = await this.admitEvent(event, false, signal);
-    try { this.options.onAdmissionTiming?.({ innerAdmissionMs: performance.now() - start, action: result.action }); } catch { /* Telemetry cannot reverse a settled database result. */ }
+    try { this.options.onAdmissionTiming?.({ innerAdmissionMs: performance.now() - start, action: result.action, ...(eventId ? { eventId } : {}) }); } catch { /* Telemetry cannot reverse a settled database result. */ }
     return result;
   }
 
