@@ -30,7 +30,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    await db`INSERT INTO communities(tenant_id,community_id,relays) VALUES (${tenant},${link.communityId},ARRAY[]::text[])`;
    await db`INSERT INTO channel_links(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,enabled)
      VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'standalone-channel',true)`;
-   await db`INSERT INTO cursors(tenant_id,community_id,stream_pk,relay_url,last_seen_at) VALUES (${tenant},${link.communityId},'old','pool',100),(${tenant},${link.communityId},'new','pool',200)`;
+   await db`INSERT INTO cursors(tenant_id,community_id,stream_pk,relay_url,last_seen_at) VALUES (${tenant},${link.communityId},'old','pool',100),(${tenant},${link.communityId},'new','pool',200),(${tenant},${link.communityId},'late','pool',50),(${tenant},${link.communityId},'future','pool',1600)`;
    await db`INSERT INTO channel_delivery_checkpoints(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,last_seen_at)
      VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},80)`;
    await db`INSERT INTO messages(tenant_id,community_id,concord_channel_id,discord_channel_id,discord_message_id,concord_rumor_id,origin,author_ref)
@@ -41,6 +41,10 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    await db.unsafe(await readFile(new URL('migrations/022_delivery_lifecycle.sql',directory),'utf8'));
    await db.unsafe(await readFile(new URL('migrations/023_delivery_pause.sql',directory),'utf8'));
    await db.unsafe(await readFile(new URL('migrations/024_delivery_recovery_floor.sql',directory),'utf8'));
+   await db`INSERT INTO channel_delivery_lifecycles(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,recovery_floor,legacy_boundaries)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'intermediate', 'intermediate',1000,1000,${db.json({future:1600,old:100})})`;
+   await db.unsafe(await readFile(new URL('migrations/025_delivery_legacy_boundaries.sql',directory),'utf8'));
+   expect((await db`SELECT legacy_boundaries FROM channel_delivery_lifecycles WHERE discord_channel_id='intermediate'`)[0].legacy_boundaries).toEqual({future:999,old:100});
    // Match the deployment migration hook: explicit DML grants after migrations,
    // not superuser tests or a dependency on unspecified default privileges.
    await admin.unsafe(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
@@ -53,7 +57,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    const lease=(await new BridgeLeases(runtime).acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
    try {
      const snapshot=await store.activateDelivery(link,owner,['old','new'],1000);
-     expect(snapshot.repairFloor).toBe(80);expect(snapshot.activationFloor).toBe(1000);expect(snapshot.recoveryFloor).toBe(80);expect(snapshot.legacyBoundaries).toEqual({old:100,new:200});
+     expect(snapshot.repairFloor).toBe(80);expect(snapshot.activationFloor).toBe(1000);expect(snapshot.recoveryFloor).toBe(80);expect(snapshot.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999});
      const view=store.forDelivery(link,{ownerId:owner,epoch:snapshot.epoch,lease});
      const held=await view.pendingDeletes(link);
      expect(held.find(row=>row.targetRumorId==='c'.repeat(64))?.actionClass).toBe('actionable');
@@ -67,7 +71,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
      // Restart and later cursors never replace the frozen legacy boundaries.
      await store.cursorSet(link.communityId,'old',900);
      const resumed = await store.activateDelivery(link,owner,['old','new'],2000);
-     expect(resumed.legacyBoundaries).toEqual({old:100,new:200}); expect(resumed.activationFloor).toBe(1000);expect(resumed.recoveryFloor).toBe(80);
+     expect(resumed.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999}); expect(resumed.activationFloor).toBe(1000);expect(resumed.recoveryFloor).toBe(80);
      await store.terminateDelivery(link,owner,snapshot.epoch);
      const relink=await store.activateDelivery(link,owner,['old','new'],3000);
      expect(relink.repairFloor).toBe(3000);expect(relink.recoveryFloor).toBe(3000);expect(relink.legacyBoundaries).toEqual({});
@@ -76,7 +80,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    const checkpointLease=(await new BridgeLeases(runtime).acquire(bridgeResource(checkpointOnly.discordGuildId,checkpointOnly.discordChannelId)))!;
    try {
      const oldCheckpoint=await store.activateDelivery(checkpointOnly,checkpointOwner,[],1000);
-     expect(oldCheckpoint.legacyBoundaries).toEqual({}); expect(oldCheckpoint.recoveryFloor).toBe(70);
+     expect(oldCheckpoint.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999}); expect(oldCheckpoint.recoveryFloor).toBe(70);
      const view=store.forDelivery(checkpointOnly,{ownerId:checkpointOwner,epoch:oldCheckpoint.epoch,lease:checkpointLease});
      expect(await view.certifyDelivery(oldCheckpoint.version,1200,{},true)).toBe(true);
      const healed=await view.deliverySnapshot();

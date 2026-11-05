@@ -310,11 +310,11 @@ export class PostgresMappingStore implements MappingStore {
       const eligible=await tx`SELECT legacy_boundaries FROM channel_delivery_upgrade_eligibility
         WHERE ${deliveryScope(tx,this.tenantId,link)} AND owner_id=${ownerId} AND NOT consumed FOR UPDATE`;
       const legacy:Record<string,number>={};
-      if(!old && eligible.length) for(const pk of streamPks) {
-        const value=eligible[0].legacy_boundaries[pk]; if(value!=null) legacy[pk]=Number(value);
+      if(!old && eligible.length) for(const [pk,value] of Object.entries(eligible[0].legacy_boundaries)) {
+        legacy[pk]=Number(value)>at ? Math.max(0,at-1) : Number(value);
       }
       const unsafe=(!old && eligible.length)?await tx`SELECT last_seen_at FROM channel_delivery_checkpoints WHERE ${deliveryScope(tx,this.tenantId,link)}`:[];
-      const floors=[at,...Object.values(legacy),...unsafe.map(row=>Number(row.last_seen_at))];
+      const floors=[at,...streamPks.flatMap(pk => legacy[pk] === undefined ? [] : [legacy[pk]]),...unsafe.map(row=>Number(row.last_seen_at))];
       // Keep the upgrade floor for future stream discovery after repair clears.
       // A fresh lifecycle has no legacy values, so its floor remains at.
       const floor=Math.min(...floors);

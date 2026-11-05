@@ -162,20 +162,26 @@ it('resumes a certified prefix after an interrupted replay', async () => {
 });
 
 it('replays only deletions below each legacy carrier boundary', async () => {
-  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version: 0, activationFloor: 100, recoveryFloor: 100, repairFloor: 40, coverage: {}, legacyBoundaries: { first: 100, second: 50 } };
+  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version: 0, activationFloor: 1000, recoveryFloor: 100, repairFloor: 40, coverage: {}, legacyBoundaries: { first: 100, second: 50, future: 999 } };
   const store = { deliverySnapshot: async () => snapshot, certifyDelivery: async () => true };
-  const channel = { streams: [{ epoch: 0n, group: { pk: 'first' } }, { epoch: 1n, group: { pk: 'second' } }] } as unknown as ChannelV2;
+  const channel = { streams: [{ epoch: 0n, group: { pk: 'first' } }, { epoch: 1n, group: { pk: 'second' } }, { epoch: 2n, group: { pk: 'third' } }, { epoch: 3n, group: { pk: 'future' } }] } as unknown as ChannelV2;
   const delivered: string[] = [];
   const chats = [
     { rumorId: 'old message', kind: 9, streamPk: 'first', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 0n },
     { rumorId: 'old deletion', kind: 5, streamPk: 'first', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 0n },
     { rumorId: 'second message', kind: 9, streamPk: 'second', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 1n },
+    { rumorId: 'pre-link message', kind: 9, streamPk: 'third', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 2n },
+    { rumorId: 'pre-link deletion', kind: 5, streamPk: 'third', sourceWrapCreatedAt: 75, createdAt: 75, epoch: 2n },
+    { rumorId: 'unknown downtime', kind: 9, streamPk: 'third', sourceWrapCreatedAt: 150, createdAt: 150, epoch: 2n },
+    { rumorId: 'own boundary', kind: 9, streamPk: 'first', sourceWrapCreatedAt: 100, createdAt: 100, epoch: 0n },
+    { rumorId: 'new boundary', kind: 9, streamPk: 'third', sourceWrapCreatedAt: 100, createdAt: 100, epoch: 2n },
+    { rumorId: 'activation second', kind: 9, streamPk: 'future', sourceWrapCreatedAt: 1000, createdAt: 1000, epoch: 3n },
   ] as DeliveredChat[];
   const delivery = new LinkDelivery({ onError: () => {} });
   await delivery.repair({ store, channel: () => channel, deliver: async chat => { delivered.push(chat.rumorId); }, replay: async (_channel, _since, opts) => {
     await opts.onBatch!({ chats }, { signal: new AbortController().signal });
   } });
-  expect(delivered).toEqual(['old deletion', 'second message']);
+  expect(delivered).toEqual(['old deletion', 'second message', 'pre-link deletion', 'unknown downtime', 'new boundary', 'activation second']);
 });
 
 it('keeps a newer persisted gap when the final replay checkpoint is blocked', async () => {
@@ -205,11 +211,11 @@ it('keeps a newer persisted gap when the final replay checkpoint is blocked', as
 });
 
 it('starts a newly discovered stream at the preserved upgrade floor', async () => {
-  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version: 1, activationFloor: 1000, recoveryFloor: 80, certifiedUntil: 1200, coverage: { known: 1200 }, legacyBoundaries: {} };
+  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, version: 1, activationFloor: 1000, recoveryFloor: 80, certifiedUntil: 1200, coverage: { known: 1200 }, legacyBoundaries: { new: 50 } };
   const store = { deliverySnapshot: async () => snapshot, certifyDelivery: async () => true };
   const channel = { streams: [{ group: { pk: 'known' } }, { group: { pk: 'new' } }] } as unknown as ChannelV2;
   let floor = -1;
   const delivery = new LinkDelivery({ onError: () => {} });
   await delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since) => { floor = since; } });
-  expect(floor).toBe(20);
+  expect(floor).toBe(0);
 });

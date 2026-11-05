@@ -101,9 +101,9 @@ export class LinkDelivery {
     if (generation !== this.generation) throw new Error('Delivery gap changed during replay startup');
     const channel = options.channel();
     const streams = channel.streams.map(stream => stream.group.pk);
-    const missing = streams.some(pk => snapshot.coverage[pk] === undefined);
+    const missing = streams.filter(pk => snapshot.coverage[pk] === undefined);
     const floor = Math.max(0, Math.min(snapshot.repairFloor ?? snapshot.certifiedUntil ?? snapshot.activationFloor,
-      ...(missing ? [snapshot.recoveryFloor] : [])) - 60);
+      ...(missing.length ? [snapshot.recoveryFloor, ...missing.flatMap(pk => snapshot.legacyBoundaries[pk] === undefined ? [] : [snapshot.legacyBoundaries[pk]])] : [])) - 60);
     const attempt = new AbortController();
     this.attempt = attempt;
     const signal = AbortSignal.any([this.controller.signal, attempt.signal]);
@@ -116,7 +116,10 @@ export class LinkDelivery {
             if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
             if (!filterEpochCutoff([chat], options.channel()).length) continue;
             const boundary = snapshot.legacyBoundaries[chat.streamPk];
-            if (boundary !== undefined && chat.sourceWrapCreatedAt < boundary && chat.kind !== KIND_DELETE) continue;
+            // A legacy cursor completed its boundary second. A recovery floor
+            // instead begins with that second and must retain equal timestamps.
+            const oldHistory = boundary === undefined ? chat.sourceWrapCreatedAt < snapshot.recoveryFloor : chat.sourceWrapCreatedAt <= boundary;
+            if (oldHistory && chat.kind !== KIND_DELETE) continue;
             try { await options.deliver(chat, signal); }
             catch (error) {
               if (!signal.aborted) this.markGap(error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError
