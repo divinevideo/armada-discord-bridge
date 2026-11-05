@@ -116,9 +116,11 @@ export class PolicyStore {
     // Timing is opt-in. Verify correlation independently even when SQL rejects
     // before policy inspection; never label an invalid frame with its claimed ID.
     // Include this work in measured inner time rather than hiding its overhead.
+    // verifiedEvent only returns an event whose id matches its hash, and
+    // admitEvent echoes that same id, so a verified id needs no second check.
     if (this.options.onAdmissionTiming) try { eventId = verifiedEvent(event).id; } catch { /* Invalid frames retain only aggregate timing. */ }
     const result = await this.admitEvent(event, false, signal);
-    try { this.options.onAdmissionTiming?.({ innerAdmissionMs: performance.now() - start, action: result.action, ...(eventId && result.id === eventId ? { eventId } : {}) }); } catch { /* Telemetry cannot reverse a settled database result. */ }
+    try { this.options.onAdmissionTiming?.({ innerAdmissionMs: performance.now() - start, action: result.action, ...(eventId ? { eventId } : {}) }); } catch { /* Telemetry cannot reverse a settled database result. */ }
     return result;
   }
 

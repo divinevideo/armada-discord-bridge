@@ -127,7 +127,10 @@ it("exports a disposable library launcher without an entrypoint bypass", () => {
   expect(launcher).toContain('"/data/synthetic-test.json"');
   expect(launcher).toContain("new PolicyStore(sql,{capacity:");
   expect(launcher).toContain("runPlugin(process.stdin");
-  expect(launcher).toContain("eventId:event.id");
+  // Timing goes through the production emitter. Stamping the claimed event.id
+  // here would label an invalid frame with an ID nothing verified.
+  expect(launcher).toContain("admissionTimingLine(timing)");
+  expect(launcher).not.toContain("eventId:event.id");
   expect(launcher).not.toContain("process.env.MODERATION_CAPACITY_CONTRACT_FILE");
 });
 it("derives only a conservative review candidate with measured overshoot and explicit reserve", () => {
