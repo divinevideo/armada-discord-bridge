@@ -21,7 +21,7 @@ import { hostIsPublic } from "@armada-bridge/bridge/src/net";
 
 const RELAY_PROTOCOLS = new Set(["ws:", "wss:"]);
 
-async function relayIsSafe(raw: string): Promise<boolean> {
+async function relayIsSafe(raw: string, verifyHost = hostIsPublic): Promise<boolean> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -29,7 +29,7 @@ async function relayIsSafe(raw: string): Promise<boolean> {
     return false;
   }
   if (!RELAY_PROTOCOLS.has(url.protocol)) return false;
-  return hostIsPublic(url.hostname);
+  return verifyHost(url.hostname);
 }
 
 /**
@@ -37,9 +37,9 @@ async function relayIsSafe(raw: string): Promise<boolean> {
  * bad entry. Used where the list is typed by the caller and a silent drop
  * would leave them wondering why their relay never appeared.
  */
-export async function assertPublicRelays(relays: readonly string[]): Promise<void> {
+export async function assertPublicRelays(relays: readonly string[], verifyHost = hostIsPublic): Promise<void> {
   for (const relay of relays) {
-    if (!(await relayIsSafe(relay))) {
+    if (!(await relayIsSafe(relay,verifyHost))) {
       throw new Error(`not a usable relay URL: ${relay}`);
     }
   }
@@ -62,4 +62,12 @@ export async function filterPublicRelays(
     else console.warn(`portal: refusing to dial non-public relay ${relay}`);
   }
   return safe.length > 0 ? safe : [...fallback];
+}
+
+/** Coverage may only certify the complete configured set. */
+export async function deliveryRelays(relays: readonly string[], fallback: readonly string[], verifyHost = hostIsPublic): Promise<string[]> {
+  const required = relays.length ? [...relays] : [...fallback];
+  if (!required.length) throw new Error('No delivery relays configured');
+  await assertPublicRelays(required,verifyHost);
+  return required;
 }
