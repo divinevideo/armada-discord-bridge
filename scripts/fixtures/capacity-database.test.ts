@@ -2,7 +2,12 @@ import { afterAll, expect, test } from 'bun:test';
 import postgres from 'postgres';
 import { BENCHMARK_IDENTITY_SQL, benchmarkLoginGuard } from './capacity-kubernetes';
 
-const sql = postgres(process.env.DATABASE_URL!, { max: 1, onnotice() {} });
+// Postgres suites skip themselves when DATABASE_URL is unreachable (AGENTS.md);
+// connecting unconditionally failed all three tests on a bare `bun test`.
+const DB_URL = process.env.DATABASE_URL ?? 'postgres://bridge:bridge@localhost:5432/bridge';
+const sql = postgres(DB_URL, { max: 1, onnotice() {}, connect_timeout: 3 });
+const dbUp = await sql`SELECT 1`.then(() => true).catch(() => false);
+if (!dbUp) await sql.end();
 afterAll(() => sql.end());
 // client.end() resolves when the socket closes, not when the server has reaped
 // the backend, so an immediate pg_stat_activity read can still see it. Poll.
@@ -13,7 +18,7 @@ async function backendGone(pid: number): Promise<boolean> {
   }
   return false;
 }
-test('PostgreSQL identity SQL returns the bare server host rather than inet display masks', async () => {
+test.skipIf(!dbUp)('PostgreSQL identity SQL returns the bare server host rather than inet display masks', async () => {
   const [identity] = await sql.unsafe(BENCHMARK_IDENTITY_SQL);
   const [address] = await sql`SELECT pg_catalog.host(pg_catalog.inet_server_addr()) AS host`;
   expect(address.host).toBeTypeOf('string');
@@ -26,9 +31,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { finalizeCapacityMeasurement } from './strfry-capacity';
 
-test('artifact failure still closes real SQL sessions and the owned transport', async () => {
+test.skipIf(!dbUp)('artifact failure still closes real SQL sessions and the owned transport', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'capacity-artifact-failure-'));
-  const client = postgres(process.env.DATABASE_URL!, { max: 1, onnotice() {} });
+  const client = postgres(DB_URL, { max: 1, onnotice() {} });
   const [session] = await client`SELECT pg_backend_pid() AS pid`;
   const calls: string[] = [];
   try {
@@ -43,8 +48,8 @@ test('artifact failure still closes real SQL sessions and the owned transport', 
   } finally { await client.end(); await rm(directory, { recursive: true, force: true }); }
 });
 
-test('SQL shutdown failure cannot strand remaining cleanup or its idle connection', async () => {
-  const client = postgres(process.env.DATABASE_URL!, { max: 1, onnotice() {} });
+test.skipIf(!dbUp)('SQL shutdown failure cannot strand remaining cleanup or its idle connection', async () => {
+  const client = postgres(DB_URL, { max: 1, onnotice() {} });
   const [session] = await client`SELECT pg_backend_pid() AS pid`;
   const calls: string[] = [];
   try {
@@ -60,9 +65,9 @@ test('SQL shutdown failure cannot strand remaining cleanup or its idle connectio
 });
 
 for (const privilege of ['REPLICATION', 'BYPASSRLS'] as const) {
-  test(`actual PostgreSQL ${privilege} LOGIN is rejected by the benchmark guard`, async () => {
+  test.skipIf(!dbUp)(`actual PostgreSQL ${privilege} LOGIN is rejected by the benchmark guard`, async () => {
     const role = `concord_capacity_${privilege.toLowerCase()}_${process.pid}`;
-    const url = new URL(process.env.DATABASE_URL!); url.username = role;
+    const url = new URL(DB_URL); url.username = role;
     let client: ReturnType<typeof postgres> | undefined;
     try {
       await sql.unsafe(`CREATE ROLE "${role}" LOGIN ${privilege}`);
