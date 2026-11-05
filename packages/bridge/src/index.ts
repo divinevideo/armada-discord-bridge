@@ -27,6 +27,7 @@ import { BridgeLeases, bridgeResource } from "./db/leases";
 import { discordPublicChannelPolicy } from "./discord/publicChannelPolicy";
 import { BlossomStore } from "./blossom";
 import { KlipyClient } from "./klipy";
+import { startConcordDelivery } from "./concord/startup";
 import { deliverConcordChat } from "./concord/delivery";
 import { ConcordClient, resolveInvite } from "./concord/client";
 import { intakeDirectInviteKeys } from "./concord/keyIntake";
@@ -259,32 +260,37 @@ const retryCatchup = (): Promise<void> => {
     .finally(() => { catchupPending = undefined; });
   return catchupPending;
 };
-// Establish the durable floor before admitting the live tail. A failed query
-// leaves acknowledgements disabled, but does not crash-loop the gateway.
-await store.channelCursorStart(link, currentChannel.streams.map(s => s.group.pk));
-await retryCatchup();
+let unsubscribe = () => {};
+await startConcordDelivery({
+  establishFloor: async () => { await store.channelCursorStart(link, currentChannel.streams.map(s => s.group.pk)); },
+  installLive: () => {
+    unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);
+    cleanup.push(() => unsubscribe());
+  },
+  installControl: () => {
+    // Install both watches before slow history delivery can outlast the live
+    // overlap. Cursor writes stay gated until complete durable catch-up.
+    const unsubControl = client.subscribeControl(() => {
+      void retryDeletes();
+      const fresh = client.channel(link.concordChannelIdHex);
+      if (!fresh) return;
+      const keys = (c: typeof channel) => c.streams.map(s => s.group.pk).join(",");
+      if (keys(fresh) === keys(currentChannel)) return;
+      unsubscribe();
+      currentChannel = fresh;
+      unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, onCursor);
+      console.log("bridge: stream keys rotated; chat subscription refreshed");
+    });
+    cleanup.push(() => unsubControl());
+  },
+  catchUp: retryCatchup,
+});
 const deletionRetryTimer = setInterval(() => {
   void retryDeletes();
   if (!catchupReady) void retryCatchup();
 }, DELETION_RETRY_MS);
 cleanup.push(() => clearInterval(deletionRetryTimer));
 
-let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);
-cleanup.push(() => unsubscribe());
-// A rekey (epoch bump) mints new stream keys; a REQ pinned to the old ones
-// goes silent while publishes (fresh channel lookup) keep working.
-const unsubControl = client.subscribeControl(() => {
-  void retryDeletes();
-  const fresh = client.channel(link.concordChannelIdHex);
-  if (!fresh) return;
-  const keys = (c: typeof channel) => c.streams.map((s) => s.group.pk).join(",");
-  if (keys(fresh) === keys(currentChannel)) return;
-  unsubscribe();
-  currentChannel = fresh;
-  unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, onCursor);
-  console.log("bridge: stream keys rotated; chat subscription refreshed");
-});
-cleanup.push(() => unsubControl());
 console.log("bridge: live in both directions");
 
 process.on("SIGINT", () => void shutdown());
