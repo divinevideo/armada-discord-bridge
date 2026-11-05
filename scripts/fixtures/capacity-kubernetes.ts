@@ -190,7 +190,7 @@ export interface Forward {
   /** False once the kubectl process has exited. Optional so test doubles need not model it. */
   alive?(): boolean;
 }
-async function discard(reader: ReadableStreamDefaultReader<Uint8Array>) {
+async function discard(reader: { read(): Promise<{ done: boolean }> }) {
   try { while (!(await reader.read()).done); } catch { /* the process is gone */ }
 }
 export async function forward(args: string[], remotePort = 7777): Promise<Forward> {

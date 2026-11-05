@@ -404,7 +404,7 @@ test('kubectl, git and docker children never inherit the benchmark credential or
     const env = childEnvironment();
     expect(Object.keys(env).filter(key => key.startsWith('CAPACITY_'))).toEqual([]);
     // Everything else, including what kubectl's credential plugins need, passes through.
-    expect(env.PATH).toBe(process.env.PATH);
+    expect<string | undefined>(env.PATH).toBe(process.env.PATH);
     expect(childEnvironment({ KUBECONFIG: '/k', CLOUDSDK_CONFIG: '/c', CAPACITY_DATABASE_URL: 'x', UNSET: undefined })).toEqual({ KUBECONFIG: '/k', CLOUDSDK_CONFIG: '/c' });
     // The real spawn path, as the driver uses it.
     const seen = await capacityCommand(['bun', '-e', 'console.log(JSON.stringify(Object.keys(process.env).filter(k => k.startsWith("CAPACITY_"))))']);
