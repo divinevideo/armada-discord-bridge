@@ -38,7 +38,7 @@ const startWorker = (f: Fixture, sql: postgres.Sql, health: WorkerHealth, signal
 const restore = (mocks: { mockRestore(): void }[]) => { for (const mock of mocks) mock.mockRestore(); };
 
 for (const callback of ["disconnect", "subscription error"] as const) {
-  test(`worker authority stays cleared when ${callback} races the capacity await`, async () => {
+  test(`worker authority and readiness stay cleared when ${callback} races the capacity await`, async () => {
     const f = await moderationFixture(), stop = new AbortController();
     const health: WorkerHealth = { ready: false, code: "starting", checkedAt: 0, authority: { available: true, validUntil: Date.now() + 30_000 } };
     const capacityEntered = Promise.withResolvers<void>(), releaseCapacity = Promise.withResolvers<void>(), refreshReturned = Promise.withResolvers<void>();
@@ -65,6 +65,9 @@ for (const callback of ["disconnect", "subscription error"] as const) {
       expect(health.authority).toBeUndefined();
       releaseCapacity.resolve();
       await refreshReturned.promise;
+      // A stale refresh publishes no readiness either: /readyz keeps the
+      // disconnect's 503 rather than the pre-disconnect policy's 200.
+      expect({ ready: health.ready, code: health.code, checkedAt: health.checkedAt }).toEqual({ ready: false, code: "policy_unavailable", checkedAt: 0 });
       expect(await (await workerMetricsResponse(sql, health.authority)).text()).toBe("# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available 0\n");
       expect(retainedDuringRefresh).toBe(true);
     } finally {
