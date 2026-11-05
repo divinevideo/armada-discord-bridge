@@ -414,3 +414,30 @@ test('kubectl, git and docker children never inherit the benchmark credential or
     for (const [key, value] of [['CAPACITY_DATABASE_URL', before.url], ['CAPACITY_KUBERNETES_CONFIG', before.config]] as const) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   }
 });
+
+import { finalizeCapacityMeasurement, realpathOfFuture } from './strfry-capacity';
+import { mkdir, realpath, symlink } from 'node:fs/promises';
+test('cleanup reports the first failure, runs every step, and surfaces the later failures instead of replacing it', async () => {
+  const ran: string[] = [], suppressed: string[] = [];
+  const fail = (name: string) => () => { ran.push(name); throw new Error(name + ' failed'); };
+  await expect(finalizeCapacityMeasurement(async () => { ran.push('artifacts'); throw new Error('artifacts failed'); }, [fail('pods'), () => { ran.push('temp'); }, fail('forward')], error => suppressed.push((error as Error).message))).rejects.toThrow('artifacts failed');
+  expect(ran).toEqual(['artifacts', 'pods', 'temp', 'forward']);
+  expect(suppressed).toEqual(['pods failed', 'forward failed']);
+  // A cleanup failure alone is still the failure, and a reporter that throws cannot change that.
+  await expect(finalizeCapacityMeasurement(async () => {}, [fail('pods')], () => { throw new Error('reporter broke'); })).rejects.toThrow('pods failed');
+  await finalizeCapacityMeasurement(async () => {}, [() => {}]);
+});
+
+test('the output guard sees where mkdir would really write, through symlinks and not-yet-created directories', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'capacity-realpath-test-'));
+  try {
+    await mkdir(join(dir, 'checkout'));
+    await symlink(join(dir, 'checkout'), join(dir, 'link'));
+    const real = await realpath(dir);
+    expect(await realpathOfFuture(join(dir, 'link', 'reports', 'run'))).toBe(join(real, 'checkout', 'reports', 'run'));
+    // That resolved location is what destinationOutputGuard must refuse.
+    expect(() => destinationOutputGuard(join(real, 'checkout', 'reports', 'run'), join(real, 'checkout'))).toThrow();
+    expect(await realpathOfFuture(join(dir, 'new', 'deep', 'path'))).toBe(join(real, 'new', 'deep', 'path'));
+    expect(await realpathOfFuture(dir)).toBe(real);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

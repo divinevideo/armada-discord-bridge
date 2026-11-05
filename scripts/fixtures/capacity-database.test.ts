@@ -4,6 +4,15 @@ import { BENCHMARK_IDENTITY_SQL } from './capacity-kubernetes';
 
 const sql = postgres(process.env.DATABASE_URL!, { max: 1, onnotice() {} });
 afterAll(() => sql.end());
+// client.end() resolves when the socket closes, not when the server has reaped
+// the backend, so an immediate pg_stat_activity read can still see it. Poll.
+async function backendGone(pid: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if ((await sql`SELECT 1 FROM pg_stat_activity WHERE pid=${pid}`).length === 0) return true;
+    await Bun.sleep(50);
+  }
+  return false;
+}
 test('PostgreSQL identity SQL returns the bare server host rather than inet display masks', async () => {
   const [identity] = await sql.unsafe(BENCHMARK_IDENTITY_SQL);
   const [address] = await sql`SELECT pg_catalog.host(pg_catalog.inet_server_addr()) AS host`;
@@ -30,7 +39,7 @@ test('artifact failure still closes real SQL sessions and the owned transport', 
       [async () => { await client.end(); calls.push('sql'); }, () => { calls.push('locker'); }, () => { calls.push('transport'); }, () => { calls.push('temp'); }],
     )).rejects.toThrow();
     expect(calls).toEqual(['sql', 'locker', 'transport', 'temp']);
-    expect((await sql`SELECT 1 FROM pg_stat_activity WHERE pid=${session.pid}`).length).toBe(0);
+    expect(await backendGone(session.pid)).toBe(true);
   } finally { await client.end(); await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -46,6 +55,6 @@ test('SQL shutdown failure cannot strand remaining cleanup or its idle connectio
       () => { calls.push('temp'); },
     ])).rejects.toThrow('synthetic shutdown failure');
     expect(calls).toEqual(['sql', 'locker', 'transport', 'temp']);
-    expect((await sql`SELECT 1 FROM pg_stat_activity WHERE pid=${session.pid}`).length).toBe(0);
+    expect(await backendGone(session.pid)).toBe(true);
   } finally { await client.end(); }
 });

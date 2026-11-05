@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve, join } from "node:path";
+import { resolve, join, basename } from "node:path";
 import postgres from "postgres";
 import { KubernetesCapacity, SafeDiagnostic, capacityRelayName, childEnvironment, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
 import { schnorr } from "@noble/curves/secp256k1.js";
@@ -205,16 +205,32 @@ export function caseFailureReason(error: unknown, withheld: boolean): string {
   return error instanceof Error ? error.message : "measurement failed";
 }
 
-export async function finalizeCapacityMeasurement(writeArtifacts: () => Promise<void>, cleanup: readonly (() => void | Promise<void>)[]): Promise<void> {
-  const closeFrom = async (index: number): Promise<void> => {
-    if (index === cleanup.length) return;
-    try { await cleanup[index](); }
-    finally { await closeFrom(index + 1); }
-  };
-  // Artifact I/O and any one shutdown can fail independently. Each remaining
-  // resource must still close, especially the API-owned database forward.
-  try { await writeArtifacts(); }
-  finally { await closeFrom(0); }
+/**
+ * Artifact I/O and any one shutdown can fail independently. Every remaining
+ * resource must still close, especially the API-owned database forward. The
+ * first failure is the one thrown; later ones are handed to `onSuppressed`
+ * rather than replacing it, so the cause is not lost behind a consequence.
+ */
+export async function finalizeCapacityMeasurement(writeArtifacts: () => Promise<void>, cleanup: readonly (() => void | Promise<void>)[], onSuppressed: (error: unknown) => void = () => {}): Promise<void> {
+  const failures: unknown[] = [];
+  try { await writeArtifacts(); } catch (error) { failures.push(error); }
+  for (const step of cleanup) try { await step(); } catch (error) { failures.push(error); }
+  for (const extra of failures.slice(1)) try { onSuppressed(extra); } catch { /* reporting cannot fail the run */ }
+  if (failures.length) throw failures[0];
+}
+
+/** Resolve symlinks in the part of a path that exists, so a guard sees where mkdir would really write. */
+export async function realpathOfFuture(path: string): Promise<string> {
+  const missing: string[] = [];
+  let current = resolve(path);
+  while (true) {
+    try { return join(await realpath(current), ...missing.reverse()); }
+    catch (error) {
+      const parent = resolve(current, "..");
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || parent === current) throw error;
+      missing.push(basename(current)); current = parent;
+    }
+  }
 }
 
 export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityMeasurementReport> {
@@ -222,6 +238,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   const destination = process.env.CAPACITY_KUBERNETES_CONFIG ? destinationConfig(JSON.parse(await readFile(process.env.CAPACITY_KUBERNETES_CONFIG, "utf8"))) : undefined;
   if (destination && process.env.CAPACITY_EXECUTE_DESTINATION !== "1") throw new Error("Destination execution requires explicit CAPACITY_EXECUTE_DESTINATION=1");
   if (destination) destinationOutputGuard(process.env.CAPACITY_OUTPUT_DIR, await command(["git", "rev-parse", "--show-toplevel"]));
+  if (destination) destinationOutputGuard(await realpathOfFuture(resolve(process.env.CAPACITY_OUTPUT_DIR!)), await realpath(await command(["git", "rev-parse", "--show-toplevel"])));
   const kube = destination ? new KubernetesCapacity(destination, matrix) : undefined;
   const image = destination?.image ?? process.env.STRFRY_TEST_IMAGE;
   if (!image) throw new Error("STRFRY_TEST_IMAGE must name a locally built exact candidate");
@@ -230,11 +247,6 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   if (!/^[0-9a-f]{40}$/.test(sourceSha ?? "") || !/^[0-9a-f]{40}$/.test(harnessSha) || !/^sha256:[0-9a-f]{64}$/.test(imageInfo.Id)) throw new Error("Immutable image/source/harness identity required");
   if (await command(["git", "status", "--porcelain", "--untracked-files=no"])) throw new Error("Commit the capacity harness before measuring");
   const label = kube ? `capacity-${hash(crypto.randomUUID()).slice(0, 20)}` : `capacity-${process.pid}-${crypto.randomUUID()}`;
-  const directory = await mkdtemp(join(tmpdir(), label));
-  await chmod(directory, 0o755);
-  const output = resolve(process.env.CAPACITY_OUTPUT_DIR ?? join(directory, "report"));
-  await mkdir(output, { recursive: true });
-  if (destination) destinationOutputGuard(await realpath(output), await realpath(await command(["git", "rev-parse", "--show-toplevel"])));
   const platform = `${imageInfo.Os}/${imageInfo.Architecture}`, host = destination ? "amd64" : await command(["docker", "info", "--format", "{{.Architecture}}"]);
   const native = ({ x86_64: "amd64", aarch64: "arm64" } as Record<string, string>)[host] ?? host;
   const pgImage = "postgres:16@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6";
@@ -250,8 +262,8 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   const docker = (...args: string[]) => command(["docker", ...args]);
   const relayLogs = (name: string) => kube ? kube.logs(name) : docker("logs", name);
   const removeRelay = (name: string) => kube ? kube.remove(name) : docker("rm", "-f", name);
-  await writeFile(join(directory, "launcher.ts"), launcher);
-  await writeFile(join(directory, "plugin.sh"), "#!/bin/sh\nexec bun /capacity/launcher.ts\n", { mode: 0o755 });
+  const directory = await mkdtemp(join(tmpdir(), label));
+  const output = resolve(process.env.CAPACITY_OUTPUT_DIR ?? join(directory, "report"));
   // Declared before the body so an interrupt runs the very cleanup the `finally`
   // does. `runCleanup` is idempotent: whichever path starts it, the other waits.
   const cleanup: (() => void | Promise<void>)[] = [
@@ -268,9 +280,15 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     async () => { if (!output.startsWith(directory + "/")) await rm(directory, { recursive: true, force: true }); },
   ];
   let cleaning: Promise<void> | undefined;
-  const runCleanup = (writeArtifacts: () => Promise<void>) => (cleaning ??= finalizeCapacityMeasurement(writeArtifacts, cleanup));
+  const noteSuppressed = (error: unknown) => console.error("Capacity cleanup also failed: " + caseFailureReason(error, !!kube));
+  const runCleanup = (writeArtifacts: () => Promise<void>) => (cleaning ??= finalizeCapacityMeasurement(writeArtifacts, cleanup, noteSuppressed));
   const stopInterruptCleanup = cleanupOnInterrupt(() => runCleanup(async () => {}));
+  let failure: { error: unknown } | undefined;
   try {
+    await chmod(directory, 0o755);
+    await mkdir(output, { recursive: true });
+    await writeFile(join(directory, "launcher.ts"), launcher);
+    await writeFile(join(directory, "plugin.sh"), "#!/bin/sh\nexec bun /capacity/launcher.ts\n", { mode: 0o755 });
     if (kube && destination) {
       report.resourceEnvelope.database = await kube.prepare();
       const credentials = process.env.CAPACITY_DATABASE_URL;
@@ -442,17 +460,27 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       if (kube) await kube.close();
       await writeFile(join(output, "partial-report.json"), JSON.stringify(report, null, 2) + "\n");
     }
+  } catch (error) {
+    failure = { error }; throw error;
   } finally {
     stopInterruptCleanup();
-    await runCleanup(async () => {
-      report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
-      const artifact = serializeCapacityReport(report);
-      await writeFile(join(output, "measurement-report.json"), artifact.json);
-      await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
-      await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
-      await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
-      if (kube) await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
-    });
+    // A cleanup failure must not replace the measurement error that caused it
+    // (a Pod that could not be removed is reported, not allowed to hide why the
+    // run failed). With no earlier failure it is the failure.
+    try {
+      await runCleanup(async () => {
+        report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
+        const artifact = serializeCapacityReport(report);
+        await writeFile(join(output, "measurement-report.json"), artifact.json);
+        await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
+        await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
+        await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
+        if (kube) await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
+      });
+    } catch (cleanupError) {
+      if (!failure) throw cleanupError;
+      noteSuppressed(cleanupError);
+    }
   }
 
   console.log(`Capacity raw report: ${output}; certified=false`);
