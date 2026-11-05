@@ -18,8 +18,10 @@ import { BridgeLeases, BridgeLeaseUnavailableError, bridgeResource, type BridgeL
 import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/effectGuard";
 import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
 import { PublicCapacityGuard } from "../../moderation/src/publicCapacity";
-import { deliverConcordChat } from "@armada-bridge/bridge/src/concord/delivery";
-import { randomBytes } from "node:crypto";
+import { LinkDelivery } from "@armada-bridge/bridge/src/concord/linkDelivery";
+import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from "@armada-bridge/bridge/src/deletionPolicy";
+import { deliverConcordChat, observeDeletionEffects } from "@armada-bridge/bridge/src/concord/delivery";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
   KIND_WRAP,
   Permissions,
@@ -86,9 +88,11 @@ interface Running {
   link: ChannelLink;
   primary: ReturnType<typeof localIdentity>;
   router?: BridgeRouter;
-  deletionRetryTimer?: ReturnType<typeof setInterval>;
-  concordCatchupReady?: boolean;
-  concordCatchupPending?: Promise<void>;
+  deliveryStore?: PostgresMappingStore;
+  delivery?: LinkDelivery;
+  deliveryEpoch?: string;
+  deliveryRecoveryFloor?: number;
+  stopped?: boolean;
   status: "pending_confirm" | "active";
   unsubChat: () => void;
   unsubControl: () => void;
@@ -187,6 +191,12 @@ export const BRIDGE_COMMANDS = [
 
 class PublicPolicyUnavailableError extends Error {}
 
+async function settleWithin(work: Promise<unknown>, timeoutMs = 1_000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([work.catch(() => {}),new Promise<void>(resolve=>{timer=setTimeout(resolve,timeoutMs);})]);
+  if(timer)clearTimeout(timer);
+}
+
 export class BridgeManager {
   private adapter?: DiscordAdapter;
   private readonly running = new Map<string, Running>();
@@ -201,6 +211,14 @@ export class BridgeManager {
   /** Set once the initial boot's startAll has run, so a LATE gateway connect
    *  knows to bring up deferred bridges rather than double-starting them. */
   private booted = false;
+  private deliveryTimer?: ReturnType<typeof setInterval>;
+  private deliveryTicking = false;
+  private readonly repairing = new Set<string>();
+  private repairCursor = 0;
+  private shuttingDown = false;
+  private readonly startingPools = new Set<RelayPool>();
+  private readonly startingAdapters = new Set<DiscordAdapter>();
+  private readonly startingLeases = new Set<BridgeLease>();
 
   constructor(
     private readonly sql: postgres.Sql,
@@ -238,11 +256,13 @@ export class BridgeManager {
   get discordConnected(): boolean { return this.adapter?.client.isReady() ?? false; }
 
   async init(): Promise<void> {
+    if (this.shuttingDown) return;
     if (this.env.discordBotToken) {
       await this.connectAdapter();
     } else {
       console.warn("portal: DISCORD_TOKEN not set; bridges cannot go live");
     }
+    if (this.shuttingDown) return;
     await this.startAll(await this.bridgesToStart());
     this.booted = true;
   }
@@ -275,24 +295,24 @@ export class BridgeManager {
       onBotCommand: (message) => this.handleBotCommand(message),
       onMessageUpdate: async (msg) => {
         const rb = this.activeRouterFor(msg.channelId);
-        if (rb) await rb.router!.onDiscordEdit(msg, rb.link);
+        if (rb) await this.routeDiscord(rb,()=>rb.router!.onDiscordEdit(msg, rb.link));
       },
       onMessageDelete: async (del) => {
         const rb = this.activeRouterFor(del.channelId);
-        if (rb) await rb.router!.onDiscordDelete(del, rb.link);
+        if (rb) await this.routeDiscord(rb,()=>rb.router!.onDiscordDelete(del, rb.link));
       },
       onReactionAdd: async (reaction) => {
         const rb = this.activeRouterFor(reaction.channelId);
-        if (rb) await rb.router!.onDiscordReaction(reaction, rb.link);
+        if (rb) await this.routeDiscord(rb,()=>rb.router!.onDiscordReaction(reaction, rb.link));
       },
       onReactionRemove: async (reaction) => {
         const rb = this.activeRouterFor(reaction.channelId);
-        if (rb) await rb.router!.onDiscordReactionRemove(reaction, rb.link);
+        if (rb) await this.routeDiscord(rb,()=>rb.router!.onDiscordReactionRemove(reaction, rb.link));
       },
       onTyping: async (typing) => {
         if (typing.bot) return;
         const rb = this.activeRouterFor(typing.channelId);
-        if (rb) await rb.router!.onDiscordTyping(typing.userId, rb.link);
+        if (rb?.delivery) rb.delivery.typing(async signal => { signal.throwIfAborted(); await rb.router!.onDiscordTyping(typing.userId, rb.link); });
       },
     }, async (channelId) => {
       const running = this.activeRouterFor(channelId);
@@ -314,16 +334,19 @@ export class BridgeManager {
    */
   private async connectAdapter(attempt = 0): Promise<void> {
     const token = this.env.discordBotToken;
-    if (!token) return;
+    if (!token || this.shuttingDown) return;
     const adapter = this.buildAdapter(token);
+    this.startingAdapters.add(adapter);
     try {
       await adapter.start();
+      if (this.shuttingDown) { await adapter.stop(); return; }
       this.adapter = adapter;
       console.log("portal: discord gateway up");
       if (this.booted) void this.onAdapterConnected();
     } catch (error) {
       await adapter.stop().catch(() => {}); // don't leak a half-open client
       this.adapter = undefined;
+      if (this.shuttingDown) return;
       const cap = Math.min(GATEWAY_RETRY_BASE_MS * 2 ** Math.min(attempt, 6), GATEWAY_RETRY_MAX_MS);
       const delay = cap / 2 + Math.random() * (cap / 2);
       console.error(
@@ -331,7 +354,7 @@ export class BridgeManager {
         error,
       );
       this.adapterRetryTimer = setTimeout(() => void this.connectAdapter(attempt + 1), delay);
-    }
+    } finally { this.startingAdapters.delete(adapter); }
   }
 
   /**
@@ -385,7 +408,63 @@ export class BridgeManager {
 
   private async onDiscord(msg: DiscordInboundMessage): Promise<void> {
     const rb = this.activeRouterFor(msg.channelId);
-    if (rb) await rb.router!.onDiscordMessage(msg, rb.link);
+    if (rb) await this.routeDiscord(rb,()=>rb.router!.onDiscordMessage(msg, rb.link));
+  }
+
+  private async routeDiscord<T>(rb: Running, work: () => Promise<T>): Promise<T | undefined> {
+    if (!rb.delivery || rb.stopped) return undefined;
+    let result: T | undefined;
+    const admitted=rb.delivery.admit(Math.floor(Date.now()/1000),async signal=>{
+      signal.throwIfAborted();
+      try { result=await work(); }
+      catch(error) {
+        if(error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError) rb.delivery!.markGap(error.repairFloor);
+        throw error;
+      }
+    });
+    if (!admitted) return undefined;
+    await admitted; return result;
+  }
+
+  private retryDeletes(rb: Running, wake = false): Promise<void> {
+    if(!rb.delivery || !rb.router || rb.stopped) return Promise.resolve();
+    return rb.delivery.requestRetry(wake,async (shouldWake,signal)=>{
+      signal.throwIfAborted();
+      try { await rb.router!.retryPendingDeletes(rb.link,shouldWake); }
+      catch(error) {
+        if(error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError) rb.delivery!.markGap(error.repairFloor);
+        throw error;
+      }
+    }).catch(error=>console.warn(`bridge ${rb.id}: pending deletion retry failed`,error));
+  }
+
+  private ensureDeliveryScheduler(): void {
+    if(this.shuttingDown || this.deliveryTimer)return;
+    this.deliveryTimer=setInterval(()=>void this.tickDeliveries(),DELETION_RETRY_MS);
+    this.deliveryTimer.unref();
+    void this.tickDeliveries();
+  }
+
+  private async tickDeliveries(): Promise<void> {
+    if(this.deliveryTicking)return;
+    this.deliveryTicking=true;
+    try {
+      const active=[...this.running.values()].filter(rb=>rb.status==='active' && rb.router && rb.delivery && !rb.stopped);
+      if(!active.length)return;
+      const byOwner=new Map(active.map(rb=>[rb.id,rb]));
+      const due=await this.store.dueDeletionLinks(128,[...byOwner.keys()]);
+      for(const item of due) {const rb=byOwner.get(item.ownerId);if(rb && rb.deliveryEpoch===item.epoch) void this.retryDeletes(rb);}
+      const slots=Math.max(0,4-this.repairing.size);
+      for(let scanned=0,started=0;scanned<active.length && started<slots;scanned++) {
+        const rb=active[(this.repairCursor+scanned)%active.length];
+        if(this.repairing.has(rb.id) || rb.stopped)continue;
+        this.repairing.add(rb.id);started++;
+        void this.backfillMissed(rb).catch(error=>{if(!rb.stopped)console.warn(`bridge ${rb.id}: catch-up incomplete`,error);})
+          .finally(()=>this.repairing.delete(rb.id));
+      }
+      this.repairCursor=(this.repairCursor+Math.max(1,slots))%active.length;
+    } catch(error) {console.warn('portal: delivery scheduler failed',error);}
+    finally {this.deliveryTicking=false;}
   }
 
   private activeRouterFor(discordChannelId: string): Running | undefined {
@@ -495,13 +574,19 @@ export class BridgeManager {
     const primary = localIdentity(primarySk);
     const masterSecretSealed = await this.sharedMasterSecret(row.community_id, row.discord_guild_id);
 
-    await this.sql`
-      UPDATE bridges SET
-        master_secret_sealed = ${masterSecretSealed},
-        primary_sk_sealed = ${seal(this.env.sealKeyHex, bytesToHex(primarySk))},
-        primary_pk = ${primary.pk},
-        status = 'active', status_detail = NULL, updated_at = now()
-      WHERE bridge_id = ${row.bridge_id}`;
+    if (!row.concord_channel_id || !row.discord_channel_id) throw new Error("bridge must have both channels before activation");
+    const link: ChannelLink = {communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,
+      discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
+    await this.sql.begin(async tx => {
+      await this.store.activateDelivery(link,row.bridge_id,[],Math.floor(Date.now()/1000),tx);
+      const changed=await tx`UPDATE bridges SET
+        master_secret_sealed=${masterSecretSealed},primary_sk_sealed=${seal(this.env.sealKeyHex,bytesToHex(primarySk))},
+        primary_pk=${primary.pk},status='active',status_detail=NULL,updated_at=now()
+        WHERE bridge_id=${row.bridge_id} AND status=${row.status} AND community_id=${link.communityId}
+          AND concord_channel_id=${link.concordChannelIdHex} AND discord_guild_id=${link.discordGuildId}
+          AND discord_channel_id=${link.discordChannelId} RETURNING bridge_id`;
+      if(!changed.length) throw new Error('Bridge changed during imported activation');
+    });
 
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${row.bridge_id}`;
     return fresh;
@@ -517,6 +602,7 @@ export class BridgeManager {
   }
 
   private async start(row: BridgeRow): Promise<void> {
+    if (this.shuttingDown) throw new Error("Portal is shutting down");
     if (this.running.has(row.bridge_id)) return;
     // An active bridge mirrors in both directions through the shared gateway,
     // so without it there is nothing to attach — defer before doing the relay
@@ -538,6 +624,8 @@ export class BridgeManager {
         console.error(`bridge ${row.bridge_id}: lease loss cleanup failed`, error));
     });
     if (!lease) throw new BridgeLeaseUnavailableError("Bridge lease is owned by another worker");
+    if (this.shuttingDown) { await lease.release(); throw new Error("Portal is shutting down"); }
+    this.startingLeases.add(lease);
     try {
       await this.startOwned(row, lease);
       starting = false;
@@ -553,12 +641,19 @@ export class BridgeManager {
         throw new BridgeLeaseUnavailableError("Bridge lease expired during startup");
       }
       throw error;
-    }
+    } finally { this.startingLeases.delete(lease); }
   }
 
   private async startOwned(row: BridgeRow, lease: BridgeLease): Promise<void> {
     const cleanup: Array<() => void | Promise<void>> = [];
     try {
+      const observedLink = row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id
+        ? {communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true} : undefined;
+      const observedState = observedLink ? await this.store.inspectDelivery(observedLink) : undefined;
+      if (this.shuttingDown) throw new Error("Portal is shutting down");
+      if (row.status === 'active' && observedState && (!observedState.active || observedState.suspended || observedState.ownerId !== row.bridge_id))
+        throw new Error('Delivery lifecycle is no longer current');
+      const observedEpoch = observedState?.epoch ?? null;
       const inviteUrl = unseal(this.env.sealKeyHex, row.invite_url_sealed!);
       const invite = parseInviteLink(inviteUrl);
       if (!invite) throw new Error("stored invite no longer parses");
@@ -569,7 +664,9 @@ export class BridgeManager {
           STOCK_RELAYS,
         ),
       );
-      const { community } = await resolveInvite(inviteUrl, bootstrap).finally(() => void bootstrap.close());
+      this.startingPools.add(bootstrap);
+      const { community } = await resolveInvite(inviteUrl, bootstrap).finally(async () => { await bootstrap.close().catch(()=>{}); this.startingPools.delete(bootstrap); });
+      if (this.shuttingDown) throw new Error("Portal is shutting down");
 
       const primarySk = Uint8Array.from(Buffer.from(unseal(this.env.sealKeyHex, row.primary_sk_sealed!), "hex"));
       const primary = localIdentity(primarySk);
@@ -582,12 +679,14 @@ export class BridgeManager {
       // every start (2026-09-24). The npub is public already (kind 0, guestbook).
       const pool = identityRelayPool(await filterPublicRelays(community.relays, STOCK_RELAYS), primarySk);
 
-      cleanup.push(() => pool.close());
+      this.startingPools.add(pool);
+      cleanup.push(() => { this.startingPools.delete(pool); return pool.close(); });
       // Fold the Control Plane first: it reads from the community root the
       // invite carried, so the roster — and with it, who may vend a channel key
       // — is knowable before we accept any. The intake refuses anyone else.
       const preflight = new ConcordClient(community, pool, primary);
       const folded = await preflight.syncControl();
+      if (this.shuttingDown) throw new Error("Portal is shutting down");
       let rawClient = preflight;
       if (this.env.mode !== "public") {
 
@@ -596,19 +695,27 @@ export class BridgeManager {
         // that serves `channels()` is built, so a gated channel is present on the
         // first pass.
         const floor = identityRelayPool(inviteDeliveryRelays([]), primarySk);
+        this.startingPools.add(floor);
         const intake = await intakeDirectInviteKeys([pool, floor], primary, community, {
           isAuthorizedSender: (pk) =>
             isAuthorized(folded.roster, pk, community.owner, Permissions.MANAGE_CHANNELS),
-        }).finally(() => void floor.close());
+        }).finally(async () => { await floor.close().catch(()=>{}); this.startingPools.delete(floor); });
+        if (this.shuttingDown) throw new Error("Portal is shutting down");
 
         rawClient =
           intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
         if (intake.learned.length > 0) await rawClient.syncControl();
       }
+      let runningRef: Running | undefined;
       const assertMayForward = async () => {
+        if (runningRef?.stopped || this.shuttingDown) throw new Error("Bridge is stopping");
         await lease.assertCurrent();
         const [state] = await this.sql`SELECT status FROM bridges WHERE bridge_id = ${row.bridge_id}`;
         if (!state || !["active", "pending_confirm"].includes(state.status)) throw new Error("Bridge is paused or unlinked");
+        if (state.status === "active") {
+          if (!runningRef?.deliveryStore) throw new Error("Delivery session is not ready");
+          await runningRef.deliveryStore.assertDeliveryCurrent();
+        }
         try {
           await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
         } catch (error) {
@@ -620,7 +727,11 @@ export class BridgeManager {
         if (!current || (this.env.mode === "public" && current.isPrivate)) throw new Error("Concord channel must be public");
         await this.assertPublicCapacity(community.idHex);
         await lease.assertCurrent();
-        await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
+        if (runningRef?.stopped || this.shuttingDown) throw new Error("Bridge is stopping");
+        if (state.status === "active") await runningRef!.deliveryStore!.assertDeliveryCurrent();
+        const [latest] = await this.sql`SELECT status FROM bridges WHERE bridge_id=${row.bridge_id}`;
+        if (!latest || latest.status !== state.status) throw new Error("Bridge status changed");
+        if (state.status === "active") await this.sql`UPDATE bridges SET status_detail = NULL WHERE bridge_id = ${row.bridge_id}
           AND status_detail = 'Forwarding blocked: public visibility unavailable'`;
       };
       const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
@@ -640,7 +751,7 @@ export class BridgeManager {
       // planes plus the fold we already hold decides it (see ./severance.ts for
       // the three cases); a throw below lands in startTracked as a SeveredError
       // and is not retried.
-      await this.detectSeveranceAtBoot(row, community, pool, rawClient.folded, primary);
+      await this.detectSeveranceAtBoot(row, community, pool, rawClient.folded, primary, observedEpoch);
       // Refresh display names each start: renames heal on the next boot, and
       // rows from before the name columns existed backfill themselves. The two
       // lookups hit different Discord endpoints and neither reads the other, so
@@ -661,29 +772,6 @@ export class BridgeManager {
           discord_channel_name = coalesce(${discordName ?? null}, discord_channel_name),
           discord_guild_name = coalesce(${guildName ?? null}, discord_guild_name)
         WHERE bridge_id = ${row.bridge_id}`;
-      // Four announcements the bridge owes the relays, none of which anything
-      // below reads: the join, our giftwrap inbox (so the next key handoff is
-      // delivered to the relays we actually watch rather than the stock interop
-      // floor), the bot's profile, and the command manifest. Awaited in sequence
-      // they cost four publish timeouts — up to ~32s during which the bridge is
-      // fully folded and able to mirror, but routing has not been attached. So
-      // they are fired together and not waited on; each already swallows its own
-      // failure, exactly as announceBridge does.
-      void Promise.all([
-        client.publishJoin().catch(() => {}),
-        client.publishDmRelays(primary, community.relays).catch(() => {}),
-        client
-          .publishProfile(primary, {
-            name: "Discord <-> Armada Bridge Bot",
-            picture: this.adapter?.botAvatarUrl,
-            about:
-              "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
-            bot: true,
-          })
-          .catch(() => {}),
-        client.publishManifest(BRIDGE_COMMANDS).catch(() => {}),
-      ]);
-
       const link: ChannelLink = {
         discordGuildId: row.discord_guild_id ?? "",
         discordChannelId: row.discord_channel_id ?? "",
@@ -707,21 +795,20 @@ export class BridgeManager {
         unsubSeverance: () => {},
       };
 
-      // Persist the first replay floor before any live subscription can accept
-      // work, including a fresh link whose first durable delivery overflows.
-      if (rb.status === "active") await this.store.channelCursorStart(link, channel.streams.map(s => s.group.pk));
-      cleanup.push(() => { if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer); rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance(); });
-      rb.unsubChat = client.subscribeChannel(
-        channel,
-        (chat) => this.onConcordChat(rb, chat, row.confirm_code ?? ""),
-        (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
-        (streamPk, wrapAt) => {
-          if (!rb.concordCatchupReady || !rb.router) return;
-          rb.router.assertDeletionDeliveryDurable();
-          client.assertDeliveryHealthy();
-          return this.store.channelCursorSet(rb.link, wrapAt);
-        },
-      );
+      runningRef = rb;
+      if (rb.status === "active") await this.armDelivery(rb);
+      await lease.assertCurrent();
+      if (this.shuttingDown) throw new Error("Portal is shutting down");
+      this.running.set(rb.id, rb);
+      cleanup.push(() => {
+        rb.stopped = true; rb.delivery?.stop();
+        rb.unsubChat(); rb.unsubControl(); rb.unsubSeverance();
+        if (this.running.get(rb.id) === rb) this.running.delete(rb.id);
+      });
+      if (rb.status === "active") {
+        this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
+      }
+      rb.unsubChat = this.subscribeChat(rb, row.confirm_code ?? "");
       // A rekey (epoch bump) mints new stream keys; a REQ pinned to the old
       // ones goes silent while publishes (fresh channel lookup) keep working.
       // Re-subscribe whenever the fold changes the channel's stream set. The
@@ -739,12 +826,12 @@ export class BridgeManager {
           joinedAtMs,
         });
         if (!verdict) return;
-        void this.applySeverance(rb.id, verdict, community).catch((error) =>
+        void this.applySeverance(rb.id, verdict, community, rb).catch((error) =>
           console.error(`bridge ${rb.id}: severance handling failed`, error),
         );
       };
       rb.unsubControl = client.subscribeControl((folded) => {
-        void rb.router?.retryPendingDeletes(rb.link).catch(error => console.warn(`bridge ${rb.id}: pending deletion retry failed`, error));
+        if (rb.router && rb.delivery) void this.retryDeletes(rb,true);
         this.refreshChatSubscription(rb, row.confirm_code ?? "");
         checkSeverance(folded);
       });
@@ -769,8 +856,32 @@ export class BridgeManager {
       );
 
       if (rb.status === "active") {
+      // Four announcements the bridge owes the relays, none of which anything
+      // below reads: the join, our giftwrap inbox (so the next key handoff is
+      // delivered to the relays we actually watch rather than the stock interop
+      // floor), the bot's profile, and the command manifest. Awaited in sequence
+      // they cost four publish timeouts — up to ~32s during which the bridge is
+      // fully folded and able to mirror, but routing has not been attached. So
+      // they are fired together and not waited on; each already swallows its own
+      // failure, exactly as announceBridge does.
+      void Promise.all([
+        client.publishJoin().catch(() => {}),
+        client.publishDmRelays(primary, community.relays).catch(() => {}),
+        client
+          .publishProfile(primary, {
+            name: "Discord <-> Armada Bridge Bot",
+            picture: this.adapter?.botAvatarUrl,
+            about:
+              "Automated bridge account: posts link confirmations and mirrors this channel with a Discord server.",
+            bot: true,
+          })
+          .catch(() => {}),
+        client.publishManifest(BRIDGE_COMMANDS).catch(() => {}),
+      ]);
+
+      }
+      if (rb.status === "active") {
         const liveFromMs = Date.now();
-        this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
         this.catchUpDiscord(rb, liveFromMs).catch((error) =>
           console.warn(`bridge ${rb.id}: Discord catch-up failed:`, error),
         );
@@ -785,7 +896,7 @@ export class BridgeManager {
         });
       }
       await lease.assertCurrent();
-      this.running.set(rb.id, rb);
+      this.startingPools.delete(pool);
     } catch (error) {
       for (const close of cleanup.reverse()) await Promise.resolve().then(close).catch(() => {});
       const current = this.running.get(row.bridge_id);
@@ -801,32 +912,11 @@ export class BridgeManager {
    * admission so restart cannot mistake a first-delivery gap for a fresh link.
    */
   private backfillMissed(rb: Running): Promise<void> {
-    if (rb.concordCatchupPending) return rb.concordCatchupPending;
-    const pending = this.performBackfill(rb).finally(() => {
-      if (rb.concordCatchupPending === pending) rb.concordCatchupPending = undefined;
+    if(!rb.delivery || !rb.deliveryStore || !rb.router || rb.stopped) return Promise.resolve();
+    return rb.delivery.repair({store:rb.deliveryStore,channel:()=>rb.channel,relays:()=>rb.pool.urls,
+      replay:(channel,floor,opts)=>rb.client.backfillChannel(channel,floor,500,opts),
+      deliver:async(chat,signal)=>{signal.throwIfAborted();await this.deliverRoutedChat(rb,chat);},
     });
-    rb.concordCatchupPending = pending;
-    return pending;
-  }
-
-  private async performBackfill(rb: Running): Promise<void> {
-    const streamPks = rb.channel.streams.map((s) => s.group.pk);
-    const cursor = await this.store.channelCursorStart(rb.link, streamPks);
-    // Small overlap absorbs relay/pool clock skew; dedupe eats the rest.
-    let mirrored = 0;
-    await rb.client.backfillChannel(rb.channel, cursor - 60, 500, { onBatch: async ({ chats, newestWrapAt }) => {
-      for (const chat of chats) {
-        if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
-        const ids = await this.deliverRoutedChat(rb, chat);
-        mirrored += ids.length > 0 ? 1 : 0;
-      }
-      if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
-      rb.router.assertDeletionDeliveryDurable();
-      rb.client.assertDeliveryHealthy();
-      if (newestWrapAt !== undefined) await this.store.channelCursorSet(rb.link, newestWrapAt);
-    } });
-    rb.concordCatchupReady = true;
-    if (mirrored > 0) console.log(`bridge ${rb.id}: backfilled ${mirrored} missed messages`);
   }
 
   /**
@@ -885,9 +975,10 @@ export class BridgeManager {
       mirror: async (message) => {
         // A bridge stopped mid-replay has no router; the rest is moot.
         if (!rb.router) return false;
-        const rumorId = await rb.router
-          .onDiscordMessage(restToInbound(message, rb.link.discordGuildId, rb.link.discordChannelId), rb.link)
+        const rumorId = await this.routeDiscord(rb,()=>rb.router!
+          .onDiscordMessage(restToInbound(message, rb.link.discordGuildId, rb.link.discordChannelId), rb.link))
           .catch((error) => {
+            if (error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError) throw error;
             console.warn(`bridge ${rb.id}: catch-up of Discord message ${message.id} failed:`, error);
             return undefined;
           });
@@ -898,30 +989,27 @@ export class BridgeManager {
     if (capped) console.warn(`bridge ${rb.id}: Discord catch-up stopped at ${DISCORD_CATCHUP_MAX} messages`);
   }
 
-  /** Tear down and rebuild the chat REQ when the channel's stream set changes. */
+  private subscribeChat(rb: Running, confirmCode: string): () => void {
+    const pending = rb.status === 'pending_confirm';
+    const shared = !pending && rb.delivery
+      ? {lane:rb.delivery,currentChannel:()=>rb.channel} : undefined;
+    return rb.client.subscribeChannel(rb.channel,
+      chat => this.onConcordChat(rb,chat,confirmCode).catch(error => {
+        if (pending) { console.warn(`bridge ${rb.id}: confirmation attempt failed`,error); return; }
+        throw error;
+      }),
+      (relayUrl,error) => { rb.delivery?.subscriptionError(relayUrl); console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`,error); },
+      undefined,shared);
+  }
+
+  /** Reuse the same lane and live dedupe across stream key rotation. */
   private refreshChatSubscription(rb: Running, confirmCode: string): void {
-    const fresh = rb.client.channel(rb.link.concordChannelIdHex);
-    // A channel vanishing from the fold is its own (local) condition — deleted,
-    // or privatized past our keys — not community severance; the community
-    // going away is the watchers in detectSeveranceAtBoot/checkSeverance.
-    if (!fresh) return;
-    const keys = (c: ChannelV2) => c.streams.map((s) => s.group.pk).join(",");
-    if (keys(fresh) === keys(rb.channel)) return;
-    rb.unsubChat();
-    rb.channel = fresh;
-    rb.unsubChat = rb.client.subscribeChannel(
-      fresh,
-      (chat) => {
-        return this.onConcordChat(rb, chat, confirmCode);
-      },
-      (relayUrl, error) => console.error(`bridge ${rb.id}: chat subscription ${relayUrl}:`, error),
-      (streamPk, wrapAt) => {
-        if (!rb.concordCatchupReady || !rb.router) return;
-        rb.router.assertDeletionDeliveryDurable();
-        rb.client.assertDeliveryHealthy();
-        return this.store.channelCursorSet(rb.link, wrapAt);
-      },
-    );
+    const fresh=rb.client.channel(rb.link.concordChannelIdHex);
+    if(!fresh)return;
+    const keys=(c:ChannelV2)=>c.streams.map(s=>s.group.pk).join(',');
+    if(keys(fresh)===keys(rb.channel)) { rb.channel=fresh; return; }
+    if(rb.delivery) rb.delivery.markGap(rb.deliveryRecoveryFloor ?? 0);
+    rb.unsubChat();rb.channel=fresh;rb.unsubChat=this.subscribeChat(rb,confirmCode);
     console.log(`bridge ${rb.id}: stream keys rotated; chat subscription refreshed`);
   }
 
@@ -935,27 +1023,37 @@ export class BridgeManager {
         isAuthorized(folded.roster, chat.author, rb.client.community.owner, Permissions.MANAGE_CHANNELS);
       if (!authorized) return;
 
+      if (rb.stopped || this.running.get(rb.id) !== rb) return;
       await rb.assertMayForward();
-      const [row] = await this.sql<BridgeRow[]>`
-        UPDATE bridges SET status = 'active', status_detail = NULL, updated_at = now()
-        WHERE bridge_id = ${rb.id} RETURNING *`;
-      await this.store.channelCursorStart(rb.link, rb.channel.streams.map(s => s.group.pk));
-      rb.status = "active";
+      const row = await this.sql.begin(async tx => {
+        await this.store.activateDelivery(rb.link,rb.id,rb.channel.streams.map(s=>s.group.pk),Math.floor(Date.now()/1000),tx);
+        const [updated] = await tx<BridgeRow[]>`UPDATE bridges SET status='active',status_detail=NULL,updated_at=now()
+          WHERE bridge_id=${rb.id} AND status='pending_confirm' AND community_id=${rb.link.communityId}
+            AND concord_channel_id=${rb.link.concordChannelIdHex} AND discord_guild_id=${rb.link.discordGuildId}
+            AND discord_channel_id=${rb.link.discordChannelId} RETURNING *`;
+        if (!updated) throw new Error('Confirmation no longer owns this link');
+        return updated;
+      });
+      rb.status = 'active';
+      rb.unsubChat(); rb.unsubChat = () => {};
       try {
-        this.attachRouting(rb, unseal(this.env.sealKeyHex, row.master_secret_sealed!), row.options);
+        if (!this.adapter) throw new GatewayUnavailableError();
+        await this.armDelivery(rb);
+        if (rb.stopped || this.running.get(rb.id) !== rb) throw new Error('Bridge stopped during confirmation');
+        this.attachRouting(rb,unseal(this.env.sealKeyHex,row.master_secret_sealed!),row.options);
+        rb.unsubChat = this.subscribeChat(rb,confirmCode);
+        void this.catchUpDiscord(rb,Date.now()).catch(error=>console.warn(`bridge ${rb.id}: Discord catch-up failed`,error));
       } catch (error) {
-        if (!(error instanceof GatewayUnavailableError)) throw error;
-        // Confirmed while the gateway was down. The row stays active; routing
-        // attaches on the next restart. Don't sever, and don't claim it's live.
-        console.warn(`bridge ${rb.id}: confirmed while Discord gateway down; will attach on reconnect`);
+        rb.stopped = true; rb.delivery?.stop();
+        await settleWithin(rb.lease.release());
+        await this.closeRunning(rb);
+        this.scheduleStartRetry(rb.id,0,true);
+        console.warn(`bridge ${rb.id}: confirmed; delivery deferred`,error);
         return;
       }
-      await rb.client
-        .sendChat(rb.channel, {
-          content: "Bridge confirmed. This channel is now mirrored with Discord.",
-          author: rb.primary,
-        })
-        .catch(() => {});
+      await rb.client.sendChat(rb.channel,{
+        content:"Bridge confirmed. This channel is now mirrored with Discord.",author:rb.primary,
+      }).catch(()=>{});
       return;
     }
     if (!rb.router) throw new Error("Bridge routing is not ready");
@@ -980,8 +1078,10 @@ export class BridgeManager {
    * webhooks don't). The bridge stays active; mirroring resumes on its own
    * once the permission is granted.
    */
-  private async alertMissingWebhookPermission(rb: Running): Promise<void> {
-    const detail = "the bot is missing Manage Webhooks in the linked Discord channel; Armada messages can't mirror there until it's granted";
+  private async alertMissingWebhookPermission(rb: Running): Promise<void> { return this.alertDiscordPermission(rb,'Manage Webhooks'); }
+
+  private async alertDiscordPermission(rb: Running, permission: 'Manage Webhooks' | 'Manage Messages' | 'View Channel'): Promise<void> {
+    const detail = `the bot needs ${permission} in the linked Discord channel`;
     const [claimed] = await this.sql`
       UPDATE bridges SET perm_alerted_at = now(), status_detail = ${detail}
       WHERE bridge_id = ${rb.id} AND perm_alerted_at IS NULL
@@ -991,9 +1091,7 @@ export class BridgeManager {
     await rb.client
       .sendChat(rb.channel, {
         content:
-          "Heads up: the Discord bridge bot is missing the \"Manage Webhooks\" permission in the " +
-          "linked channel, so messages from here aren't being mirrored to Discord. A Discord admin " +
-          "can grant the bot Manage Webhooks on that channel to restore it.",
+          `Heads up: the Discord bridge bot needs ${permission} in the linked channel to complete its work.`,
         author: rb.primary,
       })
       .catch(() => {});
@@ -1001,7 +1099,7 @@ export class BridgeManager {
     await this.adapter
       ?.notice(
         rb.link.discordChannelId,
-        "I can't mirror Armada messages into this channel until I'm granted the \"Manage Webhooks\" permission here.",
+        `I need ${permission} in this channel to complete bridge work.`,
       )
       .catch(() => {});
   }
@@ -1015,13 +1113,14 @@ export class BridgeManager {
     // that races the gateway being down. Throwing — never severing — is the
     // whole point: a missing gateway is not the community going away.
     if (!this.adapter) throw new GatewayUnavailableError();
-    if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer);
-    rb.concordCatchupReady = false;
+    if (!rb.deliveryStore || !rb.delivery) throw new Error("Delivery session is not ready");
     rb.router = new BridgeRouter(
       rb.client,
       new PuppetCache(masterSecretHex),
-      this.store,
-      this.adapter,
+      rb.deliveryStore,
+      observeDeletionEffects(this.adapter, observation => {
+        void this.alertDiscordPermission(rb,observation.permission).catch(error => console.warn(`bridge ${rb.id}: permission alert failed`,error));
+      }),
       new Kind0ProfileResolver(rb.pool),
       { applicationId: this.adapter.applicationId, webhookIds: this.adapter.ownWebhookIds },
       {
@@ -1031,14 +1130,7 @@ export class BridgeManager {
         klipy: this.env.klipyApiKey ? new KlipyClient(this.env.klipyApiKey) : undefined,
       },
     );
-    const retryDeletes = () => rb.router?.retryPendingDeletes(rb.link).catch(error => console.warn(`bridge ${rb.id}: pending deletion retry failed`, error));
-    void retryDeletes();
-    const retryCatchup = () => this.backfillMissed(rb).catch(error => console.warn(`bridge ${rb.id}: catch-up incomplete; checkpoint remains pinned and retry is scheduled`, error));
-    void retryCatchup();
-    rb.deletionRetryTimer = setInterval(() => {
-      void retryDeletes();
-      if (!rb.concordCatchupReady) void retryCatchup();
-    }, DELETION_RETRY_MS);
+    this.ensureDeliveryScheduler();
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);
     this.announceBridge(rb).catch(() => {});
   }
@@ -1071,20 +1163,40 @@ export class BridgeManager {
     }).catch(() => {});
   }
 
+  /** Worker attachment must commit its uncertainty marker before producers start. */
+  private async armDelivery(rb: Running): Promise<void> {
+    if (rb.stopped || this.shuttingDown) throw new Error('Bridge stopped before delivery arming');
+    const sessionId = randomUUID();
+    const opened = await this.store.openDelivery(rb.link,rb.id,rb.lease,rb.channel.streams.map(stream => stream.group.pk),
+      Math.floor(Date.now()/1000),sessionId,rb.pool.urls);
+    if (rb.stopped || this.shuttingDown) throw new Error('Bridge stopped while delivery was arming');
+    rb.deliveryStore = opened.store;
+    rb.deliveryEpoch = opened.snapshot.epoch;
+    rb.deliveryRecoveryFloor = opened.snapshot.recoveryFloor;
+    rb.delivery = new LinkDelivery({
+      onError: error => console.warn(`bridge ${rb.id}: delivery operation failed`,error),
+      onGap: floor => opened.store.markDeliveryGap(floor),
+    });
+  }
+
   private async closeRunning(rb: Running): Promise<void> {
     // Remove only this instance, before yielding: a replacement must never be
     // deleted by an old lease's delayed cleanup. Fencing is still in the DB.
     if (this.running.get(rb.id) !== rb) return;
     this.running.delete(rb.id);
+    if (![...this.running.values()].some(item => item.status === "active" && item.delivery)) {
+      if (this.deliveryTimer) clearInterval(this.deliveryTimer);
+      this.deliveryTimer = undefined;
+    }
     if (this.byDiscordChannel.get(rb.link.discordChannelId) === rb.id) {
       this.byDiscordChannel.delete(rb.link.discordChannelId);
     }
-    if (rb.deletionRetryTimer) clearInterval(rb.deletionRetryTimer);
+    rb.stopped = true; rb.delivery?.stop();
     rb.router = undefined;
     try { rb.unsubChat(); } catch {}
     try { rb.unsubControl(); } catch {}
     try { rb.unsubSeverance(); } catch {}
-    await rb.pool.close().catch(() => {});
+    await settleWithin(rb.pool.close());
   }
 
   private async onLeaseLost(bridgeId: string, lease: BridgeLease): Promise<void> {
@@ -1095,16 +1207,39 @@ export class BridgeManager {
     } finally {
       // This is not an operator pause: preserve durable status and retry even
       // if storage is still down. retryStart re-reads any subsequent pause.
-      this.scheduleStartRetry(bridgeId, 0, true);
+      if (!this.shuttingDown) this.scheduleStartRetry(bridgeId, 0, true);
     }
+  }
+
+  async shutdown(timeoutMs = 2_000): Promise<void> {
+    if(this.shuttingDown)return;
+    this.shuttingDown=true;
+    if(this.deliveryTimer)clearInterval(this.deliveryTimer);
+    this.deliveryTimer=undefined;
+    if(this.adapterRetryTimer)clearTimeout(this.adapterRetryTimer);
+    for(const timer of this.startRetryTimers.values())clearTimeout(timer);
+    this.startRetryTimers.clear();
+    const running=[...this.running.values()];
+    for(const rb of running) {rb.stopped=true;rb.delivery?.stop();try{rb.unsubChat();}catch{}}
+    const work=Promise.allSettled([
+      ...running.flatMap(rb=>[rb.lease.release(),this.closeRunning(rb)]),
+      ...[...this.startingLeases].map(lease=>lease.release()),
+      ...[...this.startingPools].map(pool=>pool.close()),
+      ...[...this.startingAdapters].map(adapter=>adapter.stop()),
+      ...(this.adapter?[this.adapter.stop()]:[]),
+    ]);
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    await Promise.race([work,new Promise<void>(resolve=>{timer=setTimeout(resolve,timeoutMs);})]);
+    if(timer)clearTimeout(timer);
   }
 
   async stop(bridgeId: string, status: "paused" | "unlinked", detail?: string): Promise<void> {
     this.cancelStartRetry(bridgeId);
     const rb = this.running.get(bridgeId);
-    if (rb) { try { rb.unsubChat(); } catch {} rb.unsubChat = () => {}; }
+    if (rb) { rb.stopped = true; rb.delivery?.stop(); try { rb.unsubChat(); } catch {} rb.unsubChat = () => {}; }
     try {
       await this.sql.begin(async tx => {
+      await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
         const [row] = await tx<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id=${bridgeId}`;
         if (!row) return;
         if (row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
@@ -1131,7 +1266,7 @@ export class BridgeManager {
       });
     } finally {
       if (rb) {
-        await rb.lease.release().catch(error => console.warn(`bridge ${bridgeId}: lease release failed`,error));
+        await settleWithin(rb.lease.release().catch(error => console.warn(`bridge ${bridgeId}: lease release failed`,error)));
         await this.closeRunning(rb);
       }
     }
@@ -1143,6 +1278,7 @@ export class BridgeManager {
     await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
     const next = row.status === "paused" ? "active" : row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
     await this.sql.begin(async tx => {
+      await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
       if (next === 'active' && row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
         const link: ChannelLink = { communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,
           discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true };
@@ -1169,12 +1305,19 @@ export class BridgeManager {
    * Park bridge, 2026-08-10), and severed rows are never retried.
    */
   private async startTracked(row: BridgeRow, attempt = 0): Promise<void> {
+    if(this.shuttingDown)return;
     // A deferred bridge can be nudged by both onAdapterConnected() and its own
     // backoff timer; start() also guards, but skip the work up front.
     if (this.running.has(row.bridge_id)) return;
+    let observedEpoch: string | null | undefined;
     try {
+      if (row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
+        const link:ChannelLink={communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
+        observedEpoch=(await this.store.inspectDelivery(link))?.epoch ?? null;
+      }
       await this.start(row);
     } catch (error) {
+      if(this.shuttingDown)return;
       if (error instanceof BridgeLeaseUnavailableError) {
         // Another owner (or a just-dead process's 90s lease) is not a bridge
         // failure. Do not overwrite its status detail or wait minutes to retry.
@@ -1214,7 +1357,7 @@ export class BridgeManager {
       // unhandled rejection that killed the process — 2026-09-24, a postgres
       // CONNECT_TIMEOUT 70 minutes into a CPU-bound boot restarted the whole
       // thousand-bridge boot from zero.
-      await this.handleStartFailure(row, String(error), attempt).catch((bookkeepingError) => {
+      await this.handleStartFailure(row, String(error), attempt, observedEpoch).catch((bookkeepingError) => {
         console.error(`bridge ${row.bridge_id}: could not record start failure; retrying anyway:`, bookkeepingError);
         this.scheduleStartRetry(row.bridge_id, attempt);
       });
@@ -1234,11 +1377,12 @@ export class BridgeManager {
     );
   }
 
-  private async handleStartFailure(row: BridgeRow, detail: string, attempt: number): Promise<void> {
+  private async handleStartFailure(row: BridgeRow, detail: string, attempt: number, observedEpoch?: string | null): Promise<void> {
     const since = row.options?.startFailedAt;
     const firstAt = typeof since === "string" ? Date.parse(since) : NaN;
     if (Number.isFinite(firstAt) && Date.now() - firstAt >= START_FAILURE_SEVER_AFTER_MS) {
-      await this.markSevered(row.bridge_id, detail);
+      if (observedEpoch === undefined) { this.scheduleStartRetry(row.bridge_id,attempt); return; }
+      await this.markSevered(row.bridge_id, detail, row, observedEpoch);
       return;
     }
     console.warn(`bridge ${row.bridge_id}: start failed (attempt ${attempt + 1}), will retry: ${detail}`);
@@ -1256,6 +1400,7 @@ export class BridgeManager {
   }
 
   private scheduleStartRetry(bridgeId: string, attempt: number, leaseContention = false): void {
+    if(this.shuttingDown)return;
     if (this.startRetryTimers.has(bridgeId)) return;
     // Full jitter: bridges share relays, so one relay outage puts many
     // bridges into this path at once — identical delays would line them all
@@ -1300,15 +1445,23 @@ export class BridgeManager {
       WHERE bridge_id = ${row.bridge_id}`;
   }
 
-  private async markSevered(bridgeId: string, detail: string): Promise<void> {
-    this.cancelStartRetry(bridgeId);
-    console.error(`bridge ${bridgeId}: severed: ${detail}`);
-    // Drop the failing-streak marker so a manual resume after a sever starts
-    // a fresh grace window instead of instantly re-severing on one failure.
-    await this.sql`
-      UPDATE bridges SET status = 'severed', status_detail = ${detail},
-        options = options - 'startFailedAt', updated_at = now()
-      WHERE bridge_id = ${bridgeId}`;
+  private async markSevered(bridgeId: string, detail: string, expected: BridgeRow, expectedEpoch: string | null): Promise<void> {
+    const changed=await this.sql.begin(async tx=>{
+      await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
+      if(expected.community_id && expected.concord_channel_id && expected.discord_guild_id && expected.discord_channel_id) {
+        const link:ChannelLink={communityId:expected.community_id,concordChannelIdHex:expected.concord_channel_id,
+          discordGuildId:expected.discord_guild_id,discordChannelId:expected.discord_channel_id,enabled:true};
+        const state=await this.store.inspectDelivery(link,tx);
+        if((state?.epoch ?? null)!==expectedEpoch || (state && state.ownerId!==bridgeId))return false;
+        await this.store.terminateDelivery(link,bridgeId,expectedEpoch ?? undefined,tx);
+      }
+      const rows=await tx`UPDATE bridges SET status='severed',status_detail=${detail},options=options-'startFailedAt',updated_at=now()
+        WHERE bridge_id=${bridgeId} AND status=${expected.status} AND community_id IS NOT DISTINCT FROM ${expected.community_id}
+          AND concord_channel_id IS NOT DISTINCT FROM ${expected.concord_channel_id} AND discord_guild_id IS NOT DISTINCT FROM ${expected.discord_guild_id}
+          AND discord_channel_id IS NOT DISTINCT FROM ${expected.discord_channel_id} RETURNING bridge_id`;
+      return rows.length>0;
+    });
+    if(changed) {this.cancelStartRetry(bridgeId);console.error(`bridge ${bridgeId}: severed: ${detail}`);}
   }
 
   /**
@@ -1326,27 +1479,47 @@ export class BridgeManager {
     bridgeId: string,
     verdict: SeveranceVerdict,
     community: { idHex: string; relays?: string[]; name?: string },
+    expected?: Running,
+    expectedRow?: BridgeRow,
+    expectedEpoch?: string | null,
   ): Promise<void> {
-    const rb = this.running.get(bridgeId);
-    if (rb) {
-      // Same teardown as stop(): release invalidates the local handle before
-      // its DB round trip, then subscriptions and pool close. A teardown
-      // failure must not prevent the durable record below.
-      await rb.lease.release().catch((error) => console.warn(`bridge ${bridgeId}: lease release failed`, error));
+    const rb=this.running.get(bridgeId);
+    if(expected && rb!==expected)return;
+    if(expected) { expected.stopped=true; expected.delivery?.stop(); try {expected.unsubChat();}catch{} expected.unsubChat=()=>{}; }
+    const changed=await this.sql.begin(async tx=>{
+      await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
+      const [row]=await tx<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id=${bridgeId}`;
+      if(!row)return false;
+      if(expectedRow && (row.status!==expectedRow.status || row.community_id!==expectedRow.community_id ||
+        row.concord_channel_id!==expectedRow.concord_channel_id || row.discord_guild_id!==expectedRow.discord_guild_id ||
+        row.discord_channel_id!==expectedRow.discord_channel_id)) return false;
+      if(expected && this.running.get(bridgeId)!==expected)return false;
+      if(row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
+        const link:ChannelLink={communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,
+          discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
+        const state=await this.store.inspectDelivery(link,tx);
+        if(expectedEpoch !== undefined && (state?.epoch ?? null) !== expectedEpoch) return false;
+        if(expected?.status === 'active' && (!state || state.ownerId!==bridgeId || !expected.deliveryEpoch)) return false;
+        const terminated=await this.store.terminateDelivery(link,bridgeId,expected?.deliveryEpoch ?? state?.epoch,tx);
+        if(expected?.status === 'active' && !terminated)return false;
+      }
+      const updated=await tx`UPDATE bridges SET status='severed',status_detail=${severanceDetail(verdict)},
+        options=options-'startFailedAt',updated_at=now() WHERE bridge_id=${bridgeId} AND status=${row.status}
+        AND community_id IS NOT DISTINCT FROM ${row.community_id} AND concord_channel_id IS NOT DISTINCT FROM ${row.concord_channel_id}
+        AND discord_guild_id IS NOT DISTINCT FROM ${row.discord_guild_id} AND discord_channel_id IS NOT DISTINCT FROM ${row.discord_channel_id}
+        RETURNING bridge_id`;
+      return updated.length>0;
+    });
+    if(!changed)return;
+    this.cancelStartRetry(bridgeId);
+    if(rb && (!expected || rb===expected)) {
+      await settleWithin(rb.lease.release().catch(error=>console.warn(`bridge ${bridgeId}: lease release failed`,error)));
       await this.closeRunning(rb);
     }
-    await this.markSevered(bridgeId, severanceDetail(verdict));
-    // Best-effort, like every secondary bookkeeping write here: the bridges
-    // row is the dashboard's surface and already stands; this row is the
-    // durable per-community reason, worth recording but not worth failing the
-    // action for.
-    await this.sql`
-      INSERT INTO communities (tenant_id, community_id, relays, name, severed_reason)
-      VALUES ('default', ${community.idHex}, ${community.relays ?? []}, ${community.name ?? null}, ${verdict.reason})
-      ON CONFLICT (tenant_id, community_id)
-      DO UPDATE SET severed_reason = EXCLUDED.severed_reason`.catch((error) =>
-      console.warn(`bridge ${bridgeId}: could not record severed_reason:`, error),
-    );
+    await this.sql`INSERT INTO communities (tenant_id,community_id,relays,name,severed_reason)
+      VALUES ('default',${community.idHex},${community.relays ?? []},${community.name ?? null},${verdict.reason})
+      ON CONFLICT (tenant_id,community_id) DO UPDATE SET severed_reason=EXCLUDED.severed_reason`.catch(error=>
+      console.warn(`bridge ${bridgeId}: could not record severed_reason:`,error));
   }
 
   /**
@@ -1364,6 +1537,7 @@ export class BridgeManager {
     pool: RelayPool,
     folded: FoldedControl | undefined,
     primary: ReturnType<typeof localIdentity>,
+    expectedEpoch: string | null,
   ): Promise<void> {
     const wraps = await pool
       .query([
@@ -1381,7 +1555,7 @@ export class BridgeManager {
       joinedAtMs: row.created_at instanceof Date ? row.created_at.getTime() : Date.parse(String(row.created_at)),
     });
     if (!verdict) return;
-    await this.applySeverance(row.bridge_id, verdict, community);
+    await this.applySeverance(row.bridge_id, verdict, community, undefined, row, expectedEpoch);
     throw new SeveredError(verdict);
   }
 

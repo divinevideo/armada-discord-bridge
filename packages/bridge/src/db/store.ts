@@ -30,7 +30,13 @@ export class PostgresMappingStore implements MappingStore {
   private async write<T>(work: (tx: postgres.TransactionSql) => Promise<T>, link?: ChannelLink): Promise<T> {
     if(link) this.checkLink(link);
     return this.sql.begin(async tx => {
-      if(this.bound) await lockDelivery(tx,this.tenantId,this.bound.link,this.bound.fence);
+      if(this.bound) {
+        // Bound worker operations so shutdown can fence and release a stalled
+        // callback without changing timeouts for unrelated portal imports.
+        await tx`SET LOCAL statement_timeout = '15s'`;
+        await tx`SET LOCAL lock_timeout = '5s'`;
+        await lockDelivery(tx,this.tenantId,this.bound.link,this.bound.fence);
+      }
       else if(link) await tx`SELECT pg_advisory_xact_lock(hashtextextended(${this.tenantId + deletionLinkKey(link)},19306))`;
       const result=await work(tx);
       if(this.bound) await assertLockedLease(tx,this.bound.fence.lease);
@@ -278,6 +284,8 @@ export class PostgresMappingStore implements MappingStore {
     Promise<{store:PostgresMappingStore;snapshot:DeliverySnapshot}> {
     const relaySet=[...new Set(relays)].sort();
     const snapshot=await this.sql.begin(async tx=>{
+      await tx`SET LOCAL statement_timeout = '15s'`;
+      await tx`SET LOCAL lock_timeout = '5s'`;
       const row=await lockDelivery(tx,this.tenantId,link);
       if(lease.resource!==`discord:${link.discordGuildId}:${link.discordChannelId}`) throw new StaleDeliveryFenceError('Delivery lease scope mismatch');
       await assertLockedLease(tx,lease);

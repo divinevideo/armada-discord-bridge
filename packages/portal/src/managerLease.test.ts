@@ -161,3 +161,10 @@ test("lease retry stays capped at 2.5–5 seconds regardless of the attempt coun
     internal.cancelStartRetry("relay-outage");
   }
 });
+
+test('stop closes its running resources even when lease release never resolves',async()=>{
+ const f=fixture();
+ f.register({resource:'synthetic-resource',holder:'00000000-0000-4000-8000-000000000000',token:1n,assertCurrent:async()=>{},renew:async()=>{},release:async()=>new Promise<void>(()=>{})});
+ const result=await Promise.race([f.manager.stop(f.row.bridge_id,'paused').then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),2600))]);
+ expect(result).toBe(true);expect(f.closed()).toEqual([1,1,1]);expect(f.row.status).toBe('paused');
+},4000);

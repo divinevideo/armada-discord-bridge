@@ -1,3 +1,4 @@
+import { Shutdown } from "@armada-bridge/bridge/src/shutdown";
 import { guildInScope } from "@armada-bridge/bridge/src/deploymentMode";
 /**
  * Portal server: JSON API + static SPA, one Bun process. In dev, run the
@@ -36,12 +37,26 @@ import type { BridgeRow } from "./manager";
 import { seal, unseal } from "./seal";
 import { originGuard, securityHeaders } from "./security";
 
+const shutdownState = new Shutdown(5_000);
+let exitCode = 0;
+async function shutdown(code = 0): Promise<void> {
+  exitCode = Math.max(exitCode,code);
+  await shutdownState.begin();
+  process.exit(exitCode);
+}
+process.on('SIGINT',()=>void shutdown());
+process.on('SIGTERM',()=>void shutdown());
+
 const env = loadPortalEnv();
 if (process.env.PORTAL_SCHEMA_MODE && process.env.PORTAL_SCHEMA_MODE !== "verify") throw new Error("Invalid schema mode");
 await migrate(env.databaseUrl, { readOnly: process.env.PORTAL_SCHEMA_MODE === "verify" });
-const sql = postgres(env.databaseUrl, { onnotice: () => {} });
+shutdownState.signal.throwIfAborted();
+const sql = postgres(env.databaseUrl, { onnotice: () => {}, connect_timeout: 5 });
+shutdownState.register(()=>sql.end({timeout:2}));
 const sessions = new Sessions(sql, env.sealKeyHex, env.baseUrl.startsWith("https:"));
 const manager = new BridgeManager(sql, env);
+shutdownState.register(()=>manager.shutdown());
+shutdownState.finishStartup();
 /**
  * Deliberately NOT awaited. `init()` resumes every active bridge, and each
  * resume folds that community over its relays — so a single unreachable relay
@@ -56,7 +71,7 @@ void manager
   .catch((error) => console.error("portal: bridge resume failed:", error))
   // After the bridges, whatever became of them: a resumed import's wiring and
   // history stages route through the live bridges.
-  .then(() => importer.resumeInterrupted())
+  .then(() => { if (!shutdownState.signal.aborted) return importer.resumeInterrupted(); })
   .catch((error) => console.error("portal: import resume failed:", error));
 
 /**
