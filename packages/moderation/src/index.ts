@@ -1,5 +1,6 @@
 import { loadPublicCapacity } from "./publicCapacity";
 import { collectMetrics } from "./metrics";
+import { workerMetricsResponse } from "./workerMetrics";
 import { apiReadiness, lifecycleWriteReadinessResponse } from "./apiReadiness";
 import { CoopHandoff } from "./coopHandoff";
 import postgres from "postgres";
@@ -42,6 +43,7 @@ export async function runModerationService(options: { capacity?: ReturnType<type
     const server = Bun.serve({ hostname: "0.0.0.0", port, fetch(request) {
       const path = new URL(request.url).pathname;
       if (path === "/healthz") return new Response("ok");
+      if (path === "/metrics") return workerMetricsResponse(sql, health.authority);
       if (path !== "/readyz") return new Response(null, { status: 404 });
       return Response.json({ code: health.code }, { status: health.ready && Date.now() - health.checkedAt < 30_000 ? 200 : 503, headers: { "cache-control": "no-store" } });
     } });
