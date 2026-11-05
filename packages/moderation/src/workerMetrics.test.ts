@@ -15,6 +15,12 @@ test("worker authority observes the verified current grant and expires without a
   expect(await (await workerMetricsResponse(sql, undefined)).text()).toBe("# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available 0\n");
 });
 
+test("an observation lapses within 30 seconds even when the policy claims longer freshness", async () => {
+  const f = await moderationFixture(), now = Date.now();
+  const observation = observeWorkerAuthority(f.community, f.moderator.pk, { ...f.policy, validUntil: now + 3_600_000 }, now);
+  expect(observation).toEqual({ available: true, validUntil: now + 30_000 });
+});
+
 test("revoked or missing grants and banned workers cannot report authority", async () => {
   const f = await moderationFixture();
   const state = controlState(f.policy);
