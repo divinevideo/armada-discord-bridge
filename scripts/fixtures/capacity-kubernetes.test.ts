@@ -489,3 +489,43 @@ test('destination timing records follow the deployed emitter: verified lowercase
   expect(line({ innerAdmissionMs: 2, eventId: 'A'.repeat(64) })).toBe('');
   expect(line({ innerAdmissionMs: 2, eventId: 'abc' })).toBe('');
 });
+
+test('a Pod whose creation is still in flight when shutdown begins is removed, not stranded', async () => {
+  const calls: string[][] = [];
+  let releaseCreate!: () => void;
+  const created = new Promise<void>(resolve => { releaseCreate = resolve; });
+  const pod = { metadata: { name: 'capacity-synthetic-1', uid: 'late-uid' } };
+  const execute = async (args: string[]) => {
+    calls.push(args);
+    if (args.includes('create')) { await created; return JSON.stringify(pod); }
+    if (args.includes('get') && args.includes('pod')) return JSON.stringify(pod);
+    return '';
+  };
+  const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, execute);
+  const starting = backend.start('capacity-synthetic-1', '/missing', '/missing').catch((e: Error) => e);
+  while (!calls.some(c => c.includes('create'))) await Bun.sleep(1);
+  await backend.finish();                       // sweeps an empty map while create is in flight
+  expect(calls.some(c => c.includes('delete'))).toBe(false);
+  releaseCreate();
+  const error = await starting;
+  expect(String(error)).toContain('already finished');
+  const removal = calls.find(c => c.includes('delete'))!;
+  expect(removal).toBeDefined();
+  expect(calls.some(c => c.includes('wait') && c.includes('--for=jsonpath={.status.phase}=Running'))).toBe(false);
+  expect((backend as any).pods.size).toBe(0);
+});
+
+test('concurrent removals of one Pod share a single delete and neither reports a false failure', async () => {
+  const calls: string[][] = [];
+  let present = true;
+  const execute = async (args: string[]) => {
+    calls.push(args);
+    if (args.includes('get') && args.includes('pod')) { if (!present) throw new Error('NotFound'); return JSON.stringify({ metadata: { name: 'capacity-synthetic-1', uid: 'u' } }); }
+    if (args.includes('delete')) { await Bun.sleep(20); present = false; }
+    return '';
+  };
+  const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, execute);
+  (backend as any).pods.set('capacity-synthetic-1', { uid: 'u' });
+  await Promise.all([backend.close(), backend.finish()]);
+  expect(calls.filter(c => c.includes('delete'))).toHaveLength(1);
+});

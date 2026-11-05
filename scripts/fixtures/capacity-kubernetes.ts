@@ -318,6 +318,16 @@ export class KubernetesCapacity {
     const created = JSON.parse(await this.execute([...this.args(), 'create', '-f', '-', '-o', 'json'], JSON.stringify(manifest)));
     need(created.metadata?.uid, 'Created benchmark Pod has no UID');
     this.pods.set(name, { uid: created.metadata.uid });
+    // finish() sets `closed` before it sweeps, and this check and the set above
+    // run in one synchronous step. So either the Pod was already tracked when
+    // the sweep took its snapshot (and is removed there), or `create` was still
+    // in flight, the sweep saw an empty map, and this is the only place left
+    // that can remove it. Without it an interrupt during creation left a Pod
+    // running that nothing deleted.
+    if (this.closed) {
+      try { await this.remove(name); } catch { throw new SafeDiagnostic('A Pod created during shutdown could not be removed; inspect the dedicated namespace'); }
+      throw new SafeDiagnostic('Capacity backend already finished');
+    }
     await this.execute([...this.args(), 'wait', '--for=jsonpath={.status.phase}=Running', `pod/${name}`, '--timeout=180s']);
     const pod = await this.owned(name);
     const identity = JSON.parse(await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'bun', '-e', "console.log(JSON.stringify({sourceSha:process.env.MODERATION_SOURCE_SHA,platform:process.platform+'/'+(process.arch==='x64'?'amd64':process.arch)}))"]));
@@ -349,7 +359,19 @@ export class KubernetesCapacity {
     for (let n = 0; n < 180; n++) { const pod = await this.owned(name); if ((pod.status?.containerStatuses?.[0]?.restartCount ?? 0) > count && pod.status?.containerStatuses?.[0]?.state?.running) { const f = await this.portForward([...this.args(), 'pod/' + name]); this.pods.get(name)!.forward = f; return f.url; } await Bun.sleep(1000); }
     throw new Error('Benchmark container did not restart with retained data');
   }
-  async remove(name: string) {
+  private removals = new Map<string, Promise<void>>();
+  /**
+   * Concurrent callers share one removal. An interrupt's sweep and the
+   * measurement loop's own per-case close can both reach the same Pod; the
+   * second delete would find it gone and report "could not be removed" for a
+   * Pod that was in fact removed.
+   */
+  remove(name: string): Promise<void> {
+    let removal = this.removals.get(name);
+    if (!removal) { removal = this.removeOnce(name).finally(() => this.removals.delete(name)); this.removals.set(name, removal); }
+    return removal;
+  }
+  private async removeOnce(name: string) {
     const pod = await this.owned(name); const record = this.pods.get(name)!; record.forward?.stop();
     // The Pod's data lives in a subPath of the shared benchmark volume, which
     // outlives it. Reclaim the relay database now: each Pod otherwise leaves
