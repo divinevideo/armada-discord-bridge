@@ -73,10 +73,20 @@ export function benchmarkNamespaceGuard(c: DestinationConfig, namespace: Json, p
 export function capacityRelayName(label: string, mode: string, sequence: number): string {
   return `${label}-${mode.replaceAll('_', '-')}-${sequence}`;
 }
+/**
+ * Upper bound on a benchmark Pod's life. Pods are bare (restartPolicy Always,
+ * 2 CPU / 1 GiB limits) and every cleanup path is a `finally` or a signal
+ * handler, so a kill -9, crash or laptop sleep would otherwise leave them
+ * running in the shared cluster indefinitely, and the next run's namespace
+ * guard ("no existing workloads") would then refuse until someone cleaned up
+ * by hand. A single case can hold one Pod across every history point and
+ * repetition, so this is generous rather than tight.
+ */
+export const POD_LIFETIME_SECONDS = 6 * 60 * 60;
 export function benchmarkPod(c: DestinationConfig, m: Resources, name: string) {
   need(name.length <= 63 && /^capacity-[a-z0-9-]+$/.test(name), 'Invalid owned benchmark Pod name');
   return { apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: c.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } }, spec: {
-    hostNetwork: false, automountServiceAccountToken: false, restartPolicy: 'Always', terminationGracePeriodSeconds: 5,
+    hostNetwork: false, automountServiceAccountToken: false, restartPolicy: 'Always', terminationGracePeriodSeconds: 5, activeDeadlineSeconds: POD_LIFETIME_SECONDS,
     nodeSelector: { 'cloud.google.com/gke-provisioning': 'standard', 'kubernetes.io/arch': 'amd64' },
     securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: 'RuntimeDefault' } },
     initContainers: [{ name: 'prepare-data', image: c.image, command: ['mkdir', '-p', '/storage/' + name],
@@ -157,6 +167,7 @@ export class KubernetesCapacity {
   readonly evidence: Json = { version: 1, certified: false, controllerModelVerified: false, destinationMatched: false, relayObservations: [] };
   private databasePrimary?: { name: string; uid: string; address: string };
   private databaseForward?: Forward;
+  private closed = false;
   private pods = new Map<string, { uid: string; config: string; directory: string; forward?: Forward }>();
   constructor(c: unknown, private matrix: CapacityMatrix, private execute: Run = capacityCommand, private portForward = forward) { this.config = destinationConfig(c); }
   private args() { return ['kubectl', `--context=${this.config.context}`, '--request-timeout=30s', '-n', this.config.namespace]; }
@@ -222,6 +233,9 @@ export class KubernetesCapacity {
     need(address === '127.0.0.1' || address === '::1' || address === this.databasePrimary.address, 'Controller server address is inconsistent with its owned primary transport');
   }
   async finish() {
+    // An interrupt can run this while the measurement is still awaiting a Pod
+    // creation. Refuse new Pods afterwards so one cannot appear after the sweep.
+    this.closed = true;
     try { await this.close(); } finally { this.databaseForward?.stop(); this.databaseForward = undefined; }
   }
   private async owned(name: string) {
@@ -238,6 +252,7 @@ export class KubernetesCapacity {
     for (const name of this.pods.keys()) await this.upload(name, '/capacity/calibration.json', data);
   }
   async start(name: string, config: string, directory: string, contract?: string, communities: [string, string][] = []) {
+    need(!this.closed, 'Capacity backend already finished');
     const manifest = benchmarkPod(this.config, this.matrix, name);
     if (contract) (manifest.spec.containers[0].env as Json[]).push({ name: 'MODERATION_COMMUNITY_ORGS', value: JSON.stringify(Object.fromEntries(communities)) });
     // create, never apply/adopt an existing Pod; cleanup is restricted to its returned UID.
@@ -279,6 +294,14 @@ export class KubernetesCapacity {
   }
   async remove(name: string) {
     const pod = await this.owned(name); const record = this.pods.get(name)!; record.forward?.stop();
+    // The Pod's data lives in a subPath of the shared benchmark volume, which
+    // outlives it. Reclaim the relay database now: each Pod otherwise leaves
+    // its LMDB behind, entrypoint mode creates one Pod per history point, and
+    // the growing tree is re-walked by fsGroup ownership handling on every
+    // later Pod start. Best effort: a Pod past its deadline cannot be exec'd
+    // into. Only the empty per-Pod directory remains, which a container
+    // mounting that subPath cannot remove.
+    await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'rm', '-rf', '/data/db']).catch(() => {});
     // UID precondition prevents a replacement resource from being removed by cleanup.
     await this.execute([...this.args(), 'delete', '--raw', `/api/v1/namespaces/${this.config.namespace}/pods/${name}`, '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: pod.metadata.uid } }));
     await this.execute([...this.args(), 'wait', '--for=delete', `pod/${name}`, '--timeout=90s']);

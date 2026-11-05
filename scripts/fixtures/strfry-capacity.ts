@@ -184,6 +184,20 @@ export function rendezvous(parties: number) {
   return { abandon: arrive, wait: () => { arrive(); return opened; } };
 }
 
+/**
+ * Run cleanup on SIGINT/SIGTERM. Every other cleanup path is a `finally`,
+ * which a Ctrl-C or kill skips, leaving benchmark Pods and containers running.
+ * `once`, so a second signal takes the default action and can still kill a
+ * stuck cleanup. Returns the uninstaller.
+ */
+export function cleanupOnInterrupt(run: () => Promise<void>, exit: (code: number) => void = (code) => process.exit(code), report: (message: string) => void = (message) => console.error(message)): () => void {
+  const handler = (signal: NodeJS.Signals) => {
+    void run().catch((error) => report("Capacity cleanup after interrupt failed: " + (error instanceof SafeDiagnostic ? error.message : "diagnostics withheld"))).finally(() => exit(signal === "SIGINT" ? 130 : 143));
+  };
+  process.once("SIGINT", handler); process.once("SIGTERM", handler);
+  return () => { process.off("SIGINT", handler); process.off("SIGTERM", handler); };
+}
+
 /** The reason recorded against a case whose measurement threw. */
 export function caseFailureReason(error: unknown, withheld: boolean): string {
   if (error instanceof SafeDiagnostic) return error.message;
@@ -238,6 +252,24 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   const removeRelay = (name: string) => kube ? kube.remove(name) : docker("rm", "-f", name);
   await writeFile(join(directory, "launcher.ts"), launcher);
   await writeFile(join(directory, "plugin.sh"), "#!/bin/sh\nexec bun /capacity/launcher.ts\n", { mode: 0o755 });
+  // Declared before the body so an interrupt runs the very cleanup the `finally`
+  // does. `runCleanup` is idempotent: whichever path starts it, the other waits.
+  const cleanup: (() => void | Promise<void>)[] = [
+    () => { for (const ws of sockets) try { ws.close(); } catch { /* already closed */ } },
+    () => sql?.end({ timeout: 2 }),
+    () => locker?.end({ timeout: 2 }),
+    async () => {
+      if (kube) await kube.finish();
+      else {
+        for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
+        await docker("network", "rm", label).catch(() => {});
+      }
+    },
+    async () => { if (!output.startsWith(directory + "/")) await rm(directory, { recursive: true, force: true }); },
+  ];
+  let cleaning: Promise<void> | undefined;
+  const runCleanup = (writeArtifacts: () => Promise<void>) => (cleaning ??= finalizeCapacityMeasurement(writeArtifacts, cleanup));
+  const stopInterruptCleanup = cleanupOnInterrupt(() => runCleanup(async () => {}));
   try {
     if (kube && destination) {
       report.resourceEnvelope.database = await kube.prepare();
@@ -410,7 +442,8 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       await writeFile(join(output, "partial-report.json"), JSON.stringify(report, null, 2) + "\n");
     }
   } finally {
-    await finalizeCapacityMeasurement(async () => {
+    stopInterruptCleanup();
+    await runCleanup(async () => {
       report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
       const artifact = serializeCapacityReport(report);
       await writeFile(join(output, "measurement-report.json"), artifact.json);
@@ -418,19 +451,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
       await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
       if (kube) await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
-    }, [
-      ...sockets.map(ws => () => ws.close()),
-      () => sql?.end({ timeout: 2 }),
-      () => locker?.end({ timeout: 2 }),
-      async () => {
-        if (kube) await kube.finish();
-        else {
-          for (const name of containers.reverse()) await docker("rm", "-f", name).catch(() => {});
-          await docker("network", "rm", label).catch(() => {});
-        }
-      },
-      async () => { if (!output.startsWith(directory + "/")) await rm(directory, { recursive: true, force: true }); },
-    ]);
+    });
   }
 
   console.log(`Capacity raw report: ${output}; certified=false`);

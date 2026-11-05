@@ -304,3 +304,48 @@ test('a sample whose preparation fails abandons the gate instead of stranding th
   gate.abandon();
   expect(await Promise.race([released.then(() => 'released'), Bun.sleep(500).then(() => 'stranded')])).toBe('released');
 });
+
+import { POD_LIFETIME_SECONDS } from './capacity-kubernetes';
+import { cleanupOnInterrupt } from './strfry-capacity';
+test('benchmark Pods are bounded in lifetime so a skipped cleanup cannot strand them', () => {
+  const pod = benchmarkPod(config, matrix, 'capacity-synthetic-1');
+  expect(pod.spec.activeDeadlineSeconds).toBe(POD_LIFETIME_SECONDS);
+  expect(POD_LIFETIME_SECONDS).toBeGreaterThan(3600);
+  expect(POD_LIFETIME_SECONDS).toBeLessThanOrEqual(24 * 3600);
+});
+
+test('removal reclaims the relay database only for an owned Pod and refuses new Pods once finished', async () => {
+  const calls: string[][] = [];
+  let uid = 'owned-uid';
+  const execute = async (args: string[]) => {
+    calls.push(args);
+    if (args.includes('get') && args.includes('pod')) return JSON.stringify({ metadata: { name: 'capacity-synthetic-1', uid } });
+    return '';
+  };
+  const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, execute);
+  (backend as any).pods.set('capacity-synthetic-1', { uid: 'owned-uid' });
+  uid = 'replacement';
+  await expect(backend.remove('capacity-synthetic-1')).rejects.toThrow('ownership');
+  expect(calls.some(c => c.includes('rm'))).toBe(false);
+  uid = 'owned-uid';
+  await backend.remove('capacity-synthetic-1');
+  const reclaim = calls.findIndex(c => c.includes('rm') && c.includes('/data/db'));
+  const removal = calls.findIndex(c => c.includes('delete'));
+  expect(reclaim).toBeGreaterThan(-1); expect(removal).toBeGreaterThan(reclaim);
+  // An interrupt may finish the backend while a creation is still in flight.
+  await backend.finish();
+  await expect(backend.start('capacity-synthetic-2', '/missing', '/missing')).rejects.toThrow('already finished');
+  expect(calls.some(c => c.includes('create'))).toBe(false);
+});
+
+test('an interrupt runs cleanup, reports a failure without leaking detail, and exits with the signal status', async () => {
+  const exits: number[] = [], reports: string[] = [];
+  const done = new Promise<void>(resolve => {
+    const stop = cleanupOnInterrupt(async () => { throw new Error('cleanup failed postgres://synthetic:private-password@db.example/x'); }, code => { exits.push(code); stop(); resolve(); }, message => reports.push(message));
+    process.emit('SIGTERM', 'SIGTERM');
+  });
+  await done;
+  expect(exits).toEqual([143]);
+  expect(reports).toEqual(['Capacity cleanup after interrupt failed: diagnostics withheld']);
+  expect(process.listenerCount('SIGTERM')).toBe(0);
+});
