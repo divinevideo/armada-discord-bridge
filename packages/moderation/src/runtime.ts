@@ -50,18 +50,25 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
   const pool = new RelayPool([options.relayUrl], { onDisconnect: () => { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; void watcher?.disconnected(); } });
   watcher = new PolicyWatcher(community, store, pool, [...options.publicAuthors, identity.pk], identity);
   const refresh = async () => {
-    clearAuthority();
+    // Capture the generation; do not clear on entry. The last observation
+    // stays bounded by its own validUntil, and every action authorization
+    // refreshes too, so clearing here would read as lost authority for the
+    // length of each routine refresh. Disconnects and subscription errors
+    // still bump the generation; a failed refresh clears before rethrowing,
+    // because worker.tick swallows the failures of action-path refreshes.
     const generation = authorityGeneration;
-    const policy = await watcher!.refresh();
-    await observeWorkerCapacity(sql, capacity, community.idHex);
-    registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
-    health.checkedAt = Date.now();
-    // Capacity observation awaits SQL after the policy refresh. A disconnect
-    // during that await must not let this old policy restore a green gauge.
-    if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt);
-    health.ready = !policy.rekeyPending;
-    health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
-    return policy;
+    try {
+      const policy = await watcher!.refresh();
+      await observeWorkerCapacity(sql, capacity, community.idHex);
+      registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
+      health.checkedAt = Date.now();
+      // Capacity observation awaits SQL after the policy refresh. A disconnect
+      // during that await must not let this old policy restore a green gauge.
+      if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt);
+      health.ready = !policy.rekeyPending;
+      health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
+      return policy;
+    } catch (error) { clearAuthority(); throw error; }
   };
   registerStreamKeys([...controlGroups(community), ...guestbookGroups(community), ...community.heldRoots.map((root) => baseRekeyGroupKey(root.key, community.id, root.epoch + 1n))], pool.urls);
   const actions = new ConcordActions(community, identity, refresh);
