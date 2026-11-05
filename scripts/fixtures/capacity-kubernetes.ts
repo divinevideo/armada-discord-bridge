@@ -40,8 +40,12 @@ export function destinationConfig(value: unknown): DestinationConfig {
 }
 export function destinationOutputGuard(output: string | undefined, checkout: string) {
   need(output && isAbsolute(output), 'Private absolute destination output directory required');
-  const path = relative(resolve(checkout), resolve(output));
-  need(path.startsWith('..' + '/') || isAbsolute(path), 'Destination reports must stay outside the checkout');
+  // `to` lies outside `from`. A bare '..' prefix test would also match a child
+  // named '..reports', and testing only '../' once rejected the checkout's
+  // parent while accepting every higher ancestor, up to '/' itself.
+  const outside = (from: string, to: string) => { const path = relative(resolve(from), resolve(to)); return path === '..' || path.startsWith('..' + '/') || isAbsolute(path); };
+  need(outside(checkout, output), 'Destination reports must stay outside the checkout');
+  need(outside(output, checkout), 'Destination reports need a dedicated directory, not an ancestor of the checkout');
 }
 export function benchmarkURLGuard(c: Pick<DestinationConfig, 'databaseRole' | 'databaseName'>, value: string) {
   try {
@@ -94,7 +98,10 @@ export function benchmarkPod(c: DestinationConfig, m: Resources, name: string) {
   return { apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: c.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } }, spec: {
     hostNetwork: false, automountServiceAccountToken: false, restartPolicy: 'Always', terminationGracePeriodSeconds: 5, activeDeadlineSeconds: POD_LIFETIME_SECONDS,
     nodeSelector: { 'cloud.google.com/gke-provisioning': 'standard', 'kubernetes.io/arch': 'amd64' },
-    securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: 'RuntimeDefault' } },
+    // The claim is shared by every benchmark Pod. With the default policy each
+    // mount chowns it recursively, so Pod startup grows with earlier runs'
+    // data and can exceed the Running wait before a sample even starts.
+    securityContext: { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, fsGroupChangePolicy: 'OnRootMismatch', seccompProfile: { type: 'RuntimeDefault' } },
     initContainers: [{ name: 'prepare-data', image: c.image, command: ['mkdir', '-p', '/storage/' + name],
       securityContext: { runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ['ALL'] } },
       resources: { requests: { cpu: '10m', memory: '16Mi' }, limits: { cpu: '100m', memory: '64Mi' } },
@@ -156,8 +163,9 @@ export function destinationTimingLog(text: string): string {
       // two sinks cannot disagree about what a timing record is.
       if (value.type !== 'moderation_admission_timing' || !Number.isFinite(value.innerAdmissionMs) || value.innerAdmissionMs < 0) return [];
       if ('eventId' in value && (typeof value.eventId !== 'string' || !HEX_ID.test(value.eventId))) return [];
-      // The deployed emitter is aggregate-only; calibration can add correlation.
-      // Retaining an absent ID lets the sampler use only its single-flight fallback.
+      // strfryPlugin adds an eventId only for a frame it verified, and an image
+      // predating that correlation emits none. Keeping an absent ID absent
+      // leaves the sampler only its single-flight fallback, never a guess.
       return [JSON.stringify({ type: value.type, ...('eventId' in value ? { eventId: value.eventId } : {}), innerAdmissionMs: value.innerAdmissionMs })];
     } catch { return []; }
   }).join('\n');

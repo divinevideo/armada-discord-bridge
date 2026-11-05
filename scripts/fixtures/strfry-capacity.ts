@@ -327,7 +327,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       const url = await kube.controllerDatabaseURL(credentials);
       await destinationDatabaseSetup(async () => {
         benchmarkURLGuard(destination, url);
-        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {}, connection: { options: '' } }); locker = postgres(url, { max: 1, onnotice: () => {}, connection: { options: '' } });
+        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {}, connection: { options: '' } }); locker = postgres(url, { max: 1, max_lifetime: null, onnotice: () => {}, connection: { options: '' } });
         const [identity] = await sql.unsafe<Omit<DatabaseObservation, "populatedTables" | "schemaPresent">[]>(BENCHMARK_IDENTITY_SQL);
         const tables = await sql`SELECT n.nspname AS schema,c.relname AS name,pg_catalog.pg_get_userbyid(c.relowner)=current_user AS owned FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','m','f') ORDER BY n.nspname,c.relname`;
         let populatedTables = 0;
@@ -357,7 +357,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       catch { if (attempt > 200) throw new SafeDiagnostic("Capacity PostgreSQL unavailable"); await Bun.sleep(100); }
     }
     const pgPort = (await docker("port", dbName, "5432/tcp")).split(":").at(-1), url = `postgres://bridge@127.0.0.1:${pgPort}/bridge`;
-    sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, onnotice: () => {} });
+    sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, max_lifetime: null, onnotice: () => {} });
     }
     if (!sql || !locker) throw new SafeDiagnostic("Capacity database connection was not initialized");
     // Shared-cluster role creation/membership is not benchmark authority. The
@@ -400,7 +400,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     }
     let sequence = 0;
     async function effect(id: string) { return Number((await sql!`SELECT count(*) AS count FROM (SELECT event_id FROM moderation.carriers WHERE event_id=${id} UNION ALL SELECT event_id FROM moderation.accepted_control WHERE event_id=${id} UNION ALL SELECT event_id FROM moderation.rekey_events WHERE event_id=${id}) q`)[0].count) > 0; }
-    async function sample(instance: Awaited<ReturnType<typeof start>>, f: ReturnType<typeof capacityFixture>, id: CapacityCaseId, expectedAccept: boolean, event: NostrEvent, inFlight = 1, gate?: ReturnType<typeof rendezvous>): Promise<CapacitySample> {
+    async function sample(instance: Awaited<ReturnType<typeof start>>, f: ReturnType<typeof capacityFixture>, id: CapacityCaseId, expectedAccept: boolean, event: NostrEvent, inFlight = 1, gate?: ReturnType<typeof rendezvous>, holdLockMs?: number): Promise<CapacitySample> {
       const prepare = async () => {
         kube?.assertTransportAlive();
         await sql!`UPDATE moderation.community_policy SET payload=jsonb_set(payload,'{validUntil}',${sql!.json(Date.now()+120000)}) WHERE community_id=${f.policy.communityId}`;
@@ -415,20 +415,44 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       };
       const { measuredPolicy, measuredRekeys, before, messagesFrom, logsBefore } = await prepare().catch((error) => { gate?.abandon(); throw error; });
       await gate?.wait();
-      const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
-      let ok: any[] | undefined, error: string | undefined;
-      try { ok = await until(() => instance.publisher.messages.slice(messagesFrom).find((m) => m[0] === "OK" && m[1] === event.id), matrix.observationTimeoutMs); } catch { error = "matching OK not observed within observer horizon"; }
-      const wallMs = performance.now() - started, accepted = ok?.[2] === true;
-      const dbAtAck = await effect(event.id), persisted = await instance.publisher.query(event.id);
-      let fanout = instance.subscriber.messages.some((m) => m[0] === "EVENT" && m[2]?.id === event.id);
-      // A post-ack observation horizon exceeds the unchanged external hook deadline.
-      await Bun.sleep(matrix.lateObservationMs);
-      fanout = instance.subscriber.messages.some((m) => m[0] === "EVENT" && m[2]?.id === event.id);
-      const dbAfter = await effect(event.id), persistedAfter = await instance.publisher.query(event.id);
-      const timings = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).slice(logsBefore).flatMap((line) => { try { return [JSON.parse(line.slice(line.indexOf("{")))]; } catch { return []; } });
-      const correlated = timings.filter((timing) => timing.eventId === event.id);
-      const timing = correlated.length === 1 ? correlated[0].innerAdmissionMs : inFlight === 1 && timings.length === 1 ? timings[0].innerAdmissionMs : null;
-      return { caseId: id, historyCount: measuredPolicy!.controlEvents.length + measuredRekeys.length, historyBytes: Buffer.byteLength(JSON.stringify(measuredPolicy!.controlEvents)) + Buffer.byteLength(JSON.stringify(measuredRekeys.map(row => row.event))), rekeyCount: measuredRekeys.length, streamCount: f.streams.length, inFlight, wallMs, innerAdmissionMs: Number.isFinite(timing) ? timing : null, expectedAccept, accepted, okReceived: !!ok, persisted, fanout, lateDatabaseWrite: !before && !dbAtAck && dbAfter, unsafeEffect: (!accepted && (dbAfter || persistedAfter || fanout)) || (accepted && (!dbAfter || !persistedAfter)), ...(["plugin_failure", "external_timeout"].includes(id) ? { innerNotStarted: true } : {}), ...(error ? { error } : {}) };
+      // Hold the room's policy lock across the send itself, not around the
+      // whole sample. Taken before prepare(), it blocked entrypoint replay's own
+      // observeCurrent (same advisory key) for the full hold, so the EVENT went
+      // out after release and the injected SQL timeout was accepted. Kubernetes
+      // log reads in prepare() can also outlast the 250ms contention window.
+      let release: Promise<unknown> | undefined;
+      if (holdLockMs) {
+        await locker!`SELECT pg_advisory_lock(hashtextextended(${f.policy.communityId},483210))`;
+        // The locker must keep one session for the whole hold. postgres.js retires
+        // a pooled connection after 30-60 minutes by default and closes it when
+        // idle, which drops a session lock without any error. If that happens
+        // mid-hold, a fault sample measures nothing, so a lost lock must fail it.
+        release = Bun.sleep(holdLockMs).then(async () => {
+          const [held] = await locker!`SELECT pg_advisory_unlock(hashtextextended(${f.policy.communityId},483210)) AS released`;
+          if (!held.released) throw new SafeDiagnostic("Fault-injection lock was lost before release");
+        });
+        // The hold ends while the sample is still in its post-ack observation
+        // horizon, seconds before the finally awaits it. Mark the rejection as
+        // observed now so Bun does not report it as unhandled; the finally's
+        // await still rethrows it into the case reason.
+        release.catch(() => {});
+      }
+      try {
+        const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
+        let ok: any[] | undefined, error: string | undefined;
+        try { ok = await until(() => instance.publisher.messages.slice(messagesFrom).find((m) => m[0] === "OK" && m[1] === event.id), matrix.observationTimeoutMs); } catch { error = "matching OK not observed within observer horizon"; }
+        const wallMs = performance.now() - started, accepted = ok?.[2] === true;
+        const dbAtAck = await effect(event.id), persisted = await instance.publisher.query(event.id);
+        let fanout = instance.subscriber.messages.some((m) => m[0] === "EVENT" && m[2]?.id === event.id);
+        // A post-ack observation horizon exceeds the unchanged external hook deadline.
+        await Bun.sleep(matrix.lateObservationMs);
+        fanout = instance.subscriber.messages.some((m) => m[0] === "EVENT" && m[2]?.id === event.id);
+        const dbAfter = await effect(event.id), persistedAfter = await instance.publisher.query(event.id);
+        const timings = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).slice(logsBefore).flatMap((line) => { try { return [JSON.parse(line.slice(line.indexOf("{")))]; } catch { return []; } });
+        const correlated = timings.filter((timing) => timing.eventId === event.id);
+        const timing = correlated.length === 1 ? correlated[0].innerAdmissionMs : inFlight === 1 && timings.length === 1 ? timings[0].innerAdmissionMs : null;
+        return { caseId: id, historyCount: measuredPolicy!.controlEvents.length + measuredRekeys.length, historyBytes: Buffer.byteLength(JSON.stringify(measuredPolicy!.controlEvents)) + Buffer.byteLength(JSON.stringify(measuredRekeys.map(row => row.event))), rekeyCount: measuredRekeys.length, streamCount: f.streams.length, inFlight, wallMs, innerAdmissionMs: Number.isFinite(timing) ? timing : null, expectedAccept, accepted, okReceived: !!ok, persisted, fanout, lateDatabaseWrite: !before && !dbAtAck && dbAfter, unsafeEffect: (!accepted && (dbAfter || persistedAfter || fanout)) || (accepted && (!dbAfter || !persistedAfter)), ...(["plugin_failure", "external_timeout"].includes(id) ? { innerNotStarted: true } : {}), ...(error ? { error } : {}) };
+      } finally { await release; }
     }
     for (const entry of report.cases) {
       if (interrupted) break;
@@ -446,8 +470,8 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           if (kube) await kube.updateFixtures(directory);
           await store.install(f.policy, f.streams, 0);
           // A reviewed entrypoint replay uses normal operator observations,
-          // never the calibration seed or an implicit durable-pause reset.
-          if (entrypointCapacity) await entrypointCapacity.observeCurrent("synthetic-capacity", f.policy.communityId);
+          // taken by sample() before each send, never the calibration seed or
+          // an implicit durable-pause reset.
           if (calibration) {
             // Only the disposable operator seeds its own fixture latch; the deployed entrypoint has no bypass.
             const table = await sql`SELECT to_regclass('moderation.public_capacity_state') AS name`;
@@ -464,17 +488,11 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
             if (entry.id === "cold" && rep > 0) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await removeRelay(instance.name); instance = await start(entry.id); }
             const event = entry.id === "append" ? f.append() : entry.id === "rekey" ? f.rekey(sequence++) : f.message(sequence++);
             const expected = expectedCapacityAcceptance(entry.id, count);
-            let release: Promise<unknown> | undefined;
-            if (entry.id === "lock_contention" || entry.id === "sql_timeout") {
-              await locker`SELECT pg_advisory_lock(hashtextextended(${f.policy.communityId},483210))`;
-              release = Bun.sleep(entry.id === "sql_timeout" ? 2000 : 250).then(() => locker!`SELECT pg_advisory_unlock(hashtextextended(${f.policy.communityId},483210))`);
-            }
-            try {
-              if (entry.id === "concurrency") {
-                const gate = rendezvous(matrix.concurrency);
-                entry.samples.push(...await Promise.all(Array.from({ length: matrix.concurrency }, () => sample(instance!, f, entry.id, expected, f.message(sequence++), matrix.concurrency, gate))));
-              } else entry.samples.push(await sample(instance, f, entry.id, expected, event));
-            } finally { await release; }
+            const holdLockMs = entry.id === "sql_timeout" ? 2000 : entry.id === "lock_contention" ? 250 : undefined;
+            if (entry.id === "concurrency") {
+              const gate = rendezvous(matrix.concurrency);
+              entry.samples.push(...await Promise.all(Array.from({ length: matrix.concurrency }, () => sample(instance!, f, entry.id, expected, f.message(sequence++), matrix.concurrency, gate))));
+            } else entry.samples.push(await sample(instance, f, entry.id, expected, event, 1, undefined, holdLockMs));
             const recent = entry.samples.at(-1)!;
             if (expected && (!recent.accepted || recent.wallMs >= 3000)) {
               bracketFailure = count;

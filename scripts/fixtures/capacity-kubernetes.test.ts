@@ -43,6 +43,7 @@ describe('isolated destination measurement', () => {
     expect(c.volumeMounts[0]).toEqual({ name: 'data', mountPath: '/data', subPath: 'capacity-synthetic-1' });
     expect(c.resources.limits).toEqual({ cpu: '2', memory: '1073741824' });
     expect(c.securityContext.runAsNonRoot).toBe(true);
+    expect(pod.spec.securityContext.fsGroupChangePolicy).toBe('OnRootMismatch');
     expect(c.env.find((e: any) => e.name === 'MODERATION_DATABASE_URL')).toEqual({ name: 'MODERATION_DATABASE_URL', valueFrom: { secretKeyRef: { name: 'benchmark-database', key: 'DATABASE_URL' } } });
     expect(JSON.stringify(pod)).not.toContain('postgres://');
     expect(JSON.stringify(pod)).not.toContain('LoadBalancer');
@@ -130,6 +131,10 @@ test('raw destination reports require a private output path outside the checkout
   expect(() => destinationOutputGuard('report', '/synthetic/checkout')).toThrow();
   expect(() => destinationOutputGuard('/synthetic/checkout/reports', '/synthetic/checkout')).toThrow();
   expect(() => destinationOutputGuard('/synthetic/private/reports', '/synthetic/checkout')).not.toThrow();
+  expect(() => destinationOutputGuard('/synthetic/checkout-reports', '/synthetic/checkout')).not.toThrow();
+  expect(() => destinationOutputGuard('/synthetic/checkout/..reports', '/synthetic/checkout')).toThrow('outside the checkout');
+  // Ancestors hold the checkout itself; the parent and '/' are refused alike.
+  for (const ancestor of ['/synthetic', '/', '/synthetic/checkout/..']) expect(() => destinationOutputGuard(ancestor, '/synthetic/checkout')).toThrow('ancestor');
 });
 
 test('destination preflight compares the selected relay, separate PVC and running CNPG primary', async () => {
@@ -213,8 +218,9 @@ test('entrypoint replay binds the reviewed contract to the exact image and prese
   expect(() => capacityContractForEntrypoint({ imageId: identity.imageId, version: 1 }, identity)).toThrow('Invalid capacity contract');
 });
 
-test('retains the production emitter timing shape without inventing event correlation or exposing extra fields', () => {
-  // strfryPlugin emits aggregate timing; only the calibration launcher adds eventId.
+test('keeps an uncorrelated emitter line aggregate, without inventing correlation or exposing extra fields', () => {
+  // strfryPlugin omits eventId for a frame it could not verify, as does an image
+  // predating verified correlation; the filter must not supply one.
   const emitted = { type: 'moderation_admission_timing', innerAdmissionMs: 3, action: 'accept' };
   const filtered = destinationTimingLog(JSON.stringify({ ...emitted, database: 'postgres://synthetic:private-password@db.example/benchmark', token: 'private-token' }));
   expect(JSON.parse(filtered)).toEqual({ type: emitted.type, innerAdmissionMs: emitted.innerAdmissionMs });
