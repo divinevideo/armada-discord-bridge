@@ -43,6 +43,8 @@ export class PostgresMappingStore implements MappingStore {
     return {deleteRumorId:row.delete_rumor_id,targetRumorId:row.target_rumor_id,author:row.author,
       ...(row.citation ? {citation:row.citation}:{}),createdAtMs:Number(row.created_at_ms),actionClass:row.action_class,
       sourceWrapCreatedAt:Number(row.source_wrap_created_at),firstObservedAtMs:Number(row.first_observed_at_ms),
+      ...(row.inner_created_at == null ? {} : {innerCreatedAt:Number(row.inner_created_at)}),
+      ...(row.inner_epoch == null ? {} : {innerEpoch:row.inner_epoch}),
       ...(row.expires_at_ms == null ? {} : {expiresAtMs:Number(row.expires_at_ms)}),
       nextAttemptAtMs:Number(row.next_attempt_at_ms),attempts:row.attempts};
   }
@@ -61,10 +63,10 @@ export class PostgresMappingStore implements MappingStore {
         const plan=planDeletionIntake(held.map(row=>this.deletion(row)),rows,Number(clock.ms));
         for(const row of plan.writes) await tx`INSERT INTO pending_concord_deletes
           (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,delete_rumor_id,target_rumor_id,
-           author,citation,created_at_ms,action_class,source_wrap_created_at,first_observed_at_ms,expires_at_ms,next_attempt_at_ms,attempts)
+           author,citation,created_at_ms,action_class,source_wrap_created_at,first_observed_at_ms,expires_at_ms,next_attempt_at_ms,attempts,inner_created_at,inner_epoch)
           VALUES (${this.tenantId},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},
           ${row.deleteRumorId},${row.targetRumorId},${row.author},${row.citation?tx.json(row.citation):null},${row.createdAtMs},
-          ${row.actionClass!},${row.sourceWrapCreatedAt!},${row.firstObservedAtMs!},${row.expiresAtMs??null},${row.nextAttemptAtMs!},${row.attempts!})
+          ${row.actionClass!},${row.sourceWrapCreatedAt!},${row.firstObservedAtMs!},${row.expiresAtMs??null},${row.nextAttemptAtMs!},${row.attempts!},${row.innerCreatedAt??null},${row.innerEpoch??null})
           ON CONFLICT (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,delete_rumor_id,target_rumor_id)
           DO UPDATE SET action_class='actionable',expires_at_ms=NULL`;
         plan.outcome.disposedExpired+=expired; return plan.outcome;

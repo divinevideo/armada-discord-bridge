@@ -47,7 +47,9 @@ describe('durable pending Concord deletions', () => {
     const deletion = (await openChatBatch([fixture.moderatorDeleteEvent], channel))[0];
     await create().onConcordChat(deletion, link);
     expect(deleted).toEqual([]);
-    expect(await store.pendingDeletes(link)).toHaveLength(1);
+    const [held] = await store.pendingDeletes(link);
+    expect(held.innerCreatedAt).toBe(deletion.createdAt);
+    expect(held.innerEpoch).toBe(deletion.epoch.toString());
     await store.cursorSet(community.idHex, channel.current.group.pk, deletion.createdAt + 600);
     await connection.end();
     connection = postgres(url, { max: 1 });

@@ -11,7 +11,7 @@
  *     and never bridge a rumor we already have a mapping row for.
  */
 
-import { canActOnMember, citationFromTags, citationSatisfied, citationToTag, Permissions, KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION, KIND_TYPING } from "@armada-bridge/concord-core";
+import { filterEpochCutoff, canActOnMember, citationFromTags, citationSatisfied, citationToTag, Permissions, KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION, KIND_TYPING } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 
 import type { ConcordClient } from "./concord/client";
@@ -113,6 +113,8 @@ export interface PendingConcordDelete {
   createdAtMs: number;
   /** Verified outer carrier time (seconds), never the inner rumor timestamp. */
   sourceWrapCreatedAt?: number;
+  innerCreatedAt?: number;
+  innerEpoch?: string;
   firstObservedAtMs?: number;
   actionClass?: "unresolved" | "actionable";
   expiresAtMs?: number;
@@ -877,6 +879,7 @@ export class BridgeRouter {
       for (const targetRumorId of targets) {
         const row: PendingConcordDelete = { deleteRumorId:chat.rumorId,targetRumorId,author:chat.author,
           ...(citation ? {citation:citationToTag(citation)} : {}),createdAtMs:Date.now(),
+          innerCreatedAt:chat.createdAt, innerEpoch:chat.epoch.toString(),
           sourceWrapCreatedAt:(chat as OpenedChat & {sourceWrapCreatedAt?:number}).sourceWrapCreatedAt };
         const evidence=await this.deleteEvidence(row,link);
         if(evidence.scoped.length && this.mayDelete(row,evidence.targetAuthor,link)) row.actionClass='actionable';
@@ -937,7 +940,20 @@ export class BridgeRouter {
     return { retired,reaction,scoped,targetAuthor:scoped.length ? this.targetAuthor(reaction ?? scoped[0]) : '' };
   }
 
+  private assertDeletionEpoch(deletion: PendingConcordDelete, link: ChannelLink): void {
+    // Older rows have no verified inner provenance; preserve their existing
+    // behavior instead of fabricating an epoch from the carrier or timestamp.
+    if (deletion.innerEpoch === undefined || deletion.innerCreatedAt === undefined) return;
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) throw new Error("Concord channel unavailable for deletion cutoff");
+    // The core read-side rule uses only epoch and createdAt. Retaining these
+    // verified fields avoids storing content or keys merely to apply that rule.
+    const evidence = { epoch: BigInt(deletion.innerEpoch), createdAt: deletion.innerCreatedAt } as OpenedChat;
+    if (!filterEpochCutoff([evidence], channel).length) throw new Error("Concord deletion is past its epoch cutoff");
+  }
+
   private async applyDelete(deletion: PendingConcordDelete, link: ChannelLink): Promise<void> {
+    this.assertDeletionEpoch(deletion, link);
     const target = deletion.targetRumorId;
     const {retired,reaction,scoped,targetAuthor}=await this.deleteEvidence(deletion,link);
     // A mapping from another link proves no target scope here.
@@ -958,6 +974,7 @@ export class BridgeRouter {
       }
     }
     const authorize = () => {
+      this.assertDeletionEpoch(deletion, link);
       if (!this.mayDelete(deletion, targetAuthor, link)) throw new Error("Concord deletion authority changed");
     };
     // Retired targets still prove scope and author, but must never remove a
@@ -973,7 +990,7 @@ export class BridgeRouter {
     } else if (!reaction) {
       for (const row of scoped) {
         // The mapping's actual author is authoritative, even for split parts.
-        const check = () => { if (!this.mayDelete(deletion, this.targetAuthor(row), link)) throw new Error("Concord deletion authority changed"); };
+        const check = () => { this.assertDeletionEpoch(deletion, link); if (!this.mayDelete(deletion, this.targetAuthor(row), link)) throw new Error("Concord deletion authority changed"); };
         await this.assertMayForward(); check();
         await this.deletionWebhooks.delete(link, row.discordMessageId, check, () => this.assertMayForward());
       }

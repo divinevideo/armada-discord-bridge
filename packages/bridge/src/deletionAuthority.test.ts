@@ -357,3 +357,19 @@ it('drains accepted actions despite repeated fold wakeups of blocked promotions'
  expect(await store.pendingDeletes(h.link)).toEqual([]);
  expect(h.deleted).toHaveLength(1153);
 });
+
+it('rechecks the stored deletion epoch against a rotation before retrying', async () => {
+  const h = deletionHarness();
+  const grant = bytesToHex(grantLocator(h.community.id, hex32(fixture.expected.moderator)));
+  const full = h.client.folded!;
+  h.client.folded = foldControlState(openControlWraps(fixture.controlEvents, controlGroups(h.community)).filter(e => bytesToHex(e.entityId) !== grant), h.community.id, h.community.owner);
+  await h.router.onConcordChat(await opened(fixture.chatEvent, h.channel), h.link);
+  const deletion = await opened(fixture.moderatorDeleteEvent, h.channel);
+  await h.router.onConcordChat(deletion, h.link);
+  expect(await h.store.pendingDeletes(h.link)).toHaveLength(1);
+  h.client.folded = full;
+  const retired = { ...h.channel, streams: h.channel.streams.map(s => ({ ...s, retiredAt: deletion.createdAt - 1 })) };
+  h.client.channel = () => retired;
+  await h.router.retryPendingDeletes(h.link, true);
+  expect(h.deleted).toEqual([]);
+});
