@@ -153,6 +153,22 @@ export function capacityContractForEntrypoint(value: unknown, identity: { imageI
   return validateCapacityContract(value, identity);
 }
 
+/**
+ * Entrypoint replay refreshes the operator observation before each sample so
+ * the relay's freshness gate sees a normal operator, never a calibration seed.
+ * That operator cannot observe a policy with a rekey pending (observeCurrent
+ * refuses it), and an accepted rekey is exactly what sets the flag, so the
+ * second repetition of the rekey case used to throw here and mark the whole
+ * case unsupported. Leave the stored observation to govern instead: the relay
+ * either admits the next rekey on it or refuses honestly, and that outcome is
+ * the measurement.
+ */
+export async function refreshEntrypointObservation(capacity: { observeCurrent(orgId: string, communityId: string): Promise<unknown> } | undefined, policy: { rekeyPending?: boolean } | undefined, orgId: string, communityId: string): Promise<boolean> {
+  if (!capacity || policy?.rekeyPending) return false;
+  await capacity.observeCurrent(orgId, communityId);
+  return true;
+}
+
 export async function finalizeCapacityMeasurement(writeArtifacts: () => Promise<void>, cleanup: readonly (() => void | Promise<void>)[]): Promise<void> {
   const closeFrom = async (index: number): Promise<void> => {
     if (index === cleanup.length) return;
@@ -285,7 +301,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       const measuredPolicy = await store.getPolicy(f.policy.communityId);
       const measuredRekeys = await sql!`SELECT event FROM moderation.rekey_events WHERE community_id=${f.policy.communityId}`;
       const hasCapacity = await sql!`SELECT to_regclass('moderation.public_capacity_state') AS name`;
-      if (entrypointCapacity) await entrypointCapacity.observeCurrent("synthetic-capacity", f.policy.communityId);
+      if (entrypointCapacity) await refreshEntrypointObservation(entrypointCapacity, measuredPolicy, "synthetic-capacity", f.policy.communityId);
       else if (hasCapacity[0].name) await sql!`UPDATE moderation.public_capacity_state SET observed_at=clock_timestamp() WHERE org_id='synthetic-capacity' AND community_id=${f.policy.communityId}`;
       const before = await effect(event.id), messagesFrom = instance.publisher.messages.length;
       const logsBefore = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).length;

@@ -251,3 +251,16 @@ test('every required case yields a valid owned Pod name, including cases whose i
   }
   expect(capacityRelayName(label, 'cache_entries', 7)).toBe(label + '-cache-entries-7');
 });
+
+import { refreshEntrypointObservation } from './strfry-capacity';
+test('entrypoint replay does not ask the operator to observe a policy with a rekey pending', async () => {
+  const observed: string[] = [];
+  const capacity = { observeCurrent: async (org: string, community: string) => { observed.push(org + '/' + community); throw new Error('Capacity policy unavailable'); } };
+  // An accepted rekey sets rekeyPending; the next repetition must not call the refusing observer.
+  expect(await refreshEntrypointObservation(capacity, { rekeyPending: true }, 'org', 'room')).toBe(false);
+  expect(observed).toEqual([]);
+  // Without a pending rekey the observation is still taken, and its refusal still surfaces.
+  await expect(refreshEntrypointObservation(capacity, { rekeyPending: false }, 'org', 'room')).rejects.toThrow('Capacity policy unavailable');
+  expect(observed).toEqual(['org/room']);
+  expect(await refreshEntrypointObservation(undefined, { rekeyPending: false }, 'org', 'room')).toBe(false);
+});
