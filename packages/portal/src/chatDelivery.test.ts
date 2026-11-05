@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { channelsView, openChatBatch } from '@armada-bridge/concord-core';
+import { ConcordClient } from '@armada-bridge/bridge/src/concord/client';
 import { LinkDelivery } from '@armada-bridge/bridge/src/concord/linkDelivery';
 import { bootstrapFixture } from '../../../scripts/fixtures/community-bootstrap';
 import fixture from '../../../test-fixtures/concord/community-interop.json';
@@ -22,7 +23,7 @@ function harness(chats: typeof message[], failure: unknown) {
   manager.alertMissingWebhookPermission=async()=>{alerts++;};
   const rb={id:'synthetic-chat-delivery',channel,delivery,deliveryStore:store,pool:{urls:['synthetic-relay']},
     link:{communityId:community.idHex,concordChannelIdHex:channel.idHex,discordGuildId:'g',discordChannelId:'c',enabled:true},
-    client:{backfillChannel:async(_channel:unknown,since:number,_limit:number,opts:any)=>{await opts.onBatch({chats},{signal:opts.signal});await opts.onWindowComplete({since,until:300,runUntil:300},{signal:opts.signal});}},
+    client:{repairDelivery: ConcordClient.prototype.repairDelivery, syncControlComplete: async () => folded, channel: () => channel, backfillChannel:async(_channel:unknown,since:number,_limit:number,opts:any)=>{await opts.onBatch({chats},{signal:opts.signal});await opts.onWindowComplete({since,until:300,runUntil:300},{signal:opts.signal});}},
     router:{onConcordChat:async()=>{if(++delivered===1)throw failure;return ['mirror'];}},
   };
   return {manager,rb,checkpoints,alerts:()=>alerts,delivered:()=>delivered};

@@ -36,7 +36,7 @@ it('aborts catch-up before cleanup and fences a late callback', async () => {
   let effects = 0, checkpoints = 0, late: Promise<void> | undefined;
   const channel = { streams: [{ epoch: 0n, group: { pk: 'stream' } }] } as unknown as ChannelV2;
   const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, version: 0, activationFloor: 100, recoveryFloor: 100, ordinaryCoverage: {}, repairFloor: 100, coverage: {}, legacyBoundaries: {} };
-  const run = delivery.repair({ store: { deliverySnapshot: async () => snapshot, certifyDelivery: async () => { checkpoints++; return true; } }, channel: () => channel,
+  const run = delivery.repair({discover: async () => () => {},  store: { deliverySnapshot: async () => snapshot, certifyDelivery: async () => { checkpoints++; return true; } }, channel: () => channel,
     deliver: async (_chat, signal) => { entered(); await blocked; signal.throwIfAborted(); effects++; },
     replay: async (_channel, _since, opts) => {
       const chat = { rumorId: 'synthetic', streamPk: 'stream', sourceWrapCreatedAt: 100, createdAt: 100, epoch: 0n, kind: 5 } as DeliveredChat;
@@ -65,7 +65,7 @@ it('handles real SIGTERM during a blocked synthetic catch-up', async () => {
     let released=false; shutdown.register(()=>{clearInterval(keepAlive);released=true;});
     const snapshot={ownerId:'o',epoch:'e',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version:0,activationFloor:100,recoveryFloor:100,repairFloor:100,coverage:{},ordinaryCoverage:{},legacyBoundaries:{}};
     const channel={streams:[{epoch:0n,group:{pk:'s'}}]};
-    const run=lane.repair({store:{deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{checkpoints++;return true;}},channel:()=>channel,
+    const run=lane.repair({discover: async () => () => {}, store:{deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{checkpoints++;return true;}},channel:()=>channel,
       deliver:async(_chat,signal)=>{process.stdout.write('ready\\n');await blocked;signal.throwIfAborted();effects++;},
       replay:async(_c,_s,opts)=>{const pending=opts.onBatch({chats:[{rumorId:'r',streamPk:'s',sourceWrapCreatedAt:100,createdAt:100,epoch:0n,kind:5}]},{signal:opts.signal});void pending.catch(()=>{});await Promise.race([pending,new Promise((_r,reject)=>opts.signal.addEventListener('abort',()=>reject(opts.signal.reason),{once:true}))]);}});
     void run.catch(()=>{});

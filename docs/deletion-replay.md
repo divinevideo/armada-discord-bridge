@@ -97,6 +97,26 @@ unavailable or unsupported configured source is never silently dropped.
 Bootstrap discovery is separate from delivery coverage. No uncertified REQ/EOSE
 fallback currently establishes completeness.
 
+Before each runtime payload replay, the coordinator requires complete retained
+control inventory from every configured source through the same authenticated
+per-relay enumeration and exact-ID fetch primitives. Control editions determine
+which payload streams exist; a stable partial fold or successful capped control
+REQ does not prove that set complete. Control discovery has no settled-time or
+future outer-timestamp cutoff: a future-dated edition can reveal a stream with
+past payloads. Both runtime entry points use this shared discovery prerequisite. Startup also
+requires complete discovery before public/readable channel classification and
+key-intake authorization, and repeats it after learning private-channel keys.
+
+The control fold retains at most 16,384 unique wraps and 16 MiB of encoded event
+bytes per worker, including standing-subscription arrivals. Complete discovery
+has a five-minute deadline and fetch batches of at most 100. Source inventory
+limits split historical intervals oldest first. An oversized second or
+unbounded future tail fails explicitly; no source or matching time range is
+silently omitted. Failed discovery retains recovery from zero and retries.
+A newly received control wrap invalidates the captured discovery context even
+before the batched live refold runs. Certification also checks the same worker,
+relay and stream context after awaited work.
+
 A run freezes its settled upper bound at run-start seconds minus 60. It first
 requests the full remaining interval, bisecting only when inventory, sync or
 decoded resource limits require it, oldest interval first. The union is bounded

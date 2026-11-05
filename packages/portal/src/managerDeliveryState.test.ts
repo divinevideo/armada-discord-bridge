@@ -412,7 +412,7 @@ test.skipIf(!reachable)('queued pending signed payloads never bypass the armed l
   // Once the frozen replay upper reaches that second, real relay inventory and
   // window certification recover it through the active lane.
   retained=[queued,queuedDelete];Date.now=()=> (queued.created_at+120)*1000;
-  await lane.repair({store:armedStore,channel:()=>channel,
+  await lane.repair({discover: async () => () => {}, store:armedStore,channel:()=>channel,
    replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:chat=>m.deliverRoutedChat(rb,chat)});
   expect(seen[0]).toBe('active failure');expect(seen.slice(1).sort()).toEqual(['','queued before activation']);
   const completed=await armedStore.deliverySnapshot();expect(completed.repairFloor).toBeUndefined();expect(completed.certifiedUntil).toBe(queued.created_at+60);

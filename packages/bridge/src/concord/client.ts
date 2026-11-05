@@ -45,7 +45,9 @@ import {
   wrapSeal,
 } from "@armada-bridge/concord-core";
 import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from "../deletionPolicy";
-import { LinkDelivery } from "./linkDelivery";
+import { LinkDelivery, type RepairOptions } from "./linkDelivery";
+import { REPLAY_MAX_IDS } from "./reconciliation";
+import { controlInventory, CONTROL_MAX_BYTES } from "./controlInventory";
 import type {
   ChannelV2,
   CommunityListEntry,
@@ -168,7 +170,33 @@ export interface SendChatOptions {
 }
 
 export class ConcordClient {
+  /** Runtime startup must discover streams before public/readable classification,
+   * including when Direct Invite intake created a client with additional keys. */
+  static async discover(community: CommunityV2, pool: RelayLike, primary: LocalIdentity, opts?: { signal?: AbortSignal }): Promise<ConcordClient> {
+    const client = new ConcordClient(community, pool, primary);
+    await client.syncControlComplete(opts);
+    return client;
+  }
+
   folded?: FoldedControl;
+  private readonly controlWraps = new Map<string, NostrEvent>();
+  private controlBytes = 0;
+  private controlGeneration = 0;
+
+  private rememberControl(wraps: NostrEvent[]): void {
+    for (const wrap of wraps) {
+      if (this.controlWraps.has(wrap.id)) continue;
+      const bytes = Buffer.byteLength(JSON.stringify(wrap));
+      if (this.controlWraps.size >= REPLAY_MAX_IDS || this.controlBytes + bytes > CONTROL_MAX_BYTES) throw new Error('Complete control discovery exceeds resource bounds');
+      this.controlWraps.set(wrap.id, wrap); this.controlBytes += bytes; this.controlGeneration++;
+    }
+  }
+
+  private foldRememberedControl(): FoldedControl {
+    const editions = openControlWraps([...this.controlWraps.values()], controlGroups(this.community));
+    this.folded = foldControlState(editions, this.community.id, this.community.owner);
+    return this.folded;
+  }
 
   /** The bridge's own posting identity; the router skips its messages. */
   get primaryPk(): string {
@@ -196,9 +224,36 @@ export class ConcordClient {
       [{ kinds: [KIND_WRAP], authors: groups.map((g) => g.pk) }],
       opts,
     );
-    const editions = openControlWraps(wraps, groups);
-    this.folded = foldControlState(editions, this.community.id, this.community.owner);
-    return this.folded;
+    this.rememberControl(wraps);
+    return this.foldRememberedControl();
+  }
+
+  /** Runtime certification always discovers control independently of chat inventory. */
+  repairDelivery(lane: LinkDelivery, options: Omit<RepairOptions, 'replay' | 'discover'> & { refresh: () => void }): Promise<void> {
+    return lane.repair({ ...options, discover: async signal => {
+      try { await this.syncControlComplete({ signal }); }
+      catch (error) { if (!signal.aborted) lane.markGap(0); throw error; }
+      signal.throwIfAborted();
+      options.refresh();
+      const discovered = this.channel(options.channel().idHex);
+      if (!discovered) throw new Error('Discovered channel is no longer readable');
+      const expectedStreams = discovered.streams.map(stream => stream.group.pk).sort().join(',');
+      const generation = this.controlGeneration;
+      return () => {
+        if (options.channel().streams.map(stream => stream.group.pk).sort().join(',') !== expectedStreams) throw new Error('Runtime channel does not match complete discovery');
+        if (generation !== this.controlGeneration) { lane.markGap(0); throw new Error('Control inventory changed during replay'); }
+      };
+    }, replay: (channel, floor, opts) => this.backfillChannel(channel, floor, 500, opts) });
+  }
+
+  async syncControlComplete(opts?: { signal?: AbortSignal }): Promise<FoldedControl> {
+    const groups = controlGroups(this.community), authors = groups.map(g => g.pk);
+    const signal = AbortSignal.any([AbortSignal.timeout(5 * 60_000), ...(opts?.signal ? [opts.signal] : [])]);
+    const wraps = await controlInventory(this.pool, authors, signal);
+    signal.throwIfAborted();
+    if (JSON.stringify(controlGroups(this.community).map(g => g.pk)) !== JSON.stringify(authors)) throw new Error('Control discovery keys changed');
+    this.rememberControl(wraps);
+    return this.foldRememberedControl();
   }
 
   /** Channels readable with held keys, per the current fold. */
@@ -409,24 +464,25 @@ export class ConcordClient {
    * fold memo keeps one entry per community, so sibling bridges of a large
    * community kept evicting each other's.
    */
-  subscribeControl(onFold?: (folded: FoldedControl) => void): () => void {
+  subscribeControl(onFold?: (folded: FoldedControl) => void, onError?: (source: string, error: unknown) => void): () => void {
     const groups = controlGroups(this.community);
-    const wraps: NostrEvent[] = [];
-    const seen = new Set<string>();
     let pending: ReturnType<typeof setTimeout> | undefined;
     const refold = () => {
       pending = undefined;
-      const editions = openControlWraps(wraps, groups);
-      this.folded = foldControlState(editions, this.community.id, this.community.owner);
-      onFold?.(this.folded);
+      try { const folded = this.foldRememberedControl(); onFold?.(folded); }
+      catch (error) {
+        if (onError) onError('control', error);
+        else console.warn('bridge: control fold failed', error);
+      }
     };
     const unsubscribe = this.pool.subscribe(
       [{ kinds: [KIND_WRAP], authors: groups.map((g) => g.pk) }],
       {
+        onError,
         onEvent: (wrap) => {
-          if (seen.has(wrap.id)) return;
-          seen.add(wrap.id);
-          wraps.push(wrap);
+          if (this.controlWraps.has(wrap.id)) return;
+          try { this.rememberControl([wrap]); }
+          catch (error) { onError?.('control', error); return; }
           pending ??= setTimeout(refold, CONTROL_REFOLD_MS);
         },
       },

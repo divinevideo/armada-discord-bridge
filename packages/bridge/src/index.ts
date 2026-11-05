@@ -128,8 +128,8 @@ shutdownState.register(() => pool.close());
 // already carried, so it needs no private-channel key — which means the
 // roster, and therefore who is entitled to vend a channel key, is knowable
 // before we accept any. The intake below refuses bundles from anyone else.
-const preflight = new ConcordClient(community, pool, primary);
-const folded = await preflight.syncControl();
+const preflight = await ConcordClient.discover(community, pool, primary, { signal: shutdownState.signal });
+const folded = preflight.folded!;
 shutdownState.signal.throwIfAborted();
 let rawClient = preflight;
 if (config.mode !== "public") {
@@ -154,8 +154,7 @@ if (config.mode !== "public") {
 
   // Re-fold only when the intake actually changed the key set; otherwise the
   // preflight client already holds the answer.
-  rawClient = intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
-  if (intake.learned.length > 0) await rawClient.syncControl();
+  rawClient = intake.learned.length > 0 ? await ConcordClient.discover(intake.community, pool, primary, { signal: shutdownState.signal }) : preflight;
   shutdownState.signal.throwIfAborted();
 }
 const client = guardEffects(rawClient, assertMayForward, CONCORD_EFFECT_METHODS);
@@ -288,14 +287,22 @@ const onSubError = (relayUrl: string, error: unknown): void => {
   lane.subscriptionError(relayUrl);
   console.error(`bridge: chat subscription ${relayUrl}:`, error);
 };
-const retryCatchup = () => lane.repair({
+let unsubscribe = () => {};
+const refreshChannel = () => {
+  const fresh = client.channel(link.concordChannelIdHex);
+  if (!fresh) throw new Error('Concord channel is no longer readable');
+  const changed = fresh.streams.map(s => s.group.pk).join(',') !== currentChannel.streams.map(s => s.group.pk).join(',');
+  if (changed) { lane.markGap(openedDelivery.snapshot.recoveryFloor); unsubscribe(); }
+  currentChannel = fresh;
+  if (changed) unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, undefined, { lane, currentChannel: () => currentChannel });
+};
+const retryCatchup = () => client.repairDelivery(lane, {
   store: deliveryStore!, channel: () => currentChannel, relays: () => pool.urls,
-  replay: (snapshot, floor, options) => client.backfillChannel(snapshot, floor, 500, options),
+  refresh: refreshChannel,
   deliver: async (chat, signal) => { signal.throwIfAborted(); await onChat(chat); },
 }).catch(error => {
   if (!shutdownState.signal.aborted) console.warn("bridge: catch-up incomplete; retry is scheduled", error);
 });
-let unsubscribe = () => {};
 await startConcordDelivery({
   establishFloor: async () => { await deliveryStore!.assertDeliveryCurrent(); },
   installLive: () => {
@@ -305,17 +312,9 @@ await startConcordDelivery({
   installControl: () => {
     const unsubControl = client.subscribeControl(() => {
       void retryDeletes(true);
-      const fresh = client.channel(link.concordChannelIdHex);
-      if (!fresh) return;
-      const keys = (c: typeof channel) => c.streams.map(s => s.group.pk).join(",");
-      if (keys(fresh) === keys(currentChannel)) return;
-      lane.markGap(openedDelivery.snapshot.recoveryFloor);
-      unsubscribe();
-      currentChannel = fresh;
-      unsubscribe = client.subscribeChannel(fresh, onChat, onSubError, undefined, { lane, currentChannel: () => currentChannel });
+      refreshChannel();
       void retryCatchup();
-      console.log("bridge: stream keys rotated; chat subscription refreshed");
-    });
+    }, onSubError);
     shutdownState.register(() => unsubControl());
   },
   catchUp: retryCatchup,

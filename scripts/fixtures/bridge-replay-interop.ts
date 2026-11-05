@@ -3,9 +3,9 @@ import { strict as assert } from 'node:assert';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { bytesToHex, channelGroupKey, mintCommunity, voiceGroupKey, voiceMediaKey } from '@armada-bridge/concord-core';
+import { bytesToHex, channelGroupKey, mintCommunity, voiceGroupKey, voiceMediaKey, buildChannelEdition, currentControlWriteGroup, sealEdition } from '@armada-bridge/concord-core';
 import type { ChannelV2 } from '@armada-bridge/concord-core';
-import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
 import type { NostrEvent } from 'nostr-tools/pure';
 import { ConcordClient } from '../../packages/bridge/src/concord/client';
 import { RelayPool, type RelayLike } from '../../packages/bridge/src/concord/pool';
@@ -23,7 +23,8 @@ async function docker(args: string[], input?: string) {
 try {
   const pins = await docker(['run', '--rm', image, 'sh', '-c', 'git rev-parse HEAD && git -C external/negentropy rev-parse HEAD']);
   assert.equal(pins, '3fd1bc538e5e4dc2d122041064753be0177748b4\n929c591b6c7a444bd106ee884c760568936dfef8');
-  const { community } = mintCommunity('Synthetic replay fixture', getPublicKey(generateSecretKey()), ['wss://relay.example']);
+  const owner = localIdentity(generateSecretKey());
+  const { community } = mintCommunity('Synthetic replay fixture', owner.pk, ['wss://relay.example']);
   const id = new Uint8Array(32).fill(7), group = channelGroupKey(community.root, id, 0), stream = { epoch: 0n, group };
   const channel: ChannelV2 = { id, idHex: bytesToHex(id), name: 'synthetic', isPrivate: false, streams: [stream], current: stream,
     voice: { room: voiceGroupKey(community.root, id, 0), mediaKey: voiceMediaKey(community.root, id, 0) } };
@@ -35,6 +36,11 @@ try {
     await writer.sendChat(channel, { content: `synthetic replay ${i}`, author, ms: at * 1000 + i });
     events[i] = finalizeEvent({ ...events[i], created_at: at }, group.sk);
   }
+  const controlEvents: NostrEvent[] = [];
+  for (let i = 1; i <= 12; i++) {
+    const edition = await sealEdition(buildChannelEdition(new Uint8Array(32).fill(i), { name: `Synthetic channel ${i}`, private: false }, { actorPubkey: owner.pk, version: 1n }), currentControlWriteGroup(community), owner.signer);
+    controlEvents.push(finalizeEvent({ ...edition, created_at: i === 12 ? Math.floor(Date.now() / 1000) + 10 : at }, currentControlWriteGroup(community).sk));
+  }
   for (const cap of [4, 8, 300, 400, 2]) {
     const name = `bridge-replay-${process.pid}-${cap}`, path = join(directory, `${cap}.conf`);
     await writeFile(path, `db = "/tmp/replay-db/"\nrelay { nofiles = 0 bind = "0.0.0.0" port = 7777 maxFilterLimit = ${cap} negentropy { maxSyncEvents = ${cap === 2 ? 8 : 1000000} } auth { enabled = false } logging { invalidEvents = false } }\n`);
@@ -45,7 +51,7 @@ try {
       try { await fetch(`http://127.0.0.1:${port}`); break; }
       catch { if (attempt >= 100) throw new Error(`Relay did not start: ${await docker(['logs', name])}`); await Bun.sleep(100); }
     }
-    await docker(['exec', '-i', name, '/build/strfry', '--config=/tmp/replay.conf', 'import'], events.map(e => JSON.stringify(e)).join('\n') + '\n');
+    await docker(['exec', '-i', name, '/build/strfry', '--config=/tmp/replay.conf', 'import'], [...events, ...controlEvents].map(e => JSON.stringify(e)).join('\n') + '\n');
     const pool = new RelayPool([`ws://127.0.0.1:${port}`]); pools.push(pool);
     assert.equal((await pool.queryStrict([{ kinds: [1059], authors: [group.pk], since: at, until: at, limit: 500 }])).length, cap);
     const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
@@ -53,16 +59,19 @@ try {
       let certified = false;
       await assert.rejects(client.backfillChannel(channel, at, 500, { onWindowComplete: async () => { certified = true; } }), /second exceeds/);
       assert.equal(certified, false);
-      console.log('PASS pinned strfry maxSyncEvents=8: NEG-ERR splits and an oversized second remains uncertified');
+      await assert.rejects(client.syncControlComplete());
+      console.log('PASS pinned strfry maxSyncEvents=8: payload/control NEG-ERR splits and oversized seconds remain uncertified');
       await pool.close(); continue;
     }
+    await client.syncControlComplete();
+    assert.equal(client.channels().length, 12);
     const found = new Set<string>(); let certified = 0;
     const result = await client.backfillChannel(channel, at, 500, {
       onBatch: async ({ chats }) => { assert(chats.length <= 100); for (const chat of chats) { found.add(chat.content); assert.equal(chat.sourceWrapCreatedAt, at); } },
       onWindowComplete: async ({ until }) => { certified = until; assert.equal(found.size, 403); },
     });
     assert.equal(found.size, 403); assert.equal(result.certifiedUntil, certified); assert(certified >= at);
-    console.log(`PASS pinned strfry cap=${cap}: 403 same-second wraps, inventory+exact-ID fetch+decoded delivery+certified endpoint`);
+    console.log(`PASS pinned strfry cap=${cap}: 403 same-second wraps, complete control (including future wrapper), exact-ID fetch+decoded delivery+certified endpoint`);
     await pool.close();
   }
 } finally {

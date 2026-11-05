@@ -1,7 +1,7 @@
 const guards = new WeakMap<object, { port: object; before: () => Promise<void>; methods: ReadonlySet<string> }>();
 
 export const CONCORD_EFFECT_METHODS: ReadonlySet<string> = new Set([
-  "sendChat", "sendTyping", "publishJoin", "publishProfile", "publishDmRelays", "publishManifest", "backfillChannel",
+  "sendChat", "sendTyping", "publishJoin", "publishProfile", "publishDmRelays", "publishManifest", "backfillChannel", "repairDelivery",
 ]);
 
 /** Keep authorization adjacent to each external effect, including retries and media work. */

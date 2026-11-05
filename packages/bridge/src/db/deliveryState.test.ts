@@ -280,7 +280,7 @@ test.skipIf(!reachable)('an uncertain replacement recovers zero after a gap writ
   };
   const lane=new LinkDelivery({onError:()=>{},onGap:async()=>{throw new Error('storage unavailable');}});
   const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2;
-  const replay=lane.repair({store:checked,channel:()=>channel,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+  const replay=lane.repair({discover: async () => () => {}, store:checked,channel:()=>channel,deliver:async()=>{},replay:async(_channel,since,opts)=>{
    await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
   }});
   void replay.catch(()=>{});
@@ -321,7 +321,7 @@ for (const legacy of [false,true]) test.skipIf(!reachable)(`replacement recovers
   expect(replacement.snapshot.repairFloor).toBe(0);
   await replacement.store.insert({discordMessageId:`discord-message-${legacy}`,discordChannelId:scope.discordChannelId,concordRumorId:interopFixture.expected.message.id,concordChannelId:scope.concordChannelIdHex,communityId:scope.communityId,origin:'concord',authorRef:interopFixture.expected.member,partIndex:0});
   const router=make(replacement.store), lane=new LinkDelivery({onError:()=>{},onGap:floor=>replacement.store.markDeliveryGap(floor)});
-  await lane.repair({store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:(item)=>router.onConcordChat(item,scope)});
+  await lane.repair({discover: async () => () => {}, store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:(item)=>router.onConcordChat(item,scope)});
   expect(deleted).toEqual([`discord-message-${legacy}`]);
  } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
 });
@@ -348,11 +348,11 @@ test.skipIf(!reachable)('unlink does not revive old signed deletions after a new
   const webhooks={send:async()=> 'message',edit:async()=>{},react:async()=>{},unreact:async()=>{},sendTyping:async()=>{},delete:async(_l:ChannelLink,id:string,authorize?:()=>void)=>{authorize?.();deleted.push(id);}};
   const firstRouter=new BridgeRouter(client,new PuppetCache('ab'.repeat(32)),firstNew.store,webhooks,{resolve:async pk=>({name:pk})},{applicationId:'synthetic',webhookIds:new Set()},{beforeSideEffect:()=>firstNew.store.assertDeliveryCurrent()});
   const firstLane=new LinkDelivery({onError:()=>{},deletionFloor:firstNew.snapshot.deletionFloor,onGap:floor=>firstNew.store.markDeliveryGap(floor)});
-  await firstLane.repair({store:firstNew.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:item=>firstRouter.onConcordChat(item,scope)});expect(deleted).toEqual([]);
+  await firstLane.repair({discover: async () => () => {}, store:firstNew.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:item=>firstRouter.onConcordChat(item,scope)});expect(deleted).toEqual([]);
   const replacement=await store.openDelivery(scope,'new-owner',lease,[],3000,crypto.randomUUID(),relays);expect(replacement.snapshot.repairFloor).toBe(0);
   const router=new BridgeRouter(client,new PuppetCache('ab'.repeat(32)),replacement.store,webhooks,{resolve:async pk=>({name:pk})},{applicationId:'synthetic',webhookIds:new Set()},{beforeSideEffect:()=>replacement.store.assertDeliveryCurrent()});
   const lane=new LinkDelivery({onError:()=>{},deletionFloor:replacement.snapshot.deletionFloor,onGap:floor=>replacement.store.markDeliveryGap(floor)});
-  const repair=()=>lane.repair({store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:item=>router.onConcordChat(item,scope)});
+  const repair=()=>lane.repair({discover: async () => () => {}, store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:item=>router.onConcordChat(item,scope)});
   await repair();expect(deleted).toEqual([]);
   events=[current];await replacement.store.markDeliveryGap(0);await repair();expect(deleted).toEqual(['old-copy']);
  } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}

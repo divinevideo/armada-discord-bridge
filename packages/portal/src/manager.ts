@@ -697,8 +697,8 @@ export class BridgeManager {
       // Fold the Control Plane first: it reads from the community root the
       // invite carried, so the roster — and with it, who may vend a channel key
       // — is knowable before we accept any. The intake refuses anyone else.
-      const preflight = new ConcordClient(community, pool, primary);
-      const folded = await preflight.syncControl();
+      const preflight = await ConcordClient.discover(community, pool, primary);
+      const folded = preflight.folded!;
       if (this.shuttingDown) throw new Error("Portal is shutting down");
       let rawClient = preflight;
       if (this.env.mode !== "public") {
@@ -716,8 +716,7 @@ export class BridgeManager {
         if (this.shuttingDown) throw new Error("Portal is shutting down");
 
         rawClient =
-          intake.learned.length > 0 ? new ConcordClient(intake.community, pool, primary) : preflight;
-        if (intake.learned.length > 0) await rawClient.syncControl();
+          intake.learned.length > 0 ? await ConcordClient.discover(intake.community, pool, primary) : preflight;
       }
       let runningRef: Running | undefined;
       const assertMayForward = async () => {
@@ -851,7 +850,7 @@ export class BridgeManager {
         if (rb.router && rb.delivery) void this.retryDeletes(rb,true);
         this.refreshChatSubscription(rb, row.confirm_code ?? "");
         checkSeverance(folded);
-      });
+      }, (source, error) => { rb.delivery?.subscriptionError(source); console.warn(`bridge ${rb.id}: control subscription failed`, error); });
       // Severance cases 2-3 arrive on their own planes: the dissolved tombstone
       // and the base-rekey window (see severanceStreamKeys). Wraps accumulate
       // because a Refounding publishes as several chunks and only a COMPLETE
@@ -931,8 +930,8 @@ export class BridgeManager {
    */
   private backfillMissed(rb: Running): Promise<void> {
     if(!rb.delivery || !rb.deliveryStore || !rb.router || rb.stopped) return Promise.resolve();
-    return rb.delivery.repair({store:rb.deliveryStore,channel:()=>rb.channel,relays:()=>rb.pool.urls,
-      replay:(channel,floor,opts)=>rb.client.backfillChannel(channel,floor,500,opts),
+    return rb.client.repairDelivery(rb.delivery,{store:rb.deliveryStore,channel:()=>rb.channel,relays:()=>rb.pool.urls,
+      refresh:()=>{ this.refreshChatSubscription(rb, ""); },
       deliver:async(chat,signal)=>{signal.throwIfAborted();await this.deliverRoutedChat(rb,chat);},
     });
   }

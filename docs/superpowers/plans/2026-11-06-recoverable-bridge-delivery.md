@@ -62,4 +62,3 @@ Files: docs/deletion-replay.md, scripts/probe-backlog.ts/tests, task ledger.
 - [ ] Document finite unresolved guarantee, durable actionable retries, mapping lifetime, configured-relay availability and60sec lateness/backdating assumptions. No infinite storage/loss guarantee claim.
 - [ ] Full actual-PG test gate, all required types/build, isolated wire test where runtime available; fresh independent whole-branch review plus focused re-review of fixes.
 - [ ] Commit, push owned PR7, verify current checks, announce fixes and request existing change reviewers only. Merge only actual approved exact head, no bypass.
-

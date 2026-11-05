@@ -125,7 +125,7 @@ it('commits completed replay windows and clears only the frozen final window', a
   };
   const channel = { streams: [{ group: { pk: 'stream' } }] } as unknown as ChannelV2;
   const delivery = new LinkDelivery({ onError: () => {} });
-  await delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, _since, opts) => {
+  await delivery.repair({discover: async () => () => {},  store, channel: () => channel, deliver: async () => {}, replay: async (_channel, _since, opts) => {
     await opts.onWindowComplete!({ since: 40, until: 299, runUntil: 500 }, { signal: new AbortController().signal });
     await opts.onWindowComplete!({ since: 300, until: 500, runUntil: 500 }, { signal: new AbortController().signal });
   } });
@@ -147,7 +147,7 @@ it('resumes a certified prefix after an interrupted replay', async () => {
   delivery.markGap(100);
   await delivery.flushGaps();
   const floors: number[] = [];
-  const options = { store, channel: () => channel, deliver: async () => {}, replay: async (_channel: ChannelV2, since: number, opts: ReplayOptions) => {
+  const options = { discover: async () => () => {}, store, channel: () => channel, deliver: async () => {}, replay: async (_channel: ChannelV2, since: number, opts: ReplayOptions) => {
     floors.push(since);
     if (floors.length === 1) {
       await opts.onWindowComplete!({ since, until: 339, runUntil: 800 }, { signal: new AbortController().signal });
@@ -178,7 +178,7 @@ it('replays only deletions below each legacy carrier boundary', async () => {
     { rumorId: 'activation second', kind: 9, streamPk: 'future', sourceWrapCreatedAt: 1000, createdAt: 1000, epoch: 3n },
   ] as DeliveredChat[];
   const delivery = new LinkDelivery({ onError: () => {} });
-  await delivery.repair({ store, channel: () => channel, deliver: async chat => { delivered.push(chat.rumorId); }, replay: async (_channel, _since, opts) => {
+  await delivery.repair({discover: async () => () => {},  store, channel: () => channel, deliver: async chat => { delivered.push(chat.rumorId); }, replay: async (_channel, _since, opts) => {
     await opts.onBatch!({ chats }, { signal: new AbortController().signal });
   } });
   expect(delivered).toEqual(['old deletion', 'second message', 'pre-link deletion', 'unknown downtime', 'new boundary', 'activation second']);
@@ -199,7 +199,7 @@ it('keeps a newer persisted gap when the final replay checkpoint is blocked', as
   };
   const delivery = new LinkDelivery({ onError: () => {}, onGap: async floor => { version++; repairFloor = Math.min(repairFloor ?? floor, floor); } });
   const channel = { streams: [{ group: { pk: 'stream' } }] } as unknown as ChannelV2;
-  const running = delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since, opts) => {
+  const running = delivery.repair({discover: async () => () => {},  store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since, opts) => {
     await opts.onWindowComplete!({ since, until: 500, runUntil: 500 }, { signal: opts.signal! });
   } });
   await started;
@@ -216,7 +216,7 @@ it('starts a newly discovered stream at the preserved upgrade floor', async () =
   const channel = { streams: [{ group: { pk: 'known' } }, { group: { pk: 'new' } }] } as unknown as ChannelV2;
   let floor = -1;
   const delivery = new LinkDelivery({ onError: () => {} });
-  await delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since) => { floor = since; } });
+  await delivery.repair({discover: async () => () => {},  store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since) => { floor = since; } });
   expect(floor).toBe(0);
 });
 
@@ -278,7 +278,7 @@ it('suppresses ordinary historical carriers below previously completed stream co
     {rumorId:'new ordinary',kind:9,streamPk:'stream',sourceWrapCreatedAt:501,createdAt:501,epoch:0n},
   ] as DeliveredChat[];
   const delivered:string[]=[]; const delivery=new LinkDelivery({onError:()=>{}});
-  await delivery.repair({store,channel:()=>channel,deliver:async chat=>{delivered.push(chat.rumorId);},replay:async(_channel,_since,opts)=>{
+  await delivery.repair({discover: async () => () => {}, store,channel:()=>channel,deliver:async chat=>{delivered.push(chat.rumorId);},replay:async(_channel,_since,opts)=>{
     await opts.onBatch!({chats},{signal:new AbortController().signal});
   }});
   expect(delivered).toEqual(['old deletion','new ordinary']);
@@ -290,7 +290,7 @@ it('advances a dense one-second historical prefix across repeated short attempts
     certifyDelivery:async(expected:number,until:number,next:Record<string,number>)=>{if(expected!==version)return false;version++;coverage=next;repairFloor=until+1;return true;}};
   const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2, floors:number[]=[];
   const delivery=new LinkDelivery({onError:()=>{}});
-  const options={store,channel:()=>channel,deliver:async()=>{},replay:async(_channel:ChannelV2,since:number,opts:ReplayOptions)=>{
+  const options={discover: async () => () => {}, store,channel:()=>channel,deliver:async()=>{},replay:async(_channel:ChannelV2,since:number,opts:ReplayOptions)=>{
     floors.push(since); await opts.onWindowComplete!({since,until:since,runUntil:1000},{signal:new AbortController().signal}); throw new Error('budget');
   }};
   for(let i=0;i<3;i++) await expect(delivery.repair(options)).rejects.toThrow('budget');
@@ -303,7 +303,7 @@ it('invalidates a replay whose configured relay set changes during the run', asy
   const store={deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{writes++;return true;},setDeliveryRelays:async()=>snapshot};
   const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2;
   const lane=new LinkDelivery({onError:()=>{},onGap:async floor=>{floors.push(floor);}});
-  await expect(lane.repair({store,channel:()=>channel,relays:()=>relays,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+  await expect(lane.repair({discover: async () => () => {}, store,channel:()=>channel,relays:()=>relays,deliver:async()=>{},replay:async(_channel,since,opts)=>{
     relays=['wss://a.example','wss://b.example'];
     await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
   }})).rejects.toThrow('relay');
@@ -318,7 +318,7 @@ it('rechecks the relay set after an awaited checkpoint', async () => {
   const store={deliverySnapshot:async()=>snapshot,setDeliveryRelays:async()=>snapshot,certifyDelivery:async()=>{entered();await blocked;return true;}};
   const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2, floors:number[]=[];
   const lane=new LinkDelivery({onError:()=>{},onGap:async floor=>{floors.push(floor);}});
-  const repair=lane.repair({store,channel:()=>channel,relays:()=>relays,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+  const repair=lane.repair({discover: async () => () => {}, store,channel:()=>channel,relays:()=>relays,deliver:async()=>{},replay:async(_channel,since,opts)=>{
     await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
   }});
   await started;relays=['wss://b.example'];release();
@@ -332,7 +332,7 @@ it('rechecks the stream inventory after an awaited checkpoint', async () => {
   const store={deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>{entered();await blocked;return true;}};
   let channel={streams:[{group:{pk:'first'}}]} as unknown as ChannelV2; const floors:number[]=[];
   const lane=new LinkDelivery({onError:()=>{},onGap:async floor=>{floors.push(floor);}});
-  const repair=lane.repair({store,channel:()=>channel,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+  const repair=lane.repair({discover: async () => () => {}, store,channel:()=>channel,deliver:async()=>{},replay:async(_channel,since,opts)=>{
     await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
   }});
   await started;channel={streams:[{group:{pk:'first'}},{group:{pk:'second'}}]} as unknown as ChannelV2;release();
@@ -344,7 +344,7 @@ it('replays zero inventory but only applies deletions from the current lifecycle
   const channel={streams:[{epoch:0n,group:{pk:'stream'}}]} as unknown as ChannelV2;
   const seen:string[]=[];let from=-1;
   const lane=new LinkDelivery({onError:()=>{},deletionFloor:2000} as any);
-  await lane.repair({store:{deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>true},channel:()=>channel,deliver:async chat=>{seen.push(chat.rumorId);},replay:async(_c,since,opts)=>{
+  await lane.repair({discover: async () => () => {}, store:{deliverySnapshot:async()=>snapshot,certifyDelivery:async()=>true},channel:()=>channel,deliver:async chat=>{seen.push(chat.rumorId);},replay:async(_c,since,opts)=>{
     from=since;await opts.onBatch!({chats:[{rumorId:'old',kind:5,streamPk:'stream',sourceWrapCreatedAt:80,createdAt:80,epoch:0n},{rumorId:'current',kind:5,streamPk:'stream',sourceWrapCreatedAt:2000,createdAt:80,epoch:0n}] as DeliveredChat[]},{signal:opts.signal!});
   }});
   expect(from).toBe(0);expect(seen).toEqual(['current']);

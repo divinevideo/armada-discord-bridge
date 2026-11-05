@@ -9,7 +9,8 @@ type RepairStore = {
   certifyDelivery(version: number, until: number, coverage: Record<string, number>, complete: boolean): Promise<boolean>;
   setDeliveryRelays?(relays: string[]): Promise<DeliverySnapshot>;
 };
-type RepairOptions = {
+export type RepairOptions = {
+  discover: (signal: AbortSignal) => Promise<() => void>;
   store: RepairStore;
   channel: () => ChannelV2;
   relays?: () => readonly string[];
@@ -119,12 +120,14 @@ export class LinkDelivery {
     if (this.gapFloor !== undefined && !this.gapWriter) this.markGap(this.gapFloor);
     await this.flushGaps();
     this.controller.signal.throwIfAborted();
-    const generation = this.generation;
     const capturedRelays = options.relays ? [...new Set(options.relays())].sort() : undefined;
     if (capturedRelays) {
       if (!options.store.setDeliveryRelays) throw new Error('Delivery store cannot fence relay context');
       await options.store.setDeliveryRelays(capturedRelays);
     }
+    const assertDiscovery = await options.discover(this.controller.signal);
+    await this.flushGaps();
+    const generation = this.generation;
     let snapshot = await options.store.deliverySnapshot();
     this.controller.signal.throwIfAborted();
     if (generation !== this.generation) throw new Error('Delivery gap changed during replay startup');
@@ -139,6 +142,7 @@ export class LinkDelivery {
     const streams = channel.streams.map(stream => stream.group.pk);
     const capturedStreams = [...new Set(streams)].sort();
     const assertContext = () => {
+      assertDiscovery();
       assertRelays();
       const current = options.channel();
       if (!current || JSON.stringify([...new Set(current.streams.map(stream => stream.group.pk))].sort()) !== JSON.stringify(capturedStreams)) {
