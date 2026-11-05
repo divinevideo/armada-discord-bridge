@@ -1276,7 +1276,11 @@ export class BridgeManager {
     const [row] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
     if (!row) throw new Error("no such bridge");
     await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
-    const next = row.status === "paused" ? "active" : row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
+    const priorLink = row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id
+      ? {communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true} : undefined;
+    const priorState = priorLink && row.status === 'severed' ? await this.store.inspectDelivery(priorLink) : undefined;
+    const resumeExisting = row.status === 'paused' || (row.status === 'severed' && priorState?.ownerId === bridgeId && priorState.active && priorState.suspended);
+    const next = resumeExisting ? "active" : row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
     await this.sql.begin(async tx => {
       await tx`SET LOCAL statement_timeout = '15s'`; await tx`SET LOCAL lock_timeout = '5s'`;
       if (next === 'active' && row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
@@ -1453,7 +1457,7 @@ export class BridgeManager {
           discordGuildId:expected.discord_guild_id,discordChannelId:expected.discord_channel_id,enabled:true};
         const state=await this.store.inspectDelivery(link,tx);
         if((state?.epoch ?? null)!==expectedEpoch || (state && state.ownerId!==bridgeId))return false;
-        await this.store.terminateDelivery(link,bridgeId,expectedEpoch ?? undefined,tx);
+        if(state?.active) await this.store.suspendDelivery(link,bridgeId,state.epoch,tx);
       }
       const rows=await tx`UPDATE bridges SET status='severed',status_detail=${detail},options=options-'startFailedAt',updated_at=now()
         WHERE bridge_id=${bridgeId} AND status=${expected.status} AND community_id IS NOT DISTINCT FROM ${expected.community_id}
@@ -1493,15 +1497,17 @@ export class BridgeManager {
       if(expectedRow && (row.status!==expectedRow.status || row.community_id!==expectedRow.community_id ||
         row.concord_channel_id!==expectedRow.concord_channel_id || row.discord_guild_id!==expectedRow.discord_guild_id ||
         row.discord_channel_id!==expectedRow.discord_channel_id)) return false;
-      if(expected && this.running.get(bridgeId)!==expected)return false;
+      if(expected && (this.running.get(bridgeId)!==expected || row.status!==expected.status))return false;
       if(row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
         const link:ChannelLink={communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,
           discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true};
         const state=await this.store.inspectDelivery(link,tx);
         if(expectedEpoch !== undefined && (state?.epoch ?? null) !== expectedEpoch) return false;
-        if(expected?.status === 'active' && (!state || state.ownerId!==bridgeId || !expected.deliveryEpoch)) return false;
-        const terminated=await this.store.terminateDelivery(link,bridgeId,expected?.deliveryEpoch ?? state?.epoch,tx);
-        if(expected?.status === 'active' && !terminated)return false;
+        if(expected?.status === 'active' && (!state || state.suspended || state.ownerId!==bridgeId || !expected.deliveryEpoch)) return false;
+        if (state?.ownerId === bridgeId && state.active) {
+          const suspended=await this.store.suspendDelivery(link,bridgeId,expected?.deliveryEpoch ?? state.epoch,tx);
+          if(expected?.status === 'active' && !suspended)return false;
+        }
       }
       const updated=await tx`UPDATE bridges SET status='severed',status_detail=${severanceDetail(verdict)},
         options=options-'startFailedAt',updated_at=now() WHERE bridge_id=${bridgeId} AND status=${row.status}

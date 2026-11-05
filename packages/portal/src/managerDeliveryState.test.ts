@@ -179,3 +179,56 @@ test.skipIf(!reachable)('confirmation with gateway down stays active but starts 
   expect(rb.delivery).toBeUndefined();expect(subscriptions).toBe(0);expect(effects).toBe(0);expect(retries).toBe(1);expect(m.running.has(owner)).toBe(false);
  } finally {await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
 });
+
+test.skipIf(!reachable)('seven-day start failure suspends accepted deletions until resume or unlink',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,discordChannelId:`failure-retain-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id,confirm_code)
+    VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId},'deadbeef')`;
+  const [row]=await sql`SELECT * FROM bridges WHERE bridge_id=${owner}`;
+  const state=await store.activateDelivery(scope,owner,[],1000),opened=await store.openDelivery(scope,owner,lease);
+  await opened.store.saveDeletes(scope,[{deleteRumorId:'d',targetRumorId:'t',author:'a',createdAtMs:Date.now(),sourceWrapCreatedAt:1,actionClass:'actionable'}]);
+  await m.markSevered(owner,'synthetic seven-day outage',row,state.epoch);
+  expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('severed');
+  expect((await store.inspectDelivery(scope))?.suspended).toBe(true);expect(await store.pendingDeletes(scope)).toHaveLength(1);
+  await expect(opened.store.assertDeliveryCurrent()).rejects.toThrow();
+  m.startTracked=async()=>{};await m.resume(owner);
+  expect((await store.inspectDelivery(scope))?.epoch).toBe(state.epoch);expect(await store.pendingDeletes(scope)).toHaveLength(1);
+  const resumed=await store.openDelivery(scope,owner,lease);expect(resumed.snapshot.repairFloor).toBe(0);
+  await m.stop(owner,'unlinked');expect(await store.pendingDeletes(scope)).toHaveLength(0);
+ } finally {await lease.release();await sql`DELETE FROM pending_concord_deletes WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
+
+test.skipIf(!reachable)('a bridge ban suspends accepted deletions and authorized resume preserves them',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,discordChannelId:`ban-retain-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ const lease=(await new BridgeLeases(sql).acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id,confirm_code)
+    VALUES (${owner},'synthetic','active',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId},'deadbeef')`;
+  const state=await store.activateDelivery(scope,owner,[],1000),opened=await store.openDelivery(scope,owner,lease);
+  await opened.store.saveDeletes(scope,[{deleteRumorId:'d',targetRumorId:'t',author:'a',createdAtMs:Date.now(),sourceWrapCreatedAt:1,actionClass:'actionable'}]);
+  const rb:any={id:owner,status:'active',link:scope,deliveryEpoch:state.epoch,lease:{release:async()=>{}},pool:{close:async()=>{}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};m.running.set(owner,rb);
+  await m.applySeverance(owner,{reason:'banned',pubkey:'c'.repeat(64),bannedAtMs:1000},{idHex:scope.communityId},rb);
+  expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('severed');
+  expect((await store.inspectDelivery(scope))?.suspended).toBe(true);expect(await store.pendingDeletes(scope)).toHaveLength(1);
+  await expect(opened.store.assertDeliveryCurrent()).rejects.toThrow();
+  m.startTracked=async()=>{};await m.resume(owner);
+  expect((await store.inspectDelivery(scope))?.epoch).toBe(state.epoch);expect(await store.pendingDeletes(scope)).toHaveLength(1);
+  expect((await store.openDelivery(scope,owner,lease)).snapshot.repairFloor).toBe(0);
+  await m.stop(owner,'unlinked');expect(await store.pendingDeletes(scope)).toHaveLength(0);
+ } finally {await lease.release();await sql`DELETE FROM pending_concord_deletes WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
+
+test.skipIf(!reachable)('a delayed severance cannot overwrite an operator pause',async()=>{
+ const owner=crypto.randomUUID(),scope={...link,discordChannelId:`paused-verdict-${suffix}`},m=new BridgeManager(sql,{mode:'legacy'} as PortalEnv) as any;
+ try {
+  await sql`INSERT INTO bridges(bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+    VALUES (${owner},'synthetic','paused',${scope.communityId},${scope.concordChannelIdHex},${scope.discordGuildId},${scope.discordChannelId})`;
+  const state=await store.activateDelivery(scope,owner,[],1000);await store.suspendDelivery(scope,owner,state.epoch);
+  const rb:any={id:owner,status:'active',link:scope,deliveryEpoch:state.epoch,lease:{release:async()=>{}},pool:{close:async()=>{}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};m.running.set(owner,rb);
+  await m.applySeverance(owner,{reason:'banned',pubkey:'c'.repeat(64),bannedAtMs:1000},{idHex:scope.communityId},rb);
+  expect((await sql`SELECT status FROM bridges WHERE bridge_id=${owner}`)[0].status).toBe('paused');
+  expect((await store.inspectDelivery(scope))?.suspended).toBe(true);
+ } finally {await sql`DELETE FROM channel_delivery_lifecycles WHERE discord_channel_id=${scope.discordChannelId}`;await sql`DELETE FROM bridges WHERE bridge_id=${owner}`;}
+});
