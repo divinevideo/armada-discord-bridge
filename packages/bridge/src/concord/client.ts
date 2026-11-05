@@ -342,6 +342,7 @@ export class ConcordClient {
   ): () => void {
     const seenRumors = new Set<string>();
     let deliveries: Promise<void> = Promise.resolve();
+    let queuedDeliveries = 0;
     let cursorHealthy = true;
     // Live tail only: without a floor, relays replay stored history into the
     // router on every (re)subscribe. Catch-up after downtime is cursor work,
@@ -359,6 +360,16 @@ export class ConcordClient {
       {
         onError,
         onEvent: (wrap) => {
+          // Bound admission before the promise chain: a blocked Discord send
+          // otherwise hides arbitrarily many wraps from the router's own cap.
+          // Overflow may contain a deletion, so never acknowledge later wraps
+          // past this gap; restart/catch-up must replay the relay copy.
+          if (queuedDeliveries >= 200) {
+            cursorHealthy = false;
+            onError?.("dispatch", new Error("Concord delivery queue full; cursor remains pinned until resubscription"));
+            return;
+          }
+          queuedDeliveries++;
           deliveries = deliveries.then(async () => {
             const opened = await openChatBatch([wrap], channel);
             for (const chat of opened) {
@@ -375,7 +386,7 @@ export class ConcordClient {
             // failed before durable storage. A fresh catch-up can retry it.
             cursorHealthy = false;
             onError?.("dispatch", error);
-          });
+          }).finally(() => { queuedDeliveries--; });
         },
       },
     );

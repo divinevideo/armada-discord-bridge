@@ -375,6 +375,39 @@ describe('durable delivery cursor', () => {
     expect(cursors).toEqual([wrap.created_at]);
   });
 
+  it('bounds signed burst admission while a handler is blocked and pins overflow cursors', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey());
+    const wraps: NostrEvent[] = [];
+    for (let i = 0; i < 206; i++) wraps.push((await client.sendChat(channel, { content: `burst ${i}`, author })).wrap);
+    let enter!: () => void, release!: () => void, drain!: () => void;
+    const started = new Promise<void>(resolve => { enter = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const drained = new Promise<void>(resolve => { drain = resolve; });
+    const contents: string[] = []; const errors: unknown[] = []; const cursors: number[] = [];
+    client.subscribeChannel(channel, async chat => {
+      contents.push(chat.content);
+      if (contents.length === 1) { enter(); await blocked; }
+      if (contents.length === 200) drain();
+    }, (_url, error) => errors.push(error), (_pk, at) => cursors.push(at));
+    pool.emit(wraps[0]); await started;
+    for (const wrap of wraps.slice(1, 205)) pool.emit(wrap);
+    expect(contents).toHaveLength(1);
+    expect(errors).toHaveLength(5);
+    expect(cursors).toEqual([]);
+    release(); await drained;
+    // Once the admitted batch drains, new work is accepted without forgetting
+    // that five durable wraps still require catch-up after this subscription.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    pool.emit(wraps[205]);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(contents).toHaveLength(201);
+    expect(contents.at(-1)).toBe('burst 205');
+    expect(contents).not.toContain('burst 200');
+    expect(cursors).toEqual([]);
+  });
+
   it('pins the cursor after a storage failure rather than advancing on a later success', async () => {
     const { community } = makeCommunity(); const channel = makeChannel(community);
     const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));

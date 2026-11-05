@@ -23,7 +23,10 @@ Workers retry at startup, on control folds, when target mappings appear, and
 every ten seconds. Periodic/fold retries share the normal channel effect lane,
 coalesce overlapping notifications, and rotate through at most 128 records per
 batch so a denied prefix cannot starve a later satisfied citation. Both dispatch
-entry points await durable handling before acknowledging stream cursors.
+entry points await durable handling before acknowledging stream cursors. Live
+subscriptions admit at most 200 wraps, including the in-flight delivery, before
+constructing their promise chain. Overflow is refused synchronously and pins
+that subscription’s cursor so later successes cannot hide the replay gap.
 
 Lease/visibility checks and the synchronous current-fold check run again at the
 Discord adapter's final dispatch boundary. Reactions retain their mapping until
