@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, realpath } from "node:f
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import postgres from "postgres";
-import { KubernetesCapacity, capacityRelayName, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
+import { KubernetesCapacity, SafeDiagnostic, capacityRelayName, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { encrypt } from "nostr-tools/nip44";
 import { getEventHash, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -96,14 +96,14 @@ async function until<T>(check: () => T | undefined, timeout: number): Promise<T>
   const started = performance.now();
   while (true) {
     const result = check(); if (result !== undefined) return result;
-    if (performance.now() - started >= timeout) throw new Error("Capacity observer deadline exceeded");
+    if (performance.now() - started >= timeout) throw new SafeDiagnostic("Capacity observer deadline exceeded");
     await Bun.sleep(5);
   }
 }
 async function socket(url: string) {
   const ws = new WebSocket(url), messages: any[][] = [];
   ws.addEventListener("message", (event) => messages.push(JSON.parse(String(event.data))));
-  await new Promise<void>((resolve, reject) => { ws.addEventListener("open", () => resolve()); ws.addEventListener("error", () => reject(new Error("Capacity relay socket failed"))); });
+  await new Promise<void>((resolve, reject) => { ws.addEventListener("open", () => resolve()); ws.addEventListener("error", () => reject(new SafeDiagnostic("Capacity relay socket failed"))); });
   return { ws, messages, query: async (id: string) => {
     const sub = crypto.randomUUID(), from = messages.length;
     ws.send(JSON.stringify(["REQ", sub, { ids: [id] }]));
@@ -169,6 +169,13 @@ export async function refreshEntrypointObservation(capacity: { observeCurrent(or
   return true;
 }
 
+/** The reason recorded against a case whose measurement threw. */
+export function caseFailureReason(error: unknown, withheld: boolean): string {
+  if (error instanceof SafeDiagnostic) return error.message;
+  if (withheld) return "Destination sample failed (diagnostics withheld)";
+  return error instanceof Error ? error.message : "measurement failed";
+}
+
 export async function finalizeCapacityMeasurement(writeArtifacts: () => Promise<void>, cleanup: readonly (() => void | Promise<void>)[]): Promise<void> {
   const closeFrom = async (index: number): Promise<void> => {
     if (index === cleanup.length) return;
@@ -220,7 +227,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     if (kube && destination) {
       report.resourceEnvelope.database = await kube.prepare();
       const credentials = process.env.CAPACITY_DATABASE_URL;
-      if (!credentials) throw new Error("Dedicated private CAPACITY_DATABASE_URL required");
+      if (!credentials) throw new SafeDiagnostic("Dedicated private CAPACITY_DATABASE_URL required");
       const url = await kube.controllerDatabaseURL(credentials);
       await destinationDatabaseSetup(async () => {
         benchmarkURLGuard(destination, url);
@@ -229,7 +236,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
         const tables = await sql`SELECT n.nspname AS schema,c.relname AS name,pg_catalog.pg_get_userbyid(c.relowner)=current_user AS owned FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','m','f') ORDER BY n.nspname,c.relname`;
         let populatedTables = 0;
         for (const table of tables) {
-          if (!table.owned || !['public', 'moderation'].includes(table.schema)) throw new Error("Unexpected benchmark table ownership/schema");
+          if (!table.owned || !['public', 'moderation'].includes(table.schema)) throw new SafeDiagnostic("Unexpected benchmark table ownership/schema");
           if ((await sql`SELECT EXISTS(SELECT 1 FROM ${sql(table.schema + '.' + table.name)} LIMIT 1) AS present`)[0].present) populatedTables++;
         }
         const schemaPresent = ['community_policy','streams','public_capacity_state','publication_recoveries'].every(name => tables.some(table => table.schema === 'moderation' && table.name === name));
@@ -248,22 +255,22 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     const pgId = await docker("inspect", dbName, "--format", "{{.Image}}");
     const pgPlatform = await docker("image", "inspect", pgId, "--format", "{{.Os}}/{{.Architecture}}");
     report.resourceEnvelope.database += `;localImageId=${pgId};platform=${pgPlatform}`;
-    if (pgLimits.Memory !== matrix.databaseMemoryBytes || pgLimits.NanoCpus !== matrix.databaseCpu * 1e9) throw new Error("PostgreSQL resource limits differ from matrix");
+    if (pgLimits.Memory !== matrix.databaseMemoryBytes || pgLimits.NanoCpus !== matrix.databaseCpu * 1e9) throw new SafeDiagnostic("PostgreSQL resource limits differ from matrix");
     for (let attempt = 0; ; attempt++) {
       try { await docker("exec", dbName, "pg_isready", "-h", "127.0.0.1", "-U", "bridge"); break; }
-      catch { if (attempt > 200) throw new Error("Capacity PostgreSQL unavailable"); await Bun.sleep(100); }
+      catch { if (attempt > 200) throw new SafeDiagnostic("Capacity PostgreSQL unavailable"); await Bun.sleep(100); }
     }
     const pgPort = (await docker("port", dbName, "5432/tcp")).split(":").at(-1), url = `postgres://bridge@127.0.0.1:${pgPort}/bridge`;
     sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, onnotice: () => {} });
     }
-    if (!sql || !locker) throw new Error("Capacity database connection was not initialized");
+    if (!sql || !locker) throw new SafeDiagnostic("Capacity database connection was not initialized");
     // Shared-cluster role creation/membership is not benchmark authority. The
     // isolated destination DB must be pre-migrated by the approved operator.
     if (!kube) await migrateModeration(sql!);
     const store = new PolicyStore(sql!);
     const entrypointCapacity = entrypointContract ? new PublicCapacityStore(sql!, entrypointContract) : undefined;
     async function ready(port: string | undefined) {
-      for (let attempt = 0; ; attempt++) { try { await fetch(`http://127.0.0.1:${port}`); return; } catch { if (attempt > 200) throw new Error("Capacity relay unavailable"); await Bun.sleep(50); } }
+      for (let attempt = 0; ; attempt++) { try { await fetch(`http://127.0.0.1:${port}`); return; } catch { if (attempt > 200) throw new SafeDiagnostic("Capacity relay unavailable"); await Bun.sleep(50); } }
     }
     let relaySequence = 0;
     async function start(mode: string) {
@@ -278,12 +285,12 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       } else {
       const args = ["run", "-d", "--name", name, "--network", label, "--cpus", String(matrix.cpu), "--memory", String(matrix.memoryBytes), "--ulimit", "nofile=65536:65536", "-p", "127.0.0.1::7777", "-v", `${config}:/data/strfry.conf:ro`, "-v", `${directory}:/capacity:ro`, "-e", "MODERATION_DATABASE_URL=postgres://bridge@pg/bridge", "-e", "MODERATION_CAPACITY_TIMING=1", "-e", `MODERATION_SOURCE_SHA=${sourceSha}`, "-e", `MODERATION_CAPACITY_PLATFORM=${platform}`, "-e", `MODERATION_COMMUNITY_ORGS=${JSON.stringify(Object.fromEntries(communities))}`];
       if (!calibration) {
-        if (!process.env.CAPACITY_CONTRACT_FILE) throw new Error("Entrypoint measurement requires an explicitly reviewed external contract");
+        if (!process.env.CAPACITY_CONTRACT_FILE) throw new SafeDiagnostic("Entrypoint measurement requires an explicitly reviewed external contract");
         args.push("-v", `${resolve(process.env.CAPACITY_CONTRACT_FILE)}:/capacity-contract.json:ro`, "-e", "MODERATION_CAPACITY_CONTRACT_FILE=/capacity-contract.json");
       }
       args.push(imageInfo.Id); containers.push(name); await docker(...args);
       const limits = JSON.parse(await docker("inspect", name, "--format", "{{json .HostConfig}}"));
-      if (limits.Memory !== matrix.memoryBytes || limits.NanoCpus !== matrix.cpu * 1e9) throw new Error("Relay resource limits differ from matrix");
+      if (limits.Memory !== matrix.memoryBytes || limits.NanoCpus !== matrix.cpu * 1e9) throw new SafeDiagnostic("Relay resource limits differ from matrix");
       const port = (await docker("port", name, "7777/tcp")).split(":").at(-1);
       relayUrl = `ws://127.0.0.1:${port}`;
       }
@@ -348,7 +355,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           }
           let beforeRestart: NostrEvent | undefined;
           if (entry.id === "warm" || entry.id === "restart") { beforeRestart = f.message(sequence++); const warm = await sample(instance, f, entry.id, count > 0, beforeRestart); entry.samples.push(warm); }
-          if (entry.id === "restart") { instance.publisher.ws.close(); instance.subscriber.ws.close(); const restartedUrl = kube ? await kube.restart(instance.name) : (await docker("restart", instance.name), `ws://127.0.0.1:${(await docker("port", instance.name, "7777/tcp")).split(":").at(-1)}`); const port = new URL(restartedUrl).port; await ready(port); const publisher = await socket(`ws://127.0.0.1:${port}`), subscriber = await socket(`ws://127.0.0.1:${port}`); sockets.push(publisher.ws, subscriber.ws); subscriber.ws.send(JSON.stringify(["REQ", "after-restart", { kinds: [1059] }])); await until(() => subscriber.messages.some((m) => m[0] === "EOSE") ? true : undefined, 5000); instance = { name: instance.name, publisher, subscriber }; if (count > 0 && beforeRestart && !await publisher.query(beforeRestart.id)) throw new Error("Accepted carrier lost across actual relay restart"); }
+          if (entry.id === "restart") { instance.publisher.ws.close(); instance.subscriber.ws.close(); const restartedUrl = kube ? await kube.restart(instance.name) : (await docker("restart", instance.name), `ws://127.0.0.1:${(await docker("port", instance.name, "7777/tcp")).split(":").at(-1)}`); const port = new URL(restartedUrl).port; await ready(port); const publisher = await socket(`ws://127.0.0.1:${port}`), subscriber = await socket(`ws://127.0.0.1:${port}`); sockets.push(publisher.ws, subscriber.ws); subscriber.ws.send(JSON.stringify(["REQ", "after-restart", { kinds: [1059] }])); await until(() => subscriber.messages.some((m) => m[0] === "EOSE") ? true : undefined, 5000); instance = { name: instance.name, publisher, subscriber }; if (count > 0 && beforeRestart && !await publisher.query(beforeRestart.id)) throw new SafeDiagnostic("Accepted carrier lost across actual relay restart"); }
           for (let rep = 0; rep < matrix.repetitions; rep++) {
             if (entry.id === "cold" && rep > 0) { instance.publisher.ws.close(); instance.subscriber.ws.close(); await removeRelay(instance.name); instance = await start(entry.id); }
             const event = entry.id === "append" ? f.append() : entry.id === "rekey" ? f.rekey(sequence++) : f.message(sequence++);
@@ -377,7 +384,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
         const limits = entry.id === "cache_entries" && generatedCount <= matrix.cacheEntryWorkingSet ? "cache entry pressure not reached" : entry.id === "cache_bytes" && generatedBytes <= matrix.cacheByteWorkingSet ? "cache byte pressure not reached" : entry.samples.some((s) => s.innerAdmissionMs === null && !s.innerNotStarted) ? "inner timing unavailable or concurrent attribution ambiguous" : undefined;
         entry.status = limits ? "unsupported" : "measured"; entry.reason = limits;
         if (instance) { await writeFile(join(output, entry.id + "-relay.log"), await relayLogs(instance.name)); }
-      } catch (error) { entry.status = "unsupported"; entry.reason = kube ? "Destination sample failed (diagnostics withheld)" : error instanceof Error ? error.message : "measurement failed"; }
+      } catch (error) { entry.status = "unsupported"; entry.reason = caseFailureReason(error, !!kube); }
       if (kube) await kube.close();
       await writeFile(join(output, "partial-report.json"), JSON.stringify(report, null, 2) + "\n");
     }

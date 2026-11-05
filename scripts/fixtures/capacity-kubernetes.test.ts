@@ -264,3 +264,24 @@ test('entrypoint replay does not ask the operator to observe a policy with a rek
   expect(observed).toEqual(['org/room']);
   expect(await refreshEntrypointObservation(undefined, { rekeyPending: false }, 'org', 'room')).toBe(false);
 });
+
+import { SafeDiagnostic } from './capacity-kubernetes';
+import { caseFailureReason } from './strfry-capacity';
+test('a destination case keeps harness-authored reasons and withholds everything else', async () => {
+  const secret = 'postgres://synthetic:private-password@db.example/benchmark';
+  // Fixed-text harness failures stay readable so a config error is not mistaken for a cluster fault.
+  expect(caseFailureReason(new SafeDiagnostic('Invalid owned benchmark Pod name'), true)).toBe('Invalid owned benchmark Pod name');
+  expect(() => { try { benchmarkPod(config, matrix, 'capacity_bad_name'); } catch (e) { expect(caseFailureReason(e, true)).toBe('Invalid owned benchmark Pod name'); throw e; } }).toThrow();
+  // Arbitrary errors (driver, subprocess, parse) may carry credentials and stay withheld on a destination.
+  expect(caseFailureReason(new Error('connect failed ' + secret), true)).toBe('Destination sample failed (diagnostics withheld)');
+  expect(caseFailureReason('not an error', true)).toBe('Destination sample failed (diagnostics withheld)');
+  // The local Docker backend has nothing to withhold.
+  expect(caseFailureReason(new Error('docker said no'), false)).toBe('docker said no');
+  expect(caseFailureReason(undefined, false)).toBe('measurement failed');
+  // Database guard failures name the violated precondition instead of one generic sentence.
+  await expect(destinationDatabaseSetup(async () => { benchmarkDatabaseGuard(config, { ...db, populatedTables: 3 }); })).rejects.toThrow('empty migrated dedicated database');
+  let error: unknown;
+  try { await destinationDatabaseSetup(async () => { throw new Error('driver failure ' + secret); }); } catch (e) { error = e; }
+  expect(String(error)).toContain('diagnostics withheld');
+  expect(String(error)).not.toContain('private-password');
+});

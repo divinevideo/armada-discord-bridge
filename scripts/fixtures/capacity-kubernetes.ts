@@ -15,7 +15,16 @@ export interface DatabaseObservation {
 type Json = Record<string, any>;
 type Resources = Pick<CapacityMatrix, 'cpu' | 'memoryBytes' | 'databaseCpu' | 'databaseMemoryBytes'>;
 export type Run = (args: string[], input?: string) => Promise<string>;
-function need(condition: unknown, message: string): asserts condition { if (!condition) throw new Error(message); }
+/**
+ * An error whose message is a fixed string authored by this harness, so it can
+ * be recorded as a case's reason without leaking anything. Everything else
+ * (subprocess, driver, parse and network errors) may carry connection strings
+ * or tokens and stays withheld. Without this distinction every Kubernetes-mode
+ * failure collapsed into one opaque reason and an operator could not tell a
+ * configuration error from a cluster fault.
+ */
+export class SafeDiagnostic extends Error {}
+function need(condition: unknown, message: string): asserts condition { if (!condition) throw new SafeDiagnostic(message); }
 export function destinationConfig(value: unknown): DestinationConfig {
   const c = value as DestinationConfig;
   need(c && /^[a-zA-Z0-9_.:-]+$/.test(c.context ?? ''), 'Explicit Kubernetes context required');
@@ -97,7 +106,12 @@ export function verifyRelayReadback(c: DestinationConfig, m: Resources, pod: Jso
   need(node.metadata?.labels?.['cloud.google.com/gke-provisioning'] === 'standard' && node.metadata?.labels?.['kubernetes.io/arch'] === 'amd64', 'Actual node is not native standard compute');
 }
 export async function destinationDatabaseSetup<T>(work: () => Promise<T>): Promise<T> {
-  try { return await work(); } catch { throw new Error('Isolated destination database validation failed (diagnostics withheld)'); }
+  try { return await work(); } catch (error) {
+    // Guard failures (populated tables, wrong role, missing schema) are the
+    // operator's actionable signal and carry fixed text; driver errors do not.
+    if (error instanceof SafeDiagnostic) throw error;
+    throw new SafeDiagnostic('Isolated destination database validation failed (diagnostics withheld)');
+  }
 }
 export function destinationTimingLog(text: string): string {
   return text.split('\n').flatMap(line => {
@@ -117,7 +131,7 @@ export async function capacityCommand(args: string[], input?: string): Promise<s
     const [out, code] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
     if (code !== 0) throw new Error('process failure');
     return out.trim();
-  } catch { throw new Error('Capacity Kubernetes command failed (diagnostics withheld)'); }
+  } catch { throw new SafeDiagnostic('Capacity Kubernetes command failed (diagnostics withheld)'); }
 }
 
 interface Forward { url: string; stop(): void }
