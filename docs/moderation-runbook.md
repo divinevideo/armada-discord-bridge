@@ -632,7 +632,11 @@ provenance bits or convert synthetic calibration into public admission evidence.
 With an independently reviewed candidate contract, repeat on a **new empty,
 migrated benchmark database** using `CAPACITY_MODE=entrypoint` and
 `CAPACITY_CONTRACT_FILE`. That phase invokes the unchanged image's real policy
-launcher with its contract path; it preserves the normal admission and deadline
-checks. Final destination/controller review and a measured contract remain
+launcher with its contract path. Before fixture admission it validates the full
+candidate contract against the exact image, source and platform, then uses the
+normal operator capacity observation against installed policy and real counts.
+It never seeds normal capacity rows or clears a pause in entrypoint mode; those
+synthetic seed operations remain calibration-only. It preserves normal admission
+and deadline checks. Final destination/controller review and a measured contract remain
 separate release work. A successful unit test or simulated Kubernetes lifecycle
 is not evidence that the destination benchmark has run.

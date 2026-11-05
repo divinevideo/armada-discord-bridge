@@ -172,3 +172,11 @@ test('failing subprocess and SQL setup with credential-bearing errors never expo
   expect(JSON.parse(logs)).toEqual({ type: 'moderation_admission_timing', eventId, innerAdmissionMs: 2 });
   expect(logs).not.toContain('private-');
 });
+
+import { capacityContractForEntrypoint } from './strfry-capacity';
+
+test('entrypoint replay binds the reviewed contract to the exact image and preserves full validation', () => {
+  const identity = { imageId: 'sha256:' + 'a'.repeat(64), sourceSha: sha, platform: 'linux/amd64' };
+  expect(() => capacityContractForEntrypoint({ imageId: 'sha256:' + 'c'.repeat(64) }, identity)).toThrow('image identity');
+  expect(() => capacityContractForEntrypoint({ imageId: identity.imageId, version: 1 }, identity)).toThrow('Invalid capacity contract');
+});

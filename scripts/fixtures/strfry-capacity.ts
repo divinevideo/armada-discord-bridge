@@ -13,8 +13,9 @@ import { baseRekeyGroupKey, buildChannelEdition, buildMetadataEdition, buildReke
 import type { CommunityV2, GroupKey, Rumor } from "@armada-bridge/concord-core";
 import type { CommunityPolicy, StreamDescriptor } from "../../packages/moderation/src/contracts";
 import { controlState } from "../../packages/moderation/src/relayPolicy";
+import { PublicCapacityStore } from "../../packages/moderation/src/publicCapacity";
 import { PolicyStore, migrateModeration } from "../../packages/moderation/src/policyStore";
-import { REQUIRED_CAPACITY_CASES, capacityReportHash } from "../../packages/moderation/src/capacityContract";
+import { REQUIRED_CAPACITY_CASES, capacityReportHash, validateCapacityContract } from "../../packages/moderation/src/capacityContract";
 import type { DatabaseObservation } from "./capacity-kubernetes";
 import type { CapacityCaseId, CapacityMeasurementReport, CapacitySample } from "../../packages/moderation/src/capacityContract";
 
@@ -147,6 +148,11 @@ export function summarizeCapacity(report: CapacityMeasurementReport, urgentReser
       unsafeOutcomes: entry.samples.filter(sample => sample.unsafeEffect || sample.lateDatabaseWrite || !sample.okReceived).length })) };
 }
 
+export function capacityContractForEntrypoint(value: unknown, identity: { imageId: string; sourceSha: string; platform: string }) {
+  if (!value || typeof value !== "object" || (value as { imageId?: unknown }).imageId !== identity.imageId) throw new Error("Reviewed entrypoint contract image identity mismatch");
+  return validateCapacityContract(value, identity);
+}
+
 export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityMeasurementReport> {
   validateMatrix(matrix);
   const destination = process.env.CAPACITY_KUBERNETES_CONFIG ? destinationConfig(JSON.parse(await readFile(process.env.CAPACITY_KUBERNETES_CONFIG, "utf8"))) : undefined;
@@ -174,6 +180,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   const communities: [string, string][] = [];
   const calibration = process.env.CAPACITY_MODE !== "entrypoint";
   if (!calibration && !process.env.CAPACITY_CONTRACT_FILE) throw new Error("Entrypoint replay requires a reviewed measured candidate contract");
+  const entrypointContract = calibration ? undefined : capacityContractForEntrypoint(JSON.parse(await readFile(process.env.CAPACITY_CONTRACT_FILE!, "utf8")), { imageId: imageInfo.Id, sourceSha, platform });
   const synthetic = { version: 1, sourceSha, harnessSha, imageId: imageInfo.Id, platform, reportHash: "0".repeat(64), resourceEnvelope: report.resourceEnvelope, maxima: { historyCount: 4096, historyBytes: Number.MAX_SAFE_INTEGER, rekeyCount: 4096, streamCount: 1024, inFlight: matrix.concurrency, innerAdmissionMs: 1499 }, thresholds: { warningHistoryCount: 4095, pauseHistoryCount: 4096, urgentReserve: 0 }, deadlines: { sqlMs: 1500, pluginMs: 2000, externalMs: 3000, observedMaxMs: 2999 }, maxSampleAgeMs: 120000, measuredAt: Date.now() };
   const launcher = capacityCalibrationLauncher();
   const docker = (...args: string[]) => command(["docker", ...args]);
@@ -224,6 +231,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
     // isolated destination DB must be pre-migrated by the approved operator.
     if (!kube) await migrateModeration(sql!);
     const store = new PolicyStore(sql!);
+    const entrypointCapacity = entrypointContract ? new PublicCapacityStore(sql!, entrypointContract) : undefined;
     async function ready(port: string | undefined) {
       for (let attempt = 0; ; attempt++) { try { await fetch(`http://127.0.0.1:${port}`); return; } catch { if (attempt > 200) throw new Error("Capacity relay unavailable"); await Bun.sleep(50); } }
     }
@@ -263,7 +271,8 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       const measuredPolicy = await store.getPolicy(f.policy.communityId);
       const measuredRekeys = await sql!`SELECT event FROM moderation.rekey_events WHERE community_id=${f.policy.communityId}`;
       const hasCapacity = await sql!`SELECT to_regclass('moderation.public_capacity_state') AS name`;
-      if (hasCapacity[0].name) await sql!`UPDATE moderation.public_capacity_state SET observed_at=clock_timestamp() WHERE org_id='synthetic-capacity' AND community_id=${f.policy.communityId}`;
+      if (entrypointCapacity) await entrypointCapacity.observeCurrent("synthetic-capacity", f.policy.communityId);
+      else if (hasCapacity[0].name) await sql!`UPDATE moderation.public_capacity_state SET observed_at=clock_timestamp() WHERE org_id='synthetic-capacity' AND community_id=${f.policy.communityId}`;
       const before = await effect(event.id), messagesFrom = instance.publisher.messages.length;
       const logsBefore = (await relayLogs(instance.name)).split("\n").filter((line) => line.includes('"type":"moderation_admission_timing"')).length;
       const started = performance.now(); instance.publisher.ws.send(JSON.stringify(["EVENT", event]));
@@ -295,6 +304,9 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
           await writeFile(join(directory, "calibration.json"), JSON.stringify({ contract: synthetic, communities }));
           if (kube) await kube.updateFixtures(directory);
           await store.install(f.policy, f.streams, 0);
+          // A reviewed entrypoint replay uses normal operator observations,
+          // never the calibration seed or an implicit durable-pause reset.
+          if (entrypointCapacity) await entrypointCapacity.observeCurrent("synthetic-capacity", f.policy.communityId);
           if (calibration) {
             // Only the disposable operator seeds its own fixture latch; the deployed entrypoint has no bypass.
             const table = await sql`SELECT to_regclass('moderation.public_capacity_state') AS name`;
