@@ -303,8 +303,10 @@ export class KubernetesCapacity {
     // The interrupt handler exits the process the moment this resolves, so a
     // creation still in flight must finish (and remove its own Pod, see
     // createPod) before then; a process that has exited cannot clean up after
-    // a `kubectl create` the API server went on to complete. Bounded by the
-    // 30 s request timeout every kubectl call carries.
+    // a `kubectl create` the API server went on to complete. Not instant: the
+    // wait covers create (30 s timeout) plus that Pod's own removal chain, up to
+    // about three minutes in the worst case. Every step has its own timeout, so
+    // it cannot hang, and a second signal still takes the default action.
     await Promise.allSettled([...this.creations]);
     try { await this.close(); } finally { this.databaseForward?.stop(); this.databaseForward = undefined; }
   }

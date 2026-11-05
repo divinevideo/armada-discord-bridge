@@ -636,7 +636,9 @@ it is not a read-only preflight. Keep actual community listeners and the public
 tunnel held throughout measurement. The driver removes its Pods, including each
 Pod's relay database, on normal exit and on SIGINT/SIGTERM; every Pod also
 carries a six-hour `activeDeadlineSeconds` as the backstop for a `kill -9` or
-crash that no handler can intercept. The deadline stops the compute but leaves a
+crash that no handler can intercept, and for a Ctrl-C that kills `kubectl create`
+after the API server accepted the request (the Pod's UID is then never learned,
+so it cannot be tracked or removed by the driver). The deadline stops the compute but leaves a
 Failed Pod object, and the namespace guard refuses any existing Pod, so delete
 such leftovers by hand before the next run. It retains
 the benchmark database and reports for reviewed cleanup; it never drops a
