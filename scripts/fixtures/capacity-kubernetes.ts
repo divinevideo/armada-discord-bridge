@@ -1,6 +1,7 @@
 /** Private synthetic destination measurements. Importing never contacts Kubernetes or SQL. */
 import { readFile, readdir } from 'node:fs/promises';
 import { join, isAbsolute, relative, resolve } from 'node:path';
+import { HEX_ID } from '../../packages/moderation/src/relayPolicy';
 import type { CapacityMatrix } from './strfry-capacity';
 
 export interface DestinationConfig {
@@ -146,8 +147,10 @@ export function destinationTimingLog(text: string): string {
   return text.split('\n').flatMap(line => {
     try {
       const value = JSON.parse(line.slice(line.indexOf('{')));
-      if (value.type !== 'moderation_admission_timing' || !Number.isFinite(value.innerAdmissionMs)) return [];
-      if ('eventId' in value && (typeof value.eventId !== 'string' || !/^[0-9a-f]{64}$/.test(value.eventId))) return [];
+      // Same acceptance as the deployed emitter (admissionTimingLine), so the
+      // two sinks cannot disagree about what a timing record is.
+      if (value.type !== 'moderation_admission_timing' || !Number.isFinite(value.innerAdmissionMs) || value.innerAdmissionMs < 0) return [];
+      if ('eventId' in value && (typeof value.eventId !== 'string' || !HEX_ID.test(value.eventId))) return [];
       // The deployed emitter is aggregate-only; calibration can add correlation.
       // Retaining an absent ID lets the sampler use only its single-flight fallback.
       return [JSON.stringify({ type: value.type, ...('eventId' in value ? { eventId: value.eventId } : {}), innerAdmissionMs: value.innerAdmissionMs })];
@@ -214,7 +217,7 @@ export class KubernetesCapacity {
   private databasePrimary?: { name: string; uid: string; address: string };
   private databaseForward?: Forward;
   private closed = false;
-  private pods = new Map<string, { uid: string; config: string; directory: string; forward?: Forward }>();
+  private pods = new Map<string, { uid: string; forward?: Forward }>();
   constructor(c: unknown, private matrix: CapacityMatrix, private execute: Run = capacityCommand, private portForward: (args: string[], remotePort?: number) => Promise<Forward> = forward) { this.config = destinationConfig(c); }
   private args() { return ['kubectl', `--context=${this.config.context}`, '--request-timeout=30s', '-n', this.config.namespace]; }
   private async json(args: string[]) { return JSON.parse(await this.execute([...this.args(), ...args, '-o', 'json'])); }
@@ -314,7 +317,7 @@ export class KubernetesCapacity {
     // create, never apply/adopt an existing Pod; cleanup is restricted to its returned UID.
     const created = JSON.parse(await this.execute([...this.args(), 'create', '-f', '-', '-o', 'json'], JSON.stringify(manifest)));
     need(created.metadata?.uid, 'Created benchmark Pod has no UID');
-    this.pods.set(name, { uid: created.metadata.uid, config, directory });
+    this.pods.set(name, { uid: created.metadata.uid });
     await this.execute([...this.args(), 'wait', '--for=jsonpath={.status.phase}=Running', `pod/${name}`, '--timeout=180s']);
     const pod = await this.owned(name);
     const identity = JSON.parse(await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'bun', '-e', "console.log(JSON.stringify({sourceSha:process.env.MODERATION_SOURCE_SHA,platform:process.platform+'/'+(process.arch==='x64'?'amd64':process.arch)}))"]));
@@ -332,9 +335,7 @@ export class KubernetesCapacity {
       await this.upload(name, '/capacity/contract.json', await readFile(contract, 'utf8'));
       // The real launcher reads its file path at startup. The private wrapper
       // sets only this path, never source identity or an admission bypass.
-      const record = this.pods.get(name)!;
       await this.upload(name, '/capacity/entrypoint.sh', '#!/bin/sh\nexport MODERATION_CAPACITY_CONTRACT_FILE=/capacity/contract.json\nexec /usr/local/bin/relay-policy\n', true);
-      record.config = config;
     }
     await this.upload(name, '/capacity/ready', 'ready\n');
     const f = await this.portForward([...this.args(), 'pod/' + name]); this.pods.get(name)!.forward = f;

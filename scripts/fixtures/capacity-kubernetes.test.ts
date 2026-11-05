@@ -480,3 +480,12 @@ test('preflight accepts the same storage size spelled differently and still refu
   await expect(run('20Gi', '20480Mi')).resolves.toContain('cnpg=');
   await expect(run('20Gi', '21Gi')).rejects.toThrow('storage size');
 });
+
+test('destination timing records follow the deployed emitter: verified lowercase IDs and non-negative durations only', () => {
+  const line = (value: object) => destinationTimingLog(JSON.stringify({ type: 'moderation_admission_timing', ...value }));
+  expect(line({ innerAdmissionMs: 3 })).not.toBe('');
+  expect(line({ innerAdmissionMs: 0, eventId: 'a'.repeat(64) })).not.toBe('');
+  expect(line({ innerAdmissionMs: -1 })).toBe('');
+  expect(line({ innerAdmissionMs: 2, eventId: 'A'.repeat(64) })).toBe('');
+  expect(line({ innerAdmissionMs: 2, eventId: 'abc' })).toBe('');
+});
