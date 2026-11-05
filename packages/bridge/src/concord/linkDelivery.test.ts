@@ -219,3 +219,51 @@ it('starts a newly discovered stream at the preserved upgrade floor', async () =
   await delivery.repair({ store, channel: () => channel, deliver: async () => {}, replay: async (_channel, since) => { floor = since; } });
   expect(floor).toBe(0);
 });
+
+it('coalesces retry notifications while the effect lane is blocked', async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const wakes: boolean[] = [];
+  const delivery = new LinkDelivery({ onError: () => {} });
+  const first = delivery.run(async () => blocked);
+  const retry = async (wake: boolean) => { wakes.push(wake); };
+  for (let i = 0; i < 1000; i++) delivery.requestRetry(i === 500, retry);
+  release(); await first;
+  await delivery.run(async () => {});
+  expect(wakes).toEqual([true]);
+});
+
+it('keeps a fold wake that arrives while a normal retry is running', async () => {
+  let release!: () => void, entered!: () => void, awakened!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const done = new Promise<void>(resolve => { awakened = resolve; });
+  const wakes: boolean[] = [];
+  const delivery = new LinkDelivery({ onError: () => {} });
+  const retry = async (wake: boolean) => { wakes.push(wake); if (!wake) { entered(); await blocked; } else awakened(); };
+  const first = delivery.requestRetry(false, retry);
+  await started;
+  void delivery.requestRetry(true, retry);
+  release(); await first;
+  expect(await Promise.race([done.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 20))])).toBe(true);
+  expect(wakes).toEqual([false, true]);
+});
+
+it('pins a replay gap when a live relay subscription fails', async () => {
+  const floors: number[] = [];
+  const delivery = new LinkDelivery({ onError: () => {}, onGap: async floor => { floors.push(floor); } });
+  delivery.subscriptionError('synthetic-relay', 1000);
+  await delivery.flushGaps();
+  expect(floors).toEqual([940]);
+  delivery.subscriptionError('dispatch', 1100);
+  await delivery.flushGaps();
+  expect(floors).toEqual([940]);
+});
+
+it('does not let a broken error observer poison the delivery lane', async () => {
+  const delivery = new LinkDelivery({ onError: () => { throw new Error('observer failed'); } });
+  await expect(delivery.run(async () => { throw new Error('effect failed'); })).rejects.toThrow('effect failed');
+  let ran = false;
+  await delivery.run(async () => { ran = true; });
+  expect(ran).toBe(true);
+});

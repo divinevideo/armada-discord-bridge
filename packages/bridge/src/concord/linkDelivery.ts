@@ -22,6 +22,8 @@ export class LinkDelivery {
   private gaps: Promise<void> = Promise.resolve();
   private gapWriter?: Promise<void>;
   private repairPending?: Promise<void>;
+  private retryPending?: Promise<void>;
+  private retryWake = false;
   private attempt?: AbortController;
   private queued = 0;
   private typingQueued = false;
@@ -37,8 +39,11 @@ export class LinkDelivery {
   stop(): void { this.controller.abort(); this.attempt?.abort(); }
   run(work: (signal: AbortSignal) => Promise<void>): Promise<void> {
     const result = this.lane.then(() => { this.controller.signal.throwIfAborted(); return work(this.controller.signal); });
-    this.lane = result.catch(error => { this.options.onError(error); });
+    this.lane = result.catch(error => { try { this.options.onError(error); } catch {} });
     return result;
+  }
+  subscriptionError(source: string, now = Math.floor(Date.now() / 1000)): void {
+    if (source !== 'dispatch' && !this.controller.signal.aborted) this.markGap(Math.max(0, now - 60));
   }
   markGap(floor: number): void {
     this.generation++;
@@ -56,7 +61,7 @@ export class LinkDelivery {
       this.gaps = pending;
       void pending.then(() => { if (this.gapWriter === pending) this.gapWriter = undefined; }, error => {
         if (this.gapWriter === pending) this.gapWriter = undefined;
-        this.options.onError(error);
+        try { this.options.onError(error); } catch {}
       });
     }
   }
@@ -71,6 +76,20 @@ export class LinkDelivery {
     if (generation !== this.generation) { await this.flushGaps(); return false; }
     if (committed && complete) this.gapFloor = undefined;
     return committed;
+  }
+  requestRetry(wake: boolean, work: (wake: boolean, signal: AbortSignal) => Promise<void>): Promise<void> {
+    this.retryWake ||= wake;
+    if (this.retryPending) return this.retryPending;
+    const pending = this.run(async signal => {
+      const shouldWake = this.retryWake;
+      this.retryWake = false;
+      await work(shouldWake, signal);
+    }).finally(() => {
+      if (this.retryPending === pending) this.retryPending = undefined;
+      if (this.retryWake && !this.controller.signal.aborted) void this.requestRetry(false, work).catch(() => {});
+    });
+    this.retryPending = pending;
+    return pending;
   }
   typing(work: (signal: AbortSignal) => Promise<void>): void {
     if (this.typingQueued) return;
