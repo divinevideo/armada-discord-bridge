@@ -46,7 +46,7 @@ export function validateMatrix(value: unknown): CapacityMatrix {
 
 /** Every counted history item is a distinct valid owner edition in a contiguous chain. */
 export function capacityFixture(historyCount: number, options: { label?: string; roots?: number; channels?: number; large?: boolean } = {}) {
-  if (!Number.isSafeInteger(historyCount) || historyCount < 0 || historyCount > 4095) throw new Error("Invalid history count");
+  if (!Number.isSafeInteger(historyCount) || historyCount < 0 || historyCount > 4095) throw new SafeDiagnostic("Invalid history count");
   const label = options.label ?? "fixture", ownerKey = seed(label + ":owner"), memberKey = seed(label + ":member");
   const owner = getPublicKey(ownerKey), member = getPublicKey(memberKey), ownerSalt = seed(label + ":salt"), id = communityIdOf(hex32(owner), ownerSalt);
   const rootCount = options.roots ?? 1;
@@ -79,7 +79,7 @@ export function capacityFixture(historyCount: number, options: { label?: string;
   const policy: CommunityPolicy = { communityId: community.idHex, owner, ownerSalt: bytesToHex(ownerSalt), rootEpoch: community.rootEpoch.toString(), revision: 1, complete: true, validUntil: Date.now() + 120000, controlStreams, controlEvents, banned: [], publicAuthors: [owner, member], snapshotAuthorities: [owner] };
   if (historyCount === 0) streams.splice(controlStreams.length, channels.length * rootCount);
   const folded = controlState(policy).folded;
-  if (folded.incomplete.length || new Set(controlEvents.map((e) => e.id)).size !== historyCount || controlEvents.some((e) => !verifyEvent(e))) throw new Error("Capacity fixture failed contiguous valid history validation");
+  if (folded.incomplete.length || new Set(controlEvents.map((e) => e.id)).size !== historyCount || controlEvents.some((e) => !verifyEvent(e))) throw new SafeDiagnostic("Capacity fixture failed contiguous valid history validation");
   const channelId = bytesToHex(channels[0]), chat = channelGroupKey(community.root, channels[0], community.rootEpoch);
   const message = (sequence: number) => sealed(buildRumor({ pubkey: member, kind: 9, content: "Synthetic capacity message " + sequence, tags: channelBindingTags(channelId, community.rootEpoch), ms: 1701000000000 + sequence }), chat, memberKey);
   const rekey = (sequence = 0) => sealed(buildRekeyRumors(owner, { scope: { kind: "root" }, newEpoch: community.rootEpoch + 1n, prevEpoch: community.rootEpoch, prevCommit: bytesToHex(epochKeyCommitment(community.rootEpoch, community.root)) }, [], 1701000000000 + sequence)[0], rekeyGroup, ownerKey);

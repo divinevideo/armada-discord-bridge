@@ -564,3 +564,22 @@ test('a signal that arrives during the final cleanup waits for it instead of kil
   expect(exits).toEqual([143]);
   expect(process.listenerCount('SIGTERM')).toBe(0);
 });
+
+test('a relay that never restarts and a forward that never becomes ready are reported with their own reasons', async () => {
+  // These are exactly how a SIGTERM that PID 1 ignores would surface; an operator must see them.
+  const pod = { metadata: { name: 'capacity-synthetic-1', uid: 'u' }, status: { containerStatuses: [{ restartCount: 0, state: { running: {} } }] } };
+  const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, async (args: string[]) => args.includes('get') && args.includes('pod') ? JSON.stringify(pod) : '');
+  (backend as any).pods.set('capacity-synthetic-1', { uid: 'u' });
+  const restartError = await backend.restart('capacity-synthetic-1', 2, 1).catch((e: unknown) => e);
+  expect(restartError).toBeInstanceOf(SafeDiagnostic);
+  expect(caseFailureReason(restartError, true)).toBe('Benchmark container did not restart with retained data');
+
+  const dir = await mkdtemp(join(tmpdir(), 'capacity-forward-fail-'));
+  try {
+    const script = join(dir, 'kubectl');
+    await writeFile(script, '#!/bin/sh\nexit 1\n'); await chmod(script, 0o755);
+    const forwardError = await forward([script, 'pod/synthetic']).catch((e: unknown) => e);
+    expect(forwardError).toBeInstanceOf(SafeDiagnostic);
+    expect(caseFailureReason(forwardError, true)).toBe('Private benchmark port-forward did not become ready');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

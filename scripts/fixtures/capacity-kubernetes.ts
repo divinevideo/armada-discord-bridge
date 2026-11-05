@@ -206,7 +206,7 @@ export async function forward(args: string[], remotePort = 7777): Promise<Forwar
       const port = text.match(new RegExp(`Forwarding from 127\\.0\\.0\\.1:(\\d+) -> ${remotePort}`));
       if (port) { ready = true; void discard(reader); return { url: `ws://127.0.0.1:${port[1]}`, stop: () => child.kill(), alive: () => !exited }; }
     }
-    throw new Error('Private benchmark port-forward did not become ready');
+    throw new SafeDiagnostic('Private benchmark port-forward did not become ready');
   } catch (e) { child.kill(); throw e; }
   finally { if (!ready) reader.releaseLock(); }
 }
@@ -352,12 +352,12 @@ export class KubernetesCapacity {
     return f.url;
   }
   async logs(name: string) { await this.owned(name); return destinationTimingLog(await this.execute([...this.args(), 'logs', name, '-c', 'relay'])); }
-  async restart(name: string) {
+  async restart(name: string, attempts = 180, intervalMs = 1000) {
     this.pods.get(name)?.forward?.stop();
     const before = await this.owned(name), count = before.status?.containerStatuses?.[0]?.restartCount ?? 0;
     await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'sh', '-c', 'kill -TERM 1']).catch(() => {});
-    for (let n = 0; n < 180; n++) { const pod = await this.owned(name); if ((pod.status?.containerStatuses?.[0]?.restartCount ?? 0) > count && pod.status?.containerStatuses?.[0]?.state?.running) { const f = await this.portForward([...this.args(), 'pod/' + name]); this.pods.get(name)!.forward = f; return f.url; } await Bun.sleep(1000); }
-    throw new Error('Benchmark container did not restart with retained data');
+    for (let n = 0; n < attempts; n++) { const pod = await this.owned(name); if ((pod.status?.containerStatuses?.[0]?.restartCount ?? 0) > count && pod.status?.containerStatuses?.[0]?.state?.running) { const f = await this.portForward([...this.args(), 'pod/' + name]); this.pods.get(name)!.forward = f; return f.url; } await Bun.sleep(intervalMs); }
+    throw new SafeDiagnostic('Benchmark container did not restart with retained data');
   }
   private removals = new Map<string, Promise<void>>();
   /**
