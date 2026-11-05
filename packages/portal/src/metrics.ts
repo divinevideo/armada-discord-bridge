@@ -1,7 +1,10 @@
 import type postgres from "postgres";
 
-/** Fixed aggregate series: paused/severed records remain operational failures
- * even after their in-memory bridge has stopped and sockets look healthy. */
+/** Fixed aggregate series from persisted state: a paused or severed bridge has
+ * no in-memory bridge, so the socket gauges stay healthy while it forwards
+ * nothing. Only severed is the community cutting a bridge off. Paused is the
+ * owner's own Pause (POST /api/bridges/:id/pause) or migration 017's
+ * duplicate resolution, so a nonzero paused count is not itself a failure. */
 export async function portalMetricsResponse(sql: postgres.Sql, discordConnected: boolean, relaySocketsDown: number): Promise<Response> {
   try {
     const [row] = await sql`SELECT count(*) FILTER (WHERE status = 'paused') AS paused,
