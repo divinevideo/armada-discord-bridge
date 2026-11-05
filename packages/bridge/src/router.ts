@@ -128,6 +128,8 @@ export interface MappingStore {
   reactionByDiscord(messageId: string, userId: string, emoji: string): Promise<ReactionMappingRow | undefined>;
   reactionByRumorId(rumorId: string): Promise<ReactionMappingRow | undefined>;
   deleteReaction(rumorId: string): Promise<void>;
+  retiredReaction(link: ChannelLink, rumorId: string): Promise<ReactionMappingRow | undefined>;
+  retireReaction(link: ChannelLink, row: ReactionMappingRow): Promise<void>;
   /** Concord-origin reactions still mirrored onto this message with this emoji. */
   countConcordReactions(messageId: string, emoji: string): Promise<number>;
 }
@@ -827,7 +829,7 @@ export class BridgeRouter {
         proxyTag(reaction.guildId, reaction.channelId, reaction.messageId),
       ],
     });
-    await this.store.deleteReaction(row.rumorId);
+    await this.store.retireReaction(link, row);
     return rumor.id;
   }
 
@@ -901,7 +903,8 @@ export class BridgeRouter {
 
   private async applyDelete(deletion: PendingConcordDelete, link: ChannelLink): Promise<void> {
     const target = deletion.targetRumorId;
-    const reaction = await this.store.reactionByRumorId(target);
+    const retired = await this.store.retiredReaction(link, target);
+    const reaction = retired ?? await this.store.reactionByRumorId(target);
     const rows = reaction ? await this.store.byDiscordId(reaction.discordMessageId) : await this.store.byRumorId(target);
     const scoped = rows.filter(row => this.inLink(row, link));
     // Another link may have mirrored this rumor before our own mapping arrives.
@@ -919,15 +922,17 @@ export class BridgeRouter {
     const authorize = () => {
       if (!this.mayDelete(deletion, targetAuthor, link)) throw new Error("Concord deletion authority changed");
     };
-    if (reaction) {
+    // Retired targets still prove scope and author, but must never remove a
+    // newer reaction that happens to use the same message and emoji.
+    if (reaction && !retired) {
       const count = await this.store.countConcordReactions(reaction.discordMessageId, reaction.emoji);
       if (reaction.origin === "concord" && count <= 1) {
         await this.assertMayForward(); authorize();
         await this.deletionWebhooks.unreact(link, reaction.discordMessageId, reaction.emoji, authorize, () => this.assertMayForward());
       }
       await this.assertMayForward(); authorize();
-      await this.store.deleteReaction(target);
-    } else {
+      await this.store.retireReaction(link, reaction);
+    } else if (!reaction) {
       for (const row of scoped) {
         // The mapping's actual author is authoritative, even for split parts.
         const check = () => { if (!this.mayDelete(deletion, this.targetAuthor(row), link)) throw new Error("Concord deletion authority changed"); };
@@ -940,7 +945,7 @@ export class BridgeRouter {
 
   /** Kind 7 -> bot reaction on the mapped Discord message. */
   private async onConcordReaction(chat: OpenedChat, link: ChannelLink): Promise<void> {
-    if (await this.store.reactionByRumorId(chat.rumorId)) return; // relay echo
+    if (await this.store.reactionByRumorId(chat.rumorId) || await this.store.retiredReaction(link, chat.rumorId)) return; // relay echo, including retired reactions
     const target = chat.tags.find((t) => t[0] === "e" && t[1])?.[1];
     if (!target) return;
     // Unicode maps directly; an Armada custom emoji maps back only when its
@@ -1296,6 +1301,14 @@ export class MemoryMappingStore implements MappingStore {
   }
   async byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]> {
     return this.rows.filter((r) => r.discordMessageId === discordMessageId);
+  }
+  private retiredReactions = new Map<string, ReactionMappingRow>();
+  async retiredReaction(link: ChannelLink, rumorId: string): Promise<ReactionMappingRow | undefined> {
+    return this.retiredReactions.get(`${deletionLinkKey(link)}:${rumorId}`);
+  }
+  async retireReaction(link: ChannelLink, row: ReactionMappingRow): Promise<void> {
+    this.retiredReactions.set(`${deletionLinkKey(link)}:${row.rumorId}`, row);
+    await this.deleteReaction(row.rumorId);
   }
   reactions: ReactionMappingRow[] = [];
   async insertReaction(row: ReactionMappingRow): Promise<void> {

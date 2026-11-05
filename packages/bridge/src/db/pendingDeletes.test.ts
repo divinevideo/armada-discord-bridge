@@ -1,8 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import postgres from 'postgres';
-import { channelsView, controlGroups, grantLocator, bytesToHex, hex32, openChatBatch, openControlWraps, foldControlState } from '@armada-bridge/concord-core';
+import { buildRumor, channelBindingTags, sealRumor, wrapSeal, channelsView, controlGroups, grantLocator, bytesToHex, hex32, openChatBatch, openControlWraps, foldControlState } from '@armada-bridge/concord-core';
 import { generateSecretKey } from 'nostr-tools/pure';
 import fixture from '../../../../test-fixtures/concord/community-interop.json';
+import { moderationFixture } from '../../../../scripts/fixtures/moderation-events';
 import { bootstrapFixture } from '../../../../scripts/fixtures/community-bootstrap';
 import { ConcordClient } from '../concord/client';
 import { localIdentity } from '../concord/signer';
@@ -20,7 +21,9 @@ const pending = (id: string, author = 'actor'): PendingConcordDelete => ({ delet
 beforeAll(() => migrate(url));
 afterAll(async () => {
   await sql`DELETE FROM pending_concord_deletes WHERE tenant_id LIKE ${tenant + '%'}`;
-  await sql`DELETE FROM messages WHERE tenant_id = ${tenant}`;
+  await sql`DELETE FROM retired_concord_reactions WHERE tenant_id LIKE ${tenant + '%'}`;
+  await sql`DELETE FROM reaction_mappings WHERE tenant_id LIKE ${tenant + '%'}`;
+  await sql`DELETE FROM messages WHERE tenant_id LIKE ${tenant + '%'}`;
   await sql`DELETE FROM cursors WHERE tenant_id = ${tenant}`;
   await sql.end();
 });
@@ -52,6 +55,56 @@ describe('durable pending Concord deletions', () => {
     await create().retryPendingDeletes(link);
     expect(deleted).toEqual(['synthetic-message']);
     expect(await store.pendingDeletes(link)).toEqual([]);
+    await connection.end();
+  });
+
+  it('retains retired reaction evidence across crash, later signed deletes and reaction re-add', async () => {
+    const f = await moderationFixture();
+    const client = new ConcordClient(f.community, { query: async () => [], publish: async () => {}, subscribe: () => () => {}, close: async () => {} }, localIdentity(generateSecretKey()));
+    client.folded = foldControlState(openControlWraps(f.policy.controlEvents, controlGroups(f.community)), f.community.id, f.owner.pk);
+    const channel = channelsView(f.community, client.folded)[0];
+    const scope = { ...link, communityId: f.community.idHex, concordChannelIdHex: channel.idHex };
+    const testTenant = tenant + '-reaction';
+    let connection = postgres(url, { max: 1 });
+    let store = new PostgresMappingStore(connection, testTenant);
+    let reacted = 0, unreacted = 0, sequence = 0;
+    const event = async (kind: number, target: string) => {
+      const rumor = buildRumor({ pubkey: f.member.pk, kind, content: kind === 7 ? '👍' : '', tags: [...channelBindingTags(channel.idHex, 0n), ['e', target]], ms: Date.now() + sequence++ });
+      return (await openChatBatch([wrapSeal(await sealRumor(rumor, 20013, channel.current.group, f.member.signer), channel.current.group)], channel))[0];
+    };
+    const create = () => new BridgeRouter(client, new PuppetCache('ab'.repeat(32)), store, {
+      send: async () => 'reaction-parent', delete: async () => {}, edit: async () => {}, react: async () => { reacted++; },
+      unreact: async (_link, _id, _emoji, authorize) => { authorize?.(); unreacted++; }, sendTyping: async () => {},
+    }, { resolve: async name => ({ name }) }, { applicationId: 'synthetic', webhookIds: new Set() }, { beforeSideEffect: async () => {} });
+    await store.insert({ discordMessageId: 'reaction-parent', discordChannelId: scope.discordChannelId, concordRumorId: f.allowedRumorId, concordChannelId: channel.idHex, communityId: f.community.idHex, origin: 'concord', authorRef: f.member.pk, partIndex: 0 });
+    let router = create();
+    const reaction = await event(7, f.allowedRumorId);
+    await router.onConcordChat(reaction, scope);
+    const deletion = await event(5, reaction.rumorId);
+    // Crash boundary: retirement committed, pending-action cleanup did not.
+    store.completeDelete = async () => { throw new Error('crash before completion'); };
+    await router.onConcordChat(deletion, scope);
+    expect(unreacted).toBe(1);
+    expect(await store.reactionByRumorId(reaction.rumorId)).toBeUndefined();
+    expect(await store.pendingDeletes(scope)).toHaveLength(1);
+    expect(await store.retiredReaction(scope, reaction.rumorId)).toMatchObject({ authorRef: f.member.pk });
+    expect(await store.retiredReaction({ ...scope, discordChannelId: 'another-channel' }, reaction.rumorId)).toBeUndefined();
+    expect(await store.retiredReaction({ ...scope, discordGuildId: 'another-guild' }, reaction.rumorId)).toBeUndefined();
+    await connection.end();
+    connection = postgres(url, { max: 1 }); store = new PostgresMappingStore(connection, testTenant); router = create();
+    await router.retryPendingDeletes(scope);
+    expect(await store.pendingDeletes(scope)).toEqual([]);
+    const readded = await event(7, f.allowedRumorId);
+    await router.onConcordChat(readded, scope);
+    await router.onConcordChat(await event(5, reaction.rumorId), scope);
+    await router.retryPendingDeletes(scope);
+    expect(await store.pendingDeletes(scope)).toEqual([]);
+    expect(unreacted).toBe(1); // Old-target duplicate must not remove the new reaction.
+    expect(reacted).toBe(2);
+    expect(await store.reactionByRumorId(readded.rumorId)).toBeDefined();
+    expect(await store.reactionByDiscord('reaction-parent', f.member.pk, '👍')).toMatchObject({ rumorId: readded.rumorId });
+    await router.onConcordChat(reaction, scope); // retired rumor replay cannot resurrect it
+    expect(reacted).toBe(2);
     await connection.end();
   });
 

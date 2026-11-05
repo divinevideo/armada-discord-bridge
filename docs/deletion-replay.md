@@ -29,11 +29,18 @@ constructing their promise chain. Overflow is refused synchronously and pins
 that subscription’s cursor so later successes cannot hide the replay gap.
 
 Lease/visibility checks and the synchronous current-fold check run again at the
-Discord adapter's final dispatch boundary. Reactions retain their mapping until
-removal succeeds; partial message deletes can retry idempotently. A webhook's
+Discord adapter's final dispatch boundary. Reactions retain their active mapping until
+removal succeeds. Migration `020_retired_concord_reactions.sql` then preserves
+scoped target evidence atomically with active mapping removal. This evidence
+outlives pending-action cleanup, so crash replay and later distinct deletions
+can resolve the original author without removing a newly added reaction. Retired
+rows remain outside active Discord reaction lookups, and old reaction rumor
+replays cannot resurrect them. Like message mappings, this target evidence is
+retained independently of the bounded pending-action queue. Partial message
+deletes can retry idempotently. A webhook's
 Unknown Message response alone does not prove a Discord-origin post is gone:
 the bot endpoint must also resolve the fallback.
 
-Ship the additive migration with the worker source through the existing release
+Ship both additive migrations with the worker source through the existing release
 process. Local synthetic tests and an isolated database prove source behavior,
 not live Discord delivery or production admission readiness.

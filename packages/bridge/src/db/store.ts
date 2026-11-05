@@ -115,6 +115,27 @@ export class PostgresMappingStore implements MappingStore {
     return rows[0] ? this.toReactionRow(rows[0]) : undefined;
   }
 
+  async retiredReaction(link: ChannelLink, rumorId: string): Promise<ReactionMappingRow | undefined> {
+    const rows = await this.sql`SELECT rumor_id, discord_message_id, emoji, origin, author_ref
+      FROM retired_concord_reactions WHERE tenant_id = ${this.tenantId} AND community_id = ${link.communityId}
+      AND concord_channel_id = ${link.concordChannelIdHex} AND discord_guild_id = ${link.discordGuildId}
+      AND discord_channel_id = ${link.discordChannelId} AND rumor_id = ${rumorId}`;
+    return rows[0] ? this.toReactionRow(rows[0]) : undefined;
+  }
+
+  async retireReaction(link: ChannelLink, row: ReactionMappingRow): Promise<void> {
+    // A later distinct deletion still needs target evidence. Retire atomically
+    // with active removal, rather than leaving a crash gap or deduping re-adds.
+    await this.sql.begin(async tx => {
+      await tx`INSERT INTO retired_concord_reactions
+        (tenant_id, community_id, concord_channel_id, discord_guild_id, discord_channel_id,
+         rumor_id, discord_message_id, emoji, origin, author_ref)
+        VALUES (${this.tenantId}, ${link.communityId}, ${link.concordChannelIdHex}, ${link.discordGuildId}, ${link.discordChannelId},
+          ${row.rumorId}, ${row.discordMessageId}, ${row.emoji}, ${row.origin}, ${row.authorRef}) ON CONFLICT DO NOTHING`;
+      await tx`DELETE FROM reaction_mappings WHERE tenant_id = ${this.tenantId} AND rumor_id = ${row.rumorId}`;
+    });
+  }
+
   async deleteReaction(rumorId: string): Promise<void> {
     await this.sql`
       DELETE FROM reaction_mappings
