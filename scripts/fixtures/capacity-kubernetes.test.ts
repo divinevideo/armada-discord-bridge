@@ -349,3 +349,19 @@ test('an interrupt runs cleanup, reports a failure without leaking detail, and e
   expect(reports).toEqual(['Capacity cleanup after interrupt failed: diagnostics withheld']);
   expect(process.listenerCount('SIGTERM')).toBe(0);
 });
+
+import { chmod } from 'node:fs/promises';
+test('the loopback Docker script cannot be redirected to a live cluster by leftover destination settings', async () => {
+  const bin = await mkdtemp(join(tmpdir(), 'capacity-script-test-'));
+  try {
+    const dump = join(bin, 'env.txt');
+    await writeFile(join(bin, 'docker'), '#!/bin/sh\necho sha256:' + 'e'.repeat(64) + '\n');
+    await writeFile(join(bin, 'bun'), '#!/bin/sh\nenv > ' + dump + '\n');
+    await chmod(join(bin, 'docker'), 0o755); await chmod(join(bin, 'bun'), 0o755);
+    const run = Bun.spawn(['bash', 'scripts/test-strfry-capacity.sh'], { cwd: join(import.meta.dir, '..', '..'), stdout: 'pipe', stderr: 'pipe', env: { PATH: bin + ':' + process.env.PATH, HOME: process.env.HOME ?? '/', STRFRY_TEST_IMAGE: 'synthetic', CAPACITY_KUBERNETES_CONFIG: '/synthetic/destination.json', CAPACITY_EXECUTE_DESTINATION: '1', CAPACITY_DATABASE_URL: 'postgres://synthetic:private-password@db.example/x' } });
+    expect(await run.exited).toBe(0);
+    const seen = await Bun.file(dump).text();
+    expect(seen).toContain('STRFRY_TEST_IMAGE=sha256:' + 'e'.repeat(64));
+    for (const name of ['CAPACITY_KUBERNETES_CONFIG', 'CAPACITY_EXECUTE_DESTINATION', 'CAPACITY_DATABASE_URL']) expect(seen).not.toContain(name + '=');
+  } finally { await rm(bin, { recursive: true, force: true }); }
+});
