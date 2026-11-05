@@ -117,3 +117,50 @@ test("a failed action-path refresh clears worker authority although the tick swa
     await running;
   }
 });
+
+// A worker whose refreshes succeed, so its first iteration publishes authority.
+const greenWorker = (f: Fixture, health: WorkerHealth, stop: AbortController, hooks: { tick?: () => Promise<boolean>; restrictions?: () => Promise<void>; disconnected?: () => Promise<void> }) => {
+  isolate(stop, [
+    spyOn(RelayPool.prototype, "subscribe").mockReturnValue(() => {}),
+    spyOn(PolicyWatcher.prototype, "refresh").mockResolvedValue(f.policy),
+    spyOn(PolicyWatcher.prototype, "disconnected").mockImplementation(hooks.disconnected ?? (async () => {})),
+    spyOn(PublicCapacityStore.prototype, "observeCurrent").mockResolvedValue({ state: "unknown", reasonCode: "synthetic", remainingBudget: 0 }),
+    spyOn(ModerationWorker.prototype, "tick").mockImplementation(hooks.tick ?? (async () => false)),
+    spyOn(DiscordRestrictionObserver.prototype, "tick").mockImplementation(hooks.restrictions ?? (async () => {})),
+  ]);
+  return startWorker(f, fakeSql(), health, stop.signal);
+};
+
+test("a loop failure outside refresh clears worker authority", async () => {
+  const f = await moderationFixture(), stop = new AbortController();
+  const health: WorkerHealth = { ready: false, code: "starting", checkedAt: 0 };
+  const caught = Promise.withResolvers<{ before?: boolean; after?: boolean; code: WorkerHealth["code"] }>();
+  let before: boolean | undefined;
+  const running = greenWorker(f, health, stop, {
+    restrictions: async () => { before = health.authority?.available; throw new Error("synthetic loop failure"); },
+    // The loop's catch awaits disconnected() after clearing, so this sees its result.
+    disconnected: async () => { caught.resolve({ before, after: health.authority?.available, code: health.code }); },
+  });
+  try {
+    const observed = await caught.promise;
+    expect(observed).toEqual({ before: true, after: undefined, code: "policy_unavailable" });
+  } finally {
+    stop.abort();
+    await running;
+  }
+});
+
+test("stopping the worker clears a green authority observation", async () => {
+  const f = await moderationFixture(), stop = new AbortController();
+  const health: WorkerHealth = { ready: false, code: "starting", checkedAt: 0 };
+  const ticked = Promise.withResolvers<boolean | undefined>();
+  const running = greenWorker(f, health, stop, { tick: async () => { ticked.resolve(health.authority?.available); return false; } });
+  try {
+    expect(await ticked.promise).toBe(true);
+  } finally {
+    stop.abort();
+    await running;
+  }
+  expect(health.authority).toBeUndefined();
+  expect(health.code).toBe("stopped");
+});
