@@ -645,3 +645,25 @@ for (const acquisition of ['database', 'relay'] as const) {
     expect(finished).toBe(true);
   });
 }
+
+for (const failure of ['unreadable', 'replaced'] as const) {
+  test(`finish stops every local forward even when an owned Pod is ${failure}`, async () => {
+    const stops: string[] = [], deletes: string[] = [];
+    const backend = new KubernetesCapacity(config, { ...fullMatrix, ...matrix } as any, async args => {
+      if (args.includes('get') && args.includes('broken')) {
+        if (failure === 'unreadable') throw new Error('synthetic API read failure');
+        return JSON.stringify({ metadata: { uid: 'replacement' } });
+      }
+      if (args.includes('get')) return JSON.stringify({ metadata: { uid: 'owned' } });
+      if (args.includes('delete')) deletes.push(args.join(' '));
+      return '';
+    });
+    (backend as any).pods.set('broken', { uid: 'owned', forward: { stop: () => stops.push('broken') } });
+    (backend as any).pods.set('healthy', { uid: 'owned', forward: { stop: () => stops.push('healthy') } });
+    (backend as any).databaseForward = { stop: () => stops.push('database') };
+    await expect(backend.finish()).rejects.toThrow('could not be removed');
+    expect(stops).toEqual(['broken', 'healthy', 'database']);
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]).toContain('/pods/healthy');
+  });
+}

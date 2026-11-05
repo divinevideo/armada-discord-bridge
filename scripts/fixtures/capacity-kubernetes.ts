@@ -422,7 +422,11 @@ export class KubernetesCapacity {
     return removal;
   }
   private async removeOnce(name: string) {
-    const pod = await this.owned(name); const record = this.pods.get(name)!; record.forward?.stop();
+    // Local transport ownership is independent of API reachability and the
+    // current remote UID. A failed ownership read must still release the
+    // recorded forward without authorizing deletion of a replacement Pod.
+    this.pods.get(name)?.forward?.stop();
+    const pod = await this.owned(name);
     // Retain PVC files for reviewed cleanup. kubectl exec targets a name,
     // not a UID: even after owned() a replacement could receive a destructive
     // command before the UID-conditioned API delete rejects that replacement.
