@@ -163,8 +163,9 @@ export function destinationTimingLog(text: string): string {
       // two sinks cannot disagree about what a timing record is.
       if (value.type !== 'moderation_admission_timing' || !Number.isFinite(value.innerAdmissionMs) || value.innerAdmissionMs < 0) return [];
       if ('eventId' in value && (typeof value.eventId !== 'string' || !HEX_ID.test(value.eventId))) return [];
-      // The deployed emitter is aggregate-only; calibration can add correlation.
-      // Retaining an absent ID lets the sampler use only its single-flight fallback.
+      // strfryPlugin adds an eventId only for a frame it verified, and an image
+      // predating that correlation emits none. Keeping an absent ID absent
+      // leaves the sampler only its single-flight fallback, never a guess.
       return [JSON.stringify({ type: value.type, ...('eventId' in value ? { eventId: value.eventId } : {}), innerAdmissionMs: value.innerAdmissionMs })];
     } catch { return []; }
   }).join('\n');

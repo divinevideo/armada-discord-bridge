@@ -218,8 +218,9 @@ test('entrypoint replay binds the reviewed contract to the exact image and prese
   expect(() => capacityContractForEntrypoint({ imageId: identity.imageId, version: 1 }, identity)).toThrow('Invalid capacity contract');
 });
 
-test('retains the production emitter timing shape without inventing event correlation or exposing extra fields', () => {
-  // strfryPlugin emits aggregate timing; only the calibration launcher adds eventId.
+test('keeps an uncorrelated emitter line aggregate, without inventing correlation or exposing extra fields', () => {
+  // strfryPlugin omits eventId for a frame it could not verify, as does an image
+  // predating verified correlation; the filter must not supply one.
   const emitted = { type: 'moderation_admission_timing', innerAdmissionMs: 3, action: 'accept' };
   const filtered = destinationTimingLog(JSON.stringify({ ...emitted, database: 'postgres://synthetic:private-password@db.example/benchmark', token: 'private-token' }));
   expect(JSON.parse(filtered)).toEqual({ type: emitted.type, innerAdmissionMs: emitted.innerAdmissionMs });
