@@ -180,3 +180,64 @@ describe("slash command dispatch", () => {
     await adapter.stop();
   });
 });
+
+describe('deletion dispatch authority', () => {
+  it('checks current Concord authority after webhook lookup and the final async policy check', async () => {
+    let allowed = true, deleted = 0;
+    const adapter = new DiscordAdapter('synthetic', { onMessage: async () => {} }, async () => { allowed = false; });
+    (adapter as unknown as { webhookFor: () => Promise<unknown> }).webhookFor = async () => ({ deleteMessage: async () => { deleted++; } });
+    await expect(adapter.delete({ discordChannelId: '100000000000000002' } as never, '100000000000000003', () => { if (!allowed) throw new Error('Concord authority changed'); })).rejects.toThrow('Concord authority');
+    expect(deleted).toBe(0);
+    await adapter.stop();
+  });
+
+  it('rechecks before bot fallback and treats already-absent messages as settled', async () => {
+    let allowed = true, deleted = 0, lookups = 0;
+    const adapter = new DiscordAdapter('synthetic', { onMessage: async () => {} }, async () => {});
+    (adapter as unknown as { webhookFor: () => Promise<unknown> }).webhookFor = async () => ({ deleteMessage: async () => { lookups++; if (lookups === 1) { allowed = false; throw { code: 50013 }; } throw { code: 10008 }; } });
+    (adapter as unknown as { textChannel: () => Promise<unknown> }).textChannel = async () => ({ messages: { delete: async () => { deleted++; throw { code: 10008 }; } } });
+    const link = { discordChannelId: '100000000000000002' } as never;
+    await expect(adapter.delete(link, '100000000000000003', () => { if (!allowed) throw new Error('Concord authority changed'); })).rejects.toThrow('Concord authority');
+    expect(deleted).toBe(0);
+    await adapter.delete(link, '100000000000000003', () => {});
+    expect(deleted).toBe(1);
+    await adapter.stop();
+  });
+});
+
+it('uses the bot endpoint for a Discord-origin message that the webhook cannot address', async () => {
+  let removed = 0;
+  const adapter = new DiscordAdapter('synthetic', { onMessage: async () => {} }, async () => {});
+  (adapter as unknown as { webhookFor: () => Promise<unknown> }).webhookFor = async () => ({ deleteMessage: async () => { throw { code: 10008 }; } });
+  (adapter as unknown as { textChannel: () => Promise<unknown> }).textChannel = async () => ({ messages: { delete: async () => { removed++; } } });
+  await adapter.delete({ discordChannelId: '100000000000000002' } as never, '100000000000000003', () => {});
+  expect(removed).toBe(1);
+  await adapter.stop();
+});
+
+it('retains the originating worker fence after shared adapter lookup', async () => {
+  let deleted = 0;
+  const adapter = new DiscordAdapter('synthetic', { onMessage: async () => {} }, async () => {});
+  (adapter as unknown as { webhookFor: () => Promise<unknown> }).webhookFor = async () => ({ deleteMessage: async () => { deleted++; } });
+  await expect(adapter.delete({ discordChannelId: '100000000000000002' } as never, '100000000000000003', () => {}, async () => { throw new Error('old worker fenced'); })).rejects.toThrow('old worker fenced');
+  expect(deleted).toBe(0);
+  await adapter.stop();
+});
+
+it('permission observations distinguish bot deletion permission and access loss without making them terminal', async () => {
+  const { discordPermissionObservation } = await import('./adapter');
+  expect(discordPermissionObservation({code:50013},'delete')).toEqual({permission:'Manage Messages',operation:'delete'});
+  expect(discordPermissionObservation({code:50001},'delete')).toEqual({permission:'View Channel',operation:'delete'});
+  expect(discordPermissionObservation({code:50013},'send')).toEqual({permission:'Manage Webhooks',operation:'send'});
+  expect(discordPermissionObservation({code:50013},'unreact')).toBeUndefined();
+  expect(discordPermissionObservation({code:10003},'delete')).toBeUndefined();
+});
+it('keeps unknown channel, missing access, and missing message permissions retryable',async()=>{
+ for(const code of [10003,50001,50013]) {
+  const adapter=new DiscordAdapter('synthetic',{onMessage:async()=>{}},async()=>{});
+  (adapter as any).webhookFor=async()=>({deleteMessage:async()=>{throw {code:10008};}});
+  (adapter as any).textChannel=async()=>({messages:{delete:async()=>{throw {code};}}});
+  await expect(adapter.delete({discordChannelId:'100000000000000002'} as never,'100000000000000003')).rejects.toMatchObject({code});
+  await adapter.stop();
+ }
+});

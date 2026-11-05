@@ -237,16 +237,6 @@ describe.skipIf(!dbUp)("severance action (stop forwarding, surface, record)", ()
     expect(comm.severed_reason).toBe("dissolved");
   });
 
-  it("a clean start clears the recorded reason", async () => {
-    const bridgeId = await newBridge();
-    await apply(bridgeId, { reason: "dissolved" });
-    await (mgr as unknown as { clearSeveredReason(r: { community_id: string }): Promise<void> }).clearSeveredReason({
-      community_id: SEVERED_COMMUNITY,
-    });
-    const { comm } = await readState(bridgeId);
-    expect(comm.severed_reason).toBeNull();
-  });
-
   it("detection fires and the bridge takes the documented action, end to end", async () => {
     // The same chain the live watchers run: mint a community whose Banlist
     // names the bridge's npub, fold it, classify it, apply it — and the row

@@ -1,0 +1,100 @@
+import { afterAll, expect, test } from 'bun:test';
+import { readdir, readFile } from 'node:fs/promises';
+import postgres from 'postgres';
+import { PostgresMappingStore, standaloneDeliveryOwner } from './store';
+import { BridgeLeases, bridgeResource } from './leases';
+import type { ChannelLink } from '../router';
+const url=process.env.DATABASE_URL;
+const admin=postgres(url??'postgres://unused:unused@127.0.0.1:1/unused',{max:2,connect_timeout:2,onnotice(){}});
+const reachable=url?await admin`SELECT 1`.then(()=>true,error=>{if(['ECONNREFUSED','ETIMEDOUT','CONNECT_TIMEOUT','ENOTFOUND'].includes(error.code))return false;throw error;}):false;
+afterAll(()=>admin.end());
+test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligibility once and runtime DML grants cover every new table',async()=>{
+ const suffix=crypto.randomUUID().replaceAll('-',''), schema=`delivery_upgrade_${suffix}`, role=`delivery_runtime_${suffix}`, password=crypto.randomUUID();
+ await admin.unsafe(`CREATE SCHEMA ${schema}`);
+ await admin.unsafe(`CREATE ROLE ${role} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`);
+ const db=postgres(url!,{max:2,connection:{search_path:schema},onnotice(){}});
+ let runtime:postgres.Sql|undefined;
+ const tenant='synthetic-upgrade';
+ const link:ChannelLink={communityId:'a'.repeat(64),concordChannelIdHex:'b'.repeat(64),discordGuildId:'synthetic-guild',discordChannelId:'synthetic-channel',enabled:true};
+ const owner=crypto.randomUUID(), checkpointOwner=crypto.randomUUID(), old=Date.now()-8*86400_000;
+ try {
+   const directory=new URL('./',import.meta.url);
+   await db.unsafe(await readFile(new URL('schema.sql',directory),'utf8'));
+   for(const file of (await readdir(new URL('migrations/',directory))).filter(file=>file.endsWith('.sql') && file<'022').sort()) await db.unsafe(await readFile(new URL('migrations/'+file,directory),'utf8'));
+   await db`INSERT INTO bridges(tenant_id,bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+     VALUES (${tenant},${owner},'synthetic-owner','paused',${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId})`;
+   await db`INSERT INTO bridges(tenant_id,bridge_id,owner_discord_id,status,community_id,concord_channel_id,discord_guild_id,discord_channel_id)
+     VALUES (${tenant},${checkpointOwner},'synthetic-owner','paused',${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'checkpoint-only')`;
+   await db`INSERT INTO channel_delivery_checkpoints(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,last_seen_at)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'checkpoint-only',70)`;
+   await db`INSERT INTO communities(tenant_id,community_id,relays) VALUES (${tenant},${link.communityId},ARRAY[]::text[])`;
+   await db`INSERT INTO channel_links(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,enabled)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'standalone-channel',true)`;
+   await db`INSERT INTO cursors(tenant_id,community_id,stream_pk,relay_url,last_seen_at) VALUES (${tenant},${link.communityId},'old','pool',100),(${tenant},${link.communityId},'new','pool',200),(${tenant},${link.communityId},'late','pool',50),(${tenant},${link.communityId},'future','pool',1600)`;
+   await db`INSERT INTO channel_delivery_checkpoints(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,last_seen_at)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},80)`;
+   await db`INSERT INTO messages(tenant_id,community_id,concord_channel_id,discord_channel_id,discord_message_id,concord_rumor_id,origin,author_ref)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordChannelId},'synthetic-message',${'c'.repeat(64)},'concord',${'d'.repeat(64)})`;
+   for(const target of ['c'.repeat(64),'e'.repeat(64)]) await db`INSERT INTO pending_concord_deletes
+     (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,delete_rumor_id,target_rumor_id,author,created_at_ms)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${'f'.repeat(64)},${target},${'1'.repeat(64)},${old})`;
+   await db.unsafe(await readFile(new URL('migrations/022_delivery_lifecycle.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/023_delivery_pause.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/024_delivery_recovery_floor.sql',directory),'utf8'));
+   await db`INSERT INTO channel_delivery_lifecycles(tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id,owner_id,activation_floor,recovery_floor,legacy_boundaries)
+     VALUES (${tenant},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},'intermediate', 'intermediate',1000,1000,${db.json({future:1600,old:100})})`;
+   await db.unsafe(await readFile(new URL('migrations/025_delivery_legacy_boundaries.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/026_delivery_worker_session.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/027_delivery_worker_generation.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/028_delivery_session_lease.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/029_delivery_relay_context.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/030_delivery_deletion_floor.sql',directory),'utf8'));
+   expect(Number((await db`SELECT deletion_floor FROM channel_delivery_lifecycles WHERE discord_channel_id='intermediate'`)[0].deletion_floor)).toBe(0);
+   expect((await db`SELECT legacy_boundaries FROM channel_delivery_lifecycles WHERE discord_channel_id='intermediate'`)[0].legacy_boundaries).toEqual({future:999,old:100});
+   // Match the deployment migration hook: explicit DML grants after migrations,
+   // not superuser tests or a dependency on unspecified default privileges.
+   await admin.unsafe(`GRANT USAGE ON SCHEMA ${schema} TO ${role}`);
+   await admin.unsafe(`GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA ${schema} TO ${role}`);
+   await admin.unsafe(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA ${schema} TO ${role}`);
+   const runtimeUrl=new URL(url!);runtimeUrl.username=role;runtimeUrl.password=password;
+   runtime=postgres(runtimeUrl.toString(),{max:2,connection:{search_path:schema},onnotice(){}});
+   expect((await runtime`SELECT rolsuper FROM pg_roles WHERE rolname=current_user`)[0].rolsuper).toBe(false);
+   const store=new PostgresMappingStore(runtime,tenant);
+   const lease=(await new BridgeLeases(runtime).acquire(bridgeResource(link.discordGuildId,link.discordChannelId)))!;
+   try {
+     const snapshot=await store.activateDelivery(link,owner,['old','new'],1000);
+     expect(snapshot.deletionFloor).toBe(0);expect(snapshot.repairFloor).toBe(80);expect(snapshot.activationFloor).toBe(1000);expect(snapshot.recoveryFloor).toBe(80);expect(snapshot.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999});
+     const view=(await store.openDelivery(link,owner,lease)).store;
+     const held=await view.pendingDeletes(link);
+     expect(held.find(row=>row.targetRumorId==='c'.repeat(64))?.actionClass).toBe('actionable');
+     expect(held.find(row=>row.targetRumorId==='e'.repeat(64))?.actionClass).toBe('unresolved');
+     expect((await view.dueDeletes(link)).map(row=>row.targetRumorId)).toEqual(['c'.repeat(64)]);
+     expect(await view.dueDeletionLinks()).toHaveLength(1);
+     await view.retryDelete(link,held[0]);await view.wakeDeletes(link);
+     const gap=await view.markDeliveryGap(90);expect(await view.certifyDelivery(gap.version,1100,{old:1100,new:1100},true)).toBe(true);
+     await view.retireReaction(link,{rumorId:'2'.repeat(64),discordMessageId:'synthetic-message',emoji:'x',origin:'concord',authorRef:'d'.repeat(64)});
+     await view.completeDelete(link,'f'.repeat(64),'c'.repeat(64));
+     // Restart and later cursors never replace the frozen legacy boundaries.
+     await store.cursorSet(link.communityId,'old',900);
+     const resumed = await store.activateDelivery(link,owner,['old','new'],2000);
+     expect(resumed.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999}); expect(resumed.activationFloor).toBe(1000);expect(resumed.recoveryFloor).toBe(80);
+     await store.terminateDelivery(link,owner,snapshot.epoch);
+     const relink=await store.activateDelivery(link,owner,['old','new'],3000);
+     expect(relink.deletionFloor).toBe(3000);expect(relink.repairFloor).toBe(3000);expect(relink.recoveryFloor).toBe(3000);expect(relink.legacyBoundaries).toEqual({});
+   } finally {await lease.release();}
+   const checkpointOnly={...link,discordChannelId:'checkpoint-only'};
+   const checkpointLease=(await new BridgeLeases(runtime).acquire(bridgeResource(checkpointOnly.discordGuildId,checkpointOnly.discordChannelId)))!;
+   try {
+     const oldCheckpoint=await store.activateDelivery(checkpointOnly,checkpointOwner,[],1000);
+     expect(oldCheckpoint.legacyBoundaries).toEqual({old:100,new:200,late:50,future:999}); expect(oldCheckpoint.recoveryFloor).toBe(70);
+     const opened=await store.openDelivery(checkpointOnly,checkpointOwner,checkpointLease); const view=opened.store;
+     expect(await view.certifyDelivery(opened.snapshot.version,1200,{},true)).toBe(true);
+     const healed=await view.deliverySnapshot();
+     expect(healed.repairFloor).toBeUndefined(); expect(healed.recoveryFloor).toBe(70);
+   } finally { await checkpointLease.release(); }
+   const standalone={...link,discordChannelId:'standalone-channel'};
+   expect((await store.activateDelivery(standalone,standaloneDeliveryOwner(standalone),['old','new'],1000)).repairFloor).toBe(100);
+   const fresh={...link,discordChannelId:'new-after-migration'};
+   expect((await store.activateDelivery(fresh,'fresh-owner',['old','new'],1000)).repairFloor).toBe(1000);
+ } finally {await runtime?.end();await db.end();await admin.unsafe(`DROP SCHEMA ${schema} CASCADE`);await admin.unsafe(`DROP ROLE ${role}`);}
+},15000);

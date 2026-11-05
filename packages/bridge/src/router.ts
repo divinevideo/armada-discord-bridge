@@ -11,7 +11,7 @@
  *     and never bridge a rumor we already have a mapping row for.
  */
 
-import { KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION, KIND_TYPING } from "@armada-bridge/concord-core";
+import { filterEpochCutoff, canActOnMember, citationFromTags, citationSatisfied, citationToTag, Permissions, KIND_COMMENT, KIND_DELETE, KIND_EDIT, KIND_MESSAGE, KIND_REACTION, KIND_TYPING } from "@armada-bridge/concord-core";
 import type { OpenedChat } from "@armada-bridge/concord-core";
 
 import type { ConcordClient } from "./concord/client";
@@ -32,6 +32,10 @@ import {
 import { isKlipyMediaHost, klipyItem } from "./klipy";
 import type { KlipyClient } from "./klipy";
 import { safeProbe } from "./net";
+
+import { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError, ActionableDeletionCapacityError, PromotionDeletionIntakeError, planDeletionIntake, observeDeletionDisposition, deletionRetryDelay, deletionKey } from "./deletionPolicy";
+import type { DeletionIntakeOutcome } from "./deletionPolicy";
+export { MAX_PENDING_DELETES_PER_LINK, MAX_PENDING_DELETES_PER_ACTOR, DELETION_RETRY_MS, MAX_PENDING_DELETE_REPLAY_BATCH, DeletionIntakeError } from "./deletionPolicy";
 
 type LocalIdentitySigner = LocalIdentity["signer"];
 import type { PuppetCache } from "./puppets";
@@ -100,7 +104,36 @@ export interface ReactionMappingRow {
   authorRef: string;
 }
 
+/** Minimal durable input: opened and verified by the channel transport, never key material. */
+export interface PendingConcordDelete {
+  deleteRumorId: string;
+  targetRumorId: string;
+  author: string;
+  citation?: string[];
+  createdAtMs: number;
+  /** Verified outer carrier time (seconds), never the inner rumor timestamp. */
+  sourceWrapCreatedAt?: number;
+  innerCreatedAt?: number;
+  innerEpoch?: string;
+  firstObservedAtMs?: number;
+  actionClass?: "unresolved" | "actionable";
+  expiresAtMs?: number;
+  nextAttemptAtMs?: number;
+  attempts?: number;
+}
+export const deletionLinkKey = (link: ChannelLink): string => JSON.stringify([
+  link.communityId, link.concordChannelIdHex, link.discordGuildId, link.discordChannelId,
+]);
+
 export interface MappingStore {
+  /** Atomic, deduplicated and bounded: capacity refusal must not acknowledge a cursor. */
+  saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<DeletionIntakeOutcome>;
+  dueDeletes(link: ChannelLink, targetRumorId?: string): Promise<PendingConcordDelete[]>;
+  promoteDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void>;
+  retryDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void>;
+  wakeDeletes(link: ChannelLink): Promise<void>;
+  pendingDeletes(link: ChannelLink, targetRumorId?: string): Promise<PendingConcordDelete[]>;
+  completeDelete(link: ChannelLink, deleteRumorId: string, targetRumorId: string): Promise<void>;
   insert(row: MessageMappingRow): Promise<void>;
   byRumorId(rumorId: string): Promise<MessageMappingRow[]>;
   byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]>;
@@ -108,6 +141,8 @@ export interface MappingStore {
   reactionByDiscord(messageId: string, userId: string, emoji: string): Promise<ReactionMappingRow | undefined>;
   reactionByRumorId(rumorId: string): Promise<ReactionMappingRow | undefined>;
   deleteReaction(rumorId: string): Promise<void>;
+  retiredReaction(link: ChannelLink, rumorId: string): Promise<ReactionMappingRow | undefined>;
+  retireReaction(link: ChannelLink, row: ReactionMappingRow): Promise<void>;
   /** Concord-origin reactions still mirrored onto this message with this emoji. */
   countConcordReactions(messageId: string, emoji: string): Promise<number>;
 }
@@ -124,14 +159,14 @@ export interface WebhookSender {
       files?: Array<{ name: string; data: Uint8Array }>;
     },
   ): Promise<string>;
-  /** Remove a bridged message (webhook delete; bot delete for user posts). */
-  delete(link: ChannelLink, discordMessageId: string): Promise<void>;
+  /** Remove a mapped message. Run authorize after the last await, beside each Discord dispatch. */
+  delete(link: ChannelLink, discordMessageId: string, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<void>;
   /** Edit a webhook-authored mirror in place. */
   edit(link: ChannelLink, discordMessageId: string, content: string): Promise<void>;
   /** React as the bot account (webhooks cannot react). */
   react(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
   /** Remove the bot's own reaction. */
-  unreact(link: ChannelLink, discordMessageId: string, emoji: string): Promise<void>;
+  unreact(link: ChannelLink, discordMessageId: string, emoji: string, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<void>;
   /** Show the bot's typing indicator in the channel (lasts ~10s on Discord). */
   sendTyping(link: ChannelLink): Promise<void>;
 }
@@ -148,6 +183,8 @@ export interface BlobPort {
 }
 
 export interface RouterOptions {
+  /** Observe retryable deletion failures through the existing operational alert path. */
+  onDeletionFailure?: (error: unknown) => void;
   /** Required at runtime: current worker ownership and deployment-specific channel permissions. */
   beforeSideEffect?: () => Promise<void>;
   /** Kind 3302 is not frozen in the CORDs yet; off by default. */
@@ -405,6 +442,8 @@ export class BridgeRouter {
   /** throttle state: direction key -> last forwarded typing signal (ms). */
   private readonly lastTyping = new Map<string, number>();
 
+  private readonly deletionWebhooks: WebhookSender;
+
   constructor(
     private readonly client: ConcordClient,
     private readonly puppets: PuppetCache,
@@ -414,9 +453,10 @@ export class BridgeRouter {
     private readonly self: { applicationId: string; webhookIds: Set<string> },
     private readonly options: RouterOptions = {},
   ) {
+    this.deletionWebhooks = webhooks;
     const before = options.beforeSideEffect ?? (() => this.assertMayForward());
     this.client = guardEffects(client, before, CONCORD_EFFECT_METHODS);
-    this.webhooks = guardEffects(webhooks, before, new Set(["send", "edit", "delete", "react", "unreact", "sendTyping"]));
+    this.webhooks = guardEffects(webhooks, before, new Set(["send", "edit", "react", "sendTyping"]));
     this.options = {
       ...options,
       blobs: options.blobs && guardEffects(options.blobs, before, new Set(["download", "upload"])),
@@ -543,6 +583,7 @@ export class BridgeRouter {
       authorRef: msg.author.id,
       partIndex: 0,
     });
+    await this.applyPendingDeletes(link, rumor.id);
     return rumor.id;
   }
 
@@ -562,6 +603,9 @@ export class BridgeRouter {
    */
   async onConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (this.queued >= MAX_QUEUED_CHATS) {
+      if (chat.kind === KIND_DELETE) {
+        throw new Error("Concord deletion queue full; delivery cursor must remain pinned");
+      }
       // Shedding load beats unbounded growth: past this the sender is flooding
       // and the relay copy is still the record. Loud, because it is data loss.
       console.warn(
@@ -588,6 +632,12 @@ export class BridgeRouter {
 
   private async dispatchConcordChat(chat: OpenedChat, link: ChannelLink): Promise<string[]> {
     if (!link.enabled) return [];
+    // The chat may have waited behind another effect while a rotation was
+    // adopted. Decode memo entries predate that rotation, so apply the core
+    // read-side cutoff again at the point this queue starts dispatching it.
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) throw new Error("Concord channel unavailable during dispatch");
+    if (!filterEpochCutoff([chat], channel).length) return [];
     // Layer 1 + 2: bridge-originated or already-bridged rumors never bounce.
     // The primary's own posts (confirm requests, announcements) stay
     // Armada-side; mirroring them trips Discord's webhook username filter
@@ -668,6 +718,7 @@ export class BridgeRouter {
         partIndex: index,
       });
     }
+    await this.applyPendingDeletes(link, chat.rumorId);
     return ids;
   }
 
@@ -798,51 +849,157 @@ export class BridgeRouter {
         proxyTag(reaction.guildId, reaction.channelId, reaction.messageId),
       ],
     });
-    await this.store.deleteReaction(row.rumorId);
+    await this.store.retireReaction(link, row);
     return rumor.id;
   }
 
+  /** Self-deletes need no rank; moderation uses exactly the clients' current fold. */
+  private mayDelete(deletion: PendingConcordDelete, targetAuthor: string, link: ChannelLink): boolean {
+    if (!link.enabled || this.client.community.idHex !== link.communityId || this.client.isBanned(deletion.author)) return false;
+    if (deletion.author === targetAuthor) return true;
+    const folded = this.client.folded;
+    return !!folded && citationSatisfied(folded, this.client.community.id, deletion.author,
+      citationFromTags(deletion.citation ? [deletion.citation] : [])) &&
+      canActOnMember(folded.roster, deletion.author, this.client.community.owner, targetAuthor, Permissions.MANAGE_MESSAGES);
+  }
+
+  private inLink(row: MessageMappingRow, link: ChannelLink): boolean {
+    return row.communityId === link.communityId && row.concordChannelId === link.concordChannelIdHex && row.discordChannelId === link.discordChannelId;
+  }
+
+  private targetAuthor(row: Pick<MessageMappingRow, "origin" | "authorRef">): string {
+    return row.origin === "discord" ? this.puppets.get(row.authorRef).pk : row.authorRef;
+  }
+
   /**
-   * Kind 5 -> remove every mapped Discord part. Honored for the rumor's own
-   * author and for MANAGE_MESSAGES holders (moderator deletes propagate).
+   * Store before acknowledging delivery: a future Grant may make the citation
+   * resolvable after the relay cursor has advanced, including after restart.
    */
   private async onConcordDelete(chat: OpenedChat, link: ChannelLink): Promise<void> {
-    const targets = chat.tags.filter((t) => t[0] === "e" && t[1]).map((t) => t[1]);
-    for (const target of targets) {
-      // A kind 7 tombstone: un-react on Discord once the last mirrored
-      // reaction with that emoji is gone (many reactors collapse into one
-      // bot reaction).
-      const reaction = await this.store.reactionByRumorId(target);
-      if (reaction) {
-        const own = reaction.origin === "concord" && reaction.authorRef === chat.author;
-        if (!own && !this.client.isModerator(chat.author)) continue;
-        await this.store.deleteReaction(target);
-        if (
-          reaction.origin === "concord" &&
-          (await this.store.countConcordReactions(reaction.discordMessageId, reaction.emoji)) === 0
-        ) {
-          await this.webhooks
-            .unreact(link, reaction.discordMessageId, reaction.emoji)
-            .catch((error) => console.warn(`bridge: discord unreact failed for ${reaction.discordMessageId}`, error));
-        }
-        continue;
+    if (chat.channelIdHex !== link.concordChannelIdHex || this.client.community.idHex !== link.communityId) return;
+    const citation = citationFromTags(chat.tags);
+    const targets = [...new Set(chat.tags.filter(t => t[0] === "e" && t[1]).map(t => t[1]))];
+    const rows: PendingConcordDelete[] = [];
+    try {
+      for (const targetRumorId of targets) {
+        const row: PendingConcordDelete = { deleteRumorId:chat.rumorId,targetRumorId,author:chat.author,
+          ...(citation ? {citation:citationToTag(citation)} : {}),createdAtMs:Date.now(),
+          innerCreatedAt:chat.createdAt, innerEpoch:chat.epoch.toString(),
+          sourceWrapCreatedAt:(chat as OpenedChat & {sourceWrapCreatedAt?:number}).sourceWrapCreatedAt };
+        const evidence=await this.deleteEvidence(row,link);
+        if(evidence.scoped.length && this.mayDelete(row,evidence.targetAuthor,link)) row.actionClass='actionable';
+        rows.push(row);
       }
+      await this.store.saveDeletes(link,rows);
+    } catch(error) { throw error instanceof DeletionIntakeError ? error : new DeletionIntakeError('Concord deletion intake failed: '+String(error),{cause:error}); }
+    // Once durable, a transient read or effect failure belongs to the retry
+    // queue. It must not masquerade as missing relay intake.
+    for (const target of targets) await this.applyPendingDeletes(link,target);
+  }
 
-      const rows = await this.store.byRumorId(target);
-      if (rows.length === 0) continue;
-      const own = rows[0].origin === "concord" && rows[0].authorRef === chat.author;
-      if (!own && !this.client.isModerator(chat.author)) continue;
-      for (const row of rows) {
-        await this.webhooks
-          .delete(link, row.discordMessageId)
-          .catch((error) => console.warn(`bridge: discord delete failed for ${row.discordMessageId}`, error));
+  private deletionRetry?: Promise<void>;
+  /** Coalesce fold/timer notifications into the channel's existing serial effect lane. */
+  retryPendingDeletes(link: ChannelLink, wake = false): Promise<void> {
+    if (this.deletionRetry) return this.deletionRetry;
+    const run = this.chatQueue.then(async () => { if(wake) await this.store.wakeDeletes(link); await this.applyPendingDeletes(link); });
+    this.chatQueue = run.catch(() => {});
+    const pending = run.finally(() => { if (this.deletionRetry === pending) this.deletionRetry = undefined; });
+    this.deletionRetry = pending;
+    return pending;
+  }
+
+  private async applyPendingDeletes(link: ChannelLink, target?: string): Promise<void> {
+    if (!link.enabled) return;
+    let batch: PendingConcordDelete[];
+    try { batch=await this.store.dueDeletes(link,target); }
+    catch(error) { console.warn('bridge: durable deletion read deferred',error); return; }
+    let gap: ActionableDeletionCapacityError | PromotionDeletionIntakeError | undefined;
+    for(const deletion of batch) {
+      try { await this.applyDelete(deletion,link); }
+      catch(error) {
+        if(error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError) {
+          if(!gap || error.repairFloor < gap.repairFloor) gap=error;
+        } else {
+          console.warn(`bridge: deletion ${deletion.deleteRumorId} remains pending`,error);
+          try { this.options.onDeletionFailure?.(error); } catch(observationError) { console.warn('bridge: deletion observation failed',observationError); }
+        }
+      }
+      // This is harmless after completion (the row is gone). Scheduling even
+      // denied citations prevents a fixed denied prefix starving later work.
+      try { await this.store.retryDelete(link,deletion); }
+      catch(error) { console.warn('bridge: durable deletion retry scheduling deferred',error); }
+    }
+    if(gap) throw gap;
+  }
+  private async deleteEvidence(deletion:PendingConcordDelete,link:ChannelLink) {
+    const retired=await this.store.retiredReaction(link,deletion.targetRumorId);
+    const reaction=retired ?? await this.store.reactionByRumorId(deletion.targetRumorId);
+    const rows=reaction ? await this.store.byDiscordId(reaction.discordMessageId) : await this.store.byRumorId(deletion.targetRumorId);
+    const scoped=rows.filter(row=>this.inLink(row,link));
+    return { retired,reaction,scoped,targetAuthor:scoped.length ? this.targetAuthor(reaction ?? scoped[0]) : '' };
+  }
+
+  private assertDeletionEpoch(deletion: PendingConcordDelete, link: ChannelLink): void {
+    // Older rows have no verified inner provenance; preserve their existing
+    // behavior instead of fabricating an epoch from the carrier or timestamp.
+    if (deletion.innerEpoch === undefined || deletion.innerCreatedAt === undefined) return;
+    const channel = this.client.channel(link.concordChannelIdHex);
+    if (!channel) throw new Error("Concord channel unavailable for deletion cutoff");
+    // The core read-side rule uses only epoch and createdAt. Retaining these
+    // verified fields avoids storing content or keys merely to apply that rule.
+    const evidence = { epoch: BigInt(deletion.innerEpoch), createdAt: deletion.innerCreatedAt } as OpenedChat;
+    if (!filterEpochCutoff([evidence], channel).length) throw new Error("Concord deletion is past its epoch cutoff");
+  }
+
+  private async applyDelete(deletion: PendingConcordDelete, link: ChannelLink): Promise<void> {
+    this.assertDeletionEpoch(deletion, link);
+    const target = deletion.targetRumorId;
+    const {retired,reaction,scoped,targetAuthor}=await this.deleteEvidence(deletion,link);
+    // A mapping from another link proves no target scope here.
+    if(!scoped.length) return;
+    if (!this.mayDelete(deletion, targetAuthor, link)) {
+      // A missing non-owner citation cannot ever become a resolved citation.
+      // Cited actions remain: later grants, ranks or an unban can change the fold.
+      if (deletion.actionClass !== "actionable" && !deletion.citation && deletion.author !== this.client.community.owner && deletion.author !== targetAuthor) {
+        await this.store.completeDelete(link, deletion.deleteRumorId, target);
+      }
+      return;
+    }
+    if(deletion.actionClass !== 'actionable') {
+      try { await this.store.promoteDelete(link,deletion); }
+      catch(error) {
+        if(error instanceof ActionableDeletionCapacityError) { error.link={...link}; throw error; }
+        throw new PromotionDeletionIntakeError(deletion,link,error);
       }
     }
+    const authorize = () => {
+      this.assertDeletionEpoch(deletion, link);
+      if (!this.mayDelete(deletion, targetAuthor, link)) throw new Error("Concord deletion authority changed");
+    };
+    // Retired targets still prove scope and author, but must never remove a
+    // newer reaction that happens to use the same message and emoji.
+    if (reaction && !retired) {
+      const count = await this.store.countConcordReactions(reaction.discordMessageId, reaction.emoji);
+      if (reaction.origin === "concord" && count <= 1) {
+        await this.assertMayForward(); authorize();
+        await this.deletionWebhooks.unreact(link, reaction.discordMessageId, reaction.emoji, authorize, () => this.assertMayForward());
+      }
+      await this.assertMayForward(); authorize();
+      await this.store.retireReaction(link, reaction);
+    } else if (!reaction) {
+      for (const row of scoped) {
+        // The mapping's actual author is authoritative, even for split parts.
+        const check = () => { this.assertDeletionEpoch(deletion, link); if (!this.mayDelete(deletion, this.targetAuthor(row), link)) throw new Error("Concord deletion authority changed"); };
+        await this.assertMayForward(); check();
+        await this.deletionWebhooks.delete(link, row.discordMessageId, check, () => this.assertMayForward());
+      }
+    }
+    await this.store.completeDelete(link, deletion.deleteRumorId, target);
   }
 
   /** Kind 7 -> bot reaction on the mapped Discord message. */
   private async onConcordReaction(chat: OpenedChat, link: ChannelLink): Promise<void> {
-    if (await this.store.reactionByRumorId(chat.rumorId)) return; // relay echo
+    if (await this.store.reactionByRumorId(chat.rumorId) || await this.store.retiredReaction(link, chat.rumorId)) return; // relay echo, including retired reactions
     const target = chat.tags.find((t) => t[0] === "e" && t[1])?.[1];
     if (!target) return;
     // Unicode maps directly; an Armada custom emoji maps back only when its
@@ -860,6 +1017,7 @@ export class BridgeRouter {
       origin: "concord",
       authorRef: chat.author,
     });
+    await this.applyPendingDeletes(link, chat.rumorId);
   }
 
   /**
@@ -1171,6 +1329,45 @@ function stripAttachedUrls(content: string, urls: string[] | undefined): string 
 /** In-memory store for tests and dry runs; Postgres implementation in db/. */
 export class MemoryMappingStore implements MappingStore {
   rows: MessageMappingRow[] = [];
+  private deletions = new Map<string, { scope: string; row: PendingConcordDelete }>();
+  constructor(private readonly now: () => number = Date.now) {}
+  private expire(link: ChannelLink): void {
+    for (const [key, value] of this.deletions) if (value.scope === deletionLinkKey(link) && value.row.actionClass === 'unresolved' && value.row.expiresAtMs! <= this.now()) {
+      this.deletions.delete(key); observeDeletionDisposition({ stored: 0, disposedExpired: 1, disposedCapacity: 0 });
+    }
+  }
+  async saveDeletes(link: ChannelLink, rows: PendingConcordDelete[]): Promise<DeletionIntakeOutcome> {
+    this.expire(link);
+    const scope = deletionLinkKey(link);
+    const held = [...this.deletions.values()].filter(value => value.scope === scope).map(value => value.row);
+    let plan: ReturnType<typeof planDeletionIntake>;
+    try { plan=planDeletionIntake(held, rows, this.now()); }
+    catch(error) { if(error instanceof ActionableDeletionCapacityError) error.link={...link}; throw error; }
+    const { writes, outcome } = plan;
+    for (const row of writes) this.deletions.set(`${scope}:${deletionKey(row)}`, { scope, row });
+    observeDeletionDisposition(outcome); return outcome;
+  }
+  async pendingDeletes(link: ChannelLink, target?: string): Promise<PendingConcordDelete[]> {
+    return [...this.deletions.values()].filter(value => value.scope === deletionLinkKey(link) && (!target || value.row.targetRumorId === target)).map(value => ({ ...value.row }));
+  }
+  async dueDeletes(link: ChannelLink, target?: string): Promise<PendingConcordDelete[]> {
+    this.expire(link);
+    return (await this.pendingDeletes(link,target)).filter(row => target || row.nextAttemptAtMs! <= this.now())
+      .sort((a,b) => a.nextAttemptAtMs! - b.nextAttemptAtMs!).slice(0,MAX_PENDING_DELETE_REPLAY_BATCH);
+  }
+  async promoteDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void> {
+    await this.saveDeletes(link,[{ ...row, actionClass: 'actionable' }]);
+  }
+  async retryDelete(link: ChannelLink, row: PendingConcordDelete): Promise<void> {
+    const current = this.deletions.get(`${deletionLinkKey(link)}:${deletionKey(row)}`)?.row;
+    if (current) { current.nextAttemptAtMs = this.now() + deletionRetryDelay(current.attempts ?? 0); current.attempts = (current.attempts ?? 0) + 1; }
+  }
+  async wakeDeletes(link: ChannelLink): Promise<void> {
+    for (const value of this.deletions.values()) if (value.scope === deletionLinkKey(link)) value.row.nextAttemptAtMs = value.row.actionClass === 'actionable' ? 0 : 1;
+  }
+  async completeDelete(link: ChannelLink, deletion: string, target: string): Promise<void> {
+    this.deletions.delete(`${deletionLinkKey(link)}:${deletion}:${target}`);
+  }
   async insert(row: MessageMappingRow): Promise<void> {
     this.rows.push(row);
   }
@@ -1179,6 +1376,14 @@ export class MemoryMappingStore implements MappingStore {
   }
   async byDiscordId(discordMessageId: string): Promise<MessageMappingRow[]> {
     return this.rows.filter((r) => r.discordMessageId === discordMessageId);
+  }
+  private retiredReactions = new Map<string, ReactionMappingRow>();
+  async retiredReaction(link: ChannelLink, rumorId: string): Promise<ReactionMappingRow | undefined> {
+    return this.retiredReactions.get(`${deletionLinkKey(link)}:${rumorId}`);
+  }
+  async retireReaction(link: ChannelLink, row: ReactionMappingRow): Promise<void> {
+    this.retiredReactions.set(`${deletionLinkKey(link)}:${row.rumorId}`, row);
+    await this.deleteReaction(row.rumorId);
   }
   reactions: ReactionMappingRow[] = [];
   async insertReaction(row: ReactionMappingRow): Promise<void> {

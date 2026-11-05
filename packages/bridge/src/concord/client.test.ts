@@ -17,16 +17,20 @@ import {
   mintCommunity,
   mintLinkSigner,
   mintToken,
+  openChatBatch,
   openGuestbookWraps,
   openWrap,
   voiceGroupKey,
   voiceMediaKey,
 } from "@armada-bridge/concord-core";
 import type { ChannelV2, InviteBundle } from "@armada-bridge/concord-core";
-import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
+import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { NostrFilter } from "@nostrify/nostrify";
 
+import { PromotionDeletionIntakeError } from "../deletionPolicy";
+import { LinkDelivery } from "./linkDelivery";
+import { deliverConcordChat } from "./delivery";
 import { CONTROL_REFOLD_MS, ConcordClient, hasProxyTag, proxyTag, resolveInvite } from "./client";
 import type { RelayLike } from "./pool";
 import { localIdentity } from "./signer";
@@ -35,9 +39,19 @@ import { localIdentity } from "./signer";
 class FakePool implements RelayLike {
   published: NostrEvent[] = [];
   private subs: Array<{ filters: NostrFilter[]; onEvent: (e: NostrEvent) => void }> = [];
-  constructor(private readonly canned: NostrEvent[] = []) {}
+  constructor(private readonly canned: NostrEvent[] = [], private readonly cap = Infinity) {}
+  readonly replayRelays = ["fake"];
+  async enumerateRelay(_url: string, filter: NostrFilter): Promise<string[]> {
+    return this.canned.filter(e => matches([filter], e) && (filter.since === undefined || e.created_at >= filter.since) && (filter.until === undefined || e.created_at <= filter.until)).map(e => e.id);
+  }
+  async fetchRelay(_url: string, ids: string[]): Promise<NostrEvent[]> { return this.canned.filter(e => ids.includes(e.id)).slice(0, this.cap); }
   async query(filters: NostrFilter[]): Promise<NostrEvent[]> {
-    return this.canned.filter((event) => matches(filters, event));
+    const found = new Map<string, NostrEvent>();
+    for (const filter of filters) for (const event of this.canned.filter(event => matches([filter], event) &&
+      (filter.since === undefined || event.created_at >= filter.since) &&
+      (filter.until === undefined || event.created_at <= filter.until))
+      .sort((a, b) => b.created_at - a.created_at).slice(0, Math.min(filter.limit ?? Infinity, this.cap))) found.set(event.id, event);
+    return [...found.values()];
   }
   async publish(event: NostrEvent): Promise<void> {
     this.published.push(event);
@@ -274,7 +288,7 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     expect(opened.tags).toContainEqual(["channel", channel.idHex]);
   });
 
-  it("subscribeChannel delivers ephemeral typing wraps and durable chat, cursors durable only", async () => {
+  it("subscribeChannel delivers ephemeral typing wraps and durable chat", async () => {
     const { community } = makeCommunity();
     const channel = makeChannel(community);
     const pool = new FakePool();
@@ -282,24 +296,18 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     const author = localIdentity(generateSecretKey());
 
     const kinds: number[] = [];
-    const cursors: Array<{ pk: string; at: number }> = [];
     client.subscribeChannel(
       channel,
       (chat) => kinds.push(chat.kind),
-      undefined,
-      (pk, at) => cursors.push({ pk, at }),
     );
 
     await client.sendTyping(channel, author);
-    const { wrap } = await client.sendChat(channel, { content: "hi", author });
+    await client.sendChat(channel, { content: "hi", author });
     for (const event of pool.published) pool.emit(event);
     await new Promise((r) => setTimeout(r, 20));
 
     expect(kinds.sort()).toEqual([KIND_MESSAGE, KIND_TYPING].sort());
-    // Only the durable chat wrap advances the cursor.
-    expect(cursors).toHaveLength(1);
-    expect(cursors[0].pk).toBe(channel.current.group.pk);
-    expect(cursors[0].at).toBe(wrap.created_at);
+
   });
 
   it("publishManifest publishes a valid kind 10304 command manifest", async () => {
@@ -349,11 +357,299 @@ describe("ConcordClient: puppet joins, typing, manifest, backfill", () => {
     await writer.sendChat(channel, { content: "older", author, ms: now - 60_000 });
     await writer.sendChat(channel, { content: "newer", author, ms: now });
 
-    const pool = new FakePool([...scratch.published].reverse()); // relay order: newest first
+    const pool = new FakePool([...scratch.published].reverse().map(e => finalizeEvent({ ...e, created_at: Math.floor(now / 1000) - 120 }, channel.current.group.sk))); // relay order: newest first
     const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
-    const { chats, newestWrapAt } = await client.backfillChannel(channel, 0);
+    const { chats, newestWrapAt } = await client.backfillChannel(channel, Math.floor(now / 1000) - 120);
 
     expect(chats.map((c) => c.content)).toEqual(["older", "newer"]);
-    expect(newestWrapAt).toBe(Math.max(...scratch.published.map((e) => e.created_at)));
+    expect(newestWrapAt).toBe(Math.floor(now / 1000) - 120);
   });
+});
+
+describe('durable delivery cursor', () => {
+  it('bounds signed burst admission and persists overflow while accepting later work', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey());
+    const wraps: NostrEvent[] = [];
+    for (let i = 0; i < 4; i++) wraps.push((await client.sendChat(channel, { content: `burst ${i}`, author })).wrap);
+    let enter!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { enter = resolve; });
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const contents: string[] = [], floors: number[] = [];
+    const lane = new LinkDelivery({ capacity: 1, onError: () => {}, onGap: async floor => { floors.push(floor); } });
+    client.subscribeChannel(channel, async chat => { contents.push(chat.content); if (contents.length === 1) { enter(); await blocked; } }, undefined, undefined, { lane, currentChannel: () => channel });
+    pool.emit(wraps[0]); await started; pool.emit(wraps[1]);
+    await lane.flushGaps(); expect(floors).toEqual([wraps[1].created_at]);
+    release(); await lane.run(async () => {});
+    pool.emit(wraps[2]); await lane.run(async () => {});
+    expect(contents).toEqual(['burst 0', 'burst 2']);
+  });
+
+  it('recovers more than 500 signed wraps in bounded oldest-first batches', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const scratch = new FakePool(); const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey()); const base = Math.floor(Date.now() / 1000) - 1000;
+    const wraps: NostrEvent[] = [];
+    for (let i = 0; i < 505; i++) {
+      const { wrap } = await writer.sendChat(channel, { content: `page ${i}`, author, ms: (base + i) * 1000 });
+      wraps.push(finalizeEvent({ ...wrap, created_at: base + i }, channel.current.group.sk));
+    }
+    const client = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+    const contents: string[] = []; const sizes: number[] = [];
+    const result = await client.backfillChannel(channel, base, 500, { onBatch: async batch => {
+      sizes.push(batch.chats.length); contents.push(...batch.chats.map(chat => chat.content));
+    } });
+    expect(contents).toEqual(Array.from({ length: 505 }, (_, i) => `page ${i}`));
+    expect(Math.max(...sizes)).toBeLessThan(500);
+    expect(result.chats).toEqual([]); // Streaming consumers do not accumulate history.
+    expect(result.newestWrapAt).toBe(base + 504);
+    let batches = 0, committedAt = base;
+    const settled = new Set<string>();
+    await expect(client.backfillChannel(channel, base, 500, { onBatch: async batch => {
+      if (++batches === 2) throw new Error('stop before second batch commits');
+      batch.chats.forEach(chat => settled.add(chat.rumorId)); committedAt = batch.newestWrapAt!;
+    } })).rejects.toThrow('stop before second batch commits');
+    expect(committedAt).toBeLessThan(base + 504);
+    const restarted = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+    for (const chat of (await restarted.backfillChannel(channel, committedAt - 1)).chats) settled.add(chat.rumorId);
+    expect(settled.size).toBe(505);
+  }, 15_000);
+
+  it('fully recovers same-second ties instead of advancing past a truncated bucket', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const scratch = new FakePool(); const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey()); const at = Math.floor(Date.now() / 1000) - 120;
+    const wraps: NostrEvent[] = [];
+    for (let i = 0; i < 6; i++) {
+      const { wrap } = await writer.sendChat(channel, { content: `tie ${i}`, author, ms: at * 1000 + i });
+      wraps.push(finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk));
+    }
+    const client = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+    const result = await client.backfillChannel(channel, at, 3);
+    expect(result.chats.map(chat => chat.content)).toEqual(Array.from({ length: 6 }, (_, i) => `tie ${i}`));
+    expect(result.newestWrapAt).toBe(at);
+  });
+
+  it('does not certify catch-up from a partial relay read', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = Object.assign(new FakePool(), { queryStrict: async () => { throw new Error('one configured relay unavailable'); }, enumerateRelay: async () => { throw new Error('one configured relay unavailable'); } });
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    let batches = 0;
+    await expect(client.backfillChannel(channel, 0, 500, { onBatch: async () => { batches++; } })).rejects.toThrow('one configured relay unavailable');
+    expect(batches).toBe(0);
+  });
+
+  it('continues delivery after an ordinary mirror error', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey()); let calls = 0, finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; }); const errors: unknown[] = [];
+    const router = { onConcordChat: async () => { if (++calls === 1) throw new Error('Discord 503'); finish(); return []; } };
+    const link = { communityId: community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true };
+    client.subscribeChannel(channel, chat => deliverConcordChat(router, chat, link, error => errors.push(error)));
+    pool.emit((await client.sendChat(channel, { content: 'temporary failure', author })).wrap);
+    pool.emit((await client.sendChat(channel, { content: 'later success', author })).wrap);
+    await done; expect(errors).toHaveLength(1); expect(calls).toBe(2);
+  });
+
+  it('persists a storage gap and continues accepting subsequent work', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    let calls = 0, finish!: () => void; const handled = new Promise<void>(resolve => { finish = resolve; });
+    const floors: number[] = []; const lane = new LinkDelivery({ onError: () => {}, onGap: async floor => { floors.push(floor); } });
+    client.subscribeChannel(channel, async () => { if (++calls === 1) throw new Error('storage unavailable'); finish(); }, undefined, undefined, { lane, currentChannel: () => channel });
+    const author = localIdentity(generateSecretKey());
+    const failed = (await client.sendChat(channel, { content: 'fails', author })).wrap;
+    pool.emit(failed); pool.emit((await client.sendChat(channel, { content: 'later', author })).wrap);
+    await handled; await lane.flushGaps(); expect(floors).toContain(failed.created_at); expect(calls).toBe(2);
+  });
+});
+
+for (const cap of [4, 8, 300, 400]) it(`recovers a same-second inventory beyond a relay cap of ${cap}`, async () => {
+  const { community } = makeCommunity(); const channel = makeChannel(community);
+  const scratch = new FakePool(), writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+  const author = localIdentity(generateSecretKey()), at = Math.floor(Date.now() / 1000) - 120;
+  const wraps: NostrEvent[] = [];
+  for (let i = 0; i < cap + 3; i++) {
+    const { wrap } = await writer.sendChat(channel, { content: `capped ${i}`, author, ms: at * 1000 + i });
+    wraps.push(finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk));
+  }
+  const client = new ConcordClient(community, new FakePool(wraps, cap), localIdentity(generateSecretKey()));
+  const runStart = Math.floor(Date.now() / 1000);
+  const result = await client.backfillChannel(channel, at);
+  expect(result.chats).toHaveLength(cap + 3);
+  expect(result.certifiedUntil).toBe(runStart - 60);
+}, 15000);
+
+it('does not certify a window until all payload batches finish and preserves verified source time', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
+  const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+  const at = Math.floor(Date.now() / 1000) - 120, author = localIdentity(generateSecretKey());
+  const { wrap } = await writer.sendChat(channel, { content: 'old rumor, newer wrap', author, ms: (at - 100) * 1000 });
+  const verified = finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk);
+  const client = new ConcordClient(community, new FakePool([verified]), localIdentity(generateSecretKey()));
+  const certified: number[] = [];
+  await expect(client.backfillChannel(channel, at, 500, {
+    onBatch: async batch => { expect(batch.chats[0].sourceWrapCreatedAt).toBe(at); expect(batch.chats[0].createdAt).toBe(at - 100); throw new Error('durability failed'); },
+    onWindowComplete: async w => { certified.push(w.until); },
+  })).rejects.toThrow('durability failed');
+  expect(certified).toEqual([]);
+});
+
+it('splits decoded byte overflow and fails closed when one second still exceeds the budget', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
+  const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey())), author = localIdentity(generateSecretKey());
+  const at = Math.floor(Date.now() / 1000) - 120, wraps: NostrEvent[] = [];
+  // Signed payloads: the decoded content plus retained seal exceeds 16 MiB in
+  // one combined window, while each half fits. No mocked byte estimator.
+  for (let i = 0; i < 240; i++) {
+    const { wrap } = await writer.sendChat(channel, { content: 'x'.repeat(35_000), author, ms: (at + (i < 120 ? 0 : 1)) * 1000 + i });
+    wraps.push(finalizeEvent({ ...wrap, created_at: at + (i < 120 ? 0 : 1) }, channel.current.group.sk));
+  }
+  const client = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+  const windows: number[] = []; let delivered = 0;
+  await client.backfillChannel(channel, at, 500, { onBatch: async b => { delivered += b.chats.length; }, onWindowComplete: async w => { windows.push(w.until); } });
+  expect(delivered).toBe(240); expect(windows[0]).toBe(at); expect(windows.length).toBeGreaterThan(1);
+  const sameSecond = wraps.map(w => finalizeEvent({ ...w, created_at: at }, channel.current.group.sk));
+  const oversized = new ConcordClient(community, new FakePool(sameSecond), localIdentity(generateSecretKey()));
+  let completed = false;
+  await expect(oversized.backfillChannel(channel, at, 500, { onBatch: async () => {}, onWindowComplete: async () => { completed = true; } })).rejects.toThrow('second exceeds');
+  expect(completed).toBe(false);
+}, 30_000);
+
+for (const phase of ['payload', 'window'] as const) it(`aborts replay while its ${phase} callback remains pending without certifying late work`, async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), scratch = new FakePool();
+  const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+  const at = Math.floor(Date.now() / 1000) - 120, author = localIdentity(generateSecretKey());
+  const { wrap } = await writer.sendChat(channel, { content: 'cancel pending callback', author, ms: at * 1000 });
+  const client = new ConcordClient(community, new FakePool([finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk)]), localIdentity(generateSecretKey()));
+  const controller = new AbortController(), cancelled = new Error('synthetic replay cancellation');
+  let enter!: () => void, release!: () => void;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let callbackSignal: AbortSignal | undefined, lateEffects = 0, windows = 0;
+  const hold = async (context?: { signal: AbortSignal }) => {
+    callbackSignal = context?.signal;
+    enter(); await held;
+    // Task3 retains this callback in its existing lane and uses the signal
+    // plus durable lifecycle/lease/version predicates before further effects.
+    callbackSignal?.throwIfAborted();
+    lateEffects++;
+  };
+  const replay = client.backfillChannel(channel, at, 500, {
+    signal: controller.signal,
+    onBatch: async (_batch, context) => { if (phase === 'payload') await hold(context); },
+    onWindowComplete: async (_window, context) => { windows++; if (phase === 'window') await hold(context); },
+  });
+  const outcome = replay.then(result => ({ status: 'completed', result }), error => ({ status: 'rejected', error }));
+  try {
+    await entered; controller.abort(cancelled);
+    const observed = await Promise.race([outcome, Bun.sleep(100).then(() => ({ status: 'still waiting' }))]);
+    expect(observed).toEqual({ status: 'rejected', error: cancelled });
+    expect(callbackSignal?.aborted).toBe(true);
+    expect(windows).toBe(phase === 'window' ? 1 : 0);
+    release();
+    await Bun.sleep(0); // late callback rejection must be consumed, not unhandled
+    expect(lateEffects).toBe(0);
+    expect(await outcome).toEqual({ status: 'rejected', error: cancelled });
+  } finally { release(); await outcome; }
+});
+
+it('does not return a certified endpoint when its completion callback synchronously cancels replay', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community);
+  const client = new ConcordClient(community, new FakePool(), localIdentity(generateSecretKey()));
+  const controller = new AbortController(), cancelled = new Error('cancel during completion');
+  await expect(client.backfillChannel(channel, Math.floor(Date.now() / 1000) - 120, 500, {
+    signal: controller.signal,
+    onWindowComplete: async () => { controller.abort(cancelled); },
+  })).rejects.toThrow('cancel during completion');
+});
+
+it('keeps live delivery serialized across subscription replacement', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), pool = new FakePool();
+  const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  const lane = new LinkDelivery({ onError: () => {} });
+  let entered!: () => void, release!: () => void, finished!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const done = new Promise<void>(resolve => { finished = resolve; });
+  const seen: string[] = [];
+  const handler = async (chat: { content: string }) => {
+    seen.push(chat.content);
+    if (chat.content === 'old') { entered(); await blocked; }
+    if (chat.content === 'new') finished();
+  };
+  const author = localIdentity(generateSecretKey());
+  const old = (await client.sendChat(channel, { content: 'old', author })).wrap;
+  const next = (await client.sendChat(channel, { content: 'new', author })).wrap;
+  const options = { lane, currentChannel: () => channel };
+  const unsubscribe = client.subscribeChannel(channel, handler, undefined, undefined, options);
+  pool.emit(old); await started;
+  unsubscribe();
+  client.subscribeChannel(channel, handler, undefined, undefined, options);
+  pool.emit(next);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(seen).toEqual(['old']);
+  release(); await done;
+  expect(seen).toEqual(['old', 'new']);
+});
+
+it('drops a queued previously decoded chat past a newly adopted retirement cutoff', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), pool = new FakePool();
+  const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  const lane = new LinkDelivery({ onError: () => {} });
+  let current = channel, entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const seen: string[] = [], author = localIdentity(generateSecretKey());
+  const first = (await client.sendChat(channel, { content: 'blocking', author })).wrap;
+  const late = (await client.sendChat(channel, { content: 'late', author })).wrap;
+  const [decoded] = await openChatBatch([late], channel);
+  client.subscribeChannel(channel, async chat => { seen.push(chat.content); if (chat.content === 'blocking') { entered(); await blocked; } }, undefined, undefined, { lane, currentChannel: () => current });
+  pool.emit(first); await started;
+  pool.emit(late);
+  current = { ...channel, streams: channel.streams.map(s => ({ ...s, retiredAt: decoded.createdAt - 1 })) };
+  release();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(seen).toEqual(['blocking']);
+});
+
+it('repairs from a promoted deletion’s original source floor', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), pool = new FakePool();
+  const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  const floors: number[] = [];
+  const lane = new LinkDelivery({ onError: () => {}, onGap: async floor => { floors.push(floor); } });
+  let failed!: () => void;
+  const done = new Promise<void>(resolve => { failed = resolve; });
+  const author = localIdentity(generateSecretKey());
+  const wrap = (await client.sendChat(channel, { content: 'wake promotion', author })).wrap;
+  const original = wrap.created_at - 100;
+  const error = new PromotionDeletionIntakeError({ deleteRumorId: 'a', targetRumorId: 'b', author: 'c', createdAtMs: Date.now(), sourceWrapCreatedAt: original }, { communityId: community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true }, new Error('storage'));
+  client.subscribeChannel(channel, async () => { throw error; }, () => failed(), undefined, { lane, currentChannel: () => channel });
+  pool.emit(wrap); await done; await lane.flushGaps();
+  expect(floors).toEqual([original]);
+});
+
+it('does not acknowledge a live wrap as certified replay coverage', async () => {
+  const { community } = makeCommunity(); const channel = makeChannel(community);
+  const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  let handled!: () => void; const done = new Promise<void>(resolve => { handled = resolve; });
+  const acknowledgements: number[] = [];
+  client.subscribeChannel(channel, () => handled(), undefined, (_pk, at) => acknowledgements.push(at));
+  pool.emit((await client.sendChat(channel, { content: 'live', author: localIdentity(generateSecretKey()) })).wrap);
+  await done; await new Promise(resolve => setTimeout(resolve, 0));
+  expect(acknowledgements).toEqual([]);
+});
+
+it('applies the lifecycle deletion boundary to verified live carriers',async()=>{
+ const {community}=makeCommunity(),channel=makeChannel(community),pool=new FakePool();
+ const client=new ConcordClient(community,pool,localIdentity(generateSecretKey())),author=localIdentity(generateSecretKey());
+ const seen:number[]=[];
+ const wrap=(await client.sendChat(channel,{content:'',kind:5,tags:[['e','ab'.repeat(32)]],author})).wrap;
+ const now=wrap.created_at,lane=new LinkDelivery({onError:()=>{},deletionFloor:now});
+ client.subscribeChannel(channel,chat=>{seen.push(chat.sourceWrapCreatedAt);},undefined,undefined,{lane,currentChannel:()=>channel});
+ const older=finalizeEvent({...wrap,created_at:now-1},channel.current.group.sk);
+ pool.emit(older);pool.emit(wrap);await lane.run(async()=>{});
+ expect(seen).toEqual([now]);
 });

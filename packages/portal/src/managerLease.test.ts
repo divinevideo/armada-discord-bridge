@@ -20,9 +20,10 @@ function fixture() {
     if (query.includes("UPDATE bridge_leases")) return expired ? [] : [{ resource: "channel" }];
     if (query.includes("SELECT 1 FROM bridge_leases")) return expired ? [] : [{}];
     if (query.includes("SELECT * FROM bridges")) return [row];
-    if (query.includes("UPDATE bridges SET status =")) row.status = values[0] as string;
+    if (query.includes("UPDATE bridges SET status")) { row.status = values[0] as string; return [{ bridge_id: row.bridge_id }]; }
     return [];
   }) as unknown as postgres.Sql;
+  (sql as any).begin = async (work: (tx: postgres.Sql) => Promise<unknown>) => work(sql);
   const manager = new BridgeManager(sql, {} as PortalEnv, { assertPublicChannel: async () => {} });
   // Only relay/gateway construction is replaced: acquisition, terminal callback,
   // same-instance cleanup, durable status and retry dispatch are production code.
@@ -117,7 +118,7 @@ test("terminal startup failure still schedules retry when status bookkeeping fai
 
 test("stop closes subscriptions and sockets and writes pause despite release failure", async () => {
   const f = fixture();
-  f.register({ token: 1n, assertCurrent: async () => {}, renew: async () => {}, release: async () => { throw new Error("release failed"); } });
+  f.register({ resource: "synthetic-resource", holder: "00000000-0000-4000-8000-000000000000", token: 1n, assertCurrent: async () => {}, renew: async () => {}, release: async () => { throw new Error("release failed"); } });
   await f.manager.stop(f.row.bridge_id, "paused");
   expect(f.closed()).toEqual([1, 1, 1]);
   expect(f.manager.isLive(f.row.bridge_id)).toBe(false);
@@ -160,3 +161,10 @@ test("lease retry stays capped at 2.5–5 seconds regardless of the attempt coun
     internal.cancelStartRetry("relay-outage");
   }
 });
+
+test('stop closes its running resources even when lease release never resolves',async()=>{
+ const f=fixture();
+ f.register({resource:'synthetic-resource',holder:'00000000-0000-4000-8000-000000000000',token:1n,assertCurrent:async()=>{},renew:async()=>{},release:async()=>new Promise<void>(()=>{})});
+ const result=await Promise.race([f.manager.stop(f.row.bridge_id,'paused').then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),2600))]);
+ expect(result).toBe(true);expect(f.closed()).toEqual([1,1,1]);expect(f.row.status).toBe('paused');
+},4000);

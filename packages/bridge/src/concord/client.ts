@@ -28,6 +28,7 @@ import {
   controlGroups,
   currentGuestbookGroup,
   dissolvedGroupKey,
+  filterEpochCutoff,
   foldControlState,
   guestbookGroups,
   inviteRefOf,
@@ -43,6 +44,11 @@ import {
   validateBundle,
   wrapSeal,
 } from "@armada-bridge/concord-core";
+import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from "../deletionPolicy";
+import { LinkDelivery, type RepairOptions } from "./linkDelivery";
+import { assertEffectCurrent } from "../effectGuard";
+import { REPLAY_MAX_IDS } from "./reconciliation";
+import { controlInventory, CONTROL_MAX_BYTES } from "./controlInventory";
 import type {
   ChannelV2,
   CommunityListEntry,
@@ -56,6 +62,9 @@ import type {
 import type { NostrEvent } from "nostr-tools/pure";
 
 import type { RelayLike } from "./pool";
+import { replayChannel } from "./replay";
+import type { DeliveredChat, ReplayOptions, ReplayResult } from "./replay";
+export type { DeliveredChat, ReplayOptions, ReplayResult, ReplayWindow, ReplayBatch, ReplayCallbackContext } from "./replay";
 import type { LocalIdentity } from "./signer";
 
 /**
@@ -162,7 +171,33 @@ export interface SendChatOptions {
 }
 
 export class ConcordClient {
+  /** Runtime startup must discover streams before public/readable classification,
+   * including when Direct Invite intake created a client with additional keys. */
+  static async discover(community: CommunityV2, pool: RelayLike, primary: LocalIdentity, opts?: { signal?: AbortSignal }): Promise<ConcordClient> {
+    const client = new ConcordClient(community, pool, primary);
+    await client.syncControlComplete(opts);
+    return client;
+  }
+
   folded?: FoldedControl;
+  private readonly controlWraps = new Map<string, NostrEvent>();
+  private controlBytes = 0;
+  private controlGeneration = 0;
+
+  private rememberControl(wraps: NostrEvent[]): void {
+    for (const wrap of wraps) {
+      if (this.controlWraps.has(wrap.id)) continue;
+      const bytes = Buffer.byteLength(JSON.stringify(wrap));
+      if (this.controlWraps.size >= REPLAY_MAX_IDS || this.controlBytes + bytes > CONTROL_MAX_BYTES) throw new Error('Complete control discovery exceeds resource bounds');
+      this.controlWraps.set(wrap.id, wrap); this.controlBytes += bytes; this.controlGeneration++;
+    }
+  }
+
+  private foldRememberedControl(): FoldedControl {
+    const editions = openControlWraps([...this.controlWraps.values()], controlGroups(this.community));
+    this.folded = foldControlState(editions, this.community.id, this.community.owner);
+    return this.folded;
+  }
 
   /** The bridge's own posting identity; the router skips its messages. */
   get primaryPk(): string {
@@ -190,9 +225,36 @@ export class ConcordClient {
       [{ kinds: [KIND_WRAP], authors: groups.map((g) => g.pk) }],
       opts,
     );
-    const editions = openControlWraps(wraps, groups);
-    this.folded = foldControlState(editions, this.community.id, this.community.owner);
-    return this.folded;
+    this.rememberControl(wraps);
+    return this.foldRememberedControl();
+  }
+
+  /** Runtime certification always discovers control independently of chat inventory. */
+  repairDelivery(lane: LinkDelivery, options: Omit<RepairOptions, 'replay' | 'discover'> & { refresh: () => void }): Promise<void> {
+    return lane.repair({ ...options, discover: async signal => {
+      try { await this.syncControlComplete({ signal }); }
+      catch (error) { if (!signal.aborted) lane.markGap(0); throw error; }
+      signal.throwIfAborted();
+      options.refresh();
+      const discovered = this.channel(options.channel().idHex);
+      if (!discovered) throw new Error('Discovered channel is no longer readable');
+      const expectedStreams = discovered.streams.map(stream => stream.group.pk).sort().join(',');
+      const generation = this.controlGeneration;
+      return () => {
+        if (options.channel().streams.map(stream => stream.group.pk).sort().join(',') !== expectedStreams) throw new Error('Runtime channel does not match complete discovery');
+        if (generation !== this.controlGeneration) { lane.markGap(0); throw new Error('Control inventory changed during replay'); }
+      };
+    }, replay: (channel, floor, opts) => this.backfillChannel(channel, floor, 500, opts) });
+  }
+
+  async syncControlComplete(opts?: { signal?: AbortSignal }): Promise<FoldedControl> {
+    const groups = controlGroups(this.community), authors = groups.map(g => g.pk);
+    const signal = AbortSignal.any([AbortSignal.timeout(5 * 60_000), ...(opts?.signal ? [opts.signal] : [])]);
+    const wraps = await controlInventory(this.pool, authors, signal);
+    signal.throwIfAborted();
+    if (JSON.stringify(controlGroups(this.community).map(g => g.pk)) !== JSON.stringify(authors)) throw new Error('Control discovery keys changed');
+    this.rememberControl(wraps);
+    return this.foldRememberedControl();
   }
 
   /** Channels readable with held keys, per the current fold. */
@@ -235,6 +297,7 @@ export class ConcordClient {
       tags: [],
       created_at: Math.floor(Date.now() / 1000),
     });
+    await assertEffectCurrent();
     await this.pool.publish(event);
   }
 
@@ -260,6 +323,7 @@ export class ConcordClient {
       tags: relays.map((url) => ["relay", url]),
       created_at: Math.floor(Date.now() / 1000),
     });
+    await assertEffectCurrent();
     await this.pool.publish(event);
   }
 
@@ -268,6 +332,7 @@ export class ConcordClient {
     const rumor = buildJoinRumor(author.pk, ms);
     // sealGuestbook signs the encrypted seal AND wraps it in one step.
     const wrap = await sealGuestbook(rumor, group, author.signer);
+    await assertEffectCurrent();
     await this.pool.publish(wrap);
     return wrap;
   }
@@ -309,6 +374,7 @@ export class ConcordClient {
       tags: [],
       created_at: Math.floor(Date.now() / 1000),
     });
+    await assertEffectCurrent();
     await this.pool.publish(event);
   }
 
@@ -326,6 +392,7 @@ export class ConcordClient {
     });
     const seal = await sealRumor(rumor, KIND_SEAL_ENCRYPTED, channel.current.group, author.signer);
     const wrap = wrapSeal(seal, channel.current.group, { ephemeral: true });
+    await assertEffectCurrent();
     await this.pool.publish(wrap);
   }
 
@@ -335,12 +402,15 @@ export class ConcordClient {
    */
   subscribeChannel(
     channel: ChannelV2,
-    onChat: (chat: OpenedChat) => void,
+    onChat: (chat: DeliveredChat) => unknown,
     onError?: (relayUrl: string, error: unknown) => void,
-    /** Called per durable wrap that opened; feeds the catch-up cursor. */
-    onCursor?: (streamPk: string, wrapCreatedAt: number) => void,
+    /** Retained for source compatibility; live payloads never certify coverage. */
+    _onCursor?: (streamPk: string, wrapCreatedAt: number) => unknown,
+    shared?: { lane: LinkDelivery; currentChannel: () => ChannelV2 },
   ): () => void {
-    const seenRumors = new Set<string>();
+    const lane = shared?.lane ?? new LinkDelivery({ onError: () => {} });
+    const currentChannel = shared?.currentChannel ?? (() => channel);
+
     // Live tail only: without a floor, relays replay stored history into the
     // router on every (re)subscribe. Catch-up after downtime is cursor work,
     // not replay-everything. Small overlap absorbs clock skew.
@@ -357,53 +427,36 @@ export class ConcordClient {
       {
         onError,
         onEvent: (wrap) => {
-          void openChatBatch([wrap], channel).then((opened) => {
-            for (const chat of opened) {
-              if (seenRumors.has(chat.rumorId)) continue;
-              if (seenRumors.size >= 65_536) seenRumors.clear();
-              seenRumors.add(chat.rumorId);
-              onChat(chat);
+          const work = async (signal: AbortSignal) => {
+            try {
+              const opened = await openChatBatch([wrap], channel);
+              signal.throwIfAborted();
+              for (const chat of filterEpochCutoff(opened, currentChannel())) {
+                if (!lane.applies({kind: chat.kind, sourceWrapCreatedAt: wrap.created_at})) continue;
+                if (lane.hasSeen(chat.rumorId)) continue;
+                signal.throwIfAborted();
+                await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });
+                signal.throwIfAborted();
+                lane.remember(chat.rumorId);
+              }
+            } catch (error) {
+              if (wrap.kind === KIND_WRAP && !signal.aborted) lane.markGap(
+                error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError ? Math.min(wrap.created_at, error.repairFloor) : wrap.created_at,
+              );
+              onError?.("dispatch", error);
+              throw error;
             }
-            if (opened.length > 0 && wrap.kind === KIND_WRAP) {
-              onCursor?.(wrap.pubkey, wrap.created_at);
-            }
-          });
+          };
+          if (wrap.kind === KIND_WRAP_EPHEMERAL) lane.typing(work);
+          else void lane.admit(wrap.created_at, work)?.catch(() => {});
         },
       },
     );
   }
 
-  /**
-   * Bounded catch-up: every durable wrap on the channel's streams newer than
-   * `sinceSec`, opened and sorted oldest-first so the caller can replay them
-   * through the router in order (the mapping table dedupes already-mirrored
-   * rumors). Returns the chats and the newest wrap timestamp seen, the next
-   * cursor value.
-   */
-  async backfillChannel(
-    channel: ChannelV2,
-    sinceSec: number,
-    limit = 500,
-    opts?: { signal?: AbortSignal },
-  ): Promise<{ chats: OpenedChat[]; newestWrapAt?: number }> {
-    const wraps = await this.pool.query(
-      [
-        {
-          kinds: [KIND_WRAP],
-          authors: channel.streams.map((s) => s.group.pk),
-          since: sinceSec,
-          limit,
-        },
-      ],
-      opts,
-    );
-    const chats = await openChatBatch(wraps, channel);
-    chats.sort((a, b) => a.ms - b.ms);
-    const newestWrapAt = wraps.reduce<number | undefined>(
-      (max, w) => (max === undefined || w.created_at > max ? w.created_at : max),
-      undefined,
-    );
-    return { chats, newestWrapAt };
+  /** Payload batches are not coverage; only completed windows may checkpoint. */
+  async backfillChannel(channel: ChannelV2, sinceSec: number, limit = 500, opts?: ReplayOptions): Promise<ReplayResult> {
+    return replayChannel(this.pool, channel, sinceSec, limit, opts);
   }
 
   /**
@@ -417,24 +470,25 @@ export class ConcordClient {
    * fold memo keeps one entry per community, so sibling bridges of a large
    * community kept evicting each other's.
    */
-  subscribeControl(onFold?: (folded: FoldedControl) => void): () => void {
+  subscribeControl(onFold?: (folded: FoldedControl) => void, onError?: (source: string, error: unknown) => void): () => void {
     const groups = controlGroups(this.community);
-    const wraps: NostrEvent[] = [];
-    const seen = new Set<string>();
     let pending: ReturnType<typeof setTimeout> | undefined;
     const refold = () => {
       pending = undefined;
-      const editions = openControlWraps(wraps, groups);
-      this.folded = foldControlState(editions, this.community.id, this.community.owner);
-      onFold?.(this.folded);
+      try { const folded = this.foldRememberedControl(); onFold?.(folded); }
+      catch (error) {
+        if (onError) onError('control', error);
+        else console.warn('bridge: control fold failed', error);
+      }
     };
     const unsubscribe = this.pool.subscribe(
       [{ kinds: [KIND_WRAP], authors: groups.map((g) => g.pk) }],
       {
+        onError,
         onEvent: (wrap) => {
-          if (seen.has(wrap.id)) return;
-          seen.add(wrap.id);
-          wraps.push(wrap);
+          if (this.controlWraps.has(wrap.id)) return;
+          try { this.rememberControl([wrap]); }
+          catch (error) { onError?.('control', error); return; }
           pending ??= setTimeout(refold, CONTROL_REFOLD_MS);
         },
       },
@@ -463,6 +517,7 @@ export class ConcordClient {
     });
     const seal = await sealRumor(rumor, KIND_SEAL_ENCRYPTED, channel.current.group, opts.author.signer);
     const wrap = wrapSeal(seal, channel.current.group);
+    await assertEffectCurrent();
     await this.pool.publish(wrap);
     return { rumor, wrap };
   }
