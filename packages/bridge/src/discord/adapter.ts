@@ -10,6 +10,26 @@
  * members. Mentions are never forwarded as pings (allowedMentions: none).
  */
 
+import { assertEffectCurrent, captureEffectGuard, withEffectGuard } from "../effectGuard";
+import type { REST, RESTOptions } from "discord.js";
+
+const requestProof = Symbol('bridge request origin');
+/** Capture each request before discord.js enters a reusable bucket/queue.
+ * Retries copy fetchOptions, retaining this private proof through every wait.
+ * Nothing is sent until that SAME request's proof is checked again. */
+export function fenceDiscordRest(rest: REST, makeRequest: RESTOptions['makeRequest'] = rest.options.makeRequest): void {
+  const queueRequest = rest.queueRequest.bind(rest);
+  rest.queueRequest = request => queueRequest({ ...request,
+    headers: { ...request.headers, [requestProof]: captureEffectGuard() },
+  });
+  rest.options.makeRequest = async (url, init) => {
+    const { [requestProof]: proof, ...headers } = init.headers as Record<string, string> & { [requestProof]?: () => Promise<void> };
+    if (!proof) throw new Error('Discord request lacks its admission proof');
+    await proof();
+    return makeRequest(url, { ...init, headers });
+  };
+}
+
 import {
   ChannelType,
   Client,
@@ -145,6 +165,7 @@ export class DiscordAdapter implements WebhookSender {
         UserManager: { maxSize: 2_000, keepOverLimit: (user) => user.id === user.client.user.id },
       }),
     });
+    fenceDiscordRest(this.client.rest);
     this.client.on("messageCreate", (message) => {
       // Guild-scoped bot commands the host intercepts BEFORE any router
       // (/help, /bridge); returning true consumes the message.
@@ -292,6 +313,13 @@ export class DiscordAdapter implements WebhookSender {
     await this.client.destroy();
   }
 
+  private dispatch<T>(channelId: string, effect: () => Promise<T>, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<T> {
+    return withEffectGuard(async () => {
+      await this.beforeEffect(channelId);
+      await beforeDispatch?.();
+    }, async () => { await assertEffectCurrent(); return effect(); }, authorize);
+  }
+
   private async webhookFor(channelId: string): Promise<Webhook> {
     await this.beforeEffect(channelId);
     const cached = this.webhookCache.get(channelId);
@@ -306,7 +334,7 @@ export class DiscordAdapter implements WebhookSender {
       (wh) => wh.name === BRIDGE_WEBHOOK_NAME && wh.token,
     );
     await this.beforeEffect(channelId);
-    const webhook = existing ?? (await text.createWebhook({ name: BRIDGE_WEBHOOK_NAME, reason: "Armada bridge persona posts" }));
+    const webhook = existing ?? (await this.dispatch(channelId, () => text.createWebhook({ name: BRIDGE_WEBHOOK_NAME, reason: "Armada bridge persona posts" })));
     this.webhookCache.set(channelId, webhook);
     this.ownWebhookIds.add(webhook.id);
     return webhook;
@@ -334,7 +362,7 @@ export class DiscordAdapter implements WebhookSender {
     });
     try {
       await this.beforeEffect(link.discordChannelId);
-      const created = await webhook.send(payload(sanitizeUsername(message.username)));
+      const created = await this.dispatch(link.discordChannelId, () => webhook.send(payload(sanitizeUsername(message.username))));
       return created.id;
     } catch (error) {
       // Discord's username filter normalizes lookalike characters, so it can
@@ -343,7 +371,7 @@ export class DiscordAdapter implements WebhookSender {
       if (!isUsernameRejection(error)) throw error;
       console.warn(`discord rejected webhook username ${JSON.stringify(message.username)}; retrying as "bridged member"`);
       await this.beforeEffect(link.discordChannelId);
-      const created = await webhook.send(payload("bridged member"));
+      const created = await this.dispatch(link.discordChannelId, () => webhook.send(payload("bridged member")));
       return created.id;
     }
   }
@@ -352,7 +380,7 @@ export class DiscordAdapter implements WebhookSender {
   async edit(link: ChannelLink, discordMessageId: string, content: string): Promise<void> {
     const webhook = await this.webhookFor(link.discordChannelId);
     await this.beforeEffect(link.discordChannelId);
-    await webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } });
+    await this.dispatch(link.discordChannelId, () => webhook.editMessage(discordMessageId, { content, allowedMentions: { parse: [] } }));
   }
 
   /**
@@ -364,7 +392,7 @@ export class DiscordAdapter implements WebhookSender {
   async notice(channelId: string, content: string): Promise<void> {
     const channel = await this.textChannel(channelId);
     await this.beforeEffect(channelId);
-    await channel.send({ content, allowedMentions: { parse: [] } });
+    await this.dispatch(channelId, () => channel.send({ content, allowedMentions: { parse: [] } }));
   }
 
   /** Display name of a guild text channel (dashboard labels). */
@@ -391,29 +419,31 @@ export class DiscordAdapter implements WebhookSender {
    * need the bot's Manage Messages permission.
    */
   async delete(link: ChannelLink, discordMessageId: string, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<void> {
-    const webhook = await this.webhookFor(link.discordChannelId);
-    await this.beforeEffect(link.discordChannelId);
-    await beforeDispatch?.();
-    authorize?.();
-    try {
-      await webhook.deleteMessage(discordMessageId);
-    } catch (error) {
-      // A webhook reports Unknown Message for a real user-authored post too.
-      // Only the bot endpoint can distinguish that from an already-gone target.
-      const channel = await this.textChannel(link.discordChannelId);
+    return withEffectGuard(beforeDispatch ?? (async () => {}), async () => {
+      const webhook = await this.webhookFor(link.discordChannelId);
       await this.beforeEffect(link.discordChannelId);
       await beforeDispatch?.();
       authorize?.();
-      try { await channel.messages.delete(discordMessageId); }
-      catch (failure) { if ((failure as { code?: number })?.code !== 10008) throw failure; }
-    }
+      try {
+        await this.dispatch(link.discordChannelId, () => webhook.deleteMessage(discordMessageId), authorize, beforeDispatch);
+      } catch (error) {
+        // A webhook reports Unknown Message for a real user-authored post too.
+        // Only the bot endpoint can distinguish that from an already-gone target.
+        const channel = await this.textChannel(link.discordChannelId);
+        await this.beforeEffect(link.discordChannelId);
+        await beforeDispatch?.();
+        authorize?.();
+        try { await this.dispatch(link.discordChannelId, () => channel.messages.delete(discordMessageId), authorize, beforeDispatch); }
+        catch (failure) { if ((failure as { code?: number })?.code !== 10008) throw failure; }
+      }
+    });
   }
 
   /** WebhookSender: show the bot's typing indicator (lasts ~10s or until a send). */
   async sendTyping(link: ChannelLink): Promise<void> {
     const channel = await this.textChannel(link.discordChannelId);
     await this.beforeEffect(link.discordChannelId);
-    await channel.sendTyping();
+    await this.dispatch(link.discordChannelId, () => channel.sendTyping());
   }
 
   /** WebhookSender: react as the bot account (webhooks cannot react). */
@@ -421,7 +451,7 @@ export class DiscordAdapter implements WebhookSender {
     const channel = await this.textChannel(link.discordChannelId);
     const message = await channel.messages.fetch(discordMessageId);
     await this.beforeEffect(link.discordChannelId);
-    await message.react(emoji);
+    await this.dispatch(link.discordChannelId, () => message.react(emoji));
   }
 
   /**
@@ -433,18 +463,20 @@ export class DiscordAdapter implements WebhookSender {
    * backtrack for a capture we do not use.
    */
   async unreact(link: ChannelLink, discordMessageId: string, emoji: string, authorize?: () => void, beforeDispatch?: () => Promise<void>): Promise<void> {
-    const custom = /^\w{2,32}:(\d{1,25})$/.exec(emoji);
-    if (custom) emoji = custom[1];
-    const channel = await this.textChannel(link.discordChannelId);
-    let message;
-    try { message = await channel.messages.fetch(discordMessageId); }
-    catch (error) { if ((error as { code?: number })?.code === 10008) return; throw error; }
-    const botId = this.client.user?.id;
-    if (!botId) throw new Error("Discord bot identity is unavailable for reaction removal");
-    await this.beforeEffect(link.discordChannelId);
-    await beforeDispatch?.();
-    authorize?.();
-    await message.reactions.resolve(emoji)?.users.remove(botId);
+    return withEffectGuard(beforeDispatch ?? (async () => {}), async () => {
+      const custom = /^\w{2,32}:(\d{1,25})$/.exec(emoji);
+      if (custom) emoji = custom[1];
+      const channel = await this.textChannel(link.discordChannelId);
+      let message;
+      try { message = await channel.messages.fetch(discordMessageId); }
+      catch (error) { if ((error as { code?: number })?.code === 10008) return; throw error; }
+      const botId = this.client.user?.id;
+      if (!botId) throw new Error("Discord bot identity is unavailable for reaction removal");
+      await this.beforeEffect(link.discordChannelId);
+      await beforeDispatch?.();
+      authorize?.();
+      await this.dispatch(link.discordChannelId, async () => message.reactions.resolve(emoji)?.users.remove(botId), authorize, beforeDispatch);
+    });
   }
 }
 

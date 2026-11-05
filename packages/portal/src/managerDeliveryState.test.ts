@@ -4,6 +4,7 @@ import { migrate } from '@armada-bridge/bridge/src/db/migrate';
 import { PostgresMappingStore } from '@armada-bridge/bridge/src/db/store';
 import { BridgeLeases, bridgeResource } from '@armada-bridge/bridge/src/db/leases';
 import type { ChannelLink } from '@armada-bridge/bridge/src/router';
+import { LinkDelivery } from '@armada-bridge/bridge/src/concord/linkDelivery';
 import { BridgeManager } from './manager';
 import type { PortalEnv } from './env';
 const url=process.env.DATABASE_URL;
@@ -367,7 +368,7 @@ test.skipIf(!reachable)('a stale confirmation cannot activate after lease takeov
 
 test('a failed severance write unregisters and retries the stopped worker',async()=>{
  const m=new BridgeManager({begin:async()=>{throw new Error('synthetic database outage');}} as unknown as postgres.Sql,{} as PortalEnv) as any;
- let released=0,closed=0,retries=0;const rb:any={id:'owner',status:'active',link:{discordChannelId:'channel'},lease:{release:async()=>{released++;}},delivery:{stop:()=>{}},pool:{close:async()=>{closed++;}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};
+ let released=0,closed=0,retries=0;const rb:any={id:'owner',status:'active',link:{discordChannelId:'channel'},lease:{release:async()=>{released++;}},delivery:new LinkDelivery({onError:()=>{}}),pool:{close:async()=>{closed++;}},unsubChat:()=>{},unsubControl:()=>{},unsubSeverance:()=>{}};
  m.running.set(rb.id,rb);m.byDiscordChannel.set('channel',rb.id);m.scheduleStartRetry=()=>{retries++;};
  await expect(m.applySeverance(rb.id,{reason:'dissolved'},{idHex:'synthetic'},rb)).rejects.toThrow('synthetic database outage');
  expect(m.isLive(rb.id)).toBe(false);expect(released).toBe(1);expect(closed).toBe(1);expect(retries).toBe(1);

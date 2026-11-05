@@ -16,6 +16,7 @@ import {
   signStreamAuths,
   streamPubkeysForRelay,
 } from "@armada-bridge/concord-core";
+import { assertEffectCurrent } from "../effectGuard";
 import { NRelay1 } from "@nostrify/nostrify";
 import type { NostrClientMsg, NostrEvent, NostrFilter } from "@nostrify/nostrify";
 import { enumerateInventory, fetchInventory, ReplayAuthError } from "./reconciliation";
@@ -69,6 +70,7 @@ class AuthedNRelay1 extends NRelay1 {
    * automatic AUTH replay. A caller must retry through its current guard. */
   override async event(event: NostrEvent, opts?: { signal?: AbortSignal }): Promise<void> {
     const signal = opts?.signal;
+    await assertEffectCurrent();
     signal?.throwIfAborted();
     if (this.socket.readyState !== WebSocket.OPEN) throw new Error("Relay is not connected");
     await new Promise<void>((resolve, reject) => {

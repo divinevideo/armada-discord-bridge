@@ -53,6 +53,16 @@ transaction, including after awaited work. Checkpoint compare-and-set cannot
 certify a newer gap or changed stream/relay inventory. Final external dispatch
 also checks current authority; a preflight check alone is insufficient.
 
+The original worker's guard and cancellation context follow each effect through
+webhook/channel/message lookup, signing and retries. The shared Discord
+adapter's current-channel policy is an additional check. Each REST request
+captures its own proof before queueing and rechecks it at actual transport
+attempts, including internal retries. Concord rechecks after signing and at
+socket dispatch without reconnect-queue publication. Delete/unreact additionally
+retain their synchronous current-target authorization beside dispatch. Shutdown
+aborts and bounds draining while still owning callbacks that have not settled;
+a successor cannot authorize an old worker's delayed request.
+
 Before any active producer attaches, the worker arms durable uncertainty. The
 marker is never cleared in this release. Each replacement attachment therefore
 enumerates retained deletion history from second zero, even if an older worker

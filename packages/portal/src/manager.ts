@@ -15,7 +15,7 @@
  */
 
 import { BridgeLeases, BridgeLeaseUnavailableError, bridgeResource, type BridgeLease } from "@armada-bridge/bridge/src/db/leases";
-import { CONCORD_EFFECT_METHODS, guardEffects } from "@armada-bridge/bridge/src/effectGuard";
+import { CONCORD_EFFECT_METHODS, guardEffects, withEffectGuard, assertEffectCurrent } from "@armada-bridge/bridge/src/effectGuard";
 import { discordPublicChannelPolicy, type PublicChannelPolicy } from "@armada-bridge/bridge/src/discord/publicChannelPolicy";
 import { PublicCapacityGuard } from "../../moderation/src/publicCapacity";
 import { LinkDelivery } from "@armada-bridge/bridge/src/concord/linkDelivery";
@@ -1091,7 +1091,7 @@ export class BridgeManager {
   private async deliverRoutedChat(rb: Running, chat: OpenedChat): Promise<string[]> {
     if (!rb.router) throw new Error("Bridge routing is not ready");
     return deliverConcordChat(rb.router, chat, rb.link, error => {
-      if (isMissingPermissions(error)) void this.alertMissingWebhookPermission(rb).catch(alertError =>
+      if (isMissingPermissions(error)) void rb.delivery!.run(() => this.alertMissingWebhookPermission(rb)).catch(alertError =>
         console.warn(`bridge ${rb.id}: missing-permission alert failed`, alertError));
       else console.warn(`bridge ${rb.id}: ordinary Concord mirror ${chat.rumorId} failed`, error);
     });
@@ -1147,7 +1147,7 @@ export class BridgeManager {
       })
       .catch(() => {});
     await rb.assertMayForward();
-    await this.adapter
+    await (this.adapter && guardEffects(this.adapter, rb.assertMayForward, new Set(["notice"])))
       ?.notice(
         rb.link.discordChannelId,
         `I need ${permission} in this channel to complete bridge work.`,
@@ -1170,7 +1170,7 @@ export class BridgeManager {
       new PuppetCache(masterSecretHex),
       rb.deliveryStore,
       observeDeletionEffects(this.adapter, observation => {
-        void this.alertDiscordPermission(rb,observation.permission).catch(error => console.warn(`bridge ${rb.id}: permission alert failed`,error));
+        void rb.delivery!.run(() => this.alertDiscordPermission(rb,observation.permission)).catch(error => console.warn(`bridge ${rb.id}: permission alert failed`,error));
       }),
       new Kind0ProfileResolver(rb.pool),
       { applicationId: this.adapter.applicationId, webhookIds: this.adapter.ownWebhookIds },
@@ -1183,7 +1183,7 @@ export class BridgeManager {
     );
     this.ensureDeliveryScheduler();
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);
-    this.announceBridge(rb).catch(() => {});
+    void rb.delivery.run(() => this.announceBridge(rb)).catch(() => {});
   }
 
   /**
@@ -1212,7 +1212,7 @@ export class BridgeManager {
       })
       .catch(() => {});
     await rb.assertMayForward();
-    await this.adapter!.send(rb.link, {
+    await guardEffects(this.adapter!, rb.assertMayForward, new Set(["send"])).send(rb.link, {
       username: "Armada Bridge",
       content: "This channel is now mirrored with an Armada community. /help lists what this bot answers.",
     }).catch(() => {});
@@ -1252,6 +1252,7 @@ export class BridgeManager {
     try { rb.unsubChat(); } catch {}
     try { rb.unsubControl(); } catch {}
     try { rb.unsubSeverance(); } catch {}
+    await settleWithin(rb.delivery?.drain() ?? Promise.resolve());
     await settleWithin(rb.pool.close());
   }
 
@@ -1696,7 +1697,7 @@ export class BridgeManager {
     if (!command) return false;
     const rb = this.activeRouterFor(message.channelId);
     if (!rb) return false; // not ours: stay silent, another bot may own it
-    void this.replyToCommand(message, command, rb).catch((error) =>
+    void rb.delivery!.run(() => this.replyToCommand(message, command, rb)).catch((error) =>
       console.error(`portal: /${command} reply failed`, error),
     );
     return true;
@@ -1709,10 +1710,10 @@ export class BridgeManager {
   ): Promise<void> {
     await rb.assertMayForward();
     if (command === "help") {
-      await message.reply(this.helpText());
+      await withEffectGuard(rb.assertMayForward, async () => { await assertEffectCurrent(); await message.reply(this.helpText()); });
       return;
     }
-    await message.reply(`Unknown command /${command}. ${this.helpText()}`);
+    await withEffectGuard(rb.assertMayForward, async () => { await assertEffectCurrent(); await message.reply(`Unknown command /${command}. ${this.helpText()}`); });
   }
 
   private helpText(): string {

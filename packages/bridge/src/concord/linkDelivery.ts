@@ -1,3 +1,4 @@
+import { withEffectGuard } from '../effectGuard';
 import { filterEpochCutoff, KIND_DELETE } from '@armada-bridge/concord-core';
 import type { ChannelV2 } from '@armada-bridge/concord-core';
 import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from '../deletionPolicy';
@@ -43,8 +44,9 @@ export class LinkDelivery {
     this.seen.add(id);
   }
   stop(): void { this.controller.abort(); this.attempt?.abort(); }
+  async drain(): Promise<void> { await Promise.allSettled([this.lane, this.repairPending, this.retryPending, this.gaps]); }
   run(work: (signal: AbortSignal) => Promise<void>): Promise<void> {
-    const result = this.lane.then(() => { this.controller.signal.throwIfAborted(); return work(this.controller.signal); });
+    const result = this.lane.then(() => { this.controller.signal.throwIfAborted(); return withEffectGuard(async () => {}, () => work(this.controller.signal), () => this.controller.signal.throwIfAborted()); });
     this.lane = result.catch(error => { try { this.options.onError(error); } catch {} });
     return result;
   }
@@ -162,7 +164,7 @@ export class LinkDelivery {
     try {
       await options.replay(channel, floor, {
         signal,
-        onBatch: async ({ chats }, context) => this.run(async () => {
+        onBatch: async ({ chats }, context) => this.run(async () => withEffectGuard(async () => {}, async () => {
           for (const chat of chats) {
             signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
             if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
@@ -181,7 +183,10 @@ export class LinkDelivery {
               throw error;
             }
           }
-        }),
+        }, () => {
+          signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
+          if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
+        })),
         onWindowComplete: async (window, context) => this.run(async () => {
           signal.throwIfAborted(); context.signal.throwIfAborted(); assertContext();
           if (generation !== this.generation) throw new Error('Delivery gap changed during replay');

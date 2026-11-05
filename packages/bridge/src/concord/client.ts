@@ -46,6 +46,7 @@ import {
 } from "@armada-bridge/concord-core";
 import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from "../deletionPolicy";
 import { LinkDelivery, type RepairOptions } from "./linkDelivery";
+import { assertEffectCurrent } from "../effectGuard";
 import { REPLAY_MAX_IDS } from "./reconciliation";
 import { controlInventory, CONTROL_MAX_BYTES } from "./controlInventory";
 import type {
@@ -296,6 +297,7 @@ export class ConcordClient {
       tags: [],
       created_at: Math.floor(Date.now() / 1000),
     });
+    await assertEffectCurrent();
     await this.pool.publish(event);
   }
 
@@ -321,6 +323,7 @@ export class ConcordClient {
       tags: relays.map((url) => ["relay", url]),
       created_at: Math.floor(Date.now() / 1000),
     });
+    await assertEffectCurrent();
     await this.pool.publish(event);
   }
 
@@ -329,6 +332,7 @@ export class ConcordClient {
     const rumor = buildJoinRumor(author.pk, ms);
     // sealGuestbook signs the encrypted seal AND wraps it in one step.
     const wrap = await sealGuestbook(rumor, group, author.signer);
+    await assertEffectCurrent();
     await this.pool.publish(wrap);
     return wrap;
   }
@@ -370,6 +374,7 @@ export class ConcordClient {
       tags: [],
       created_at: Math.floor(Date.now() / 1000),
     });
+    await assertEffectCurrent();
     await this.pool.publish(event);
   }
 
@@ -387,6 +392,7 @@ export class ConcordClient {
     });
     const seal = await sealRumor(rumor, KIND_SEAL_ENCRYPTED, channel.current.group, author.signer);
     const wrap = wrapSeal(seal, channel.current.group, { ephemeral: true });
+    await assertEffectCurrent();
     await this.pool.publish(wrap);
   }
 
@@ -511,6 +517,7 @@ export class ConcordClient {
     });
     const seal = await sealRumor(rumor, KIND_SEAL_ENCRYPTED, channel.current.group, opts.author.signer);
     const wrap = wrapSeal(seal, channel.current.group);
+    await assertEffectCurrent();
     await this.pool.publish(wrap);
     return { rumor, wrap };
   }

@@ -208,7 +208,7 @@ const lane = new LinkDelivery({
   onError: error => console.warn("bridge: delivery operation failed", error),
   onGap: floor => deliveryStore!.markDeliveryGap(floor),
 });
-shutdownState.register(() => lane.stop());
+shutdownState.register(async () => { lane.stop(); await lane.drain(); });
 shutdownState.signal.addEventListener("abort", () => lane.stop(), { once: true });
 let router: BridgeRouter;
 const runDiscord = (work: () => Promise<unknown>): Promise<void> => {
