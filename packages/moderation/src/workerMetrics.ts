@@ -27,6 +27,6 @@ export function observeWorkerAuthority(community: CommunityV2, worker: string, p
 export async function workerMetricsResponse(sql: postgres.Sql, authority?: WorkerAuthorityObservation, now?: number): Promise<Response> {
   try {
     await sql`SELECT 1`;
-    return new Response(`concord_worker_authority_available ${Number(Boolean(authority?.available && (now ?? Date.now()) < authority.validUntil))}\n`, { headers: { "content-type": "text/plain; version=0.0.4", "cache-control": "no-store" } });
+    return new Response(`# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available ${Number(Boolean(authority?.available && (now ?? Date.now()) < authority.validUntil))}\n`, { headers: { "content-type": "text/plain; version=0.0.4", "cache-control": "no-store" } });
   } catch { return new Response("unavailable", { status: 503 }); }
 }

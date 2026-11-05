@@ -10,9 +10,9 @@ test("worker authority observes the verified current grant and expires without a
   const observation = observeWorkerAuthority(f.community, f.moderator.pk, f.policy);
   expect(observation.available).toBe(true);
   const sql = (async () => []) as unknown as postgres.Sql;
-  expect(await (await workerMetricsResponse(sql, observation)).text()).toBe("concord_worker_authority_available 1\n");
-  expect(await (await workerMetricsResponse(sql, observation, f.policy.validUntil)).text()).toBe("concord_worker_authority_available 0\n");
-  expect(await (await workerMetricsResponse(sql, undefined)).text()).toBe("concord_worker_authority_available 0\n");
+  expect(await (await workerMetricsResponse(sql, observation)).text()).toBe("# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available 1\n");
+  expect(await (await workerMetricsResponse(sql, observation, f.policy.validUntil)).text()).toBe("# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available 0\n");
+  expect(await (await workerMetricsResponse(sql, undefined)).text()).toBe("# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available 0\n");
 });
 
 test("revoked or missing grants and banned workers cannot report authority", async () => {

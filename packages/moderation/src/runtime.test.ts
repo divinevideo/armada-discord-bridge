@@ -65,7 +65,7 @@ for (const callback of ["disconnect", "subscription error"] as const) {
       expect(health.authority).toBeUndefined();
       releaseCapacity.resolve();
       await refreshReturned.promise;
-      expect(await (await workerMetricsResponse(sql, health.authority)).text()).toBe("concord_worker_authority_available 0\n");
+      expect(await (await workerMetricsResponse(sql, health.authority)).text()).toBe("# TYPE concord_worker_authority_available gauge\nconcord_worker_authority_available 0\n");
       expect(retainedDuringRefresh).toBe(true);
     } finally {
       releaseCapacity.resolve(); stop.abort();
