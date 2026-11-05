@@ -529,3 +529,38 @@ test('concurrent removals of one Pod share a single delete and neither reports a
   await Promise.all([backend.close(), backend.finish()]);
   expect(calls.filter(c => c.includes('delete'))).toHaveLength(1);
 });
+
+import { settleCleanup } from './strfry-capacity';
+test('a cleanup failure never replaces the measurement failure, and handlers outlive the cleanup', async () => {
+  const suppressed: string[] = [];
+  let stops = 0;
+  const failing = async () => { throw new Error('Some owned benchmark Pods could not be removed'); };
+  // The measurement already failed: its error stays the one that propagates.
+  await settleCleanup(failing, true, () => { stops++; }, e => suppressed.push((e as Error).message));
+  expect(suppressed).toEqual(['Some owned benchmark Pods could not be removed']);
+  expect(stops).toBe(1);
+  // Nothing failed before: the cleanup failure is the failure.
+  await expect(settleCleanup(failing, false, () => { stops++; }, () => {})).rejects.toThrow('could not be removed');
+  expect(stops).toBe(2);
+  await settleCleanup(async () => {}, false, () => { stops++; }, () => {});
+  expect(stops).toBe(3);
+});
+
+test('a signal that arrives during the final cleanup waits for it instead of killing the process mid-cleanup', async () => {
+  const exits: number[] = [];
+  let finishCleanup!: () => void;
+  const cleaning = new Promise<void>(resolve => { finishCleanup = resolve; });
+  // The shared, idempotent cleanup promise the harness hands to both paths.
+  const stop = cleanupOnInterrupt(() => cleaning, code => { exits.push(code); }, () => {});
+  let listenersDuringCleanup = -1;
+  const settled = settleCleanup(async () => { listenersDuringCleanup = process.listenerCount('SIGTERM'); await cleaning; }, false, stop, () => {});
+  await Bun.sleep(5);
+  process.emit('SIGTERM', 'SIGTERM');           // arrives while cleanup is still running
+  await Bun.sleep(20);
+  expect(exits).toEqual([]);                    // it waits; it did not exit or kill anything yet
+  finishCleanup();
+  await settled; await Bun.sleep(20);
+  expect(listenersDuringCleanup).toBe(1);       // still installed while cleanup ran
+  expect(exits).toEqual([143]);
+  expect(process.listenerCount('SIGTERM')).toBe(0);
+});

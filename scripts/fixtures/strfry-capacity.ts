@@ -230,6 +230,20 @@ export async function finalizeCapacityMeasurement(writeArtifacts: () => Promise<
   if (failures.length) throw failures[0];
 }
 
+/**
+ * Final cleanup after the measurement body. A cleanup failure must not replace
+ * the measurement error that caused it (a Pod that could not be removed is
+ * reported, not allowed to hide why the run failed); with no earlier failure it
+ * is the failure. `stop` uninstalls the interrupt handlers only once cleanup
+ * has settled: a signal that arrives during it must wait for it, not take the
+ * default action and kill the process mid-cleanup with a port-forward orphaned.
+ */
+export async function settleCleanup(run: () => Promise<void>, measurementFailed: boolean, stop: () => void, onSuppressed: (error: unknown) => void): Promise<void> {
+  try { await run(); }
+  catch (error) { if (!measurementFailed) throw error; onSuppressed(error); }
+  finally { stop(); }
+}
+
 /** Resolve symlinks in the part of a path that exists, so a guard sees where mkdir would really write. */
 export async function realpathOfFuture(path: string): Promise<string> {
   const missing: string[] = [];
@@ -293,7 +307,13 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
   let cleaning: Promise<void> | undefined;
   const noteSuppressed = (error: unknown) => console.error("Capacity cleanup also failed: " + caseFailureReason(error, !!kube));
   const runCleanup = (writeArtifacts: () => Promise<void>) => (cleaning ??= finalizeCapacityMeasurement(writeArtifacts, cleanup, noteSuppressed));
-  const stopInterruptCleanup = cleanupOnInterrupt(() => runCleanup(async () => {}));
+  // Set before cleanup starts so the measurement loop stops launching work. The
+  // handler's cleanup ends the SQL sessions and removes the Pods under it; a loop
+  // still running would fail every remaining case against a closed connection
+  // (recording each as a destination failure rather than "not run") and race the
+  // sweep with its own per-case close.
+  let interrupted = false;
+  const stopInterruptCleanup = cleanupOnInterrupt(() => { interrupted = true; return runCleanup(async () => {}); });
   let failure: { error: unknown } | undefined;
   try {
     await chmod(directory, 0o755);
@@ -410,6 +430,7 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       return { caseId: id, historyCount: measuredPolicy!.controlEvents.length + measuredRekeys.length, historyBytes: Buffer.byteLength(JSON.stringify(measuredPolicy!.controlEvents)) + Buffer.byteLength(JSON.stringify(measuredRekeys.map(row => row.event))), rekeyCount: measuredRekeys.length, streamCount: f.streams.length, inFlight, wallMs, innerAdmissionMs: Number.isFinite(timing) ? timing : null, expectedAccept, accepted, okReceived: !!ok, persisted, fanout, lateDatabaseWrite: !before && !dbAtAck && dbAfter, unsafeEffect: (!accepted && (dbAfter || persistedAfter || fanout)) || (accepted && (!dbAfter || !persistedAfter)), ...(["plugin_failure", "external_timeout"].includes(id) ? { innerNotStarted: true } : {}), ...(error ? { error } : {}) };
     }
     for (const entry of report.cases) {
+      if (interrupted) break;
       try {
         // Reuse one hook process across pressure/warm points; cold/restart explicitly restart it.
         let instance: Awaited<ReturnType<typeof start>> | undefined;
@@ -467,31 +488,22 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
         const limits = entry.id === "cache_entries" && generatedCount <= matrix.cacheEntryWorkingSet ? "cache entry pressure not reached" : entry.id === "cache_bytes" && generatedBytes <= matrix.cacheByteWorkingSet ? "cache byte pressure not reached" : entry.samples.some((s) => s.innerAdmissionMs === null && !s.innerNotStarted) ? "inner timing unavailable or concurrent attribution ambiguous" : undefined;
         entry.status = limits ? "unsupported" : "measured"; entry.reason = limits;
         if (instance) { await writeFile(join(output, entry.id + "-relay.log"), await relayLogs(instance.name)); }
-      } catch (error) { entry.status = "unsupported"; entry.reason = caseFailureReason(error, !!kube); }
-      if (kube) await kube.close();
+      } catch (error) { entry.status = "unsupported"; entry.reason = interrupted ? "interrupted before completion" : caseFailureReason(error, !!kube); }
+      if (kube && !interrupted) await kube.close();
       await writeFile(join(output, "partial-report.json"), JSON.stringify(report, null, 2) + "\n");
     }
   } catch (error) {
     failure = { error }; throw error;
   } finally {
-    stopInterruptCleanup();
-    // A cleanup failure must not replace the measurement error that caused it
-    // (a Pod that could not be removed is reported, not allowed to hide why the
-    // run failed). With no earlier failure it is the failure.
-    try {
-      await runCleanup(async () => {
-        report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
-        const artifact = serializeCapacityReport(report);
-        await writeFile(join(output, "measurement-report.json"), artifact.json);
-        await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
-        await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
-        await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
-        if (kube) await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
-      });
-    } catch (cleanupError) {
-      if (!failure) throw cleanupError;
-      noteSuppressed(cleanupError);
-    }
+    await settleCleanup(() => runCleanup(async () => {
+      report.fixtureHash = hash(fixtureHashes.join("\n")); report.finishedAt = Date.now();
+      const artifact = serializeCapacityReport(report);
+      await writeFile(join(output, "measurement-report.json"), artifact.json);
+      await writeFile(join(output, "summary.json"), JSON.stringify(summarizeCapacity(report, process.env.CAPACITY_URGENT_RESERVE ? Number(process.env.CAPACITY_URGENT_RESERVE) : undefined), null, 2) + "\n");
+      await writeFile(join(output, "report.sha256"), artifact.hash + "\n");
+      await writeFile(join(output, "mode.json"), JSON.stringify({ mode: calibration ? "synthetic-library-calibration" : "actual-deployed-entrypoint", certified: false, note: "No deployment/controller/resource certification is inferred. Raw errors and unsupported cases are retained." }, null, 2) + "\n");
+      if (kube) await writeFile(join(output, "destination-observations.json"), JSON.stringify(kube.evidence, null, 2) + "\n");
+    }), failure !== undefined, stopInterruptCleanup, noteSuppressed);
   }
 
   console.log(`Capacity raw report: ${output}; certified=false`);
