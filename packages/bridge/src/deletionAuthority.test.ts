@@ -10,7 +10,7 @@ import { ConcordClient } from './concord/client';
 import { localIdentity } from './concord/signer';
 import { PuppetCache } from './puppets';
 import { BridgeRouter, MemoryMappingStore } from './router';
-import { DeletionIntakeError } from './deletionPolicy';
+import { DeletionIntakeError, PromotionDeletionIntakeError } from './deletionPolicy';
 import type { ChannelLink, MappingStore, WebhookSender } from './router';
 
 export function deletionHarness(store: MappingStore = new MemoryMappingStore(), before: () => Promise<void> = async () => {}) {
@@ -389,4 +389,43 @@ it('rechecks a queued chat after adopting a retirement cutoff', async () => {
   release(); await a;
   expect(await b).toEqual([]);
   expect(sends).toBe(1);
+});
+
+it('propagates original deletion floor when an ordinary message creates its mapping', async()=>{
+ const h=deletionHarness();
+ const deletion=await opened(fixture.moderatorDeleteEvent,h.channel), source=Math.floor(Date.now()/1000)-1000;
+ const citation=deletion.tags.find(tag=>tag[0]==='vac');
+ await h.store.saveDeletes(h.link,[{deleteRumorId:deletion.rumorId,targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:Date.now(),sourceWrapCreatedAt:source}]);
+ h.store.promoteDelete=async()=>{throw new Error('synthetic promotion outage');};
+ let ordinaryErrors=0, result:unknown;
+ try {await deliverConcordChat(h.router,await opened(fixture.chatEvent,h.channel),h.link,()=>{ordinaryErrors++;});} catch(error) {result=error;}
+ expect(result).toBeInstanceOf(PromotionDeletionIntakeError);
+ expect((result as PromotionDeletionIntakeError).repairFloor).toBe(source);
+ expect(ordinaryErrors).toBe(0);
+});
+
+it('propagates original deletion floor when a reaction creates its mapping', async()=>{
+ const h=await signedReactionHarness();
+ const reaction=await h.event(h.f.member,7,[['e',h.f.allowedRumorId]],'👍');
+ const deletion=await h.deletion(reaction.rumorId), source=Math.floor(Date.now()/1000)-1000;
+ const citation=deletion.tags.find(tag=>tag[0]==='vac');
+ await h.store.saveDeletes(h.link,[{deleteRumorId:deletion.rumorId,targetRumorId:reaction.rumorId,author:deletion.author,citation,createdAtMs:Date.now(),sourceWrapCreatedAt:source}]);
+ h.store.promoteDelete=async()=>{throw new Error('synthetic promotion outage');};
+ let result:unknown;
+ try {await deliverConcordChat(h.router,reaction,h.link,()=>{});} catch(error) {result=error;}
+ expect(result).toBeInstanceOf(PromotionDeletionIntakeError);
+ expect((result as PromotionDeletionIntakeError).repairFloor).toBe(source);
+});
+
+it('propagates a promotion failure from Discord-origin message mapping', async()=>{
+ const h=deletionHarness(), deletion=await opened(fixture.moderatorDeleteEvent,h.channel);
+ const source=Math.floor(Date.now()/1000)-1000, citation=deletion.tags.find(tag=>tag[0]==='vac');
+ await h.store.saveDeletes(h.link,[{deleteRumorId:deletion.rumorId,targetRumorId:fixture.expected.message.id,author:deletion.author,citation,createdAtMs:Date.now(),sourceWrapCreatedAt:source}]);
+ h.store.promoteDelete=async()=>{throw new Error('synthetic promotion outage');};
+ h.client.sendChat=async()=>({rumor:{id:fixture.expected.message.id}} as never);
+ const message={id:'discord-message',channelId:h.link.discordChannelId,guildId:h.link.discordGuildId,author:{id:'80351110224678912',display:'Person',bot:false},content:'synthetic'};
+ let result:unknown;
+ try {await h.router.onDiscordMessage(message,h.link);} catch(error) {result=error;}
+ expect(result).toBeInstanceOf(PromotionDeletionIntakeError);
+ expect((result as PromotionDeletionIntakeError).repairFloor).toBe(source);
 });

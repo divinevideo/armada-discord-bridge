@@ -1,3 +1,4 @@
+import { DeletionIntakeError } from '../deletionPolicy';
 import { discordPermissionObservation } from '../discord/adapter';
 import type { WebhookSender } from '../router';
 import { KIND_DELETE } from '@armada-bridge/concord-core';
@@ -13,7 +14,7 @@ export async function deliverConcordChat(
 ): Promise<string[]> {
   try { return await router.onConcordChat(chat, link); }
   catch (error) {
-    if (chat.kind === KIND_DELETE) throw error;
+    if (chat.kind === KIND_DELETE || error instanceof DeletionIntakeError) throw error;
     onOrdinaryError(error);
     return [];
   }
