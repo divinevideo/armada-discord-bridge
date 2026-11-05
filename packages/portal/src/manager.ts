@@ -1102,22 +1102,38 @@ export class BridgeManager {
   async stop(bridgeId: string, status: "paused" | "unlinked", detail?: string): Promise<void> {
     this.cancelStartRetry(bridgeId);
     const rb = this.running.get(bridgeId);
-    if (rb) {
-      // release invalidates the local handle before its DB round trip. Failure
-      // must not keep subscriptions alive or prevent the requested status write.
-      await rb.lease.release().catch((error) => console.warn(`bridge ${bridgeId}: lease release failed`, error));
-      await this.closeRunning(rb);
-    }
-    if (status === "unlinked") {
-      await this.sql`
-        UPDATE bridges SET status = 'unlinked', status_detail = ${detail ?? null},
-          invite_url_sealed = NULL, master_secret_sealed = NULL, primary_sk_sealed = NULL,
-          updated_at = now()
-        WHERE bridge_id = ${bridgeId}`;
-    } else {
-      await this.sql`
-        UPDATE bridges SET status = ${status}, status_detail = ${detail ?? null}, updated_at = now()
-        WHERE bridge_id = ${bridgeId}`;
+    if (rb) { try { rb.unsubChat(); } catch {} rb.unsubChat = () => {}; }
+    try {
+      await this.sql.begin(async tx => {
+        const [row] = await tx<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id=${bridgeId}`;
+        if (!row) return;
+        if (row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
+          const link: ChannelLink = { communityId:row.community_id, concordChannelIdHex:row.concord_channel_id,
+            discordGuildId:row.discord_guild_id, discordChannelId:row.discord_channel_id, enabled:true };
+          const state = await this.store.inspectDelivery(link,tx);
+          // The lifecycle lock precedes the status update. A different owner is
+          // left intact; an epoch race for this owner throws and rolls back.
+          if (status === 'paused') {
+            if (state?.ownerId === bridgeId) await this.store.suspendDelivery(link,bridgeId,state.epoch,tx);
+          } else await this.store.terminateDelivery(link,bridgeId,state?.epoch,tx);
+        }
+        const changed = status === 'unlinked'
+          ? await tx`UPDATE bridges SET status='unlinked',status_detail=${detail ?? null},
+              invite_url_sealed=NULL,master_secret_sealed=NULL,primary_sk_sealed=NULL,updated_at=now()
+              WHERE bridge_id=${bridgeId} AND status=${row.status} AND community_id IS NOT DISTINCT FROM ${row.community_id}
+                AND concord_channel_id IS NOT DISTINCT FROM ${row.concord_channel_id} AND discord_guild_id IS NOT DISTINCT FROM ${row.discord_guild_id}
+                AND discord_channel_id IS NOT DISTINCT FROM ${row.discord_channel_id} RETURNING bridge_id`
+          : await tx`UPDATE bridges SET status=${status},status_detail=${detail ?? null},updated_at=now()
+              WHERE bridge_id=${bridgeId} AND status=${row.status} AND community_id IS NOT DISTINCT FROM ${row.community_id}
+                AND concord_channel_id IS NOT DISTINCT FROM ${row.concord_channel_id} AND discord_guild_id IS NOT DISTINCT FROM ${row.discord_guild_id}
+                AND discord_channel_id IS NOT DISTINCT FROM ${row.discord_channel_id} RETURNING bridge_id`;
+        if (!changed.length) throw new Error('Bridge changed during stop');
+      });
+    } finally {
+      if (rb) {
+        await rb.lease.release().catch(error => console.warn(`bridge ${bridgeId}: lease release failed`,error));
+        await this.closeRunning(rb);
+      }
     }
   }
 
@@ -1125,8 +1141,19 @@ export class BridgeManager {
     const [row] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
     if (!row) throw new Error("no such bridge");
     await this.assertChannelPolicy(row.discord_guild_id ?? "", row.discord_channel_id ?? "");
-    const next = row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
-    await this.sql`UPDATE bridges SET status = ${row.status === "paused" ? "active" : next}, updated_at = now() WHERE bridge_id = ${bridgeId}`;
+    const next = row.status === "paused" ? "active" : row.confirm_code && !this.running.has(bridgeId) ? "pending_confirm" : "active";
+    await this.sql.begin(async tx => {
+      if (next === 'active' && row.community_id && row.concord_channel_id && row.discord_guild_id && row.discord_channel_id) {
+        const link: ChannelLink = { communityId:row.community_id,concordChannelIdHex:row.concord_channel_id,
+          discordGuildId:row.discord_guild_id,discordChannelId:row.discord_channel_id,enabled:true };
+        await this.store.activateDelivery(link,bridgeId,[],Math.floor(Date.now()/1000),tx);
+      }
+      const changed=await tx`UPDATE bridges SET status=${next},updated_at=now()
+        WHERE bridge_id=${bridgeId} AND status=${row.status} AND community_id IS NOT DISTINCT FROM ${row.community_id}
+          AND concord_channel_id IS NOT DISTINCT FROM ${row.concord_channel_id} AND discord_guild_id IS NOT DISTINCT FROM ${row.discord_guild_id}
+          AND discord_channel_id IS NOT DISTINCT FROM ${row.discord_channel_id} RETURNING bridge_id`;
+      if(!changed.length) throw new Error('Bridge status changed during resume');
+    });
     const [fresh] = await this.sql<BridgeRow[]>`SELECT * FROM bridges WHERE bridge_id = ${bridgeId}`;
     await this.startTracked(fresh);
   }

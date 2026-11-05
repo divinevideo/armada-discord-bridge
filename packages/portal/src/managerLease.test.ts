@@ -20,9 +20,10 @@ function fixture() {
     if (query.includes("UPDATE bridge_leases")) return expired ? [] : [{ resource: "channel" }];
     if (query.includes("SELECT 1 FROM bridge_leases")) return expired ? [] : [{}];
     if (query.includes("SELECT * FROM bridges")) return [row];
-    if (query.includes("UPDATE bridges SET status =")) row.status = values[0] as string;
+    if (query.includes("UPDATE bridges SET status")) { row.status = values[0] as string; return [{ bridge_id: row.bridge_id }]; }
     return [];
   }) as unknown as postgres.Sql;
+  (sql as any).begin = async (work: (tx: postgres.Sql) => Promise<unknown>) => work(sql);
   const manager = new BridgeManager(sql, {} as PortalEnv, { assertPublicChannel: async () => {} });
   // Only relay/gateway construction is replaced: acquisition, terminal callback,
   // same-instance cleanup, durable status and retry dispatch are production code.
