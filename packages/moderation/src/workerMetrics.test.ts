@@ -34,7 +34,10 @@ test("revoked or missing grants and banned workers cannot report authority", asy
 test("missing write key, stale, incomplete, rekey and unverified policy never report authority", async () => {
   const f = await moderationFixture();
   expect(observeWorkerAuthority({ ...f.community, controlRoot: undefined }, f.moderator.pk, f.policy).available).toBe(false);
-  for (const policy of [{ ...f.policy, validUntil: Date.now() - 1 }, { ...f.policy, complete: false }, { ...f.policy, rekeyPending: true }, { ...f.policy, controlEvents: [{ ...f.policy.controlEvents[0], sig: "0".repeat(128) }] }]) {
+  // Corrupt the whole set rather than keep one event: a lone event lacks the
+  // role and grant, so it would fail without any signature being checked.
+  const unverified = { ...f.policy, controlEvents: f.policy.controlEvents.map((event) => ({ ...event, sig: "0".repeat(128) })) };
+  for (const policy of [{ ...f.policy, validUntil: Date.now() - 1 }, { ...f.policy, complete: false }, { ...f.policy, rekeyPending: true }, unverified]) {
     expect(observeWorkerAuthority(f.community, f.moderator.pk, policy).available).toBe(false);
   }
   const gap = await sealEdition(buildChannelEdition(hex32(f.channelId), { name: "gap", private: false }, { actorPubkey: f.owner.pk, version: 3n, prevHash: hex32("ab".repeat(32)) }), currentControlWriteGroup(f.community), f.owner.signer);
