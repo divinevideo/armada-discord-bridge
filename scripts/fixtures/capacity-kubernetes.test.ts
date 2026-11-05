@@ -329,7 +329,7 @@ test('removal reclaims the relay database only for an owned Pod and refuses new 
   expect(calls.some(c => c.includes('rm'))).toBe(false);
   uid = 'owned-uid';
   await backend.remove('capacity-synthetic-1');
-  const reclaim = calls.findIndex(c => c.includes('rm') && c.includes('/data/db'));
+  const reclaim = calls.findIndex(c => c.includes('rm') && c.includes('/data/db') && c.includes('/data/strfry.conf'));
   const removal = calls.findIndex(c => c.includes('delete'));
   expect(reclaim).toBeGreaterThan(-1); expect(removal).toBeGreaterThan(reclaim);
   // An interrupt may finish the backend while a creation is still in flight.

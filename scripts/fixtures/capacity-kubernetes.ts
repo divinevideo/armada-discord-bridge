@@ -374,13 +374,14 @@ export class KubernetesCapacity {
   private async removeOnce(name: string) {
     const pod = await this.owned(name); const record = this.pods.get(name)!; record.forward?.stop();
     // The Pod's data lives in a subPath of the shared benchmark volume, which
-    // outlives it. Reclaim the relay database now: each Pod otherwise leaves
+    // outlives it. Reclaim the relay database and the config upload() wrote into
+    // the same subPath now: each Pod otherwise leaves
     // its LMDB behind, entrypoint mode creates one Pod per history point, and
     // the growing tree is re-walked by fsGroup ownership handling on every
     // later Pod start. Best effort: a Pod past its deadline cannot be exec'd
     // into. Only the empty per-Pod directory remains, which a container
     // mounting that subPath cannot remove.
-    await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'rm', '-rf', '/data/db']).catch(() => {});
+    await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'rm', '-rf', '/data/db', '/data/strfry.conf', '/data/strfry.conf.new']).catch(() => {});
     // UID precondition prevents a replacement resource from being removed by cleanup.
     await this.execute([...this.args(), 'delete', '--raw', `/api/v1/namespaces/${this.config.namespace}/pods/${name}`, '-f', '-'], JSON.stringify({ apiVersion: 'v1', kind: 'DeleteOptions', preconditions: { uid: pod.metadata.uid } }));
     await this.execute([...this.args(), 'wait', '--for=delete', `pod/${name}`, '--timeout=90s']);
