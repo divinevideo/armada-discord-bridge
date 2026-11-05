@@ -28,9 +28,9 @@ Interfaces: Add typed per-relay inventory enumeration and exact-ID fetch to Rela
 - [ ] Reproduce capped300/400 and4/8same-second loss, per-relay subset/unavailability and error-as-close.
 - [ ] Use locked nostr-tools2.24.1 nip77 engine, empty local inventory, direct current raw socket sessions, preserving stream authentication. Do not use NegentropySync or unsupported Nostrify typed send.
 - [ ] Bound frames, rounds, IDs, duration and fetch batches; always clean sessions/listeners. Explicit NEG-ERR/version/disconnect/timeout/no-progress failures.
-- [ ] Process chronological five-minute windows. Union at most16384IDs; split overflow/sync-limit windows oldest first, fail closed at oversized one second. Omit reconciliation filter limit.
+- [ ] Request the full remaining settled interval; split only on resource/sync limits, oldest first, and resume an incomplete prefix at its exact next second. Union at most16384IDs; fail closed at oversized one second. Omit reconciliation filter limit.
 - [ ] Fetch outstanding IDs in batches100 until exhausted, independently per relay; do not let returned lower cap certify missing IDs. Bounded retry/reconcile for purged carriers. Deliver decoded payloads in small batches with explicit completed-window callback. Preserve meaningful chronological delivery semantics within resource bounds; raise concrete interface conflict to root rather than inventing coverage.
-- [ ] Freeze upper bound at run start (never future wrap max); only interval endpoints certify. Fallback only with explicit verified newest-prefix/fixed-cap contract; saturated seconds incomplete.
+- [ ] Freeze upper bound at run-start seconds minus60 (never future wrap max); only interval endpoints certify. Fallback only with explicit verified newest-prefix/fixed-cap contract; saturated seconds incomplete.
 - [ ] Run focused regressions, full repository gate/types and commit. Isolated pinned-strfry wire interoperability is required evidence; report unavailable runtime honestly.
 
 ### Task 2: Durable lifecycle, deletion policy and upgrade store

@@ -4,76 +4,172 @@ A Discord copy is removed only under the current client rule: self-deletion,
 or `citationSatisfied` together with `canActOnMember(..., MANAGE_MESSAGES)`.
 A permission bit alone is insufficient. Discord-origin target authors resolve
 through the link's puppet identity; reaction scope comes from its parent message
-mapping. Tenant, community, Concord channel and Discord channel must match.
+mapping. Tenant, community, Concord channel, Discord guild and Discord channel
+must match. Current control authority, epoch retirement, visibility and lease
+checks still apply at the adapter's final dispatch boundary. Replay does not
+change the shared concord-core authorization rules.
 
-Migration `019_pending_concord_deletes.sql` adds a durable queue of minimal
-verified deletion metadata. It stores actor/target identifiers and the grant
-citation, never content, private keys or invite material. Future citations and
-unknown mappings stay pending across cursor advancement and worker restart.
+## Finite unresolved evidence and durable accepted actions
 
-Outstanding records are bounded at 4096 per link and 1024 per actor. Enqueue is
-atomic and deduplicated: capacity refusal never evicts earlier work or partially
-accepts a deletion. A failed nondurable write pins cursor advancement until a
-restart/catch-up; resolve storage or capacity first and do not manually advance
-the cursor to silence the failure. Actions without a non-owner citation are
-removed once their mapped target proves they are neither owner nor author.
-Cited denials remain eligible for reevaluation under later current authority.
+The durable queue contains minimal verified deletion metadata: actor, target,
+citation and source provenance, never message content, private keys or invites.
+Unresolved evidence has its own allocation of 4096 records per link and 1024 per
+actor. It expires seven days after the earliest of the verified outer carrier's
+creation time, first observation and current time. Replaying that retained row
+or source carrier does not renew the deadline. Future-dated unresolved carriers
+are disposed of explicitly. Expiry and unresolved overflow are aggregate policy
+dispositions, not delivery gaps; earlier work is not evicted to admit new work.
 
-Workers retry at startup, on control folds, when target mappings appear, and
-every ten seconds. Periodic/fold retries share the normal channel effect lane,
-coalesce overlapping notifications, and rotate through at most 128 records per
-batch so a denied prefix cannot starve a later satisfied citation. Both dispatch
-entry points await durable handling before acknowledging stream cursors. Live
-subscriptions admit at most 200 wraps, including the in-flight delivery, before
-constructing their promise chain. Overflow is refused synchronously and pins
-the client’s cursor acknowledgements across all later subscriptions so a fresh
-live-tail REQ cannot hide the replay gap. Only restart followed by successful
-catch-up can restore acknowledgement. Migration `021_channel_delivery_checkpoints.sql`
-stores progress for the full tenant/community/Concord-channel/Discord-guild/
-Discord-channel link, independent of changing stream keys. Workers persist its
-initial floor before admitting routed live work; legacy per-stream progress is
-inherited at the lowest existing watermark. Fresh links start at the current
-live-tail floor. Ordinary mirror send failures warn and continue, including the
-portal missing-permission alert, without poisoning deletion durability.
+This is a finite opportunity for a target mapping and sufficient current
+authority to become available. There is no perpetual first-seen tombstone per
+inner rumor: a fresh valid rewrapping after expiry is a new observation that may
+be admitted. An old retained carrier can also become actionable on restart if
+its target and current authority are now available, even if its earlier
+unresolved evidence expired. That does not renew unresolved quarantine.
 
-Catch-up reads all configured relays and splits saturated 500-wrap time windows
-into disjoint smaller windows, delivered oldest-first. Each fully handled batch
-commits its own checkpoint before reading later work, so a crash or failure can
-resume from the last complete batch. Streaming worker callbacks retain only the
-current bounded batch; they do not collect the whole backlog. Same-second ties
-expand only that second’s query, up to a 16,384-wrap query ceiling; Nostr has no
-within-second offset. A still-saturated second fails closed before its checkpoint
-advances. Incomplete catch-up keeps the worker serving live best-effort traffic
-with cursor writes disabled and retries every ten seconds; overlapping retries
-coalesce. Fix the unavailable relay or excessive same-second bucket instead of
-manually moving the checkpoint past unprocessed work.
+Once a mapped deletion is accepted as actionable, it uses a separate allocation
+with the same 4096/link and 1024/actor caps. Accepted actions never silently
+expire or downgrade when authority is lost. Current authorization gates every
+attempt; permission failures and transient database/Discord failures leave
+accepted work durable. Successful/idempotent completion and verified permanent
+inapplicability can remove records. Uncited unresolved actions are removed once
+the mapped target establishes they are neither owner nor author; cited denials
+can be reevaluated while their unresolved retention remains valid.
 
-Lease/visibility checks and the synchronous current-fold check run again at the
-Discord adapter's final dispatch boundary. Reactions retain their active mapping until
-removal succeeds. Migration `020_retired_concord_reactions.sql` then preserves
-scoped target evidence atomically with active mapping removal. This evidence
-outlives pending-action cleanup, so crash replay and later distinct deletions
-can resolve the original author without removing a newly added reaction. Retired
-rows remain outside active Discord reaction lookups, and old reaction rumor
-replays cannot resurrect them. Like message mappings, this target evidence is
-retained independently of the bounded pending-action queue. Partial message
-deletes can retry idempotently. A webhook's
-Unknown Message response alone does not prove a Discord-origin post is gone:
-the bot endpoint must also resolve the fallback.
+Retries run at startup, control folds, target mapping arrival and bounded
+scheduled due-work scans. Batches handle at most 128 due records; failed work
+backs off from ten seconds to one hour, and wakeups coalesce. A full actionable
+allocation or failed durable intake/promotion raises a typed gap and pins
+certified progress while accepted work drains. Resolve capacity, storage or
+permissions; manually advancing progress would discard the recovery obligation.
+The caps bound pending allocations, not lifetime mapping storage.
 
-Ship all three additive migrations with the worker source through the existing release
-process. Local synthetic tests and an isolated database prove source behavior,
-not live Discord delivery or production admission readiness.
+## Lifecycle and crash recovery
 
-A known quota tradeoff remains: four legal signed member deletions with 256
-unknown target identifiers each fill that actor’s 1,024 pending slots. Retry
-cannot prove those targets will never arrive, so a later deletion is refused
-and pins acknowledgement. The signed regression
-`exposes the unknown-target quota limit using four legal signed member deletions`
-records this behavior, including refusal of a subsequent mapped self-delete.
-There is no TTL, eviction, or operator repair API in this change. Dropping excess
-work, aging out unknown targets, or reserving capacity for known targets each
-changes the current delivery contract and needs an explicit admission/retention
-policy. Do not silently delete queue rows or advance the checkpoint as recovery.
-Retired target evidence likewise currently follows message-mapping retention;
-a retention window is a separate policy decision.
+A lifecycle belongs to the complete link scope and owner. Persisted worker
+session/generation, lifecycle epoch/version and the current lease resource,
+holder and token fence mutations. Lease validity is checked inside the locked
+transaction, including after awaited work. Checkpoint compare-and-set cannot
+certify a newer gap or changed stream/relay inventory. Final external dispatch
+also checks current authority; a preflight check alone is insufficient.
+
+Before any active producer attaches, the worker arms durable uncertainty. The
+marker is never cleared in this release. Each replacement attachment therefore
+enumerates retained deletion history from second zero, even if an older worker
+committed a checkpoint after a later gap write failed. This conservative policy
+can require scanning the full retained encrypted history on every attachment.
+It does not recreate keys or carriers that are no longer available.
+
+Enumeration start and deletion applicability are separate. `deletion_floor`
+records the activation second for a genuinely fresh or explicitly relinked
+lifecycle. Live intake and replay exclude deletion carriers whose verified
+outer timestamp precedes that floor, even when enumeration starts at zero.
+The boundary is inclusive. This source-clock policy also excludes a carrier
+received later if its signed timestamp predates activation. Unknown legacy or
+intermediate lifecycle provenance retains floor zero; erased provenance cannot
+be reconstructed. A terminated lifecycle's accepted actions are not inherited
+by a new lifecycle, even when old message mappings survive.
+
+Upgrade eligibility is snapshotted once and consumed only by authorized
+activation. Eligible existing links inherit the lowest available legacy or
+checkpoint floor and retain each stream's own completed-through boundary.
+A legacy cursor completes its boundary second; a recovery floor starts with
+that second. Only verified streams use their corresponding saved boundaries.
+Future legacy watermarks are capped below activation. Ordinary older messages
+and reactions are suppressed at their own completed boundaries while deletion
+recovery remains independent. Newly discovered streams use the retained
+recovery floor; current-stream coverage and preserved ordinary coverage prevent
+historical ordinary traffic from being sent again after relay changes.
+
+Fresh links start at activation rather than inheriting arbitrary legacy cursors.
+Pause/resume preserves the lifecycle and accepted work. Automatic network failure
+or reversible ban/refounding severance suspends and retains state for recovery.
+Explicit unlink terminates the lifecycle, removes its pending actions, retired
+reaction evidence and checkpoint, and fences stale worker views before cleanup.
+A later explicit relink establishes a fresh epoch and applicability floor.
+
+## Certified replay and bounds
+
+Every configured delivery relay must pass the existing public-host validation
+and independently provide strict NIP-77 inventory enumeration and exact-ID
+fetches. An empty configured list uses a vetted fallback list; an invalid,
+unavailable or unsupported configured source is never silently dropped.
+Bootstrap discovery is separate from delivery coverage. No uncertified REQ/EOSE
+fallback currently establishes completeness.
+
+A run freezes its settled upper bound at run-start seconds minus 60. It first
+requests the full remaining interval, bisecting only when inventory, sync or
+decoded resource limits require it, oldest interval first. The union is bounded
+at 16,384 IDs per window and decoded payload estimates at 16 MiB. Outstanding
+IDs are fetched in batches of at most 100 independently from every source,
+including sources whose REQ responses are capped below the requested size.
+A disappearing advertised carrier causes one fresh reconciliation; repeated
+missing IDs remain incomplete. An oversized one-second interval fails closed.
+Transport sessions, callbacks and replay waits have resource/time/abort bounds;
+a replay attempt has a five-minute deadline.
+
+Payload callbacks receive bounded batches, followed by a separate completed
+window callback only after all payload handling settles. Only that interval
+endpoint certifies progress, including empty intervals. Neither the newest live
+carrier nor a future timestamp acknowledges history. An incomplete historical
+prefix resumes at its exact next second. A settled tail instead overlaps
+`max(0, (certified_until ?? activation_floor) - 60)`; discovered streams can
+lower the start through their recovery/legacy boundaries. An existing repair
+floor is used directly, without repeatedly subtracting the tail overlap.
+
+One serial link lane admits at most 200 durable wraps including in-flight work;
+typing is coalesced separately. Live overflow, relay interruption or a stream
+change marks a recovery gap. Live dedupe cannot suppress deletion replay.
+Incomplete repair can coexist with best-effort live traffic, but never claims
+complete history. Shutdown aborts producers/replay, bounds draining and leaves
+uncertainty for the successor; cancellation cannot undo an already dispatched
+external operation, so late work remains fenced.
+
+Within each decoded window, rumor time orders candidates with a deterministic
+carrier tie break. Windows follow outer carrier time. Equivalence to a complete
+online history is therefore bounded by available retained carriers/keys,
+current authority and mappings, resource limits, and the 60-second
+lateness/backdating assumption. Arbitrarily backdated arrivals beyond the
+settled overlap, malicious withholding, purged relay history, lost keys and
+pre-migration fire-and-forget loss are not guaranteed recoverable. This is not
+an infinite storage or loss-free delivery guarantee.
+
+## Mapping evidence and operator inspection
+
+Reactions retain their active mapping until removal succeeds. Retired reaction
+rows preserve scoped parent/author evidence atomically with active mapping
+removal, independently of pending-action expiry. They stay outside active
+Discord reaction lookups; replay cannot resurrect a retired reaction or remove
+a newly added one. Message mappings and retired evidence have their own lifetime
+and disk cost rather than the pending queue's seven-day retention. Explicit
+unlink clears the scoped retired evidence; message mappings may survive.
+Partial message deletes retry idempotently. A webhook's Unknown Message response
+alone does not prove a Discord-origin post is gone: the bot endpoint must also
+resolve the fallback.
+
+`scripts/probe-backlog.ts <bridge-id> [...]` uses the operator's existing
+`DATABASE_URL` and `PORTAL_SEAL_KEY`. It reads persisted full-scope lifecycle,
+upgrade and legacy-checkpoint metadata under a read-only transaction and a
+read-only database connection. It never opens/arms a worker, consumes eligibility,
+expires pending records or advances checkpoints. Missing lifecycle state is
+reported as unknown history requiring upgrade/activation, not as live-only or
+complete. A persisted uncertainty marker selects zero for the replacement scan
+without changing the lifecycle's deletion applicability floor.
+
+The probe streams decoded candidate counts by kind (message, deletion, reaction,
+typing and other). It does not apply lifecycle/ordinary boundaries, current
+router authorization, mapping dedupe or no-op handling to predict Discord posts.
+It processes at most 65,536 decoded candidates, 4096 completed windows and a
+60-second scan deadline per link, using the same bounded replay implementation.
+A stopped/failed scan reports incomplete status and only its observed completed
+prefix separately from the persisted checkpoint. Partial-window candidate counts
+may exceed that prefix. Even a complete scan describes only the retained
+inventory through its frozen upper bound, not end-to-end delivery readiness.
+Errors use fixed reason codes without arbitrary source text; timestamps are
+seconds converted to milliseconds for display. Imports do not execute the CLI.
+
+Ship the additive migrations with the workers through the existing release
+process; do not edit applied migrations or repair history by deleting queue
+rows. Local synthetic tests, disposable PostgreSQL and isolated relay wire
+fixtures prove the tested contracts, not production relay coverage or actual
+Discord admission and effects.
