@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, chmod, realpath } from "node:f
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import postgres from "postgres";
-import { KubernetesCapacity, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup } from "./capacity-kubernetes";
+import { KubernetesCapacity, destinationConfig, benchmarkDatabaseGuard, destinationOutputGuard, destinationDatabaseSetup, BENCHMARK_IDENTITY_SQL, benchmarkURLGuard } from "./capacity-kubernetes";
 import { schnorr } from "@noble/curves/secp256k1.js";
 import { encrypt } from "nostr-tools/nip44";
 import { getEventHash, getPublicKey, verifyEvent } from "nostr-tools/pure";
@@ -194,9 +194,10 @@ export async function measureCapacity(matrix: CapacityMatrix): Promise<CapacityM
       const url = process.env.CAPACITY_DATABASE_URL;
       if (!url) throw new Error("Dedicated private CAPACITY_DATABASE_URL required");
       await destinationDatabaseSetup(async () => {
-        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {} }); locker = postgres(url, { max: 1, onnotice: () => {} });
-        const [identity] = await sql`SELECT current_database() AS database,current_user AS role,inet_server_addr()::text AS "serverAddress",split_part(current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_roles r JOIN pg_database d ON d.datname=current_database() WHERE r.rolname=current_user`;
-        const tables = await sql`SELECT n.nspname AS schema,c.relname AS name,pg_get_userbyid(c.relowner)=current_user AS owned FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','m','f') ORDER BY n.nspname,c.relname`;
+        benchmarkURLGuard(destination, url);
+        sql = postgres(url, { max: Math.max(2, matrix.concurrency), onnotice: () => {}, connection: { options: '' } }); locker = postgres(url, { max: 1, onnotice: () => {}, connection: { options: '' } });
+        const [identity] = await sql.unsafe<Omit<DatabaseObservation, "populatedTables" | "schemaPresent">[]>(BENCHMARK_IDENTITY_SQL);
+        const tables = await sql`SELECT n.nspname AS schema,c.relname AS name,pg_catalog.pg_get_userbyid(c.relowner)=current_user AS owned FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','m','f') ORDER BY n.nspname,c.relname`;
         let populatedTables = 0;
         for (const table of tables) {
           if (!table.owned || !['public', 'moderation'].includes(table.schema)) throw new Error("Unexpected benchmark table ownership/schema");

@@ -5,7 +5,7 @@ const image = 'registry.example/relay@sha256:' + 'a'.repeat(64);
 const sha = 'b'.repeat(40);
 const config = { context: 'explicit-production', namespace: 'concord-capacity-synthetic', image, sourceSha: sha, databaseCluster: { namespace: 'postgres-clusters', name: 'postgres' }, relayDeployment: { namespace: 'armada-chat', name: 'concord-relay', container: 'relay' }, relayRequests: { cpu: 0.25, memoryBytes: 268435456 }, relayStorage: { claimName: 'capacity-data', productionClaimName: 'concord-relay' }, databaseSecret: 'benchmark-database', databaseSecretKey: 'DATABASE_URL', databaseName: 'concord_capacity_synthetic', databaseRole: 'concord_capacity_synthetic', postgresVersion: '18.1', platform: 'linux/amd64' };
 const matrix = { cpu: 2, memoryBytes: 1073741824, databaseCpu: 2, databaseMemoryBytes: 8589934592 };
-const db = { database: config.databaseName, role: config.databaseRole, serverVersion: '18.1', superuser: false, createDatabase: false, createRole: false, ownsDatabase: true, populatedTables: 0, schemaPresent: true, roleMemberships: 0 };
+const db = { database: config.databaseName, role: config.databaseRole, login: config.databaseRole, loginCanLogin: true, serverVersion: '18.1', superuser: false, createDatabase: false, createRole: false, ownsDatabase: true, populatedTables: 0, schemaPresent: true, roleMemberships: 0 };
 
 describe('isolated destination measurement', () => {
   test('requires an immutable image, explicit context and isolated namespace/database', () => {
@@ -16,7 +16,7 @@ describe('isolated destination measurement', () => {
   });
   test('refuses populated, privileged, mismatched or wrong-version databases', () => {
     expect(() => benchmarkDatabaseGuard(config, db)).not.toThrow();
-    for (const change of [{ database: 'bridge' }, { role: 'postgres' }, { serverVersion: '16.4' }, { populatedTables: 1 }, { schemaPresent: false }, { roleMemberships: 1 }, { superuser: true }, { createDatabase: true }, { createRole: true }, { ownsDatabase: false }]) {
+    for (const change of [{ loginCanLogin: false }, { database: 'bridge' }, { role: 'postgres' }, { serverVersion: '16.4' }, { populatedTables: 1 }, { schemaPresent: false }, { roleMemberships: 1 }, { superuser: true }, { createDatabase: true }, { createRole: true }, { ownsDatabase: false }]) {
       expect(() => benchmarkDatabaseGuard(config, { ...db, ...change })).toThrow();
     }
   });
@@ -66,7 +66,7 @@ import fullMatrix from './capacity-matrix.json';
 test('Kubernetes lifecycle creates no exposure, verifies credentials before ready, and cleans only its UID', async () => {
   const calls: { args: string[]; input?: string }[] = [];
   const directory = await mkdtemp(join(tmpdir(), 'capacity-driver-test-'));
-  let stopped = false, uid = 'synthetic-owned-uid';
+  let stopped = false, uid = 'synthetic-owned-uid', privilegedLogin = false;
   const m = { ...fullMatrix, ...matrix } as any;
   const pod = { ...benchmarkPod(config, m, 'capacity-synthetic-1'), metadata: { name: 'capacity-synthetic-1', uid }, status: { containerStatuses: [{ name: 'relay', imageID: image, restartCount: 0 }] } } as any;
   pod.spec.nodeName = 'synthetic-native-node';
@@ -76,7 +76,7 @@ test('Kubernetes lifecycle creates no exposure, verifies credentials before read
     if (args.includes('get') && args.includes('pod')) return JSON.stringify({ ...pod, metadata: { ...pod.metadata, uid } });
     if (args.includes('get') && args.includes('node')) return JSON.stringify({ metadata: { labels: { 'cloud.google.com/gke-provisioning': 'standard', 'kubernetes.io/arch': 'amd64' } } });
     if (args.includes('exec') && args.includes('bun')) {
-      return args.at(-1)!.includes('current_database') ? JSON.stringify({ database: config.databaseName, role: config.databaseRole, version: '18.1', address: '10.0.0.2' }) : JSON.stringify({ sourceSha: sha, platform: 'linux/amd64' });
+      return args.at(-1)!.includes('current_database') ? JSON.stringify({ ...db, ...(privilegedLogin ? { login: 'synthetic_admin', superuser: true } : {}), serverAddress: '10.0.0.2' }) : JSON.stringify({ sourceSha: sha, platform: 'linux/amd64' });
     }
     return '';
   };
@@ -108,6 +108,12 @@ test('Kubernetes lifecycle creates no exposure, verifies credentials before read
     expect(backend.evidence.destinationMatched).toBe(false);
     expect(backend.evidence.controllerModelVerified).toBe(false);
     expect(calls.every(c => c.args.includes('--context=explicit-production'))).toBe(true);
+    const readyCount = calls.filter(c => c.args.at(-1)?.includes('/capacity/ready.new')).length;
+    privilegedLogin = true;
+    await expect(backend.start('capacity-synthetic-1', join(directory, 'strfry.conf'), directory)).rejects.toThrow('login');
+    expect(calls.filter(c => c.args.at(-1)?.includes('/capacity/ready.new'))).toHaveLength(readyCount);
+    await backend.close();
+
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -191,4 +197,21 @@ test('retains the production emitter timing shape without inventing event correl
   const repeated = destinationTimingLog(JSON.stringify(emitted) + '\n' + JSON.stringify({ ...emitted, innerAdmissionMs: 5 }));
   expect(repeated.split('\n')).toHaveLength(2);
   expect(repeated).not.toContain('eventId');
+});
+
+test('a privileged login cannot masquerade as the dedicated benchmark current role', () => {
+  const disguised = { ...db, login: 'synthetic_privileged_login', loginCanLogin: true };
+  expect(() => benchmarkDatabaseGuard(config, disguised)).toThrow();
+});
+
+import { benchmarkURLGuard } from './capacity-kubernetes';
+test('both benchmark connection paths refuse startup-role URL overrides and privileged usernames', () => {
+  const valid = 'postgres://' + config.databaseRole + ':synthetic-password@db.example/' + config.databaseName;
+  expect(() => benchmarkURLGuard(config, valid)).not.toThrow();
+  for (const url of [valid + '?options=-c%20role%3D' + config.databaseRole, valid + '?session_authorization=' + config.databaseRole, valid.replace(config.databaseRole + ':', 'postgres:')]) {
+    expect(() => benchmarkURLGuard(config, url)).toThrow('diagnostics withheld');
+  }
+  // The same self-contained guard is embedded in the image-side credential probe.
+  const embedded = new Function('return ' + benchmarkURLGuard.toString())();
+  expect(() => embedded(config, valid + '?options=-c%20role%3Dsynthetic_role')).toThrow();
 });

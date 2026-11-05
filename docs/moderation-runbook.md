@@ -580,8 +580,11 @@ Provision a fresh `concord_capacity_*` database and role on the selected CNPG
 PostgreSQL 18.1 cluster. The role must own this database and its local tables,
 have no superuser/create-role/create-database authority or role memberships, and
 have no privileges on the chat database. The dedicated Secret and private local
-connection must name this same database/role and observed CNPG primary. Never
-reuse the production operator, migrator or validator credential.
+connection must name this same database/role and observed CNPG primary. Both `session_user` and `current_user` must identify this dedicated LOGIN role;
+its actual login attributes are checked through qualified system catalogs. URL
+startup overrides and alternate usernames are refused for both the controller
+and mounted credential, and inherited startup options are cleared. Never reuse
+the production operator, migrator or validator credential.
 
 Apply the exact candidate moderation migrations through the approved operator
 provisioning workflow **before** measurement, then grant/transfer only the

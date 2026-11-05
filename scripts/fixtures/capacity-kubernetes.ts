@@ -9,7 +9,7 @@ export interface DestinationConfig {
   databaseName: string; databaseRole: string; postgresVersion: string;
 }
 export interface DatabaseObservation {
-  database: string; role: string; serverVersion: string; superuser: boolean; createDatabase: boolean;
+  database: string; role: string; login: string; loginCanLogin: boolean; serverVersion: string; superuser: boolean; createDatabase: boolean;
   createRole: boolean; ownsDatabase: boolean; populatedTables: number; schemaPresent: boolean; roleMemberships: number; serverAddress?: string;
 }
 type Json = Record<string, any>;
@@ -33,9 +33,21 @@ export function destinationOutputGuard(output: string | undefined, checkout: str
   const path = relative(resolve(checkout), resolve(output));
   need(path.startsWith('..' + '/') || isAbsolute(path), 'Destination reports must stay outside the checkout');
 }
+export function benchmarkURLGuard(c: Pick<DestinationConfig, 'databaseRole' | 'databaseName'>, value: string) {
+  try {
+    const url = new URL(value);
+    if (!['postgres:', 'postgresql:'].includes(url.protocol) || decodeURIComponent(url.username) !== c.databaseRole || decodeURIComponent(url.pathname.slice(1)) !== c.databaseName || [...url.searchParams.keys()].some(key => key !== 'sslmode')) throw new Error();
+  } catch { throw new Error('Dedicated benchmark URL identity or startup parameters are invalid (diagnostics withheld)'); }
+}
+export const BENCHMARK_IDENTITY_SQL = `SELECT pg_catalog.current_database() AS database,current_user AS role,session_user AS login,pg_catalog.inet_server_addr()::text AS "serverAddress",pg_catalog.split_part(pg_catalog.current_setting('server_version'),' ',1) AS "serverVersion",r.rolsuper AS superuser,r.rolcreatedb AS "createDatabase",r.rolcreaterole AS "createRole",r.rolcanlogin AS "loginCanLogin",pg_catalog.pg_get_userbyid(d.datdba)=current_user AS "ownsDatabase",(SELECT count(*)::int FROM pg_catalog.pg_auth_members WHERE member=r.oid) AS "roleMemberships" FROM pg_catalog.pg_roles r JOIN pg_catalog.pg_database d ON d.datname=pg_catalog.current_database() WHERE r.rolname=session_user`;
+export function benchmarkLoginGuard(c: DestinationConfig, o: Pick<DatabaseObservation, 'role' | 'login' | 'loginCanLogin' | 'superuser' | 'createDatabase' | 'createRole' | 'roleMemberships'>) {
+  need(o.role === c.databaseRole && o.login === c.databaseRole, 'Both session login and current role must be the dedicated benchmark role');
+  need(o.loginCanLogin === true && o.superuser === false && o.createDatabase === false && o.createRole === false && o.roleMemberships === 0, 'Benchmark login must be unprivileged and have no memberships');
+}
 export function benchmarkDatabaseGuard(c: DestinationConfig, o: DatabaseObservation) {
-  need(o.database === c.databaseName && o.role === c.databaseRole && o.serverVersion === c.postgresVersion, 'Database identity/version does not match isolated target');
-  need(o.superuser === false && o.createDatabase === false && o.createRole === false && o.ownsDatabase === true && o.populatedTables === 0 && o.schemaPresent === true && o.roleMemberships === 0, 'Benchmark requires an empty migrated dedicated database and a nonprivileged role without memberships');
+  benchmarkLoginGuard(c, o);
+  need(o.database === c.databaseName && o.serverVersion === c.postgresVersion, 'Database identity/version does not match isolated target');
+  need(o.ownsDatabase === true && o.populatedTables === 0 && o.schemaPresent === true, 'Benchmark requires an empty migrated dedicated database owned by its role');
 }
 export function benchmarkNamespaceGuard(c: DestinationConfig, namespace: Json, policies: Json[], pods: Json[], routes: Json[]) {
   need(namespace.metadata?.name === c.namespace && namespace.metadata?.labels?.['divine.video/capacity-benchmark'] === 'true', 'Namespace is not a marked synthetic benchmark');
@@ -180,8 +192,9 @@ export class KubernetesCapacity {
     this.evidence.relayObservations.push({ image: manifest.spec.containers[0].image, imageID: pod.status.containerStatuses[0].imageID, node: pod.spec.nodeName, identity, resources: pod.spec.containers[0].resources });
     // Prove the mounted dedicated credential names the same isolated DB/role/version
     // before opening the relay; never print the URL or query errors.
-    const remoteDb = JSON.parse(await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'bun', '-e', "import postgres from '/opt/divine/node_modules/postgres/src/index.js';const s=postgres(process.env.MODERATION_DATABASE_URL,{max:1,onnotice:()=>{}});try{const [r]=await s`select current_database() as database,current_user as role,current_setting('server_version') as version,inet_server_addr()::text as address`;console.log(JSON.stringify(r));}catch{process.exitCode=1;}finally{await s.end({timeout:1});}"]));
-    need(remoteDb.database === this.config.databaseName && remoteDb.role === this.config.databaseRole && remoteDb.version.split(' ')[0] === this.config.postgresVersion && remoteDb.address === this.evidence.databaseServerAddress, 'Pod benchmark credential does not match verified isolated database');
+    const remoteDb = JSON.parse(await this.execute([...this.args(), 'exec', name, '-c', 'relay', '--', 'bun', '-e', `import postgres from '/opt/divine/node_modules/postgres/src/index.js';${benchmarkURLGuard.toString()};let s;try{benchmarkURLGuard(${JSON.stringify({ databaseRole: this.config.databaseRole, databaseName: this.config.databaseName })},process.env.MODERATION_DATABASE_URL);s=postgres(process.env.MODERATION_DATABASE_URL,{max:1,onnotice:()=>{},connection:{options:''}});const [r]=await s.unsafe(${JSON.stringify(BENCHMARK_IDENTITY_SQL)});console.log(JSON.stringify(r));}catch{process.exitCode=1;}finally{await s?.end({timeout:1});}`]));
+    benchmarkLoginGuard(this.config, remoteDb);
+    need(remoteDb.database === this.config.databaseName && remoteDb.serverVersion === this.config.postgresVersion && remoteDb.serverAddress === this.evidence.databaseServerAddress, 'Pod benchmark credential does not match verified isolated database');
     await this.upload(name, '/data/strfry.conf', (await readFile(config, 'utf8')).replace(contract ? '/usr/local/bin/relay-policy' : '__no_replace__', '/capacity/entrypoint.sh'));
     for (const file of await readdir(directory)) if (['launcher.ts', 'plugin.sh', 'plugin_failure.sh', 'external_timeout.sh', 'calibration.json'].includes(file)) await this.upload(name, '/capacity/' + file, await readFile(join(directory, file), 'utf8'), file.endsWith('.sh'));
     if (contract) {
