@@ -115,7 +115,7 @@ it('coalesces overflow persistence while its database write is blocked', async (
 it('commits completed replay windows and clears only the frozen final window', async () => {
   const calls: Array<[number, boolean]> = [];
   let version = 0, repairFloor: number | undefined = 100;
-  const state = () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, version, activationFloor: 100, recoveryFloor: 100, repairFloor, coverage: {}, legacyBoundaries: {} });
+  const state = () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, ordinaryCoverage: {}, version, activationFloor: 100, recoveryFloor: 100, repairFloor, coverage: {}, legacyBoundaries: {} });
   const store = {
     deliverySnapshot: async () => state(),
     certifyDelivery: async (expected: number, until: number, _coverage: Record<string, number>, complete: boolean) => {
@@ -136,7 +136,7 @@ it('commits completed replay windows and clears only the frozen final window', a
 it('resumes a certified prefix after an interrupted replay', async () => {
   let version = 0, repairFloor: number | undefined = 100, coverage: Record<string, number> = {};
   const store = {
-    deliverySnapshot: async () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, version, activationFloor: 100, recoveryFloor: 100, repairFloor, coverage, legacyBoundaries: {} }),
+    deliverySnapshot: async () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, ordinaryCoverage: {}, version, activationFloor: 100, recoveryFloor: 100, repairFloor, coverage, legacyBoundaries: {} }),
     certifyDelivery: async (expected: number, until: number, next: Record<string, number>, complete: boolean) => {
       if (expected !== version) return false;
       version++; coverage = next; repairFloor = complete ? undefined : until + 1; return true;
@@ -162,7 +162,7 @@ it('resumes a certified prefix after an interrupted replay', async () => {
 });
 
 it('replays only deletions below each legacy carrier boundary', async () => {
-  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, version: 0, activationFloor: 1000, recoveryFloor: 100, repairFloor: 40, coverage: {}, legacyBoundaries: { first: 100, second: 50, future: 999 } };
+  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, ordinaryCoverage: {}, version: 0, activationFloor: 1000, recoveryFloor: 100, repairFloor: 40, coverage: {}, legacyBoundaries: { first: 100, second: 50, future: 999 } };
   const store = { deliverySnapshot: async () => snapshot, certifyDelivery: async () => true };
   const channel = { streams: [{ epoch: 0n, group: { pk: 'first' } }, { epoch: 1n, group: { pk: 'second' } }, { epoch: 2n, group: { pk: 'third' } }, { epoch: 3n, group: { pk: 'future' } }] } as unknown as ChannelV2;
   const delivered: string[] = [];
@@ -188,7 +188,7 @@ it('keeps a newer persisted gap when the final replay checkpoint is blocked', as
   let version = 0, repairFloor: number | undefined = 100, release!: () => void, entered!: () => void;
   const blocked = new Promise<void>(resolve => { release = resolve; });
   const started = new Promise<void>(resolve => { entered = resolve; });
-  const snapshot = () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, version, activationFloor: 100, recoveryFloor: 100, repairFloor, coverage: {}, legacyBoundaries: {} });
+  const snapshot = () => ({ ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, ordinaryCoverage: {}, version, activationFloor: 100, recoveryFloor: 100, repairFloor, coverage: {}, legacyBoundaries: {} });
   const store = {
     deliverySnapshot: async () => snapshot(),
     certifyDelivery: async (expected: number, _until: number, _coverage: Record<string, number>, complete: boolean) => {
@@ -211,7 +211,7 @@ it('keeps a newer persisted gap when the final replay checkpoint is blocked', as
 });
 
 it('starts a newly discovered stream at the preserved upgrade floor', async () => {
-  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, version: 1, activationFloor: 1000, recoveryFloor: 80, certifiedUntil: 1200, coverage: { known: 1200 }, legacyBoundaries: { new: 50 } };
+  const snapshot = { ownerId: 'owner', epoch: 'epoch', active: true, suspended: false, workerUncertain: true, sessionGeneration: 1, ordinaryCoverage: {}, version: 1, activationFloor: 1000, recoveryFloor: 80, certifiedUntil: 1200, coverage: { known: 1200 }, legacyBoundaries: { new: 50 } };
   const store = { deliverySnapshot: async () => snapshot, certifyDelivery: async () => true };
   const channel = { streams: [{ group: { pk: 'known' } }, { group: { pk: 'new' } }] } as unknown as ChannelV2;
   let floor = -1;
@@ -266,4 +266,20 @@ it('does not let a broken error observer poison the delivery lane', async () => 
   let ran = false;
   await delivery.run(async () => { ran = true; });
   expect(ran).toBe(true);
+});
+
+it('suppresses ordinary historical carriers below previously completed stream coverage', async () => {
+  const snapshot = { ownerId:'owner',epoch:'epoch',active:true,suspended:false,workerUncertain:true,sessionGeneration:1,version:2,activationFloor:100,recoveryFloor:100,repairFloor:0,coverage:{stream:500},ordinaryCoverage:{},legacyBoundaries:{} };
+  const store = { deliverySnapshot: async () => snapshot, certifyDelivery: async () => true };
+  const channel = { streams:[{epoch:0n,group:{pk:'stream'}}] } as unknown as ChannelV2;
+  const chats = [
+    {rumorId:'old ordinary',kind:9,streamPk:'stream',sourceWrapCreatedAt:400,createdAt:400,epoch:0n},
+    {rumorId:'old deletion',kind:5,streamPk:'stream',sourceWrapCreatedAt:400,createdAt:400,epoch:0n},
+    {rumorId:'new ordinary',kind:9,streamPk:'stream',sourceWrapCreatedAt:501,createdAt:501,epoch:0n},
+  ] as DeliveredChat[];
+  const delivered:string[]=[]; const delivery=new LinkDelivery({onError:()=>{}});
+  await delivery.repair({store,channel:()=>channel,deliver:async chat=>{delivered.push(chat.rumorId);},replay:async(_channel,_since,opts)=>{
+    await opts.onBatch!({chats},{signal:new AbortController().signal});
+  }});
+  expect(delivered).toEqual(['old deletion','new ordinary']);
 });

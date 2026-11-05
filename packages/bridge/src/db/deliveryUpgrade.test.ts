@@ -47,6 +47,7 @@ test.skipIf(!reachable)('upgrade snapshots existing portal and standalone eligib
    await db.unsafe(await readFile(new URL('migrations/026_delivery_worker_session.sql',directory),'utf8'));
    await db.unsafe(await readFile(new URL('migrations/027_delivery_worker_generation.sql',directory),'utf8'));
    await db.unsafe(await readFile(new URL('migrations/028_delivery_session_lease.sql',directory),'utf8'));
+   await db.unsafe(await readFile(new URL('migrations/029_delivery_relay_context.sql',directory),'utf8'));
    expect((await db`SELECT legacy_boundaries FROM channel_delivery_lifecycles WHERE discord_channel_id='intermediate'`)[0].legacy_boundaries).toEqual({future:999,old:100});
    // Match the deployment migration hook: explicit DML grants after migrations,
    // not superuser tests or a dependency on unspecified default privileges.

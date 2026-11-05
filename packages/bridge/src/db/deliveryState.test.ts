@@ -226,3 +226,24 @@ test.skipIf(!reachable)('same session id with a successor lease still starts con
   await expect(old.store.assertDeliveryCurrent()).rejects.toThrow();
  } finally {await first.release();await second?.release();await sql`DELETE FROM bridge_leases WHERE resource=${first.resource}`;}
 });
+
+test.skipIf(!reachable)('changed relay set invalidates coverage without erasing ordinary stream boundaries', async()=>{
+ const scope={...link,discordChannelId:`${tenant}-relay-set`};
+ const owner='relay-set-owner', sessionId=crypto.randomUUID();
+ const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ try {
+  await store.activateDelivery(scope,owner,[],1000);
+  const opened=await store.openDelivery(scope,owner,lease,[],1000,sessionId,['wss://relay-a.example']);
+  expect(opened.snapshot.relays).toEqual(['wss://relay-a.example']);
+  expect(await opened.store.certifyDelivery(opened.snapshot.version,1200,{stream:1200},true)).toBe(true);
+  const before=await opened.store.deliverySnapshot();
+  const changed=await opened.store.setDeliveryRelays(['wss://relay-a.example','wss://relay-b.example']);
+  expect(changed.repairFloor).toBe(0);
+  expect(changed.coverage).toEqual({});
+  expect(changed.ordinaryCoverage).toEqual({stream:1200});
+  expect(await opened.store.certifyDelivery(before.version,1300,{stream:1300},true)).toBe(false);
+  expect(await opened.store.certifyDelivery(changed.version,300,{stream:300},false)).toBe(true);
+  const changedAgain=await opened.store.setDeliveryRelays(['wss://relay-c.example']);
+  expect(changedAgain.ordinaryCoverage).toEqual({stream:1200});
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
+});

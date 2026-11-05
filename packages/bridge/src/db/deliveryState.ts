@@ -7,7 +7,7 @@ export type DeliveryLeaseProof = Pick<BridgeLease,'resource'|'holder'|'token'>;
 export interface DeliveryFence { ownerId: string; epoch: string; sessionId: string; sessionGeneration: number; lease: DeliveryLeaseProof; }
 export interface DeliverySnapshot {
  ownerId: string; epoch: string; active: boolean; suspended: boolean; version: number; activationFloor: number; recoveryFloor: number; workerUncertain: boolean; sessionGeneration: number; sessionId?: string;
- certifiedUntil?: number; repairFloor?: number; coverage: Record<string,number>; legacyBoundaries: Record<string,number>;
+ certifiedUntil?: number; repairFloor?: number; coverage: Record<string,number>; ordinaryCoverage: Record<string,number>; relays?: string[]; legacyBoundaries: Record<string,number>;
 }
 export class StaleDeliveryFenceError extends Error {}
 export const standaloneDeliveryOwner = (link: ChannelLink): string => `standalone:${link.discordGuildId}:${link.discordChannelId}:${link.communityId}:${link.concordChannelIdHex}`;
@@ -18,7 +18,7 @@ export function deliveryScope(sql: postgres.Sql | postgres.TransactionSql, tenan
 export function deliverySnapshot(row: Record<string,any>): DeliverySnapshot {
  return { ownerId:row.owner_id, epoch:row.epoch, active:row.active,suspended:row.suspended,version:Number(row.version),activationFloor:Number(row.activation_floor),recoveryFloor:Number(row.recovery_floor),workerUncertain:row.worker_uncertain,sessionGeneration:Number(row.worker_generation),...(row.worker_session ? {sessionId:row.worker_session}:{}),
  ...(row.certified_until == null ? {} : {certifiedUntil:Number(row.certified_until)}),
- ...(row.repair_floor == null ? {} : {repairFloor:Number(row.repair_floor)}),coverage:row.coverage,legacyBoundaries:row.legacy_boundaries };
+ ...(row.repair_floor == null ? {} : {repairFloor:Number(row.repair_floor)}),coverage:row.coverage,ordinaryCoverage:row.ordinary_coverage,...(row.relay_set ? {relays:row.relay_set}:{}),legacyBoundaries:row.legacy_boundaries };
 }
 /** Lock order is shared by control transitions, worker writes and lease takeover.
  * The row lock (not an MVCC EXISTS preflight) serializes the actual mutation. */

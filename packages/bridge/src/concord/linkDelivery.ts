@@ -134,7 +134,8 @@ export class LinkDelivery {
             signal.throwIfAborted(); context.signal.throwIfAborted();
             if (generation !== this.generation) throw new Error('Delivery gap changed during replay');
             if (!filterEpochCutoff([chat], options.channel()).length) continue;
-            const boundary = snapshot.legacyBoundaries[chat.streamPk];
+            const known = [snapshot.legacyBoundaries[chat.streamPk], snapshot.ordinaryCoverage[chat.streamPk], snapshot.coverage[chat.streamPk]].filter((at): at is number => at !== undefined);
+            const boundary = known.length ? Math.max(...known) : undefined;
             // A legacy cursor completed its boundary second. A recovery floor
             // instead begins with that second and must retain equal timestamps.
             const oldHistory = boundary === undefined ? chat.sourceWrapCreatedAt < snapshot.recoveryFloor : chat.sourceWrapCreatedAt <= boundary;

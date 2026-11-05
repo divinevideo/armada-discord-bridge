@@ -274,17 +274,21 @@ export class PostgresMappingStore implements MappingStore {
   /** Attach under a live lease, never reactivate from a stale control-plane row.
    * Only the migration's unconsumed eligibility may initialize missing state;
    * current persisted status and full scope must still authorize that upgrade. */
-  async openDelivery(link:ChannelLink,ownerId:string,lease:DeliveryLeaseProof,streamPks:string[]=[],at=Math.floor(Date.now()/1000),sessionId=randomUUID()):
+  async openDelivery(link:ChannelLink,ownerId:string,lease:DeliveryLeaseProof,streamPks:string[]=[],at=Math.floor(Date.now()/1000),sessionId=randomUUID(),relays:string[]=[]):
     Promise<{store:PostgresMappingStore;snapshot:DeliverySnapshot}> {
+    const relaySet=[...new Set(relays)].sort();
     const snapshot=await this.sql.begin(async tx=>{
       const row=await lockDelivery(tx,this.tenantId,link);
       if(lease.resource!==`discord:${link.discordGuildId}:${link.discordChannelId}`) throw new StaleDeliveryFenceError('Delivery lease scope mismatch');
       await assertLockedLease(tx,lease);
       if(row) {
         if(!row.active || row.suspended || row.owner_id!==ownerId) throw new StaleDeliveryFenceError('Delivery lifecycle is no longer current');
-        if(row.worker_session===sessionId && row.worker_lease_holder===lease.holder && BigInt(row.worker_lease_token ?? -1)===lease.token) { await assertLockedLease(tx,lease); return deliverySnapshot(row); }
+        if(row.worker_session===sessionId && row.worker_lease_holder===lease.holder && BigInt(row.worker_lease_token ?? -1)===lease.token && JSON.stringify(row.relay_set)===JSON.stringify(relaySet)) { await assertLockedLease(tx,lease); return deliverySnapshot(row); }
+        const changed=row.relay_set!==null && JSON.stringify(row.relay_set)!==JSON.stringify(relaySet);
         const [armed]=await tx`UPDATE channel_delivery_lifecycles SET worker_session=${sessionId},worker_lease_holder=${lease.holder},worker_lease_token=${lease.token.toString()},worker_uncertain=true,worker_generation=worker_generation+1,
-          repair_floor=CASE WHEN worker_uncertain THEN 0 ELSE repair_floor END,version=version+1
+          repair_floor=CASE WHEN worker_uncertain OR ${changed} THEN 0 ELSE repair_floor END,
+          ordinary_coverage=CASE WHEN ${changed} THEN COALESCE((SELECT jsonb_object_agg(key, max_value) FROM (SELECT key, max(value::bigint) AS max_value FROM (SELECT * FROM jsonb_each_text(ordinary_coverage) UNION ALL SELECT * FROM jsonb_each_text(coverage)) AS boundaries GROUP BY key) AS maxima), '{}'::jsonb) ELSE ordinary_coverage END,
+          coverage=CASE WHEN ${changed} THEN '{}'::jsonb ELSE coverage END,relay_set=${tx.json(relaySet)},version=version+1
           WHERE ${deliveryScope(tx,this.tenantId,link)} RETURNING *`;
         await assertLockedLease(tx,lease);
         return deliverySnapshot(armed);
@@ -298,7 +302,7 @@ export class PostgresMappingStore implements MappingStore {
       await this.activateDelivery(link,ownerId,streamPks,at,tx);
       // An upgraded owner has no proof that its prior worker stopped cleanly.
       const [armed]=await tx`UPDATE channel_delivery_lifecycles SET worker_session=${sessionId},worker_lease_holder=${lease.holder},worker_lease_token=${lease.token.toString()},worker_uncertain=true,worker_generation=worker_generation+1,
-        repair_floor=0,version=version+1 WHERE ${deliveryScope(tx,this.tenantId,link)} RETURNING *`;
+        repair_floor=0,relay_set=${tx.json(relaySet)},version=version+1 WHERE ${deliveryScope(tx,this.tenantId,link)} RETURNING *`;
       await assertLockedLease(tx,lease);
       return deliverySnapshot(armed);
     });
@@ -338,7 +342,7 @@ export class PostgresMappingStore implements MappingStore {
         VALUES (${this.tenantId},${link.communityId},${link.concordChannelIdHex},${link.discordGuildId},${link.discordChannelId},${ownerId},${at},${floor},${floor},${tx.json(legacy)},${eligible.length>0})
         ON CONFLICT (tenant_id,community_id,concord_channel_id,discord_guild_id,discord_channel_id) DO UPDATE SET
         owner_id=EXCLUDED.owner_id,epoch=gen_random_uuid(),active=true,suspended=false,activation_floor=EXCLUDED.activation_floor,recovery_floor=EXCLUDED.recovery_floor,
-        version=0,certified_until=NULL,repair_floor=EXCLUDED.repair_floor,coverage='{}',legacy_boundaries=EXCLUDED.legacy_boundaries,worker_uncertain=EXCLUDED.worker_uncertain,worker_session=NULL,worker_lease_holder=NULL,worker_lease_token=NULL,worker_generation=channel_delivery_lifecycles.worker_generation+1 RETURNING *`;
+        version=0,certified_until=NULL,repair_floor=EXCLUDED.repair_floor,coverage='{}',legacy_boundaries=EXCLUDED.legacy_boundaries,worker_uncertain=EXCLUDED.worker_uncertain,worker_session=NULL,worker_lease_holder=NULL,worker_lease_token=NULL,worker_generation=channel_delivery_lifecycles.worker_generation+1,relay_set=NULL,ordinary_coverage='{}' RETURNING *`;
       return deliverySnapshot(row);
     };
     return transaction?run(transaction):this.sql.begin(run) as Promise<DeliverySnapshot>;
@@ -391,6 +395,18 @@ export class PostgresMappingStore implements MappingStore {
     return this.write(async tx=>{
       const [row]=await tx`UPDATE channel_delivery_lifecycles SET version=version+1,
         repair_floor=least(COALESCE(repair_floor,${floor}),${floor}) WHERE ${this.scope(tx,this.bound!.link)} RETURNING *`;
+      return deliverySnapshot(row);
+    });
+  }
+  async setDeliveryRelays(relays:string[]):Promise<DeliverySnapshot> {
+    if(!this.bound) throw new Error('Delivery view required');
+    const relaySet=[...new Set(relays)].sort();
+    return this.write(async tx=>{
+      const [current]=await tx`SELECT * FROM channel_delivery_lifecycles WHERE ${this.scope(tx,this.bound!.link)}`;
+      if(JSON.stringify(current.relay_set)===JSON.stringify(relaySet)) return deliverySnapshot(current);
+      const [row]=await tx`UPDATE channel_delivery_lifecycles SET relay_set=${tx.json(relaySet)},
+        ordinary_coverage=COALESCE((SELECT jsonb_object_agg(key, max_value) FROM (SELECT key, max(value::bigint) AS max_value FROM (SELECT * FROM jsonb_each_text(ordinary_coverage) UNION ALL SELECT * FROM jsonb_each_text(coverage)) AS boundaries GROUP BY key) AS maxima), '{}'::jsonb),coverage='{}'::jsonb,repair_floor=0,version=version+1
+        WHERE ${this.scope(tx,this.bound!.link)} RETURNING *`;
       return deliverySnapshot(row);
     });
   }
