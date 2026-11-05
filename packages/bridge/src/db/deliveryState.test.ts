@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import postgres from 'postgres';
+import { channelsView, openChatBatch } from '@armada-bridge/concord-core';
+import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
+import interopFixture from '../../../../test-fixtures/concord/community-interop.json';
+import { bootstrapFixture } from '../../../../scripts/fixtures/community-bootstrap';
+import { ConcordClient } from '../concord/client';
+import { localIdentity } from '../concord/signer';
+import { BridgeRouter } from '../router';
+import { PuppetCache } from '../puppets';
+import { LinkDelivery } from '../concord/linkDelivery';
+import type { ChannelV2, OpenedChat } from '@armada-bridge/concord-core';
 import { migrate } from './migrate';
 import { PostgresMappingStore } from './store';
 import { BridgeLeases, bridgeResource } from './leases';
@@ -245,5 +255,71 @@ test.skipIf(!reachable)('changed relay set invalidates coverage without erasing 
   expect(await opened.store.certifyDelivery(changed.version,300,{stream:300},false)).toBe(true);
   const changedAgain=await opened.store.setDeliveryRelays(['wss://relay-c.example']);
   expect(changedAgain.ordinaryCoverage).toEqual({stream:1200});
+ } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
+});
+
+test.skipIf(!reachable)('an uncertain replacement recovers zero after a gap write fails during checkpoint commit', async () => {
+ const scope={...link,discordChannelId:`${tenant}-commit-gap`};
+ const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ let unlock!:()=>void, locked!:()=>void, casStarted!:()=>void;
+ const held=new Promise<void>(resolve=>{unlock=resolve;});
+ const acquired=new Promise<void>(resolve=>{locked=resolve;});
+ const started=new Promise<void>(resolve=>{casStarted=resolve;});
+ try {
+  await store.activateDelivery(scope,'commit-gap',[],100);
+  const initial=await store.openDelivery(scope,'commit-gap',lease,[],100,crypto.randomUUID());
+  const view=initial.store;
+  let locker:Promise<unknown>|undefined, first=true;
+  const checked={
+   deliverySnapshot:async()=>{
+    const snapshot=await view.deliverySnapshot();
+    if(first) { first=false; locker=sql.begin(async tx=>{await tx`SELECT 1 FROM channel_delivery_lifecycles WHERE tenant_id=${tenant} AND discord_channel_id=${scope.discordChannelId} FOR UPDATE`;locked();await held;}); await acquired; }
+    return snapshot;
+   },
+   certifyDelivery:(version:number,until:number,coverage:Record<string,number>,complete:boolean)=>{casStarted();return view.certifyDelivery(version,until,coverage,complete);},
+  };
+  const lane=new LinkDelivery({onError:()=>{},onGap:async()=>{throw new Error('storage unavailable');}});
+  const channel={streams:[{group:{pk:'stream'}}]} as unknown as ChannelV2;
+  const replay=lane.repair({store:checked,channel:()=>channel,deliver:async()=>{},replay:async(_channel,since,opts)=>{
+   await opts.onWindowComplete!({since,until:500,runUntil:500},{signal:opts.signal!});
+  }});
+  void replay.catch(()=>{});
+  await started; lane.markGap(80); await expect(lane.flushGaps()).rejects.toThrow('storage unavailable');
+  unlock(); await locker; await expect(replay).rejects.toThrow();
+  const afterCommit=await view.deliverySnapshot();
+  expect(afterCommit.repairFloor).toBeUndefined(); expect(afterCommit.workerUncertain).toBe(true);
+  const replacement=await store.openDelivery(scope,'commit-gap',lease,[],600,crypto.randomUUID());
+  expect(replacement.snapshot.repairFloor).toBe(0);
+  await expect(view.assertDeliveryCurrent()).rejects.toThrow('session');
+ } finally {unlock();await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
+});
+
+test.skipIf(!reachable)('replacement replays an old expired deletion with no pending row after an intake outage', async()=>{
+ const {community,folded}=bootstrapFixture(interopFixture), channel=channelsView(community,folded)[0];
+ const scope:ChannelLink={communityId:community.idHex,concordChannelIdHex:channel.idHex,discordGuildId:tenant,discordChannelId:`${tenant}-old-deletion`,enabled:true};
+ const lease=(await leases.acquire(bridgeResource(scope.discordGuildId,scope.discordChannelId)))!;
+ const source=80, event=finalizeEvent({...interopFixture.moderatorDeleteEvent,created_at:source},channel.current.group.sk);
+ const pool={replayRelays:['synthetic-relay'],query:async()=>[],publish:async()=>{},subscribe:()=>()=>{},close:async()=>{},
+   enumerateRelay:async(_url:string,filter:{since?:number;until?:number})=>source>=filter.since! && source<=filter.until!?[event.id]:[],
+   fetchRelay:async(_url:string,ids:string[])=>ids.includes(event.id)?[event]:[]};
+ const client=new ConcordClient(community,pool,localIdentity(generateSecretKey()));client.folded=folded;
+ const deleted:string[]=[];
+ try {
+  await store.activateDelivery(scope,'old-duplicate',[],1000);
+  const first=await store.openDelivery(scope,'old-duplicate',lease,[],1000,crypto.randomUUID(),pool.replayRelays);
+  const chat=(await openChatBatch([event],channel))[0];
+  const unavailable=new Proxy(first.store,{get(target,key){if(key==='saveDeletes')return async()=>{throw new Error('synthetic intake outage');};const value=Reflect.get(target,key,target);return typeof value==='function'?value.bind(target):value;}});
+  const webhooks={send:async()=> 'discord-message',edit:async()=>{},react:async()=>{},unreact:async()=>{},sendTyping:async()=>{},delete:async(_link:ChannelLink,id:string,authorize?:()=>void)=>{authorize?.();deleted.push(id);}};
+  const make=(mapping:PostgresMappingStore)=>new BridgeRouter(client,new PuppetCache('ab'.repeat(32)),mapping,webhooks,{resolve:async pk=>({name:pk})},{applicationId:'synthetic',webhookIds:new Set()},{beforeSideEffect:async()=>{}});
+  await expect(make(unavailable).onConcordChat({...chat,sourceWrapCreatedAt:source} as OpenedChat & {sourceWrapCreatedAt:number},scope)).rejects.toThrow('synthetic intake outage');
+  const disposition=await first.store.saveDeletes(scope,[{deleteRumorId:chat.rumorId,targetRumorId:interopFixture.expected.message.id,author:chat.author,createdAtMs:Date.now(),sourceWrapCreatedAt:source}]);
+  expect(disposition.disposedExpired).toBe(1);expect(await first.store.pendingDeletes(scope)).toHaveLength(0);
+  expect(await first.store.certifyDelivery(first.snapshot.version,1200,{},true)).toBe(true);
+  const replacement=await store.openDelivery(scope,'old-duplicate',lease,[],2000,crypto.randomUUID(),pool.replayRelays);
+  expect(replacement.snapshot.repairFloor).toBe(0);
+  await replacement.store.insert({discordMessageId:'discord-message',discordChannelId:scope.discordChannelId,concordRumorId:interopFixture.expected.message.id,concordChannelId:scope.concordChannelIdHex,communityId:scope.communityId,origin:'concord',authorRef:interopFixture.expected.member,partIndex:0});
+  const router=make(replacement.store), lane=new LinkDelivery({onError:()=>{},onGap:floor=>replacement.store.markDeliveryGap(floor)});
+  await lane.repair({store:replacement.store,channel:()=>channel,replay:(c,s,opts)=>client.backfillChannel(c,s,500,opts),deliver:(item)=>router.onConcordChat(item,scope)});
+  expect(deleted).toEqual(['discord-message']);
  } finally {await lease.release();await sql`DELETE FROM bridge_leases WHERE resource=${lease.resource}`;}
 });
