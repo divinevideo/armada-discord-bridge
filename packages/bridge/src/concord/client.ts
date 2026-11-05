@@ -28,6 +28,7 @@ import {
   controlGroups,
   currentGuestbookGroup,
   dissolvedGroupKey,
+  filterEpochCutoff,
   foldControlState,
   guestbookGroups,
   inviteRefOf,
@@ -43,6 +44,8 @@ import {
   validateBundle,
   wrapSeal,
 } from "@armada-bridge/concord-core";
+import { ActionableDeletionCapacityError, PromotionDeletionIntakeError } from "../deletionPolicy";
+import type { LinkDelivery } from "./linkDelivery";
 import type {
   ChannelV2,
   CommunityListEntry,
@@ -348,6 +351,7 @@ export class ConcordClient {
     onError?: (relayUrl: string, error: unknown) => void,
     /** Called per durable wrap that opened; feeds the catch-up cursor. */
     onCursor?: (streamPk: string, wrapCreatedAt: number) => unknown,
+    shared?: { lane: LinkDelivery; currentChannel: () => ChannelV2 },
   ): () => void {
     const seenRumors = new Set<string>();
     let deliveries: Promise<void> = Promise.resolve();
@@ -369,6 +373,30 @@ export class ConcordClient {
       {
         onError,
         onEvent: (wrap) => {
+          if (shared) {
+            const work = async (signal: AbortSignal) => {
+              try {
+                const opened = await openChatBatch([wrap], channel);
+                signal.throwIfAborted();
+                for (const chat of filterEpochCutoff(opened, shared.currentChannel())) {
+                  if (shared.lane.hasSeen(chat.rumorId)) continue;
+                  signal.throwIfAborted();
+                  await onChat({ ...chat, sourceWrapCreatedAt: wrap.created_at });
+                  signal.throwIfAborted();
+                  shared.lane.remember(chat.rumorId);
+                }
+              } catch (error) {
+                if (wrap.kind === KIND_WRAP && !signal.aborted) shared.lane.markGap(
+                  error instanceof ActionableDeletionCapacityError || error instanceof PromotionDeletionIntakeError ? Math.min(wrap.created_at, error.repairFloor) : wrap.created_at,
+                );
+                onError?.("dispatch", error);
+                throw error;
+              }
+            };
+            if (wrap.kind === KIND_WRAP_EPHEMERAL) shared.lane.typing(work);
+            else void shared.lane.admit(wrap.created_at, work)?.catch(() => {});
+            return;
+          }
           // Bound admission before the promise chain: a blocked Discord send
           // otherwise hides arbitrarily many wraps from the router's own cap.
           // Overflow may contain a deletion, so never acknowledge later wraps

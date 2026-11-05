@@ -17,6 +17,7 @@ import {
   mintCommunity,
   mintLinkSigner,
   mintToken,
+  openChatBatch,
   openGuestbookWraps,
   openWrap,
   voiceGroupKey,
@@ -27,6 +28,8 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure
 import type { NostrEvent } from "nostr-tools/pure";
 import type { NostrFilter } from "@nostrify/nostrify";
 
+import { PromotionDeletionIntakeError } from "../deletionPolicy";
+import { LinkDelivery } from "./linkDelivery";
 import { deliverConcordChat } from "./delivery";
 import { CONTROL_REFOLD_MS, ConcordClient, hasProxyTag, proxyTag, resolveInvite } from "./client";
 import type { RelayLike } from "./pool";
@@ -618,4 +621,69 @@ it('does not return a certified endpoint when its completion callback synchronou
     signal: controller.signal,
     onWindowComplete: async () => { controller.abort(cancelled); },
   })).rejects.toThrow('cancel during completion');
+});
+
+it('keeps live delivery serialized across subscription replacement', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), pool = new FakePool();
+  const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  const lane = new LinkDelivery({ onError: () => {} });
+  let entered!: () => void, release!: () => void, finished!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const done = new Promise<void>(resolve => { finished = resolve; });
+  const seen: string[] = [];
+  const handler = async (chat: { content: string }) => {
+    seen.push(chat.content);
+    if (chat.content === 'old') { entered(); await blocked; }
+    if (chat.content === 'new') finished();
+  };
+  const author = localIdentity(generateSecretKey());
+  const old = (await client.sendChat(channel, { content: 'old', author })).wrap;
+  const next = (await client.sendChat(channel, { content: 'new', author })).wrap;
+  const options = { lane, currentChannel: () => channel };
+  const unsubscribe = client.subscribeChannel(channel, handler, undefined, undefined, options);
+  pool.emit(old); await started;
+  unsubscribe();
+  client.subscribeChannel(channel, handler, undefined, undefined, options);
+  pool.emit(next);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(seen).toEqual(['old']);
+  release(); await done;
+  expect(seen).toEqual(['old', 'new']);
+});
+
+it('drops a queued previously decoded chat past a newly adopted retirement cutoff', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), pool = new FakePool();
+  const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  const lane = new LinkDelivery({ onError: () => {} });
+  let current = channel, entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const seen: string[] = [], author = localIdentity(generateSecretKey());
+  const first = (await client.sendChat(channel, { content: 'blocking', author })).wrap;
+  const late = (await client.sendChat(channel, { content: 'late', author })).wrap;
+  const [decoded] = await openChatBatch([late], channel);
+  client.subscribeChannel(channel, async chat => { seen.push(chat.content); if (chat.content === 'blocking') { entered(); await blocked; } }, undefined, undefined, { lane, currentChannel: () => current });
+  pool.emit(first); await started;
+  pool.emit(late);
+  current = { ...channel, streams: channel.streams.map(s => ({ ...s, retiredAt: decoded.createdAt - 1 })) };
+  release();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(seen).toEqual(['blocking']);
+});
+
+it('repairs from a promoted deletion’s original source floor', async () => {
+  const { community } = makeCommunity(), channel = makeChannel(community), pool = new FakePool();
+  const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+  const floors: number[] = [];
+  const lane = new LinkDelivery({ onError: () => {}, onGap: async floor => { floors.push(floor); } });
+  let failed!: () => void;
+  const done = new Promise<void>(resolve => { failed = resolve; });
+  const author = localIdentity(generateSecretKey());
+  const wrap = (await client.sendChat(channel, { content: 'wake promotion', author })).wrap;
+  const original = wrap.created_at - 100;
+  const error = new PromotionDeletionIntakeError({ deleteRumorId: 'a', targetRumorId: 'b', author: 'c', createdAtMs: Date.now(), sourceWrapCreatedAt: original }, { communityId: community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true }, new Error('storage'));
+  client.subscribeChannel(channel, async () => { throw error; }, () => failed(), undefined, { lane, currentChannel: () => channel });
+  pool.emit(wrap); await done; await lane.flushGaps();
+  expect(floors).toEqual([original]);
 });

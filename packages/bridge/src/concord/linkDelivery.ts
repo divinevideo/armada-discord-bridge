@@ -7,8 +7,14 @@ export class LinkDelivery {
   private queued = 0;
   private typingQueued = false;
   private generation = 0;
+  private readonly seen = new Set<string>();
   gapFloor?: number;
   constructor(private readonly options: { onError: (error: unknown) => void; onGap?: (floor: number) => Promise<unknown>; capacity?: number }) {}
+  hasSeen(id: string): boolean { return this.seen.has(id); }
+  remember(id: string): void {
+    if (this.seen.size >= 65_536) this.seen.clear();
+    this.seen.add(id);
+  }
   stop(): void { this.controller.abort(); }
   run(work: (signal: AbortSignal) => Promise<void>): Promise<void> {
     const result = this.lane.then(() => { this.controller.signal.throwIfAborted(); return work(this.controller.signal); });
@@ -51,7 +57,7 @@ export class LinkDelivery {
     this.typingQueued = true;
     void this.run(work).finally(() => { this.typingQueued = false; }).catch(() => {});
   }
-  admit(floor: number, work: () => Promise<void>): Promise<void> | undefined {
+  admit(floor: number, work: (signal: AbortSignal) => Promise<void>): Promise<void> | undefined {
     if (this.queued >= (this.options.capacity ?? 200)) { this.markGap(floor); return; }
     this.queued++;
     return this.run(work).finally(() => { this.queued--; });
