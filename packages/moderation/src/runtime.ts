@@ -45,14 +45,20 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
   const store = new PolicyStore(sql), driver = new LocalRelayDriver(options.relayUrl);
   const purger = new RelayPurger(new CarrierIndex(sql), driver);
   let watcher: PolicyWatcher | undefined;
-  const pool = new RelayPool([options.relayUrl], { onDisconnect: () => { health.authority = undefined; health.ready = false; health.code = "policy_unavailable"; void watcher?.disconnected(); } });
+  let authorityGeneration = 0;
+  const clearAuthority = () => { authorityGeneration++; health.authority = undefined; };
+  const pool = new RelayPool([options.relayUrl], { onDisconnect: () => { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; void watcher?.disconnected(); } });
   watcher = new PolicyWatcher(community, store, pool, [...options.publicAuthors, identity.pk], identity);
   const refresh = async () => {
+    clearAuthority();
+    const generation = authorityGeneration;
     const policy = await watcher!.refresh();
     await observeWorkerCapacity(sql, capacity, community.idHex);
     registerStreamKeys(channelsView(community, controlState(policy).folded).flatMap((channel) => channel.streams.map((stream) => stream.group)), pool.urls);
     health.checkedAt = Date.now();
-    health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt);
+    // Capacity observation awaits SQL after the policy refresh. A disconnect
+    // during that await must not let this old policy restore a green gauge.
+    if (generation === authorityGeneration) health.authority = observeWorkerAuthority(community, identity.pk, policy, health.checkedAt);
     health.ready = !policy.rekeyPending;
     health.code = policy.rekeyPending ? "rekey_recovery_required" : "ready";
     return policy;
@@ -78,7 +84,7 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
       let controlChanged = true, nextRefresh = 0;
       unsubscribe = pool.subscribe([{ kinds: [1059], authors: controlGroups(community).map((group) => group.pk) }], {
         onEvent: () => { controlChanged = true; },
-        onError: () => { health.authority = undefined; health.ready = false; health.code = "policy_unavailable"; void watcher!.disconnected(); },
+        onError: () => { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; void watcher!.disconnected(); },
       });
       while (!options.signal.aborted) {
         await assertLeadership();
@@ -95,12 +101,12 @@ export async function runModerationWorker(options: { capacity?: ReturnType<typeo
           await worker.tick();
           await restrictions.tick();
           await expireModerationRecords(options.decisions, options.lifecycle);
-        } catch { health.authority = undefined; health.ready = false; health.code = "policy_unavailable"; await watcher!.disconnected(); }
+        } catch { clearAuthority(); health.ready = false; health.code = "policy_unavailable"; await watcher!.disconnected(); }
         await delay(1000, undefined, { signal: options.signal }).catch(() => {});
       }
     });
   } finally {
-    health.authority = undefined; health.ready = false; health.code = "stopped";
+    clearAuthority(); health.ready = false; health.code = "stopped";
     unsubscribe();
     await watcher.disconnected();
     await pool.close();
