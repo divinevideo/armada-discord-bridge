@@ -18,7 +18,7 @@ function harness(chats: typeof message[], failure: unknown) {
   const rb = {
     id: 'synthetic-chat-delivery', channel, concordCatchupReady: false,
     link: { communityId: community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true },
-    client: { assertDeliveryHealthy: () => {}, backfillChannel: async () => ({ chats, newestWrapAt: 100 }) },
+    client: { assertDeliveryHealthy: () => {}, backfillChannel: async (_channel: unknown, _since: number, _limit: number, opts: { onBatch: (batch: unknown) => Promise<void> }) => { await opts.onBatch({ chats, newestWrapAt: 100 }); return { chats: [], newestWrapAt: 100 }; } },
     router: { assertDeletionDeliveryDurable: () => {}, onConcordChat: async () => { if (++delivered === 1) throw failure; return ['mirror']; } },
   };
   return { manager, rb, checkpoints, alerts: () => alerts, delivered: () => delivered };
@@ -32,6 +32,39 @@ describe('portal catch-up delivery failure boundaries', () => {
     expect(h.delivered()).toBe(2);
     expect(h.rb.concordCatchupReady).toBe(true);
     expect(h.checkpoints).toEqual([100]);
+  });
+
+  it('commits only complete earlier batches when a later deletion fails', async () => {
+    const h = harness([], new Error('unused'));
+    h.rb.router.onConcordChat = async () => ['mirror'];
+    h.rb.client.backfillChannel = async (_channel, _since, _limit, opts) => {
+      await opts.onBatch({ chats: [message], newestWrapAt: 100 });
+      h.rb.router.onConcordChat = async () => { throw new Error('later deletion storage failure'); };
+      await opts.onBatch({ chats: [deletion], newestWrapAt: 200 });
+      return { chats: [], newestWrapAt: 200 };
+    };
+    await expect(h.manager.backfillMissed(h.rb)).rejects.toThrow('later deletion storage failure');
+    expect(h.checkpoints).toEqual([100]);
+    expect(h.rb.concordCatchupReady).toBe(false);
+  });
+
+  it('coalesces catch-up retries and resumes after a relay failure', async () => {
+    const h = harness([], new Error('unused'));
+    let queries = 0, release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    h.rb.client.backfillChannel = async (_channel, _since, _limit, opts) => {
+      if (++queries === 1) { await blocked; throw new Error('relay unavailable'); }
+      await opts.onBatch({ chats: [], newestWrapAt: 100 });
+      return { chats: [], newestWrapAt: 100 };
+    };
+    const first = h.manager.backfillMissed(h.rb);
+    expect(h.manager.backfillMissed(h.rb)).toBe(first);
+    release(); await expect(first).rejects.toThrow('relay unavailable');
+    expect(h.checkpoints).toEqual([]);
+    await h.manager.backfillMissed(h.rb);
+    expect(queries).toBe(2);
+    expect(h.checkpoints).toEqual([100]);
+    expect(h.rb.concordCatchupReady).toBe(true);
   });
 
   it('keeps a failed deletion nondurable and does not complete catch-up', async () => {

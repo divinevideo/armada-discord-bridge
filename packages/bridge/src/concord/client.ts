@@ -398,40 +398,53 @@ export class ConcordClient {
     );
   }
 
-  /**
-   * Bounded catch-up: every durable wrap on the channel's streams newer than
-   * `sinceSec`, opened and sorted oldest-first so the caller can replay them
-   * through the router in order (the mapping table dedupes already-mirrored
-   * rumors). Returns the chats and the newest wrap timestamp seen, the next
-   * cursor value.
-   */
+  /** Replay oldest-first in bounded complete time windows; callers may commit each batch. */
   async backfillChannel(
     channel: ChannelV2,
     sinceSec: number,
     limit = 500,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; onBatch?: (batch: { chats: OpenedChat[]; newestWrapAt?: number }) => Promise<void> },
   ): Promise<{ chats: OpenedChat[]; newestWrapAt?: number }> {
-    const wraps = await this.pool.query(
-      [
-        {
-          kinds: [KIND_WRAP],
-          authors: channel.streams.map((s) => s.group.pk),
-          since: sinceSec,
-          limit,
-        },
-      ],
-      opts,
-    );
-    // A saturated page cannot prove the replay gap is covered. Do not return
-    // a newer checkpoint that could silently skip the omitted durable wraps.
-    if (wraps.length >= limit) throw new Error("Concord catch-up limit reached; checkpoint remains pinned");
-    const chats = await openChatBatch(wraps, channel);
-    chats.sort((a, b) => a.ms - b.ms);
-    const newestWrapAt = wraps.reduce<number | undefined>(
-      (max, w) => (max === undefined || w.created_at > max ? w.created_at : max),
-      undefined,
-    );
-    return { chats, newestWrapAt };
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 16_384) throw new Error("Invalid Concord replay page size");
+    const accumulated: OpenedChat[] = [];
+    let newestWrapAt: number | undefined;
+    const query = (since: number, until: number | undefined, pageSize: number) =>
+      (this.pool.queryStrict ?? this.pool.query).call(this.pool, [{
+        kinds: [KIND_WRAP], authors: channel.streams.map(s => s.group.pk), since,
+        ...(until === undefined ? {} : { until }), limit: pageSize,
+      }], { signal: opts?.signal });
+    const visit = async (since: number, until: number, pageSize: number, known?: NostrEvent[]): Promise<void> => {
+      opts?.signal?.throwIfAborted();
+      const wraps = known ?? await query(since, until, pageSize);
+      if (wraps.length >= pageSize) {
+        if (since < until) {
+          // Inclusive since/until cannot page safely by oldestTimestamp - 1:
+          // more than one page may share that second. Split disjoint windows.
+          const middle = since + Math.floor((until - since) / 2);
+          await visit(since, middle, limit);
+          await visit(middle + 1, until, limit);
+        } else {
+          // Nostr has no within-second offset. Expand only this collision
+          // bucket, with a memory ceiling; never certify a truncated second.
+          if (pageSize >= 16_384) throw new Error("Concord replay second exceeds 16384 wraps; checkpoint remains before that second");
+          await visit(since, until, Math.min(pageSize * 2, 16_384));
+        }
+        return;
+      }
+      const chats = await openChatBatch(wraps, channel);
+      chats.sort((a, b) => a.ms - b.ms);
+      const at = wraps.reduce<number | undefined>((max, wrap) => max === undefined ? wrap.created_at : Math.max(max, wrap.created_at), undefined);
+      // The batch callback persists effects before any later window is read.
+      // On failure, previously committed windows are a safe restart floor.
+      if (opts?.onBatch) await opts.onBatch({ chats, newestWrapAt: at });
+      else accumulated.push(...chats);
+      if (at !== undefined) newestWrapAt = newestWrapAt === undefined ? at : Math.max(newestWrapAt, at);
+    };
+    const first = await query(sinceSec, undefined, limit);
+    const upper = first.reduce((max, wrap) => Math.max(max, wrap.created_at), sinceSec);
+    await visit(sinceSec, upper, limit, first);
+    accumulated.sort((a, b) => a.ms - b.ms);
+    return { chats: accumulated, newestWrapAt };
   }
 
   /**

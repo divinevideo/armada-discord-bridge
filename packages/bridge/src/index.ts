@@ -228,35 +228,46 @@ console.log("bridge: discord gateway up");
 
 const retryDeletes = () => router.retryPendingDeletes(link).catch(error => console.error("bridge: pending deletion retry failed", error));
 await retryDeletes();
-const deletionRetryTimer = setInterval(() => void retryDeletes(), DELETION_RETRY_MS);
-cleanup.push(() => clearInterval(deletionRetryTimer));
 const onChat = (chat: OpenedChat) => deliverConcordChat(router, chat, link, error =>
   console.warn(`bridge: ordinary Concord mirror ${chat.rumorId} failed`, error));
 const onSubError = (relayUrl: string, error: unknown): void =>
   console.error(`bridge: chat subscription ${relayUrl}:`, error);
-const onCursor = (streamPk: string, wrapAt: number) => {
+let currentChannel = channel;
+let catchupReady = false;
+let catchupPending: Promise<void> | undefined;
+const onCursor = (_streamPk: string, wrapAt: number) => {
+  if (!catchupReady) return;
   router.assertDeletionDeliveryDurable();
   client.assertDeliveryHealthy();
   return store.channelCursorSet(link, wrapAt);
 };
-let currentChannel = channel;
-
-// Persist a channel-stable replay floor before the live tail can admit work.
-// The mapping table dedupes anything already mirrored.
-{
-  const streamPks = channel.streams.map((s) => s.group.pk);
-  const cursor = await store.channelCursorStart(link, streamPks);
-  const { chats, newestWrapAt } = await client.backfillChannel(channel, cursor - 60);
-  for (const chat of chats) {
-    await onChat(chat);
-  }
-  if (newestWrapAt !== undefined) {
-    router.assertDeletionDeliveryDurable();
-    client.assertDeliveryHealthy();
-    await store.channelCursorSet(link, newestWrapAt);
-  }
-  if (chats.length > 0) console.log(`bridge: backfilled ${chats.length} wraps missed while down`);
-}
+const retryCatchup = (): Promise<void> => {
+  if (catchupPending) return catchupPending;
+  catchupPending = (async () => {
+    const snapshot = currentChannel;
+    const cursor = await store.channelCursorStart(link, snapshot.streams.map(s => s.group.pk));
+    let replayed = 0;
+    await client.backfillChannel(snapshot, cursor - 60, 500, { onBatch: async ({ chats, newestWrapAt }) => {
+      for (const chat of chats) { await onChat(chat); replayed++; }
+      router.assertDeletionDeliveryDurable();
+      client.assertDeliveryHealthy();
+      if (newestWrapAt !== undefined) await store.channelCursorSet(link, newestWrapAt);
+    } });
+    catchupReady = true;
+    if (replayed > 0) console.log(`bridge: backfilled ${replayed} wraps missed while down`);
+  })().catch(error => console.warn("bridge: catch-up incomplete; checkpoint remains pinned and retry is scheduled", error))
+    .finally(() => { catchupPending = undefined; });
+  return catchupPending;
+};
+// Establish the durable floor before admitting the live tail. A failed query
+// leaves acknowledgements disabled, but does not crash-loop the gateway.
+await store.channelCursorStart(link, currentChannel.streams.map(s => s.group.pk));
+await retryCatchup();
+const deletionRetryTimer = setInterval(() => {
+  void retryDeletes();
+  if (!catchupReady) void retryCatchup();
+}, DELETION_RETRY_MS);
+cleanup.push(() => clearInterval(deletionRetryTimer));
 
 let unsubscribe = client.subscribeChannel(currentChannel, onChat, onSubError, onCursor);
 cleanup.push(() => unsubscribe());

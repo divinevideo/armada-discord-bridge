@@ -88,6 +88,7 @@ interface Running {
   router?: BridgeRouter;
   deletionRetryTimer?: ReturnType<typeof setInterval>;
   concordCatchupReady?: boolean;
+  concordCatchupPending?: Promise<void>;
   status: "pending_confirm" | "active";
   unsubChat: () => void;
   unsubControl: () => void;
@@ -799,23 +800,31 @@ export class BridgeManager {
    * A first checkpoint starts at the live tail floor; it is persisted before
    * admission so restart cannot mistake a first-delivery gap for a fresh link.
    */
-  private async backfillMissed(rb: Running): Promise<void> {
+  private backfillMissed(rb: Running): Promise<void> {
+    if (rb.concordCatchupPending) return rb.concordCatchupPending;
+    const pending = this.performBackfill(rb).finally(() => {
+      if (rb.concordCatchupPending === pending) rb.concordCatchupPending = undefined;
+    });
+    rb.concordCatchupPending = pending;
+    return pending;
+  }
+
+  private async performBackfill(rb: Running): Promise<void> {
     const streamPks = rb.channel.streams.map((s) => s.group.pk);
     const cursor = await this.store.channelCursorStart(rb.link, streamPks);
     // Small overlap absorbs relay/pool clock skew; dedupe eats the rest.
-    const { chats, newestWrapAt } = await rb.client.backfillChannel(rb.channel, cursor - 60);
     let mirrored = 0;
-    for (const chat of chats) {
+    await rb.client.backfillChannel(rb.channel, cursor - 60, 500, { onBatch: async ({ chats, newestWrapAt }) => {
+      for (const chat of chats) {
+        if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
+        const ids = await this.deliverRoutedChat(rb, chat);
+        mirrored += ids.length > 0 ? 1 : 0;
+      }
       if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
-      const ids = await this.deliverRoutedChat(rb, chat);
-      mirrored += ids.length > 0 ? 1 : 0;
-    }
-    if (!rb.router) throw new Error("Bridge routing stopped during catch-up");
-    rb.router.assertDeletionDeliveryDurable();
-    if (newestWrapAt !== undefined) {
+      rb.router.assertDeletionDeliveryDurable();
       rb.client.assertDeliveryHealthy();
-      await this.store.channelCursorSet(rb.link, newestWrapAt);
-    }
+      if (newestWrapAt !== undefined) await this.store.channelCursorSet(rb.link, newestWrapAt);
+    } });
     rb.concordCatchupReady = true;
     if (mirrored > 0) console.log(`bridge ${rb.id}: backfilled ${mirrored} missed messages`);
   }
@@ -1024,8 +1033,12 @@ export class BridgeManager {
     );
     const retryDeletes = () => rb.router?.retryPendingDeletes(rb.link).catch(error => console.warn(`bridge ${rb.id}: pending deletion retry failed`, error));
     void retryDeletes();
-    void this.backfillMissed(rb).catch(error => console.warn(`bridge ${rb.id}: catch-up backfill failed; cursor remains pinned`, error));
-    rb.deletionRetryTimer = setInterval(() => void retryDeletes(), DELETION_RETRY_MS);
+    const retryCatchup = () => this.backfillMissed(rb).catch(error => console.warn(`bridge ${rb.id}: catch-up incomplete; checkpoint remains pinned and retry is scheduled`, error));
+    void retryCatchup();
+    rb.deletionRetryTimer = setInterval(() => {
+      void retryDeletes();
+      if (!rb.concordCatchupReady) void retryCatchup();
+    }, DELETION_RETRY_MS);
     this.byDiscordChannel.set(rb.link.discordChannelId, rb.id);
     this.announceBridge(rb).catch(() => {});
   }

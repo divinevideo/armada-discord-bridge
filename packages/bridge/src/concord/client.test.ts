@@ -23,10 +23,11 @@ import {
   voiceMediaKey,
 } from "@armada-bridge/concord-core";
 import type { ChannelV2, InviteBundle } from "@armada-bridge/concord-core";
-import { generateSecretKey, getPublicKey } from "nostr-tools/pure";
+import { finalizeEvent, generateSecretKey, getPublicKey } from "nostr-tools/pure";
 import type { NostrEvent } from "nostr-tools/pure";
 import type { NostrFilter } from "@nostrify/nostrify";
 
+import { deliverConcordChat } from "./delivery";
 import { CONTROL_REFOLD_MS, ConcordClient, hasProxyTag, proxyTag, resolveInvite } from "./client";
 import type { RelayLike } from "./pool";
 import { localIdentity } from "./signer";
@@ -37,7 +38,12 @@ class FakePool implements RelayLike {
   private subs: Array<{ filters: NostrFilter[]; onEvent: (e: NostrEvent) => void }> = [];
   constructor(private readonly canned: NostrEvent[] = []) {}
   async query(filters: NostrFilter[]): Promise<NostrEvent[]> {
-    return this.canned.filter((event) => matches(filters, event));
+    const found = new Map<string, NostrEvent>();
+    for (const filter of filters) for (const event of this.canned.filter(event => matches([filter], event) &&
+      (filter.since === undefined || event.created_at >= filter.since) &&
+      (filter.until === undefined || event.created_at <= filter.until))
+      .sort((a, b) => b.created_at - a.created_at).slice(0, filter.limit ?? Infinity)) found.set(event.id, event);
+    return [...found.values()];
   }
   async publish(event: NostrEvent): Promise<void> {
     this.published.push(event);
@@ -421,12 +427,76 @@ describe('durable delivery cursor', () => {
     } finally { Date.now = realNow; }
   });
 
-  it('refuses to certify a saturated catch-up page as a complete replay', async () => {
+  it('recovers more than 500 signed wraps in bounded oldest-first batches', async () => {
     const { community } = makeCommunity(); const channel = makeChannel(community);
     const scratch = new FakePool(); const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
-    const { wrap } = await writer.sendChat(channel, { content: 'signed page', author: localIdentity(generateSecretKey()) });
-    const client = new ConcordClient(community, new FakePool([wrap, wrap]), localIdentity(generateSecretKey()));
-    await expect(client.backfillChannel(channel, 0, 2)).rejects.toThrow('catch-up limit');
+    const author = localIdentity(generateSecretKey()); const base = Math.floor(Date.now() / 1000) - 1000;
+    const wraps: NostrEvent[] = [];
+    for (let i = 0; i < 505; i++) {
+      const { wrap } = await writer.sendChat(channel, { content: `page ${i}`, author, ms: (base + i) * 1000 });
+      wraps.push(finalizeEvent({ ...wrap, created_at: base + i }, channel.current.group.sk));
+    }
+    const client = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+    const contents: string[] = []; const sizes: number[] = [];
+    const result = await client.backfillChannel(channel, base, 500, { onBatch: async batch => {
+      sizes.push(batch.chats.length); contents.push(...batch.chats.map(chat => chat.content));
+    } });
+    expect(contents).toEqual(Array.from({ length: 505 }, (_, i) => `page ${i}`));
+    expect(Math.max(...sizes)).toBeLessThan(500);
+    expect(result.chats).toEqual([]); // Streaming consumers do not accumulate history.
+    expect(result.newestWrapAt).toBe(base + 504);
+    let batches = 0, committedAt = base;
+    const settled = new Set<string>();
+    await expect(client.backfillChannel(channel, base, 500, { onBatch: async batch => {
+      if (++batches === 2) throw new Error('stop before second batch commits');
+      batch.chats.forEach(chat => settled.add(chat.rumorId)); committedAt = batch.newestWrapAt!;
+    } })).rejects.toThrow('stop before second batch commits');
+    expect(committedAt).toBeLessThan(base + 504);
+    const restarted = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+    for (const chat of (await restarted.backfillChannel(channel, committedAt - 1)).chats) settled.add(chat.rumorId);
+    expect(settled.size).toBe(505);
+  }, 15_000);
+
+  it('fully recovers same-second ties instead of advancing past a truncated bucket', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const scratch = new FakePool(); const writer = new ConcordClient(community, scratch, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey()); const at = Math.floor(Date.now() / 1000);
+    const wraps: NostrEvent[] = [];
+    for (let i = 0; i < 6; i++) {
+      const { wrap } = await writer.sendChat(channel, { content: `tie ${i}`, author, ms: at * 1000 + i });
+      wraps.push(finalizeEvent({ ...wrap, created_at: at }, channel.current.group.sk));
+    }
+    const client = new ConcordClient(community, new FakePool(wraps), localIdentity(generateSecretKey()));
+    const result = await client.backfillChannel(channel, at, 3);
+    expect(result.chats.map(chat => chat.content)).toEqual(Array.from({ length: 6 }, (_, i) => `tie ${i}`));
+    expect(result.newestWrapAt).toBe(at);
+  });
+
+  it('does not certify catch-up from a partial relay read', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = Object.assign(new FakePool(), { queryStrict: async () => { throw new Error('one configured relay unavailable'); } });
+    const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    let batches = 0;
+    await expect(client.backfillChannel(channel, 0, 500, { onBatch: async () => { batches++; } })).rejects.toThrow('one configured relay unavailable');
+    expect(batches).toBe(0);
+  });
+
+  it('keeps live cursor acknowledgement healthy after an ordinary mirror error', async () => {
+    const { community } = makeCommunity(); const channel = makeChannel(community);
+    const pool = new FakePool(); const client = new ConcordClient(community, pool, localIdentity(generateSecretKey()));
+    const author = localIdentity(generateSecretKey()); let calls = 0, finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; }); const cursors: number[] = []; const errors: unknown[] = [];
+    const router = { onConcordChat: async () => { if (++calls === 1) throw new Error('Discord 503'); return []; } };
+    const link = { communityId: community.idHex, concordChannelIdHex: channel.idHex, discordGuildId: 'g', discordChannelId: 'c', enabled: true };
+    client.subscribeChannel(channel, chat => deliverConcordChat(router, chat, link, error => errors.push(error)), undefined, (_pk, at) => {
+      cursors.push(at); if (cursors.length === 2) finish();
+    });
+    pool.emit((await client.sendChat(channel, { content: 'temporary failure', author })).wrap);
+    pool.emit((await client.sendChat(channel, { content: 'later success', author })).wrap);
+    await done;
+    expect(errors).toHaveLength(1);
+    expect(cursors).toHaveLength(2);
+    expect(() => client.assertDeliveryHealthy()).not.toThrow();
   });
 
   it('pins the cursor after a storage failure rather than advancing on a later success', async () => {

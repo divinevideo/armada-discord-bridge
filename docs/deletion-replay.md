@@ -33,8 +33,20 @@ stores progress for the full tenant/community/Concord-channel/Discord-guild/
 Discord-channel link, independent of changing stream keys. Workers persist its
 initial floor before admitting routed live work; legacy per-stream progress is
 inherited at the lowest existing watermark. Fresh links start at the current
-live-tail floor. A saturated catch-up query refuses to advance or certify
-completion; resolve the backlog before considering that worker caught up.
+live-tail floor. Ordinary mirror send failures warn and continue, including the
+portal missing-permission alert, without poisoning deletion durability.
+
+Catch-up reads all configured relays and splits saturated 500-wrap time windows
+into disjoint smaller windows, delivered oldest-first. Each fully handled batch
+commits its own checkpoint before reading later work, so a crash or failure can
+resume from the last complete batch. Streaming worker callbacks retain only the
+current bounded batch; they do not collect the whole backlog. Same-second ties
+expand only that second’s query, up to a 16,384-wrap query ceiling; Nostr has no
+within-second offset. A still-saturated second fails closed before its checkpoint
+advances. Incomplete catch-up keeps the worker serving live best-effort traffic
+with cursor writes disabled and retries every ten seconds; overlapping retries
+coalesce. Fix the unavailable relay or excessive same-second bucket instead of
+manually moving the checkpoint past unprocessed work.
 
 Lease/visibility checks and the synchronous current-fold check run again at the
 Discord adapter's final dispatch boundary. Reactions retain their active mapping until
@@ -49,6 +61,6 @@ deletes can retry idempotently. A webhook's
 Unknown Message response alone does not prove a Discord-origin post is gone:
 the bot endpoint must also resolve the fallback.
 
-Ship both additive migrations with the worker source through the existing release
+Ship all three additive migrations with the worker source through the existing release
 process. Local synthetic tests and an isolated database prove source behavior,
 not live Discord delivery or production admission readiness.

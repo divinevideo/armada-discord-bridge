@@ -65,6 +65,8 @@ export interface SubscriptionHandlers {
 
 export interface RelayLike {
   query(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
+  /** Complete replay requires every configured relay, not a partial successful subset. */
+  queryStrict?(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
   /** First relay holding a match wins; see {@link RelayPool.queryRace}. */
   queryRace?(filters: NostrFilter[], opts?: { signal?: AbortSignal }): Promise<NostrEvent[]>;
   publish(event: NostrEvent, opts?: { signal?: AbortSignal }): Promise<void>;
