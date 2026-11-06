@@ -30,6 +30,18 @@ describe('isolated destination measurement', () => {
     expect(() => benchmarkNamespaceGuard(config, namespace, [policy], [], [{ kind: 'Service' }])).toThrow();
     expect(() => benchmarkNamespaceGuard(config, { metadata: { name: config.namespace } }, [policy], [], [])).toThrow();
   });
+  test('recognizes deny-ingress policies after Kubernetes omits the empty ingress list', () => {
+    const namespace = { metadata: { name: config.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } } };
+    const storedPolicy = { spec: { podSelector: {}, policyTypes: ['Ingress', 'Egress'], egress: [{ ports: [{ port: 53, protocol: 'UDP' }] }] } };
+    expect(() => benchmarkNamespaceGuard(config, namespace, [storedPolicy], [], [])).not.toThrow();
+    for (const spec of [
+      { ...storedPolicy.spec, policyTypes: ['Egress'] },
+      { ...storedPolicy.spec, policyTypes: undefined },
+      { ...storedPolicy.spec, podSelector: { matchLabels: { app: 'some-pods' } } },
+      { ...storedPolicy.spec, ingress: [{}] },
+    ]) expect(() => benchmarkNamespaceGuard(config, namespace, [{ spec }], [], [])).toThrow();
+    expect(() => benchmarkNamespaceGuard(config, namespace, [storedPolicy, { spec: { ingress: [{}] } }], [], [])).toThrow();
+  });
   test('only prepares a nonprivileged private Pod with a dedicated credential reference', () => {
     const pod = benchmarkPod(config, matrix, 'capacity-synthetic-1');
     expect(pod.kind).toBe('Pod');
@@ -147,7 +159,7 @@ test('destination preflight compares the selected relay, separate PVC and runnin
     if (args.includes('deployment')) return JSON.stringify({ spec: { template: { spec: { containers: [relay] } } } });
     if (args.includes('pvc')) return JSON.stringify(args.includes('capacity-data') ? storage : { ...storage, spec: { ...storage.spec, volumeName: failStorage ? 'synthetic-benchmark-pv' : 'synthetic-production-pv' } });
     if (args.includes('namespace')) return JSON.stringify({ metadata: { name: config.namespace, labels: { 'divine.video/capacity-benchmark': 'true' } } });
-    if (args.includes('networkpolicies')) return JSON.stringify({ items: [{ spec: { podSelector: {}, policyTypes: ['Ingress'], ingress: [] } }] });
+    if (args.includes('networkpolicies')) return JSON.stringify({ items: [{ spec: { podSelector: {}, policyTypes: ['Ingress'] } }] });
     if (args.includes('cluster')) return JSON.stringify({ spec: { imageName: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2', memory: '8Gi' } } }, status: { currentPrimary: 'synthetic-postgres-primary' } });
     if (args.includes('pod')) return JSON.stringify({ metadata: { uid: primaryUID }, spec: { containers: [{ name: 'postgres', image: 'registry.example/postgresql:18.1-test', resources: { limits: { cpu: '2', memory: '8Gi' } } }] }, status: { podIP: '10.0.0.2' } });
     return JSON.stringify({ items: [] });
@@ -378,12 +390,15 @@ test('the loopback Docker script cannot be redirected to a live cluster by lefto
 import { forward } from './capacity-kubernetes';
 test('a long-lived port-forward is drained so chatty kubectl output cannot stall it, and its exit is observable', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'capacity-forward-test-'));
+  let f: Awaited<ReturnType<typeof forward>> | undefined;
   try {
     const marker = join(dir, 'finished'), script = join(dir, 'kubectl');
     // After the ready line, write far more than any pipe buffer to both streams.
-    await writeFile(script, `#!/bin/sh\necho "Forwarding from 127.0.0.1:41234 -> 7777"\ni=0\nwhile [ $i -lt 300 ]; do head -c 10000 /dev/zero | tr '\\0' x >&2; head -c 10000 /dev/zero | tr '\\0' y; echo; i=$((i+1)); done\necho done > ${marker}\nexec sleep 30\n`);
+    // One writer produces the output without spending the deadline spawning
+    // 1,200 head/tr processes on hosts where process creation is slower.
+    await writeFile(script, `#!/usr/bin/env bun\nconsole.log("Forwarding from 127.0.0.1:41234 -> 7777");\nawait Bun.write(Bun.stderr, 'x'.repeat(3000000));\nawait Bun.write(Bun.stdout, 'y'.repeat(3000000));\nawait Bun.write(${JSON.stringify(marker)}, 'done');\nsetInterval(() => {}, 1000);\n`);
     await chmod(script, 0o755);
-    const f = await forward([script, 'pod/synthetic']);
+    f = await forward([script, 'pod/synthetic']);
     expect(f.url).toBe('ws://127.0.0.1:41234');
     for (let n = 0; n < 100 && !await Bun.file(marker).exists(); n++) await Bun.sleep(50);
     expect(await Bun.file(marker).exists()).toBe(true);
@@ -391,7 +406,7 @@ test('a long-lived port-forward is drained so chatty kubectl output cannot stall
     f.stop();
     for (let n = 0; n < 100 && f.alive!(); n++) await Bun.sleep(20);
     expect(f.alive!()).toBe(false);
-  } finally { await rm(dir, { recursive: true, force: true }); }
+  } finally { f?.stop(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test('a dead forward is reported with a readable reason before any sample runs', async () => {

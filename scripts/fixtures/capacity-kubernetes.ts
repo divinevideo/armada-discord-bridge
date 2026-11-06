@@ -67,7 +67,10 @@ export function benchmarkNamespaceGuard(c: DestinationConfig, namespace: Json, p
   need(namespace.metadata?.name === c.namespace && namespace.metadata?.labels?.['divine.video/capacity-benchmark'] === 'true', 'Namespace is not a marked synthetic benchmark');
   need(pods.length === 0 && routes.length === 0, 'Benchmark namespace must have no existing workloads or exposure');
   need(!policies.some(p => p.spec?.ingress?.length > 0), 'Additional ingress allowances defeat benchmark isolation');
-  need(policies.some(p => Object.keys(p.spec?.podSelector ?? { invalid: true }).length === 0 && p.spec?.policyTypes?.includes('Ingress') && Array.isArray(p.spec?.ingress) && p.spec.ingress.length === 0), 'Default deny ingress required for isolated benchmark');
+  // Kubernetes omits an empty ingress list on readback. With explicit Ingress
+  // isolation, an absent list denies all traffic just like ingress: []; it is
+  // not the allow-all rule ingress: [{}], rejected above.
+  need(policies.some(p => Object.keys(p.spec?.podSelector ?? { invalid: true }).length === 0 && p.spec?.policyTypes?.includes('Ingress') && (p.spec.ingress === undefined || (Array.isArray(p.spec.ingress) && p.spec.ingress.length === 0))), 'Default deny ingress required for isolated benchmark');
 }
 /**
  * Relay names double as Kubernetes Pod names, which are DNS labels: case ids
