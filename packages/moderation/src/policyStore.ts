@@ -182,16 +182,21 @@ export class PolicyStore {
         if (!restoring && result.action === "accept" && this.capacity) {
           const org = this.options.capacity!.communities.get(communityId); if (!org) return rejected;
           let urgent = Boolean(rekey);
+          let initialControl: ReturnType<typeof parseEdition> | undefined;
           if (row) {
             const opened = openWrap(event, streamOf(row).key), state = controlState(policy!);
-            if (control) urgent = bytesToHex(parseEdition(opened).entityId) === bytesToHex(banlistLocator(hex32(communityId)));
+            if (control) {
+              const edition = parseEdition(opened), entityId = bytesToHex(edition.entityId);
+              if (!state.folded.heads.has(entityId) || policy!.controlEvents.some(e => e.id === event.id)) initialControl = edition;
+              urgent = entityId === bytesToHex(banlistLocator(hex32(communityId)));
+            }
             else if (opened.kind === 5 || opened.kind === 3309) urgent = isAuthorized(state.folded.roster, opened.author, policy!.owner, opened.kind === 5 ? Permissions.MANAGE_MESSAGES : Permissions.KICK) && citationSatisfied(state.folded, hex32(communityId), opened.author, citationFromTags(opened.tags));
           }
           // Verified self-deletions and guestbook leaves use the same measured
           // gate as staff actions. They add no control or rekey history, so
           // they preserve the finite reserve for actions that grow history.
           if (retraction && !control && !rekey) urgent = true;
-          await this.capacity.assertAdmission(tx, policy!, org, urgent, { control: control?.id, rekey: rekey?.event.id, bytes: Buffer.byteLength(JSON.stringify(event)) }, performance.now() - admissionStart);
+          await this.capacity.assertAdmission(tx, policy!, org, urgent, { control: control?.id, rekey: rekey?.event.id, bytes: Buffer.byteLength(JSON.stringify(event)), initialControl }, performance.now() - admissionStart);
         }
         if (result.action === "accept" && control) await tx`INSERT INTO moderation.accepted_control (community_id, event_id, event) VALUES (${communityId}, ${control.id}, ${tx.json(control as never)}) ON CONFLICT DO NOTHING`;
         if (result.action === "accept") for (const target of removals ?? []) {
