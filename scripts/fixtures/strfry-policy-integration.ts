@@ -136,6 +136,11 @@ try {
 } finally { await sql.end(); }
 `, { mode: 0o644 });
   for (const mode of ["strict-missing", "strict-invalid"]) {
+    const setup = await moderationFixture();
+    await store.install({ ...setup.policy, rootEpoch: "0", controlEvents: [], banned: [], validUntil: Date.now() + 60_000 }, [setup.controlStream, setup.guestbookStream], 0);
+    calibration.communities.push([setup.community.idHex, "synthetic"]);
+    await writeFile(join(directory, "calibration.json"), JSON.stringify(calibration), { mode: 0o644 });
+    await new PublicCapacityStore(sql, undefined).observeCurrent("synthetic", setup.community.idHex);
     const instance = await relay(mode), writer = await connect(instance.url), reader = await connect(instance.url);
     reader.ws.send(JSON.stringify(["REQ", "strict-live", { authors: [fixture.chatKey.pk] }]));
     await waitFor(() => reader.messages.some(m => m[0] === "EOSE") ? true : undefined);
@@ -145,6 +150,15 @@ try {
     assert.equal(reader.messages.some(m => m[0] === "EVENT" && m[2].id === event.id), false);
     assert.equal((await sql`SELECT 1 FROM moderation.carriers WHERE event_id = ${event.id}`).length, 0);
     console.log(`PASS deployed entrypoint ${mode}: no acceptance, storage, fanout or admission database mutation`);
+    for (const control of setup.policy.controlEvents.slice(0, 3)) {
+      assert.equal(await writer.publish(control), true);
+      assert.equal((await writer.query([control.id])).length, 1);
+    }
+    assert.equal((await store.getPolicy(setup.community.idHex))!.controlEvents.length, 3);
+    const profile = await setup.owner.signer.signEvent({ kind: 0, content: "{}", tags: [], created_at: Math.floor(Date.now() / 1000) });
+    assert.equal(await writer.publish(profile), false);
+    assert.equal((await writer.query([profile.id])).length, 0);
+    console.log(`PASS deployed entrypoint ${mode}: owner setup persisted and read back; ordinary writes remain closed`);
   }
   console.log("CALIBRATION synthetic library input only; positive runtime checks are not a measured launch contract");
   const normal = await relay("normal");

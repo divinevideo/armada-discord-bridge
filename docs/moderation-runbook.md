@@ -302,6 +302,18 @@ does not guess it or retroactively expose/erase that evidence.
 
 ## Durable public capacity
 
+Before a room's first capacity configuration, its owner can initialize new
+metadata, channels, roles, grants and invite registry entries through normal
+verified relay admission. This setup path accepts only first editions in root
+epoch zero, up to 16 stored control events and 64 KiB of control history. It
+requires fresh complete policy and an operator observation, no prior capacity
+configuration, no operator pause, no rekeys and no stored message traffic.
+Existing entities can only replay their exact stored event on this path;
+updates, delegated actions and ordinary writes retain normal capacity admission.
+The allowance establishes initial moderation authority without supplying or
+claiming a public traffic capacity certificate. Owner signatures still come
+from the dedicated signer; no owner private key belongs in a workload.
+
 Mount externally reviewed measurement JSON at MODERATION_CAPACITY_CONTRACT_FILE in the relay plugin, worker, portal and standalone public bridge. MODERATION_SOURCE_SHA is bound to the image build revision; validation compares the contract against that source and the actual native platform. MODERATION_COMMUNITY_ORGS supplies the existing approved organization/community scope. Missing, invalid, mismatched or stale evidence closes new public mutation. Legacy mode keeps its existing behavior. Do not convert synthetic calibration into a launch contract or claim a destination envelope from an emulated build.
 
 The worker observes actual complete history, bytes, rekeys and streams under its operator database authority. The validator can only read the durable018 state; it repeats current counts under the admission policy lock before mutation. Ordinary chat and managed elective control warn at the warning bound and stop at the pause bound. Only already-verified staff deletion, banlist control and rekey authority can use the finite measured reserve; no caller emergency flag exists. Relay-side self-deletions whose every target the member authored, and authenticated guestbook leaves, use that same measured capacity gate after policy admission; ordinary chat, edits and joins remain paused. Exhaustion, unavailable policy and unknown configuration fail closed. A capacity refusal (pause, unknown or missing contract, exhausted reserve) reaches clients as `rate-limited: room is at capacity, try again later`; all other refusals retain the opaque `blocked:` message. Independently authorized external churn remains a controller-model release assumption.

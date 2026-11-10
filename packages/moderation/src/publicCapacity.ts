@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type postgres from "postgres";
+import { VSK_CHANNEL, VSK_GRANT, VSK_INVITE_REGISTRY, VSK_METADATA, VSK_ROLE, type ParsedEdition } from "@armada-bridge/concord-core";
 import { validateCapacityContract, type PublicCapacityContract } from "./capacityContract";
 import type { CommunityPolicy } from "./contracts";
 import { PolicyStore, policyLock } from "./policyStore";
@@ -13,6 +14,7 @@ export const CAPACITY_REFUSAL = "rate-limited: room is at capacity, try again la
 /** Thrown only by the capacity gate, so admission can tell it from policy. */
 export class CapacityRefusal extends Error {}
 const unknown = (reasonCode: string): PublicCapacityState => ({ state: "unknown", reasonCode, remainingBudget: 0 });
+const SETUP_KINDS = new Set([VSK_METADATA, VSK_CHANNEL, VSK_ROLE, VSK_GRANT, VSK_INVITE_REGISTRY]);
 export function evaluatePublicCapacity(snapshot: PublicCapacitySnapshot, contract: PublicCapacityContract | undefined, now: number): PublicCapacityState {
   if (!contract) return unknown("capacity_contract_required");
   if (![now, snapshot.observedAt, snapshot.historyCount, snapshot.historyBytes, snapshot.rekeyCount, snapshot.streamCount, snapshot.inFlight].every(v => Number.isSafeInteger(v) && v >= 0) || (snapshot.innerAdmissionMs !== undefined && (!Number.isFinite(snapshot.innerAdmissionMs) || snapshot.innerAdmissionMs < 0))) return unknown("capacity_sample_invalid");
@@ -76,12 +78,26 @@ export class PublicCapacityStore {
       return { ...next, reasonCode: "capacity_operator_resumed" };
     }) as Promise<PublicCapacityState>;
   }
-  async assertAdmission(tx: postgres.TransactionSql, policy: CommunityPolicy, orgId: string, urgent: boolean, projected: { control?: string; rekey?: string; bytes: number }, gateElapsedMs: number): Promise<void> {
+  async assertAdmission(tx: postgres.TransactionSql, policy: CommunityPolicy, orgId: string, urgent: boolean, projected: { control?: string; rekey?: string; bytes: number; initialControl?: ParsedEdition }, gateElapsedMs: number): Promise<void> {
     const [row] = await tx`SELECT * FROM moderation.public_capacity_state WHERE org_id = ${orgId} AND community_id = ${policy.communityId}`;
     const snapshot = await currentCapacitySnapshot(tx, policy, orgId, 1);
     if (projected.control && !policy.controlEvents.some(e => e.id === projected.control)) { snapshot.historyCount++; snapshot.historyBytes += projected.bytes; }
     if (projected.rekey && !(await tx`SELECT 1 FROM moderation.rekey_events WHERE event_id = ${projected.rekey}`).length) { snapshot.historyCount++; snapshot.rekeyCount++; snapshot.historyBytes += projected.bytes; }
     snapshot.innerAdmissionMs = gateElapsedMs;
+    const setup = projected.initialControl, now = Date.now();
+    // A fresh room must be able to install its owner-signed initial roles and
+    // grants before load certification. This finite allowance cannot open chat,
+    // amend existing entities, override a pause or revive a previous release.
+    // The caller supplies an edition only after normal cryptographic admission;
+    // count and bytes include pending accepted control under the policy lock.
+    if (!this.contract && projected.control && setup?.author === policy.owner && setup.version === 1n && !setup.prevHash && SETUP_KINDS.has(setup.vsk)
+      && policy.complete && !policy.rekeyPending && now < policy.validUntil && (policy.rootEpoch ?? "0") === "0"
+      && row?.state === "unknown" && row.reason_code === "capacity_contract_required" && row.contract_hash === null && row.paused_at === null
+      && now >= row.observed_at.getTime() && now - row.observed_at.getTime() <= 30_000
+      && snapshot.historyCount <= 16 && snapshot.historyBytes + 1 <= 65_536 && snapshot.rekeyCount === 0 && snapshot.streamCount <= 32) {
+      const [traffic] = await tx`SELECT EXISTS (SELECT 1 FROM moderation.carriers WHERE community_id = ${policy.communityId}) AS present`;
+      if (!traffic.present) return;
+    }
     if (!this.contract || !row || row.contract_hash !== this.contractHash || row.state === "unknown") throw new CapacityRefusal("Capacity configuration unavailable");
     const evaluated = evaluatePublicCapacity({ ...snapshot, observedAt: row.observed_at.getTime() }, this.contract, Date.now());
     if (urgent) {
