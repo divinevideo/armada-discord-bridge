@@ -159,6 +159,13 @@ try {
     assert.equal(await writer.publish(profile), false);
     assert.equal((await writer.query([profile.id])).length, 0);
     console.log(`PASS deployed entrypoint ${mode}: owner setup persisted and read back; ordinary writes remain closed`);
+    writer.ws.close(); reader.ws.close();
+    // These rooms belong to separate relay instances. The later single-room
+    // restore must not inherit their policy scope from this shared test DB.
+    await sql`DELETE FROM moderation.public_capacity_state WHERE community_id = ${setup.community.idHex}`;
+    await sql`DELETE FROM moderation.community_policy WHERE community_id = ${setup.community.idHex}`;
+    calibration.communities = calibration.communities.filter(([id]) => id !== setup.community.idHex);
+    await writeFile(join(directory, "calibration.json"), JSON.stringify(calibration), { mode: 0o644 });
   }
   console.log("CALIBRATION synthetic library input only; positive runtime checks are not a measured launch contract");
   const normal = await relay("normal");
